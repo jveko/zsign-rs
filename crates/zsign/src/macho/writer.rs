@@ -5,13 +5,17 @@
 //! - Finding or creating LC_CODE_SIGNATURE load command
 //! - Updating __LINKEDIT segment to include the signature
 //! - Appending the SuperBlob signature to the binary
+//! - FAT/Universal binary support with per-architecture signing
 
 use crate::{Error, Result};
+use goblin::mach::fat::FatArch;
 use goblin::mach::header::{MH_CIGAM_64, MH_MAGIC_64};
 use goblin::mach::load_command::{CommandVariant, LinkeditDataCommand, SegmentCommand64};
-use goblin::mach::{Mach, MachO};
+use goblin::mach::{Mach, MachO, MultiArch};
 use std::fs;
 use std::path::Path;
+
+use super::signer::SignedSlice;
 
 /// Load command type for LC_CODE_SIGNATURE
 const LC_CODE_SIGNATURE: u32 = 0x1d;
@@ -27,6 +31,8 @@ const LINKEDIT_DATA_COMMAND_SIZE: u32 = 16;
 /// 2. Updated __LINKEDIT segment to include the signature
 /// 3. The signature appended at the end of the file
 ///
+/// Supports both single-architecture and FAT/Universal binaries.
+///
 /// # Arguments
 ///
 /// * `input_path` - Path to the input Mach-O binary
@@ -38,7 +44,6 @@ const LINKEDIT_DATA_COMMAND_SIZE: u32 = 16;
 /// Returns an error if:
 /// - The input file cannot be read
 /// - The binary is not a valid Mach-O
-/// - The binary is a FAT binary (not yet supported)
 /// - There is no space for LC_CODE_SIGNATURE in the load commands
 /// - The output file cannot be written
 pub fn write_signed_macho(
@@ -70,6 +75,10 @@ pub fn write_signed_macho_in_place(binary_path: impl AsRef<Path>, signature: &[u
 
 /// Embeds a code signature into Mach-O binary data.
 ///
+/// For single-architecture binaries, embeds the signature directly.
+/// For FAT/Universal binaries, this function requires the signature for the first
+/// slice only. Use `embed_signature_fat` for full FAT binary support.
+///
 /// Returns a new Vec<u8> containing the modified binary with the signature embedded.
 pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
     let mach =
@@ -77,10 +86,154 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
 
     match mach {
         Mach::Binary(macho) => embed_signature_single(data, &macho, signature),
-        Mach::Fat(_) => Err(Error::MachO(
-            "FAT binary signing not yet implemented".into(),
-        )),
+        Mach::Fat(fat) => {
+            // For backwards compatibility, sign only the first slice
+            let first_arch = fat
+                .iter_arches()
+                .next()
+                .ok_or_else(|| Error::MachO("Empty FAT binary".into()))?
+                .map_err(|e| Error::MachO(format!("Failed to read FAT arch: {}", e)))?;
+
+            let signed_slice = SignedSlice {
+                slice_index: 0,
+                offset: first_arch.offset as usize,
+                original_size: first_arch.size as usize,
+                signature: signature.to_vec(),
+            };
+
+            embed_signature_fat_impl(data, &fat, &[signed_slice])
+        }
     }
+}
+
+/// Embeds code signatures into a FAT/Universal binary for all architecture slices.
+///
+/// Each slice in the FAT binary is signed independently. The FAT header offsets
+/// are recalculated to account for size changes due to embedded signatures.
+///
+/// # Arguments
+///
+/// * `data` - The original FAT binary data
+/// * `signed_slices` - Signatures for each architecture slice (from `sign_macho_all_slices`)
+///
+/// # Returns
+///
+/// A new `Vec<u8>` containing the modified FAT binary with all signatures embedded.
+pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result<Vec<u8>> {
+    let mach =
+        Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
+
+    match mach {
+        Mach::Binary(macho) => {
+            if signed_slices.is_empty() {
+                return Err(Error::MachO("No signed slices provided".into()));
+            }
+            embed_signature_single(data, &macho, &signed_slices[0].signature)
+        }
+        Mach::Fat(fat) => embed_signature_fat_impl(data, &fat, signed_slices),
+    }
+}
+
+/// Implementation of FAT binary signature embedding.
+fn embed_signature_fat_impl(
+    data: &[u8],
+    fat: &MultiArch,
+    signed_slices: &[SignedSlice],
+) -> Result<Vec<u8>> {
+    // Collect architecture information
+    let arches: Vec<FatArch> = fat
+        .iter_arches()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::MachO(format!("Failed to read FAT arches: {}", e)))?;
+
+    if arches.is_empty() {
+        return Err(Error::MachO("Empty FAT binary".into()));
+    }
+
+    // Sign each slice and collect the results
+    let mut signed_slice_data: Vec<Vec<u8>> = Vec::with_capacity(arches.len());
+
+    for (i, arch) in arches.iter().enumerate() {
+        let offset = arch.offset as usize;
+        let size = arch.size as usize;
+        let slice_data = &data[offset..offset + size];
+
+        // Find the corresponding signed slice
+        let signature = signed_slices
+            .iter()
+            .find(|s| s.slice_index == i)
+            .map(|s| s.signature.as_slice())
+            .unwrap_or(&[]);
+
+        if signature.is_empty() {
+            // No signature for this slice, keep it as-is
+            signed_slice_data.push(slice_data.to_vec());
+        } else {
+            // Parse and sign this slice
+            let macho = MachO::parse(slice_data, 0)
+                .map_err(|e| Error::MachO(format!("Failed to parse slice {}: {}", i, e)))?;
+
+            let signed = embed_signature_single(slice_data, &macho, signature)?;
+            signed_slice_data.push(signed);
+        }
+    }
+
+    // Calculate new offsets with proper alignment
+    // FAT header: 8 bytes + (20 bytes per arch)
+    let fat_header_size = 8 + (arches.len() * 20);
+
+    // Start slices after header, aligned to page boundary
+    let mut current_offset = align_to(fat_header_size, 0x4000);
+    let mut new_offsets: Vec<(u32, u32)> = Vec::with_capacity(arches.len());
+
+    for (i, signed_data) in signed_slice_data.iter().enumerate() {
+        // Align to the arch's specified alignment (usually page size)
+        let alignment = 1u32 << arches[i].align;
+        current_offset = align_to(current_offset, alignment as usize);
+
+        new_offsets.push((current_offset as u32, signed_data.len() as u32));
+        current_offset += signed_data.len();
+    }
+
+    // Build the new FAT binary
+    let total_size = current_offset;
+    let mut output = vec![0u8; total_size];
+
+    // Write FAT header (always big-endian)
+    // Magic: 0xCAFEBABE
+    output[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+    // Number of architectures
+    output[4..8].copy_from_slice(&(arches.len() as u32).to_be_bytes());
+
+    // Write fat_arch entries
+    for (i, arch) in arches.iter().enumerate() {
+        let entry_offset = 8 + (i * 20);
+        let (new_offset, new_size) = new_offsets[i];
+
+        // cputype
+        write_u32_be(&mut output, entry_offset, arch.cputype as u32);
+        // cpusubtype
+        write_u32_be(&mut output, entry_offset + 4, arch.cpusubtype as u32);
+        // offset (new)
+        write_u32_be(&mut output, entry_offset + 8, new_offset);
+        // size (new)
+        write_u32_be(&mut output, entry_offset + 12, new_size);
+        // align
+        write_u32_be(&mut output, entry_offset + 16, arch.align);
+    }
+
+    // Write each signed slice at its new offset
+    for (i, signed_data) in signed_slice_data.iter().enumerate() {
+        let (offset, _) = new_offsets[i];
+        output[offset as usize..offset as usize + signed_data.len()].copy_from_slice(signed_data);
+    }
+
+    Ok(output)
+}
+
+/// Writes a u32 in big-endian format.
+fn write_u32_be(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
 
 /// Embeds signature into a single-architecture Mach-O binary.

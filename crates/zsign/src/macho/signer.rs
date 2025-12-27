@@ -3,6 +3,9 @@
 //! This module provides the core signing functionality for Mach-O binaries,
 //! building CodeDirectory structures with page hashes and assembling them
 //! into a SuperBlob with all required signature components.
+//!
+//! Supports both single-architecture and FAT/Universal binaries by signing
+//! each architecture slice independently.
 
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
@@ -11,13 +14,26 @@ use crate::codesign::superblob::{
     build_entitlements_blob, build_requirements_blob, build_signature_blob, SuperBlobBuilder,
 };
 use crate::crypto::cms;
-use crate::{Error, Result};
+use crate::Result;
 use openssl::pkey::{PKeyRef, Private};
 use openssl::x509::X509Ref;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
 use super::parser::{ArchSlice, MachOFile};
+
+/// Represents a signed architecture slice with its signature data.
+#[derive(Debug, Clone)]
+pub struct SignedSlice {
+    /// Index of the slice in the original Mach-O file
+    pub slice_index: usize,
+    /// Offset of the slice in the original file
+    pub offset: usize,
+    /// Size of the original slice (before signature)
+    pub original_size: usize,
+    /// The SuperBlob signature data for this slice
+    pub signature: Vec<u8>,
+}
 
 /// Sign a Mach-O binary and return the complete signature blob.
 ///
@@ -27,6 +43,10 @@ use super::parser::{ArchSlice, MachOFile};
 /// - Requirements blob (minimal empty requirements if none provided)
 /// - Entitlements blob (if provided)
 /// - CMS signature with Apple CDHash attributes
+///
+/// For single-architecture binaries, returns a single signature blob.
+/// For FAT/Universal binaries, returns the signature for the first slice only.
+/// Use `sign_macho_all_slices` for FAT binaries to get signatures for all architectures.
 ///
 /// # Arguments
 ///
@@ -46,9 +66,7 @@ use super::parser::{ArchSlice, MachOFile};
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The binary is a FAT binary (not yet supported)
-/// - CMS signing fails
+/// Returns an error if CMS signing fails.
 pub fn sign_macho(
     macho: &MachOFile,
     identifier: &str,
@@ -59,17 +77,91 @@ pub fn sign_macho(
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    // For now, handle single-arch only
-    // FAT binary support would iterate slices and rebuild
-    if macho.is_fat() {
-        return Err(Error::MachO(
-            "FAT binary signing not yet implemented".into(),
-        ));
-    }
-
     let slice = &macho.slices()[0];
     let code = macho.code_bytes(slice).to_vec();
 
+    sign_slice(
+        &code,
+        slice,
+        identifier,
+        team_id,
+        entitlements,
+        cert,
+        pkey,
+        info_plist,
+        code_resources,
+    )
+}
+
+/// Sign all slices of a Mach-O binary (including FAT/Universal binaries).
+///
+/// For single-architecture binaries, returns a single `SignedSlice`.
+/// For FAT/Universal binaries, returns a `SignedSlice` for each architecture.
+///
+/// # Arguments
+///
+/// * `macho` - The parsed Mach-O file to sign
+/// * `identifier` - Bundle identifier (e.g., "com.example.app")
+/// * `team_id` - Team identifier (None for ad-hoc signing)
+/// * `entitlements` - Optional entitlements plist data (XML format)
+/// * `cert` - X.509 signing certificate
+/// * `pkey` - Private key corresponding to the certificate
+/// * `info_plist` - Optional Info.plist data for hashing
+/// * `code_resources` - Optional CodeResources data for hashing
+///
+/// # Returns
+///
+/// A `Vec<SignedSlice>` containing signature data for each architecture slice.
+pub fn sign_macho_all_slices(
+    macho: &MachOFile,
+    identifier: &str,
+    team_id: Option<&str>,
+    entitlements: Option<&[u8]>,
+    cert: &X509Ref,
+    pkey: &PKeyRef<Private>,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> Result<Vec<SignedSlice>> {
+    let mut signed_slices = Vec::with_capacity(macho.slices().len());
+
+    for (index, slice) in macho.slices().iter().enumerate() {
+        let code = macho.code_bytes(slice).to_vec();
+
+        let signature = sign_slice(
+            &code,
+            slice,
+            identifier,
+            team_id,
+            entitlements,
+            cert,
+            pkey,
+            info_plist,
+            code_resources,
+        )?;
+
+        signed_slices.push(SignedSlice {
+            slice_index: index,
+            offset: slice.offset,
+            original_size: slice.size,
+            signature,
+        });
+    }
+
+    Ok(signed_slices)
+}
+
+/// Sign a single architecture slice and return its signature blob.
+fn sign_slice(
+    code: &[u8],
+    slice: &ArchSlice,
+    identifier: &str,
+    team_id: Option<&str>,
+    entitlements: Option<&[u8]>,
+    cert: &X509Ref,
+    pkey: &PKeyRef<Private>,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     // Build requirements blob
     let requirements = build_requirements_blob();
     let requirements_hash_sha1 = sha1_hash(&requirements);
@@ -106,7 +198,7 @@ pub fn sign_macho(
     let cd_sha1 = build_code_directory(
         identifier,
         team_id,
-        &code,
+        code,
         slice,
         &requirements_hash_sha1,
         &info_hash_sha1,
@@ -119,7 +211,7 @@ pub fn sign_macho(
     let cd_sha256 = build_code_directory(
         identifier,
         team_id,
-        &code,
+        code,
         slice,
         &requirements_hash_sha256,
         &info_hash_sha256,

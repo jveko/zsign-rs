@@ -61,9 +61,10 @@ impl IpaSigner {
     /// This performs the complete signing workflow:
     /// 1. Extract IPA to a temporary directory
     /// 2. Find the .app bundle in Payload/
-    /// 3. Sign all Mach-O binaries in the bundle
-    /// 4. Generate CodeResources
-    /// 5. Repack into a new IPA
+    /// 3. Sign all Mach-O binaries in-place
+    /// 4. Copy provisioning profile to bundle
+    /// 5. Generate CodeResources (hashes include signed binaries and profile)
+    /// 6. Repack into a new IPA
     ///
     /// # Arguments
     ///
@@ -103,21 +104,25 @@ impl IpaSigner {
     /// Sign an app bundle in place.
     ///
     /// Signs all Mach-O binaries and generates CodeResources.
+    ///
+    /// The signing workflow order is critical:
+    /// 1. First: Sign all binaries in-place (modifies binary content)
+    /// 2. Then: Copy provisioning profile to bundle
+    /// 3. Finally: Generate CodeResources (hashes all files including signed binaries and profile)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
         // Get bundle identifier from Info.plist
         let identifier = self.get_bundle_identifier(bundle_path)?;
 
-        // Find and sign all Mach-O binaries
+        // Step 1: Find and sign all Mach-O binaries in-place
+        // This must happen BEFORE CodeResources generation so hashes are correct
         let binaries = self.find_macho_binaries(bundle_path)?;
 
         for binary_path in binaries {
             self.sign_binary(&binary_path, &identifier)?;
         }
 
-        // Generate CodeResources
-        self.generate_code_resources(bundle_path)?;
-
-        // Copy provisioning profile to bundle as embedded.mobileprovision
+        // Step 2: Copy provisioning profile to bundle as embedded.mobileprovision
+        // This must happen BEFORE CodeResources generation so profile is included in hashes
         if let Some(ref profile_path) = self.provisioning_profile_path {
             let embedded_path = bundle_path.join("embedded.mobileprovision");
             fs::copy(profile_path, &embedded_path).map_err(|e| {
@@ -128,6 +133,10 @@ impl IpaSigner {
                 ))
             })?;
         }
+
+        // Step 3: Generate CodeResources
+        // This must happen LAST so all file hashes (signed binaries + profile) are correct
+        self.generate_code_resources(bundle_path)?;
 
         Ok(())
     }
