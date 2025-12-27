@@ -105,33 +105,121 @@ impl IpaSigner {
     ///
     /// Signs all Mach-O binaries and generates CodeResources.
     ///
-    /// The signing workflow order is critical:
-    /// 1. First: Sign all binaries in-place (modifies binary content)
-    /// 2. Then: Copy provisioning profile to bundle
-    /// 3. Finally: Generate CodeResources (hashes all files including signed binaries and profile)
+    /// The signing workflow uses depth-first order for nested bundles:
+    /// 1. Collect all bundles (main app, frameworks, plugins) with their depths
+    /// 2. Sort by depth (deepest first)
+    /// 3. Sign each bundle in order so nested bundles are fully signed before
+    ///    their parent includes them in CodeResources
+    ///
+    /// For each bundle, the signing order is:
+    /// 1. Sign all Mach-O binaries in-place (modifies binary content)
+    /// 2. Copy provisioning profile to bundle (main app only)
+    /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
+        // Collect all bundles with their depths
+        let mut bundles = self.collect_nested_bundles(bundle_path)?;
+
+        // Sort by depth (deepest first) to ensure nested bundles are signed
+        // before their parent includes them in CodeResources
+        bundles.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Sign each bundle in depth-first order
+        for (nested_bundle_path, _depth) in &bundles {
+            // Only copy provisioning profile to the main app bundle
+            let is_main_bundle = nested_bundle_path == bundle_path;
+            self.sign_single_bundle(nested_bundle_path, is_main_bundle)?;
+        }
+
+        Ok(())
+    }
+
+    /// Collect all nested bundles (.app, .framework, .appex) with their depths.
+    ///
+    /// Returns a vector of (path, depth) tuples where depth is the nesting level.
+    fn collect_nested_bundles(&self, bundle_path: &Path) -> Result<Vec<(PathBuf, usize)>> {
+        let mut bundles = Vec::new();
+
+        // Add the main bundle at depth 0
+        bundles.push((bundle_path.to_path_buf(), 0));
+
+        // Walk the bundle looking for nested bundles
+        for entry in WalkDir::new(bundle_path)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+
+            // Check if this is a bundle directory
+            if path.is_dir() && Self::is_bundle_directory(path) {
+                // Calculate depth based on how many bundle directories are in the path
+                let depth = self.calculate_bundle_depth(path, bundle_path);
+                bundles.push((path.to_path_buf(), depth));
+            }
+        }
+
+        Ok(bundles)
+    }
+
+    /// Check if a directory is an iOS bundle.
+    fn is_bundle_directory(path: &Path) -> bool {
+        if let Some(ext) = path.extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            matches!(ext_str.as_str(), "app" | "framework" | "appex")
+        } else {
+            false
+        }
+    }
+
+    /// Calculate the nesting depth of a bundle relative to the root bundle.
+    ///
+    /// Depth is based on how many bundle directories are in the path.
+    fn calculate_bundle_depth(&self, bundle_path: &Path, root_bundle: &Path) -> usize {
+        // Strip the root bundle prefix and count bundle directories in the remaining path
+        let relative = bundle_path.strip_prefix(root_bundle).unwrap_or(bundle_path);
+
+        let mut depth = 0;
+        for component in relative.iter() {
+            let component_str = component.to_string_lossy();
+            if component_str.ends_with(".app")
+                || component_str.ends_with(".framework")
+                || component_str.ends_with(".appex")
+            {
+                depth += 1;
+            }
+        }
+
+        depth
+    }
+
+    /// Sign a single bundle (binaries + CodeResources).
+    ///
+    /// This handles one bundle at a time. Called in depth-first order.
+    fn sign_single_bundle(&self, bundle_path: &Path, copy_provisioning_profile: bool) -> Result<()> {
         // Get bundle identifier from Info.plist
         let identifier = self.get_bundle_identifier(bundle_path)?;
 
-        // Step 1: Find and sign all Mach-O binaries in-place
+        // Step 1: Find and sign all Mach-O binaries in-place (immediate children only)
         // This must happen BEFORE CodeResources generation so hashes are correct
-        let binaries = self.find_macho_binaries(bundle_path)?;
+        let binaries = self.find_immediate_macho_binaries(bundle_path)?;
 
         for binary_path in binaries {
             self.sign_binary(&binary_path, &identifier)?;
         }
 
         // Step 2: Copy provisioning profile to bundle as embedded.mobileprovision
-        // This must happen BEFORE CodeResources generation so profile is included in hashes
-        if let Some(ref profile_path) = self.provisioning_profile_path {
-            let embedded_path = bundle_path.join("embedded.mobileprovision");
-            fs::copy(profile_path, &embedded_path).map_err(|e| {
-                Error::Signing(format!(
-                    "Failed to copy provisioning profile to {}: {}",
-                    embedded_path.display(),
-                    e
-                ))
-            })?;
+        // This is only done for the main app bundle, not nested frameworks/plugins
+        if copy_provisioning_profile {
+            if let Some(ref profile_path) = self.provisioning_profile_path {
+                let embedded_path = bundle_path.join("embedded.mobileprovision");
+                fs::copy(profile_path, &embedded_path).map_err(|e| {
+                    Error::Signing(format!(
+                        "Failed to copy provisioning profile to {}: {}",
+                        embedded_path.display(),
+                        e
+                    ))
+                })?;
+            }
         }
 
         // Step 3: Generate CodeResources
@@ -139,6 +227,57 @@ impl IpaSigner {
         self.generate_code_resources(bundle_path)?;
 
         Ok(())
+    }
+
+    /// Find Mach-O binaries that belong directly to this bundle (not nested bundles).
+    ///
+    /// This excludes binaries inside nested .framework or .appex directories.
+    fn find_immediate_macho_binaries(&self, bundle_path: &Path) -> Result<Vec<PathBuf>> {
+        let mut binaries = Vec::new();
+
+        // The main executable is named in Info.plist as CFBundleExecutable
+        let main_executable = self.get_main_executable(bundle_path)?;
+        if main_executable.exists() {
+            binaries.push(main_executable);
+        }
+
+        // Find dylibs and other binaries directly in the bundle
+        // but stop at nested bundle boundaries
+        for entry in WalkDir::new(bundle_path)
+            .min_depth(1)
+            .into_iter()
+            .filter_entry(|e| {
+                // Don't descend into nested bundles - they have their own signing
+                let path = e.path();
+                if path != bundle_path && path.is_dir() && Self::is_bundle_directory(path) {
+                    return false;
+                }
+                true
+            })
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+
+            // Skip the main executable (already added) and non-files
+            if !path.is_file() {
+                continue;
+            }
+
+            // Skip files inside _CodeSignature
+            if path
+                .components()
+                .any(|c| c.as_os_str() == "_CodeSignature")
+            {
+                continue;
+            }
+
+            // Check if this is a Mach-O binary (excluding the main executable)
+            if path != self.get_main_executable(bundle_path)? && self.is_macho_binary(path)? {
+                binaries.push(path.to_path_buf());
+            }
+        }
+
+        Ok(binaries)
     }
 
     /// Get the bundle identifier from Info.plist.
@@ -172,49 +311,6 @@ impl IpaSigner {
             });
 
         Ok(identifier)
-    }
-
-    /// Find all Mach-O binaries in the bundle.
-    fn find_macho_binaries(&self, bundle_path: &Path) -> Result<Vec<PathBuf>> {
-        let mut binaries = Vec::new();
-
-        // The main executable is named in Info.plist as CFBundleExecutable
-        let main_executable = self.get_main_executable(bundle_path)?;
-        if main_executable.exists() {
-            binaries.push(main_executable);
-        }
-
-        // Find frameworks and their binaries
-        let frameworks_dir = bundle_path.join("Frameworks");
-        if frameworks_dir.exists() {
-            for entry in WalkDir::new(&frameworks_dir)
-                .min_depth(1)
-                .max_depth(2)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file() && self.is_macho_binary(path)? {
-                    binaries.push(path.to_path_buf());
-                }
-            }
-        }
-
-        // Find plugin binaries
-        let plugins_dir = bundle_path.join("PlugIns");
-        if plugins_dir.exists() {
-            for entry in WalkDir::new(&plugins_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file() && self.is_macho_binary(path)? {
-                    binaries.push(path.to_path_buf());
-                }
-            }
-        }
-
-        Ok(binaries)
     }
 
     /// Get the main executable path from Info.plist.
