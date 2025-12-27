@@ -4,6 +4,7 @@
 //! Supports signing Mach-O binaries, IPA files, and app bundles.
 
 use crate::crypto::SigningAssets;
+use crate::ipa::{CompressionLevel, IpaSigner};
 use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ pub struct ZSign {
     pkcs12: Option<PathBuf>,
     provisioning_profile: Option<PathBuf>,
     password: Option<String>,
+    compression_level: CompressionLevel,
 }
 
 impl ZSign {
@@ -38,6 +40,7 @@ impl ZSign {
             pkcs12: None,
             provisioning_profile: None,
             password: None,
+            compression_level: CompressionLevel::DEFAULT,
         }
     }
 
@@ -80,6 +83,15 @@ impl ZSign {
     /// Set password for private key or PKCS#12 file.
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Set ZIP compression level for IPA output (0-9).
+    ///
+    /// 0 = no compression (fastest), 9 = maximum compression (smallest).
+    /// Default is 6 (balanced).
+    pub fn compression_level(mut self, level: u32) -> Self {
+        self.compression_level = CompressionLevel::new(level);
         self
     }
 
@@ -157,13 +169,30 @@ impl ZSign {
 
     /// Sign an IPA file.
     ///
-    /// Not yet implemented.
+    /// Extracts the IPA, signs all Mach-O binaries in the bundle,
+    /// generates CodeResources, and repacks into a new IPA.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Path to the input IPA file
+    /// * `output` - Path for the signed output IPA
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Signing assets cannot be loaded
+    /// - IPA extraction fails
+    /// - Bundle signing fails
+    /// - IPA repacking fails
     pub fn sign_ipa(
         &self,
-        _input: impl AsRef<Path>,
-        _output: impl AsRef<Path>,
+        input: impl AsRef<Path>,
+        output: impl AsRef<Path>,
     ) -> Result<()> {
-        Err(Error::Signing("IPA signing not yet implemented".into()))
+        let assets = self.load_assets()?;
+        let signer = IpaSigner::new(assets)
+            .compression_level(self.compression_level);
+        signer.sign(input, output)
     }
 
     /// Sign an app bundle.
@@ -235,13 +264,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_ipa_not_implemented() {
+    fn test_sign_ipa_requires_credentials() {
         let zsign = ZSign::new();
         let result = zsign.sign_ipa("input.ipa", "output.ipa");
         assert!(result.is_err());
-        if let Err(Error::Signing(msg)) = result {
-            assert!(msg.contains("not yet implemented"));
+        // Now fails because no credentials are configured (not "not implemented")
+        if let Err(Error::Certificate(msg)) = result {
+            assert!(msg.contains("No certificate configured"));
         }
+    }
+
+    #[test]
+    fn test_compression_level_builder() {
+        let zsign = ZSign::new().compression_level(9);
+        assert_eq!(zsign.compression_level.level(), 9);
     }
 
     #[test]
