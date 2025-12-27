@@ -5,8 +5,9 @@
 
 use crate::crypto::SigningAssets;
 use crate::ipa::{CompressionLevel, IpaSigner};
-use crate::macho::{sign_macho, MachOFile};
+use crate::macho::{sign_macho, write_signed_macho, MachOFile};
 use crate::{Error, Result};
+use secrecy::SecretString;
 use std::path::{Path, PathBuf};
 
 /// iOS code signing tool with builder pattern API.
@@ -27,7 +28,7 @@ pub struct ZSign {
     private_key: Option<PathBuf>,
     pkcs12: Option<PathBuf>,
     provisioning_profile: Option<PathBuf>,
-    password: Option<String>,
+    password: Option<SecretString>,
     compression_level: CompressionLevel,
 }
 
@@ -81,8 +82,10 @@ impl ZSign {
     }
 
     /// Set password for private key or PKCS#12 file.
+    ///
+    /// The password is stored securely and will be zeroized when dropped.
     pub fn password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(password.into());
+        self.password = Some(SecretString::new(password.into()));
         self
     }
 
@@ -101,8 +104,7 @@ impl ZSign {
     /// Optionally loads provisioning profile for entitlements.
     fn load_assets(&self) -> Result<SigningAssets> {
         let mut assets = if let Some(ref p12) = self.pkcs12 {
-            let pass = self.password.as_deref().unwrap_or("");
-            SigningAssets::from_p12(p12, pass)?
+            SigningAssets::from_p12(p12, self.password.as_ref())?
         } else {
             let cert = self
                 .certificate
@@ -112,7 +114,7 @@ impl ZSign {
                 .private_key
                 .as_ref()
                 .ok_or_else(|| Error::Certificate("No private key configured".into()))?;
-            SigningAssets::from_pem(cert, key, self.password.as_deref())?
+            SigningAssets::from_pem(cert, key, self.password.as_ref())?
         };
 
         if let Some(ref profile) = self.provisioning_profile {
@@ -125,12 +127,12 @@ impl ZSign {
     /// Sign a Mach-O binary.
     ///
     /// Loads signing assets, parses the Mach-O binary, generates a code signature,
-    /// and writes the signature to the output file.
+    /// and writes a complete signed binary to the output path.
     ///
     /// # Arguments
     ///
     /// * `input` - Path to the input Mach-O binary
-    /// * `output` - Path for the output signature blob
+    /// * `output` - Path for the signed output binary
     ///
     /// # Errors
     ///
@@ -161,8 +163,8 @@ impl ZSign {
             None, // code_resources
         )?;
 
-        // Write the signature blob to output
-        std::fs::write(output, &signature)?;
+        // Write the complete signed binary with embedded signature
+        write_signed_macho(input.as_ref(), output.as_ref(), &signature)?;
 
         Ok(())
     }
@@ -190,8 +192,14 @@ impl ZSign {
         output: impl AsRef<Path>,
     ) -> Result<()> {
         let assets = self.load_assets()?;
-        let signer = IpaSigner::new(assets)
+        let mut signer = IpaSigner::new(assets)
             .compression_level(self.compression_level);
+
+        // Pass provisioning profile path to IpaSigner for embedding as embedded.mobileprovision
+        if let Some(ref profile_path) = self.provisioning_profile {
+            signer = signer.provisioning_profile(profile_path);
+        }
+
         signer.sign(input, output)
     }
 
@@ -212,6 +220,7 @@ impl Default for ZSign {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_zsign_builder_default() {
@@ -238,7 +247,8 @@ mod tests {
             zsign.private_key,
             Some(PathBuf::from("/path/to/key.pem"))
         );
-        assert_eq!(zsign.password, Some("secret".to_string()));
+        assert!(zsign.password.is_some());
+        assert_eq!(zsign.password.as_ref().unwrap().expose_secret(), "secret");
     }
 
     #[test]
@@ -249,7 +259,8 @@ mod tests {
             .provisioning_profile("/path/to/profile.mobileprovision");
 
         assert_eq!(zsign.pkcs12, Some(PathBuf::from("/path/to/cert.p12")));
-        assert_eq!(zsign.password, Some("p12secret".to_string()));
+        assert!(zsign.password.is_some());
+        assert_eq!(zsign.password.as_ref().unwrap().expose_secret(), "p12secret");
         assert_eq!(
             zsign.provisioning_profile,
             Some(PathBuf::from("/path/to/profile.mobileprovision"))

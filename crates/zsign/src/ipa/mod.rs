@@ -11,7 +11,7 @@ pub use extract::{extract_ipa, validate_ipa};
 
 use crate::bundle::CodeResourcesBuilder;
 use crate::crypto::SigningAssets;
-use crate::macho::{sign_macho, MachOFile};
+use crate::macho::{sign_macho, write_signed_macho_in_place, MachOFile};
 use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,8 @@ pub struct IpaSigner {
     assets: SigningAssets,
     /// Compression level for output IPA
     compression_level: CompressionLevel,
+    /// Path to provisioning profile to embed as embedded.mobileprovision
+    provisioning_profile_path: Option<PathBuf>,
 }
 
 impl IpaSigner {
@@ -35,12 +37,22 @@ impl IpaSigner {
         Self {
             assets,
             compression_level: CompressionLevel::DEFAULT,
+            provisioning_profile_path: None,
         }
     }
 
     /// Set the compression level for the output IPA.
     pub fn compression_level(mut self, level: CompressionLevel) -> Self {
         self.compression_level = level;
+        self
+    }
+
+    /// Set the provisioning profile path to embed as embedded.mobileprovision.
+    ///
+    /// iOS apps require a provisioning profile to launch on device.
+    /// This copies the profile to the bundle as `embedded.mobileprovision`.
+    pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
+        self.provisioning_profile_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -105,10 +117,16 @@ impl IpaSigner {
         // Generate CodeResources
         self.generate_code_resources(bundle_path)?;
 
-        // Install provisioning profile if we have entitlements
-        if self.assets.entitlements.is_some() {
-            // The provisioning profile should be copied separately if needed
-            // For now, we just ensure the entitlements are embedded in the signature
+        // Copy provisioning profile to bundle as embedded.mobileprovision
+        if let Some(ref profile_path) = self.provisioning_profile_path {
+            let embedded_path = bundle_path.join("embedded.mobileprovision");
+            fs::copy(profile_path, &embedded_path).map_err(|e| {
+                Error::Signing(format!(
+                    "Failed to copy provisioning profile to {}: {}",
+                    embedded_path.display(),
+                    e
+                ))
+            })?;
         }
 
         Ok(())
@@ -253,6 +271,10 @@ impl IpaSigner {
     }
 
     /// Sign a single Mach-O binary.
+    ///
+    /// Generates a code signature and embeds it directly into the binary,
+    /// modifying the LC_CODE_SIGNATURE load command and appending the
+    /// SuperBlob signature data.
     fn sign_binary(&self, binary_path: &Path, identifier: &str) -> Result<()> {
         let macho = MachOFile::open(binary_path)?;
 
@@ -280,11 +302,8 @@ impl IpaSigner {
             None, // CodeResources hash will be added later
         )?;
 
-        // Write signature back to binary
-        // For now, we write the signature as a separate file
-        // TODO: Integrate signature into the Mach-O binary properly
-        let sig_path = binary_path.with_extension("sig");
-        fs::write(&sig_path, &signature)?;
+        // Embed signature directly into the binary
+        write_signed_macho_in_place(binary_path, &signature)?;
 
         Ok(())
     }
