@@ -1,0 +1,238 @@
+//! Safe wrapper for CMS signing with Apple custom attributes
+
+use crate::{Error, Result};
+use openssl::pkey::{PKeyRef, Private};
+use openssl::x509::X509Ref;
+use openssl_sys::{
+    ASN1_OBJECT_free, BIO, BIO_new, BIO_new_mem_buf, BIO_s_mem, CMS_ContentInfo,
+    CMS_ContentInfo_free, EVP_sha256, OBJ_txt2obj, X509, EVP_PKEY,
+};
+use std::ffi::c_int;
+use std::ptr;
+
+use super::cms_ffi::{
+    CMS_SignerInfo, CMS_add1_signer, CMS_final, CMS_sign, CMS_signed_add1_attr_by_OBJ,
+    APPLE_CDHASH_V2_OID,
+};
+
+// Use the constants from cms_ffi to avoid ambiguity
+use super::cms_ffi::{CMS_BINARY, CMS_DETACHED, CMS_NOSMIMECAP, CMS_PARTIAL};
+
+// BIO functions that need to be declared
+extern "C" {
+    fn BIO_free(a: *mut BIO) -> c_int;
+    fn BIO_ctrl(bp: *mut BIO, cmd: c_int, larg: isize, parg: *mut std::ffi::c_void) -> isize;
+    fn i2d_CMS_bio(bio: *mut BIO, cms: *mut CMS_ContentInfo) -> c_int;
+}
+
+// BIO_CTRL constants
+const BIO_CTRL_RESET: c_int = 1;
+const BIO_CTRL_INFO: c_int = 3;
+
+// Helper functions for BIO operations
+unsafe fn bio_reset(bio: *mut BIO) -> c_int {
+    BIO_ctrl(bio, BIO_CTRL_RESET, 0, ptr::null_mut()) as c_int
+}
+
+unsafe fn bio_get_mem_data(bio: *mut BIO, pp: *mut *mut u8) -> isize {
+    BIO_ctrl(bio, BIO_CTRL_INFO, 0, pp as *mut std::ffi::c_void)
+}
+
+/// Get raw X509 pointer from X509Ref
+///
+/// # Safety
+/// The returned pointer is only valid as long as the X509Ref is valid.
+unsafe fn x509_as_ptr(x509: &X509Ref) -> *mut X509 {
+    // X509Ref contains a reference to the underlying X509 structure
+    // We need to cast through the reference to get the raw pointer
+    x509 as *const X509Ref as *const X509 as *mut X509
+}
+
+/// Get raw EVP_PKEY pointer from PKeyRef
+///
+/// # Safety
+/// The returned pointer is only valid as long as the PKeyRef is valid.
+unsafe fn pkey_as_ptr(pkey: &PKeyRef<Private>) -> *mut EVP_PKEY {
+    pkey as *const PKeyRef<Private> as *const EVP_PKEY as *mut EVP_PKEY
+}
+
+/// Generate CMS signature with Apple CDHash attributes
+pub fn sign_with_apple_attrs(
+    data: &[u8],
+    cert: &X509Ref,
+    pkey: &PKeyRef<Private>,
+    cdhash_sha1: &[u8; 20],
+    cdhash_sha256: &[u8; 32],
+) -> Result<Vec<u8>> {
+    unsafe {
+        // Create BIO for data
+        let bio = BIO_new_mem_buf(data.as_ptr() as *const _, data.len() as c_int);
+        if bio.is_null() {
+            return Err(Error::Signing("Failed to create BIO".into()));
+        }
+
+        // Create CMS with PARTIAL flag to add attributes later
+        let flags = CMS_PARTIAL | CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
+        let cms = CMS_sign(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            bio,
+            flags,
+        );
+        if cms.is_null() {
+            BIO_free(bio);
+            return Err(Error::Signing("CMS_sign failed".into()));
+        }
+
+        // Add signer with SHA256
+        let cert_ptr = x509_as_ptr(cert);
+        let pkey_ptr = pkey_as_ptr(pkey);
+
+        let signer_info = CMS_add1_signer(cms, cert_ptr, pkey_ptr, EVP_sha256(), flags);
+        if signer_info.is_null() {
+            CMS_ContentInfo_free(cms);
+            BIO_free(bio);
+            return Err(Error::Signing("CMS_add1_signer failed".into()));
+        }
+
+        // Add Apple CDHash v2 attribute (contains both hashes as plist)
+        let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
+        add_apple_attribute(signer_info, APPLE_CDHASH_V2_OID, &cdhash_plist)?;
+
+        // Finalize CMS
+        bio_reset(bio);
+        if CMS_final(cms, bio, ptr::null_mut(), flags) != 1 {
+            CMS_ContentInfo_free(cms);
+            BIO_free(bio);
+            return Err(Error::Signing("CMS_final failed".into()));
+        }
+
+        // Serialize to DER
+        let out_bio = BIO_new(BIO_s_mem());
+        if out_bio.is_null() {
+            CMS_ContentInfo_free(cms);
+            BIO_free(bio);
+            return Err(Error::Signing("Failed to create output BIO".into()));
+        }
+
+        if i2d_CMS_bio(out_bio, cms) != 1 {
+            CMS_ContentInfo_free(cms);
+            BIO_free(bio);
+            BIO_free(out_bio);
+            return Err(Error::Signing("Failed to serialize CMS".into()));
+        }
+
+        // Read DER data
+        let mut buf_ptr: *mut u8 = ptr::null_mut();
+        let len = bio_get_mem_data(out_bio, &mut buf_ptr);
+        let der = std::slice::from_raw_parts(buf_ptr, len as usize).to_vec();
+
+        // Cleanup
+        CMS_ContentInfo_free(cms);
+        BIO_free(bio);
+        BIO_free(out_bio);
+
+        Ok(der)
+    }
+}
+
+/// Build CDHash plist for Apple attribute
+///
+/// Creates an XML plist with a "cdhashes" array containing both SHA-1 and SHA-256 hashes.
+/// This is used for the Apple CDHash v2 attribute (OID 1.2.840.113635.100.9.2).
+pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
+    use plist::{Dictionary, Value};
+
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "cdhashes".to_string(),
+        Value::Array(vec![
+            Value::Data(sha1.to_vec()),
+            Value::Data(sha256.to_vec()),
+        ]),
+    );
+
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, &Value::Dictionary(dict))
+        .expect("plist serialization failed");
+    buf
+}
+
+/// Add Apple custom attribute to signer info
+///
+/// Helper function to add attributes with custom OIDs to the CMS signer info.
+/// Used for Apple-specific code signing attributes like CDHash.
+unsafe fn add_apple_attribute(
+    signer_info: *mut CMS_SignerInfo,
+    oid: &str,
+    data: &[u8],
+) -> Result<()> {
+    // Create ASN1_OBJECT from OID string
+    let oid_cstr =
+        std::ffi::CString::new(oid).map_err(|_| Error::Signing("Invalid OID string".into()))?;
+
+    let obj = OBJ_txt2obj(oid_cstr.as_ptr(), 1);
+    if obj.is_null() {
+        return Err(Error::Signing(format!("Failed to create OID: {}", oid)));
+    }
+
+    // V_ASN1_OCTET_STRING = 4
+    let ret = CMS_signed_add1_attr_by_OBJ(
+        signer_info,
+        obj,
+        4, // V_ASN1_OCTET_STRING
+        data.as_ptr() as *const _,
+        data.len() as i32,
+    );
+
+    ASN1_OBJECT_free(obj);
+
+    if ret != 1 {
+        return Err(Error::Signing("Failed to add Apple attribute".into()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_cdhash_plist() {
+        let sha1 = [0u8; 20];
+        let sha256 = [0u8; 32];
+        let plist = build_cdhash_plist(&sha1, &sha256);
+
+        assert!(!plist.is_empty());
+        let plist_str = String::from_utf8_lossy(&plist);
+        assert!(plist_str.contains("cdhashes"));
+        assert!(plist_str.contains("<array>"));
+        assert!(plist_str.contains("<data>"));
+    }
+
+    #[test]
+    fn test_build_cdhash_plist_with_real_hashes() {
+        // Test with actual hash values
+        let sha1: [u8; 20] = [
+            0x2f, 0xd4, 0xe1, 0xc6, 0x7a, 0x2d, 0x28, 0xfc, 0xed, 0x84, 0x9e, 0xe1, 0xbb, 0x76,
+            0xe7, 0x39, 0x1b, 0x93, 0xeb, 0x12,
+        ];
+        let sha256: [u8; 32] = [
+            0xd7, 0xa8, 0xfb, 0xb3, 0x07, 0xd7, 0x80, 0x94, 0x69, 0xca, 0x9a, 0xbc, 0xb0, 0x08,
+            0x2e, 0x4f, 0x8d, 0x56, 0x51, 0xe4, 0x6d, 0x3c, 0xdb, 0x76, 0x2d, 0x02, 0xd0, 0xbf,
+            0x37, 0xc9, 0xe5, 0x92,
+        ];
+
+        let plist = build_cdhash_plist(&sha1, &sha256);
+
+        // Parse the plist back to verify structure
+        let parsed: plist::Value = plist::from_bytes(&plist).unwrap();
+        let dict = parsed.as_dictionary().unwrap();
+        let cdhashes = dict.get("cdhashes").unwrap().as_array().unwrap();
+
+        assert_eq!(cdhashes.len(), 2);
+        assert_eq!(cdhashes[0].as_data().unwrap(), sha1);
+        assert_eq!(cdhashes[1].as_data().unwrap(), sha256);
+    }
+}

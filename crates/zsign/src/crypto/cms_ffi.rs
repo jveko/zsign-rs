@@ -1,7 +1,7 @@
 //! Raw FFI bindings for OpenSSL CMS functions not exposed by rust-openssl
 
 use openssl_sys::*;
-use std::ffi::{c_int, c_uint};
+use std::ffi::{c_int, c_uint, c_void};
 
 // CMS_SignerInfo is opaque - we only need pointer
 #[repr(C)]
@@ -15,11 +15,11 @@ pub struct stack_st_CMS_SignerInfo {
     _private: [u8; 0],
 }
 
-// CMS flags
-pub const CMS_PARTIAL: c_int = 0x4000;
-pub const CMS_DETACHED: c_int = 0x40;
-pub const CMS_BINARY: c_int = 0x80;
-pub const CMS_NOSMIMECAP: c_int = 0x200;
+// CMS flags (defined here to ensure correct values for our use case)
+pub const CMS_PARTIAL: u32 = 0x4000;
+pub const CMS_DETACHED: u32 = 0x40;
+pub const CMS_BINARY: u32 = 0x80;
+pub const CMS_NOSMIMECAP: u32 = 0x200;
 
 extern "C" {
     pub fn CMS_sign(
@@ -45,21 +45,17 @@ extern "C" {
         flags: c_uint,
     ) -> c_int;
 
-    pub fn CMS_get0_SignerInfos(
-        cms: *mut CMS_ContentInfo,
-    ) -> *mut stack_st_CMS_SignerInfo;
+    pub fn CMS_get0_SignerInfos(cms: *mut CMS_ContentInfo) -> *mut stack_st_CMS_SignerInfo;
 
     pub fn CMS_signed_add1_attr_by_OBJ(
         si: *mut CMS_SignerInfo,
         obj: *const ASN1_OBJECT,
         type_: c_int,
-        bytes: *const std::ffi::c_void,
+        bytes: *const c_void,
         len: c_int,
     ) -> c_int;
 
-    pub fn sk_CMS_SignerInfo_num(
-        sk: *const stack_st_CMS_SignerInfo,
-    ) -> c_int;
+    pub fn sk_CMS_SignerInfo_num(sk: *const stack_st_CMS_SignerInfo) -> c_int;
 
     pub fn sk_CMS_SignerInfo_value(
         sk: *const stack_st_CMS_SignerInfo,
