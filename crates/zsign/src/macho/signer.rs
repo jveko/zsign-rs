@@ -18,6 +18,7 @@
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
 };
+use crate::codesign::constants::CS_EXECSEG_MAIN_BINARY;
 use crate::codesign::der::plist_to_der;
 use crate::codesign::superblob::{
     build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob,
@@ -409,10 +410,19 @@ fn build_code_directory(
     der_entitlements_hash: &Option<Vec<u8>>,
     is_sha1: bool,
 ) -> Vec<u8> {
+    // Compute exec_seg_flags based on binary type
+    // C++ zsign sets CS_EXECSEG_MAIN_BINARY for executable binaries
+    // TODO: Also check for get-task-allow entitlement to add CS_EXECSEG_ALLOW_UNSIGNED
+    let exec_seg_flags = if slice.is_executable {
+        CS_EXECSEG_MAIN_BINARY
+    } else {
+        0
+    };
+
     let mut builder = CodeDirectoryBuilder::new(identifier, code.to_vec())
         .requirements_hash(requirements_hash.to_vec())
         .exec_seg_limit(slice.text_segment_size)
-        .is_executable(slice.is_executable);
+        .exec_seg_flags(exec_seg_flags);
 
     if let Some(team) = team_id {
         builder = builder.team_id(team);

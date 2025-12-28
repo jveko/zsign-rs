@@ -10,8 +10,12 @@ use openssl_sys::{
 use std::ffi::c_int;
 use std::ptr;
 
+use super::assets::{
+    APPLE_ROOT_CA_CERT, APPLE_WWDR_CA_CERT, APPLE_WWDR_CA_G3_CERT,
+    APPLE_WWDR_ISSUER_HASH, APPLE_WWDR_G3_ISSUER_HASH,
+};
 use super::cms_ffi::{
-    CMS_SignerInfo, CMS_add1_signer, CMS_add1_cert, CMS_final, CMS_sign, 
+    CMS_SignerInfo, CMS_add1_signer, CMS_add1_cert, CMS_final, CMS_sign,
     CMS_signed_add1_attr_by_OBJ,
     APPLE_CDHASH_V2_OID,
 };
@@ -57,6 +61,48 @@ unsafe fn pkey_as_ptr(pkey: &PKeyRef<Private>) -> *mut EVP_PKEY {
     pkey as *const PKeyRef<Private> as *const EVP_PKEY as *mut EVP_PKEY
 }
 
+/// Get the Apple CA certificates for the CMS signature chain.
+///
+/// Returns a vector containing:
+/// 1. The appropriate Apple WWDR CA (based on the signing certificate's issuer hash)
+/// 2. The Apple Root CA
+///
+/// This matches the behavior of C++ zsign which hardcodes these certificates
+/// and adds them to the CMS signature chain automatically.
+fn get_apple_ca_chain(cert: &X509Ref) -> Result<Vec<X509>> {
+    use openssl::hash::{hash, MessageDigest};
+
+    // Get the issuer name hash to determine which WWDR CA to use
+    let issuer = cert.issuer_name();
+    let issuer_der = issuer.to_der()
+        .map_err(|e| Error::Signing(format!("Failed to encode issuer name: {}", e)))?;
+
+    // Hash with SHA-1 (X509_issuer_name_hash uses SHA-1)
+    let digest = hash(MessageDigest::sha1(), &issuer_der)
+        .map_err(|e| Error::Signing(format!("Failed to hash issuer name: {}", e)))?;
+
+    // Take first 4 bytes as little-endian u32
+    let bytes: [u8; 4] = digest[..4].try_into()
+        .map_err(|_| Error::Signing("Hash too short".into()))?;
+    let issuer_hash = u32::from_le_bytes(bytes);
+
+    // Select the appropriate WWDR certificate based on issuer hash
+    let wwdr_cert = if issuer_hash == APPLE_WWDR_ISSUER_HASH {
+        X509::from_pem(APPLE_WWDR_CA_CERT.as_bytes())
+    } else if issuer_hash == APPLE_WWDR_G3_ISSUER_HASH {
+        X509::from_pem(APPLE_WWDR_CA_G3_CERT.as_bytes())
+    } else {
+        // Unknown issuer - this may be a self-signed or ad-hoc certificate
+        // In this case, skip adding Apple CA chain (same as C++ zsign behavior)
+        return Ok(Vec::new());
+    }.map_err(|e| Error::Signing(format!("Failed to parse Apple WWDR CA: {}", e)))?;
+
+    let root_cert = X509::from_pem(APPLE_ROOT_CA_CERT.as_bytes())
+        .map_err(|e| Error::Signing(format!("Failed to parse Apple Root CA: {}", e)))?;
+
+    Ok(vec![wwdr_cert, root_cert])
+}
+
 /// Generate CMS signature with Apple CDHash attributes
 ///
 /// # Arguments
@@ -67,6 +113,12 @@ unsafe fn pkey_as_ptr(pkey: &PKeyRef<Private>) -> *mut EVP_PKEY {
 /// * `cert_chain` - Optional certificate chain (intermediate CAs)
 /// * `cdhash_sha1` - SHA-1 CDHash for Apple attribute
 /// * `cdhash_sha256` - SHA-256 CDHash for Apple attribute
+///
+/// # Apple CA Chain
+///
+/// This function automatically adds the Apple WWDR and Root CA certificates
+/// to the CMS signature chain, matching the behavior of C++ zsign. The
+/// appropriate WWDR CA is selected based on the signing certificate's issuer.
 pub fn sign_with_apple_attrs(
     data: &[u8],
     cert: &X509Ref,
@@ -75,6 +127,9 @@ pub fn sign_with_apple_attrs(
     cdhash_sha1: &[u8; 20],
     cdhash_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
+    // Get Apple CA chain (WWDR + Root CA) based on the signing certificate's issuer
+    let apple_ca_chain = get_apple_ca_chain(cert)?;
+
     unsafe {
         // Create BIO for data
         let bio = BIO_new_mem_buf(data.as_ptr() as *const _, data.len() as c_int);
@@ -96,13 +151,24 @@ pub fn sign_with_apple_attrs(
             return Err(Error::Signing("CMS_sign failed".into()));
         }
 
-        // Add certificate chain to CMS (intermediate CAs)
+        // Add user-provided certificate chain to CMS (intermediate CAs)
         for chain_cert in cert_chain {
             let chain_cert_ptr = x509_as_ptr(chain_cert.as_ref());
             if CMS_add1_cert(cms, chain_cert_ptr) != 1 {
                 CMS_ContentInfo_free(cms);
                 BIO_free(bio);
                 return Err(Error::Signing("Failed to add certificate chain".into()));
+            }
+        }
+
+        // Add Apple CA chain (WWDR CA + Root CA) automatically
+        // This matches C++ zsign behavior which hardcodes these certificates
+        for apple_cert in &apple_ca_chain {
+            let apple_cert_ptr = x509_as_ptr(apple_cert.as_ref());
+            if CMS_add1_cert(cms, apple_cert_ptr) != 1 {
+                CMS_ContentInfo_free(cms);
+                BIO_free(bio);
+                return Err(Error::Signing("Failed to add Apple CA certificate".into()));
             }
         }
 

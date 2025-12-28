@@ -186,6 +186,20 @@ pub fn build_der_entitlements_blob(der_data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Pad a byte slice to 4-byte alignment.
+///
+/// Returns a new Vec with the original data padded with null bytes
+/// to reach a 4-byte boundary.
+fn pad_to_alignment(data: &[u8], alignment: usize) -> Vec<u8> {
+    let mut padded = data.to_vec();
+    let remainder = data.len() % alignment;
+    if remainder != 0 {
+        let padding_needed = alignment - remainder;
+        padded.extend(std::iter::repeat(0u8).take(padding_needed));
+    }
+    padded
+}
+
 /// Build a minimal empty requirements blob.
 ///
 /// This creates the simplest valid requirements blob with no requirements.
@@ -201,6 +215,138 @@ pub fn build_requirements_blob() -> Vec<u8> {
     buf.extend(&CSMAGIC_REQUIREMENTS.to_be_bytes());
     buf.extend(&12u32.to_be_bytes()); // length = 12 (header only)
     buf.extend(&0u32.to_be_bytes()); // count = 0
+
+    buf
+}
+
+/// Build a full requirements blob with bundle ID and certificate subject CN.
+///
+/// This generates a designated requirement expression matching the C++ zsign
+/// implementation (SlotBuildRequirements in signing.cpp). The expression
+/// validates:
+/// 1. The bundle identifier matches
+/// 2. The signing certificate subject CN matches
+/// 3. The certificate chain is anchored to Apple
+///
+/// # Arguments
+///
+/// * `bundle_id` - The bundle identifier (e.g., "com.example.app")
+/// * `subject_cn` - The certificate subject Common Name (e.g., "iPhone Distribution: ...")
+///
+/// # Returns
+///
+/// A `Vec<u8>` containing the complete requirements blob.
+///
+/// # Structure
+///
+/// The blob structure follows Apple's requirements format:
+/// ```text
+/// Requirements blob (0xfade0c01):
+///   - magic (4) + length (4) + count (4) = 12 bytes header
+///   - index entry: type (4) + offset (4) = 8 bytes
+///
+/// Embedded Requirement (0xfade0c00):
+///   - Expression: identifier "bundle_id" and
+///                 certificate leaf[subject.CN] = "subject_cn" and
+///                 anchor apple generic (OID 1.2.840.113635.100.6.2.1)
+/// ```
+pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8> {
+    // If either is empty, fall back to the empty requirements blob (like ldid)
+    if bundle_id.is_empty() || subject_cn.is_empty() {
+        return build_requirements_blob();
+    }
+
+    // Pad strings to 4-byte alignment
+    let padded_bundle_id = pad_to_alignment(bundle_id.as_bytes(), 4);
+    let padded_subject_cn = pad_to_alignment(subject_cn.as_bytes(), 4);
+
+    // Fixed byte arrays matching C++ implementation
+    // pack1: count=1, type=designated(3), offset=0x14
+    let pack1: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x01, // count = 1
+        0x00, 0x00, 0x00, 0x03, // type = designated requirement
+        0x00, 0x00, 0x00, 0x14, // offset = 20 (header + index)
+    ];
+
+    // pack2: expression start - op_and(6), op_ident(2)
+    let pack2: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x01, // expression version = 1
+        0x00, 0x00, 0x00, 0x06, // op = OP_AND
+        0x00, 0x00, 0x00, 0x02, // op = OP_IDENT (identifier check)
+    ];
+
+    // pack3: nested and with cert field check
+    // op_and(6), op_apple_generic_anchor(15), op_and(6), op_cert_field(11),
+    // cert_slot=0 (leaf), field_name "subject.CN", match_equal(1)
+    let pack3: [u8; 40] = [
+        0x00, 0x00, 0x00, 0x06, // op = OP_AND
+        0x00, 0x00, 0x00, 0x0f, // op = OP_APPLE_GENERIC_ANCHOR
+        0x00, 0x00, 0x00, 0x06, // op = OP_AND
+        0x00, 0x00, 0x00, 0x0b, // op = OP_CERT_FIELD
+        0x00, 0x00, 0x00, 0x00, // cert slot = 0 (leaf certificate)
+        0x00, 0x00, 0x00, 0x0a, // field name length = 10
+        0x73, 0x75, 0x62, 0x6a, // "subj"
+        0x65, 0x63, 0x74, 0x2e, // "ect."
+        0x43, 0x4e, 0x00, 0x00, // "CN" + 2 bytes padding
+        0x00, 0x00, 0x00, 0x01, // match = MATCH_EQUAL
+    ];
+
+    // pack4: certificate generic OID for Apple anchor check
+    // op_cert_generic(14), cert_slot=1 (intermediate), OID length=10,
+    // OID: 1.2.840.113635.100.6.2.1 (Apple WWDR intermediate)
+    let pack4: [u8; 28] = [
+        0x00, 0x00, 0x00, 0x0e, // op = OP_CERT_GENERIC
+        0x00, 0x00, 0x00, 0x01, // cert slot = 1 (intermediate)
+        0x00, 0x00, 0x00, 0x0a, // OID length = 10
+        0x2a, 0x86, 0x48, 0x86, // OID bytes: 1.2.840.113635.100.6.2.1
+        0xf7, 0x63, 0x64, 0x06,
+        0x02, 0x01, 0x00, 0x00, // + 2 bytes padding
+        0x00, 0x00, 0x00, 0x00, // match = MATCH_EXISTS
+    ];
+
+    // Calculate inner requirement length (magic2 + length2 + pack2 + bundle_id + pack3 + subject_cn + pack4)
+    let inner_length: u32 = 4 // magic
+        + 4 // length
+        + pack2.len() as u32
+        + 4 // bundle ID length field
+        + padded_bundle_id.len() as u32
+        + pack3.len() as u32
+        + 4 // subject CN length field
+        + padded_subject_cn.len() as u32
+        + pack4.len() as u32;
+
+    // Calculate outer requirements length (magic1 + length1 + pack1 + inner_length)
+    let outer_length: u32 = 4 // magic
+        + 4 // length
+        + pack1.len() as u32
+        + inner_length;
+
+    // Build the blob
+    let mut buf = Vec::with_capacity(outer_length as usize);
+
+    // Outer requirements blob header
+    buf.extend(&CSMAGIC_REQUIREMENTS.to_be_bytes()); // 0xfade0c01
+    buf.extend(&outer_length.to_be_bytes());
+    buf.extend(&pack1);
+
+    // Inner requirement blob header
+    buf.extend(&CSMAGIC_REQUIREMENT.to_be_bytes()); // 0xfade0c00
+    buf.extend(&inner_length.to_be_bytes());
+    buf.extend(&pack2);
+
+    // Bundle ID (length + padded string)
+    buf.extend(&(bundle_id.len() as u32).to_be_bytes());
+    buf.extend(&padded_bundle_id);
+
+    // Certificate field check
+    buf.extend(&pack3);
+
+    // Subject CN (length + padded string)
+    buf.extend(&(subject_cn.len() as u32).to_be_bytes());
+    buf.extend(&padded_subject_cn);
+
+    // Apple anchor OID check
+    buf.extend(&pack4);
 
     buf
 }
@@ -274,6 +420,10 @@ pub struct SuperBlobBuilder {
     der_entitlements: Option<Vec<u8>>,
     /// CMS signature blob (slot 0x10000)
     cms_signature: Option<Vec<u8>>,
+    /// Bundle identifier for requirements blob generation
+    bundle_id: Option<String>,
+    /// Certificate subject CN for requirements blob generation
+    subject_cn: Option<String>,
 }
 
 impl SuperBlobBuilder {
@@ -334,6 +484,32 @@ impl SuperBlobBuilder {
         self
     }
 
+    /// Set the bundle identifier for requirements blob generation.
+    ///
+    /// When both `bundle_id` and `subject_cn` are provided, a full requirements
+    /// blob will be generated that validates the bundle identifier and signing
+    /// certificate, matching the C++ zsign implementation.
+    ///
+    /// If only `bundle_id` is set (without `subject_cn`), an empty requirements
+    /// blob will be used instead.
+    pub fn bundle_id(mut self, id: impl Into<String>) -> Self {
+        self.bundle_id = Some(id.into());
+        self
+    }
+
+    /// Set the certificate subject CN for requirements blob generation.
+    ///
+    /// When both `bundle_id` and `subject_cn` are provided, a full requirements
+    /// blob will be generated that validates the bundle identifier and signing
+    /// certificate, matching the C++ zsign implementation.
+    ///
+    /// If only `subject_cn` is set (without `bundle_id`), an empty requirements
+    /// blob will be used instead.
+    pub fn subject_cn(mut self, cn: impl Into<String>) -> Self {
+        self.subject_cn = Some(cn.into());
+        self
+    }
+
     /// Build the SuperBlob with all configured components.
     ///
     /// Components are ordered by slot type (matching Apple codesign/zsign):
@@ -355,8 +531,15 @@ impl SuperBlobBuilder {
             entries.push(BlobEntry::new(CSSLOT_CODEDIRECTORY, cd_sha1));
         }
 
-        // Slot 0x0002: Requirements (use empty if not provided)
-        let requirements = self.requirements.unwrap_or_else(build_requirements_blob);
+        // Slot 0x0002: Requirements
+        // Priority: explicit requirements > generated from bundle_id/subject_cn > empty
+        let requirements = if let Some(req) = self.requirements {
+            req
+        } else if let (Some(bundle_id), Some(subject_cn)) = (&self.bundle_id, &self.subject_cn) {
+            build_requirements_blob_full(bundle_id, subject_cn)
+        } else {
+            build_requirements_blob()
+        };
         entries.push(BlobEntry::new(CSSLOT_REQUIREMENTS, requirements));
 
         // Slot 0x0005: Entitlements (optional)
@@ -653,5 +836,205 @@ mod tests {
 
         let slot5 = u32::from_be_bytes([superblob[52], superblob[53], superblob[54], superblob[55]]);
         assert_eq!(slot5, CSSLOT_SIGNATURESLOT); // 0x10000
+    }
+
+    #[test]
+    fn test_pad_to_alignment() {
+        // Already aligned (4 bytes)
+        let data = b"test";
+        let padded = pad_to_alignment(data, 4);
+        assert_eq!(padded.len(), 4);
+        assert_eq!(&padded, data);
+
+        // Needs 1 byte padding (5 -> 8)
+        let data = b"hello";
+        let padded = pad_to_alignment(data, 4);
+        assert_eq!(padded.len(), 8);
+        assert_eq!(&padded[..5], data);
+        assert_eq!(&padded[5..], &[0, 0, 0]);
+
+        // Needs 2 bytes padding (6 -> 8)
+        let data = b"foobar";
+        let padded = pad_to_alignment(data, 4);
+        assert_eq!(padded.len(), 8);
+        assert_eq!(&padded[..6], data);
+        assert_eq!(&padded[6..], &[0, 0]);
+
+        // Empty stays empty
+        let data = b"";
+        let padded = pad_to_alignment(data, 4);
+        assert_eq!(padded.len(), 0);
+    }
+
+    #[test]
+    fn test_requirements_blob_full_empty_inputs() {
+        // Empty bundle_id should fall back to empty requirements
+        let blob = build_requirements_blob_full("", "iPhone Distribution: Test");
+        assert_eq!(blob.len(), 12);
+        assert_eq!(&blob[0..4], &CSMAGIC_REQUIREMENTS.to_be_bytes());
+
+        // Empty subject_cn should fall back to empty requirements
+        let blob = build_requirements_blob_full("com.example.app", "");
+        assert_eq!(blob.len(), 12);
+
+        // Both empty should fall back to empty requirements
+        let blob = build_requirements_blob_full("", "");
+        assert_eq!(blob.len(), 12);
+    }
+
+    #[test]
+    fn test_requirements_blob_full_structure() {
+        let bundle_id = "com.example.app";
+        let subject_cn = "iPhone Distribution: Test Company";
+        let blob = build_requirements_blob_full(bundle_id, subject_cn);
+
+        // Check outer magic (requirements blob)
+        assert_eq!(&blob[0..4], &CSMAGIC_REQUIREMENTS.to_be_bytes());
+
+        // Check length matches blob size
+        let outer_len = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        assert_eq!(outer_len, blob.len());
+
+        // Check count = 1
+        let count = u32::from_be_bytes([blob[8], blob[9], blob[10], blob[11]]);
+        assert_eq!(count, 1);
+
+        // Check type = designated requirement (3)
+        let req_type = u32::from_be_bytes([blob[12], blob[13], blob[14], blob[15]]);
+        assert_eq!(req_type, CSREQ_DESIGNATED);
+
+        // Check inner offset = 20 (0x14)
+        let offset = u32::from_be_bytes([blob[16], blob[17], blob[18], blob[19]]);
+        assert_eq!(offset, 0x14);
+
+        // Check inner magic (single requirement)
+        assert_eq!(&blob[20..24], &CSMAGIC_REQUIREMENT.to_be_bytes());
+
+        // Verify bundle ID is embedded
+        let bundle_id_bytes = bundle_id.as_bytes();
+        assert!(blob
+            .windows(bundle_id_bytes.len())
+            .any(|w| w == bundle_id_bytes));
+
+        // Verify subject CN is embedded
+        let subject_cn_bytes = subject_cn.as_bytes();
+        assert!(blob
+            .windows(subject_cn_bytes.len())
+            .any(|w| w == subject_cn_bytes));
+
+        // Verify "subject.CN" field name is in the blob
+        let field_name = b"subject.CN";
+        assert!(blob.windows(field_name.len()).any(|w| w == field_name));
+    }
+
+    #[test]
+    fn test_requirements_blob_full_alignment() {
+        // Test with bundle_id that needs padding (7 bytes -> 8)
+        let bundle_id = "com.abc";
+        let subject_cn = "Test";
+        let blob = build_requirements_blob_full(bundle_id, subject_cn);
+
+        // Verify the blob is well-formed (outer length matches)
+        let outer_len = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        assert_eq!(outer_len, blob.len());
+
+        // Test with bundle_id that's already aligned (8 bytes)
+        let bundle_id = "com.abcd";
+        let blob = build_requirements_blob_full(bundle_id, subject_cn);
+        let outer_len = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        assert_eq!(outer_len, blob.len());
+    }
+
+    #[test]
+    fn test_superblob_builder_with_bundle_id_and_subject_cn() {
+        let cd_sha1 = vec![0x11; 100];
+
+        let superblob = SuperBlobBuilder::new()
+            .code_directory_sha1(cd_sha1)
+            .bundle_id("com.example.app")
+            .subject_cn("iPhone Distribution: Test")
+            .build();
+
+        // Check magic
+        assert_eq!(
+            &superblob[0..4],
+            &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes()
+        );
+
+        // Should have 2 entries: CD SHA-1, requirements
+        let count = u32::from_be_bytes([superblob[8], superblob[9], superblob[10], superblob[11]]);
+        assert_eq!(count, 2);
+
+        // The requirements blob should be larger than 12 bytes (not the empty one)
+        // Find the requirements offset and check its size
+        let req_offset =
+            u32::from_be_bytes([superblob[24], superblob[25], superblob[26], superblob[27]])
+                as usize;
+        let req_magic = u32::from_be_bytes([
+            superblob[req_offset],
+            superblob[req_offset + 1],
+            superblob[req_offset + 2],
+            superblob[req_offset + 3],
+        ]);
+        assert_eq!(req_magic, CSMAGIC_REQUIREMENTS);
+
+        let req_len = u32::from_be_bytes([
+            superblob[req_offset + 4],
+            superblob[req_offset + 5],
+            superblob[req_offset + 6],
+            superblob[req_offset + 7],
+        ]);
+        // Full requirements should be > 12 bytes
+        assert!(req_len > 12);
+    }
+
+    #[test]
+    fn test_superblob_builder_explicit_requirements_takes_precedence() {
+        let cd_sha1 = vec![0x11; 100];
+        let explicit_req = build_requirements_blob(); // Empty requirements (12 bytes)
+
+        let superblob = SuperBlobBuilder::new()
+            .code_directory_sha1(cd_sha1)
+            .bundle_id("com.example.app")
+            .subject_cn("iPhone Distribution: Test")
+            .requirements(explicit_req.clone()) // Explicit takes precedence
+            .build();
+
+        // Find the requirements offset
+        let req_offset =
+            u32::from_be_bytes([superblob[24], superblob[25], superblob[26], superblob[27]])
+                as usize;
+        let req_len = u32::from_be_bytes([
+            superblob[req_offset + 4],
+            superblob[req_offset + 5],
+            superblob[req_offset + 6],
+            superblob[req_offset + 7],
+        ]);
+        // Explicit empty requirements should be 12 bytes (not full requirements)
+        assert_eq!(req_len, 12);
+    }
+
+    #[test]
+    fn test_superblob_builder_missing_subject_cn_uses_empty_requirements() {
+        let cd_sha1 = vec![0x11; 100];
+
+        // Only bundle_id, no subject_cn
+        let superblob = SuperBlobBuilder::new()
+            .code_directory_sha1(cd_sha1)
+            .bundle_id("com.example.app")
+            .build();
+
+        // Find the requirements offset
+        let req_offset =
+            u32::from_be_bytes([superblob[24], superblob[25], superblob[26], superblob[27]])
+                as usize;
+        let req_len = u32::from_be_bytes([
+            superblob[req_offset + 4],
+            superblob[req_offset + 5],
+            superblob[req_offset + 6],
+            superblob[req_offset + 7],
+        ]);
+        // Should fall back to empty requirements (12 bytes)
+        assert_eq!(req_len, 12);
     }
 }

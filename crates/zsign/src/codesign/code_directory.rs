@@ -10,14 +10,14 @@ use super::constants::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
-/// Number of special slots when DER entitlements are present
-const SPECIAL_SLOTS_WITH_DER: usize = 7;
-
-/// Number of special slots when only XML entitlements are present
-const SPECIAL_SLOTS_WITH_ENT: usize = 5;
-
-/// Number of special slots for minimal signing (info, requirements, resources)
-const SPECIAL_SLOTS_MINIMAL: usize = 3;
+// Special slot indices (negative, stored in reverse order)
+// Slot -1: Info.plist
+// Slot -2: Requirements
+// Slot -3: CodeResources
+// Slot -4: Application-specific (unused)
+// Slot -5: XML Entitlements
+// Slot -6: Rep-specific (unused, but included when -7 is present)
+// Slot -7: DER Entitlements (only for executable binaries)
 
 /// CodeDirectory header size for version 0x20400 (with exec segment fields)
 const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
@@ -38,7 +38,7 @@ const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 /// let cd = CodeDirectoryBuilder::new("com.example.app", code_data)
 ///     .team_id("TEAMID1234")
 ///     .exec_seg_limit(65536)
-///     .is_executable(true)
+///     .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
 ///     .build_sha256();
 /// ```
 pub struct CodeDirectoryBuilder {
@@ -60,8 +60,8 @@ pub struct CodeDirectoryBuilder {
     requirements_hash: Option<Vec<u8>>,
     /// Executable segment limit (__TEXT segment size)
     exec_seg_limit: u64,
-    /// Is this an executable (MH_EXECUTE)
-    is_executable: bool,
+    /// Executable segment flags (raw value, e.g., CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED)
+    exec_seg_flags: u64,
     /// Code signature flags (e.g., CS_ADHOC)
     flags: u32,
 }
@@ -84,7 +84,7 @@ impl CodeDirectoryBuilder {
             der_entitlements_hash: None,
             requirements_hash: None,
             exec_seg_limit: 0,
-            is_executable: false,
+            exec_seg_flags: 0,
             flags: 0,
         }
     }
@@ -146,12 +146,23 @@ impl CodeDirectoryBuilder {
         self
     }
 
-    /// Set whether this is an executable binary (MH_EXECUTE).
+    /// Set the raw executable segment flags.
     ///
-    /// Affects the execSegFlags field in the CodeDirectory.
-    pub fn is_executable(mut self, is_exec: bool) -> Self {
-        self.is_executable = is_exec;
+    /// This value is written directly to the execSegFlags field in the CodeDirectory.
+    /// Common flag combinations:
+    /// - `CS_EXECSEG_MAIN_BINARY` for main executables
+    /// - `CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED` for executables with get-task-allow
+    pub fn exec_seg_flags(mut self, flags: u64) -> Self {
+        self.exec_seg_flags = flags;
         self
+    }
+
+    /// Check if this is a main executable binary.
+    ///
+    /// Returns true if CS_EXECSEG_MAIN_BINARY is set in exec_seg_flags.
+    /// Used internally for determining special slot counts.
+    fn is_main_executable(&self) -> bool {
+        self.exec_seg_flags & CS_EXECSEG_MAIN_BINARY != 0
     }
 
     /// Set the code signature flags.
@@ -235,13 +246,8 @@ impl CodeDirectoryBuilder {
         buf.extend(&0u64.to_be_bytes()); // execSegBase (always 0)
         buf.extend(&self.exec_seg_limit.to_be_bytes()); // execSegLimit
 
-        // execSegFlags
-        let exec_seg_flags = if self.is_executable {
-            CS_EXECSEG_MAIN_BINARY
-        } else {
-            0
-        };
-        buf.extend(&exec_seg_flags.to_be_bytes());
+        // execSegFlags - use raw value directly
+        buf.extend(&self.exec_seg_flags.to_be_bytes());
 
         // Identifier (null-terminated)
         buf.extend(self.identifier.as_bytes());
@@ -265,13 +271,48 @@ impl CodeDirectoryBuilder {
     }
 
     /// Count the number of special slots needed.
+    ///
+    /// This implements the C++ zsign behavior of trimming trailing empty special slots.
+    /// Special slots are stored in reverse order (-7, -6, -5, -4, -3, -2, -1), so
+    /// trailing empty slots are those with higher negative indices.
+    ///
+    /// The logic:
+    /// - Slots -7 and -6 are only added for main executable binaries (CS_EXECSEG_MAIN_BINARY set)
+    /// - Trailing empty slots are trimmed from the count
+    /// - Common results: 7 (DER ent), 5 (XML ent only), 3 (minimal)
     fn count_special_slots(&self) -> usize {
-        if self.der_entitlements_hash.is_some() {
-            SPECIAL_SLOTS_WITH_DER
-        } else if self.entitlements_hash.is_some() {
-            SPECIAL_SLOTS_WITH_ENT
-        } else {
-            SPECIAL_SLOTS_MINIMAL
+        // Build the logical slots array in reverse order (-7 to -1)
+        // Each entry is true if the slot has content, false if empty
+        let mut slots: Vec<bool> = Vec::new();
+
+        // Slots -7 and -6 are only included for main executable binaries
+        if self.is_main_executable() {
+            // Slot -7: DER entitlements (has content if DER hash is present)
+            slots.push(self.der_entitlements_hash.is_some());
+            // Slot -6: Rep-specific (always empty)
+            slots.push(false);
+        }
+
+        // Slot -5: XML entitlements
+        slots.push(self.entitlements_hash.is_some());
+        // Slot -4: Application-specific (always empty)
+        slots.push(false);
+        // Slot -3: CodeResources (has content if resources hash is present)
+        slots.push(self.resources_hash.is_some());
+        // Slot -2: Requirements (has content if requirements hash is present)
+        slots.push(self.requirements_hash.is_some());
+        // Slot -1: Info.plist (has content if info hash is present)
+        slots.push(self.info_hash.is_some());
+
+        // Find the first non-empty slot from the front (highest negative index)
+        // and trim all empty slots before it
+        let first_non_empty = slots.iter().position(|&has_content| has_content);
+
+        match first_non_empty {
+            Some(idx) => slots.len() - idx,
+            // All slots are empty - return minimum 3 slots (info, requirements, resources)
+            // This matches C++ behavior which always includes at least slots -1, -2, -3
+            None => 3,
         }
     }
 
@@ -472,7 +513,7 @@ mod tests {
         let code = vec![0u8; 4096];
         let cd = CodeDirectoryBuilder::new("test", code)
             .exec_seg_limit(65536)
-            .is_executable(true)
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
             .build_sha256();
 
         // execSegLimit is at offset 72 (u64)
@@ -512,13 +553,31 @@ mod tests {
     #[test]
     fn test_code_directory_special_slots_with_der_entitlements() {
         let code = vec![0u8; 4096];
+        // DER entitlements slots -6/-7 are only included for executables (CS_EXECSEG_MAIN_BINARY set)
         let cd = CodeDirectoryBuilder::new("test", code)
             .entitlements_hash(vec![0u8; 32])
             .der_entitlements_hash(vec![0u8; 32])
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
             .build_sha256();
 
         let n_special_slots = u32::from_be_bytes([cd[24], cd[25], cd[26], cd[27]]);
         assert_eq!(n_special_slots, 7);
+    }
+
+    #[test]
+    fn test_non_executable_ignores_der_entitlements_slots() {
+        // Dylibs/frameworks should NOT have slots -6/-7 even if DER entitlements hash is set
+        // (exec_seg_flags does not have CS_EXECSEG_MAIN_BINARY set)
+        let code = vec![0u8; 4096];
+        let cd = CodeDirectoryBuilder::new("test", code)
+            .entitlements_hash(vec![0u8; 32])
+            .der_entitlements_hash(vec![0u8; 32])
+            .exec_seg_flags(0) // Not an executable
+            .build_sha256();
+
+        let n_special_slots = u32::from_be_bytes([cd[24], cd[25], cd[26], cd[27]]);
+        // Non-executables max out at 5 slots (-5 through -1), not 7
+        assert_eq!(n_special_slots, 5);
     }
 
     #[test]

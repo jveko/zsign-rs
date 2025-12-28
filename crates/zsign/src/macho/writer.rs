@@ -677,7 +677,8 @@ fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) ->
     write_u64(data, filesize_offset, new_filesize, is_big_endian);
 
     // Also update vmsize to match (page-aligned)
-    let aligned_vmsize = align_to(new_filesize as usize, 0x4000) as u64;
+    // Use 0x1000 (4096) to match C++ zsign archo.cpp L598/607
+    let aligned_vmsize = align_to(new_filesize as usize, 0x1000) as u64;
     write_u64(data, vmsize_offset, aligned_vmsize, is_big_endian);
 
     Ok(())
