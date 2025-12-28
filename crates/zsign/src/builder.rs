@@ -3,11 +3,16 @@
 //! Provides a builder pattern interface for iOS code signing operations.
 //! Supports signing Mach-O binaries, IPA files, and app bundles.
 
+#[cfg(feature = "openssl-backend")]
 use crate::crypto::SigningAssets;
+#[cfg(feature = "openssl-backend")]
 use crate::ipa::{CompressionLevel, IpaSigner};
+#[cfg(feature = "openssl-backend")]
 use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
+#[cfg(feature = "openssl-backend")]
 use secrecy::SecretString;
+#[cfg(feature = "openssl-backend")]
 use std::path::{Path, PathBuf};
 
 /// iOS code signing tool with builder pattern API.
@@ -23,6 +28,7 @@ use std::path::{Path, PathBuf};
 ///     .provisioning_profile("profile.mobileprovision")
 ///     .sign_macho("input", "output")?;
 /// ```
+#[cfg(feature = "openssl-backend")]
 #[derive(Clone)]
 pub struct ZSign {
     certificate: Option<PathBuf>,
@@ -33,6 +39,7 @@ pub struct ZSign {
     compression_level: CompressionLevel,
 }
 
+#[cfg(feature = "openssl-backend")]
 impl ZSign {
     /// Create a new ZSign builder.
     pub fn new() -> Self {
@@ -246,13 +253,14 @@ impl ZSign {
     }
 }
 
+#[cfg(feature = "openssl-backend")]
 impl Default for ZSign {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openssl-backend"))]
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;

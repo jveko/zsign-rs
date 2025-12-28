@@ -15,25 +15,39 @@
 //! This is necessary because page 0 contains the Mach-O header and load commands,
 //! which must reflect the final signature offset and size.
 
+#[cfg(feature = "openssl-backend")]
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
 };
+#[cfg(feature = "openssl-backend")]
 use crate::codesign::constants::{CS_EXECSEG_ALLOW_UNSIGNED, CS_EXECSEG_MAIN_BINARY};
+#[cfg(feature = "openssl-backend")]
 use crate::codesign::der::plist_to_der;
+#[cfg(feature = "openssl-backend")]
 use crate::codesign::superblob::{
     build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob_full,
     build_signature_blob, SuperBlobBuilder,
 };
+#[cfg(feature = "openssl-backend")]
 use crate::crypto::cms;
+#[cfg(feature = "openssl-backend")]
 use crate::Result;
+#[cfg(feature = "openssl-backend")]
 use openssl::nid::Nid;
+#[cfg(feature = "openssl-backend")]
 use openssl::pkey::{PKeyRef, Private};
+#[cfg(feature = "openssl-backend")]
 use openssl::x509::{X509, X509Ref};
+#[cfg(feature = "openssl-backend")]
 use rayon::prelude::*;
+#[cfg(feature = "openssl-backend")]
 use sha1::{Digest, Sha1};
+#[cfg(feature = "openssl-backend")]
 use sha2::Sha256;
 
+#[cfg(feature = "openssl-backend")]
 use super::parser::{ArchSlice, MachOFile};
+#[cfg(feature = "openssl-backend")]
 use super::writer::{has_enough_signature_space, prepare_code_for_signing_slice, realloc_code_sign_space_slice};
 
 /// Represents a signed architecture slice with its complete binary data.
@@ -69,6 +83,7 @@ pub struct SignedSlice {
 /// # Returns
 ///
 /// A `Vec<u8>` containing the complete signed binary.
+#[cfg(feature = "openssl-backend")]
 pub fn sign_macho(
     macho: &MachOFile,
     identifier: &str,
@@ -103,6 +118,7 @@ pub fn sign_macho(
 ///
 /// Returns a `SignedSlice` for each architecture containing the complete
 /// signed binary data ready for reassembly.
+#[cfg(feature = "openssl-backend")]
 pub fn sign_macho_all_slices(
     macho: &MachOFile,
     identifier: &str,
@@ -140,6 +156,7 @@ pub fn sign_macho_all_slices(
 }
 
 /// Sign a single slice and return complete signed binary data.
+#[cfg(feature = "openssl-backend")]
 fn sign_slice_complete(
     slice_data: &[u8],
     slice: &ArchSlice,
@@ -310,6 +327,7 @@ fn sign_slice_complete(
 /// If `original_binary_size` is provided and is larger than the signed output,
 /// the output will be padded with zeros to preserve the original size.
 /// This is important for preserving reserved signature space in the binary.
+#[cfg(feature = "openssl-backend")]
 fn embed_signature_into_prepared(
     prepared_code: &[u8],
     signature: &[u8],
@@ -340,6 +358,7 @@ fn embed_signature_into_prepared(
 }
 
 /// Build a complete SuperBlob signature from code and hashes.
+#[cfg(feature = "openssl-backend")]
 #[allow(clippy::too_many_arguments)]
 fn build_superblob(
     code: &[u8],
@@ -404,6 +423,7 @@ fn build_superblob(
 }
 
 /// Build a CodeDirectory blob with the specified hash type.
+#[cfg(feature = "openssl-backend")]
 fn build_code_directory(
     identifier: &str,
     team_id: Option<&str>,
@@ -465,12 +485,14 @@ fn build_code_directory(
     }
 }
 
+#[cfg(feature = "openssl-backend")]
 fn sha1_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha1::new();
     hasher.update(data);
     hasher.finalize().to_vec()
 }
 
+#[cfg(feature = "openssl-backend")]
 fn sha256_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -480,6 +502,7 @@ fn sha256_hash(data: &[u8]) -> Vec<u8> {
 /// Extract the Common Name (CN) from a certificate's subject.
 ///
 /// Returns the CN value if found, or None if not present.
+#[cfg(feature = "openssl-backend")]
 fn extract_subject_cn(cert: &X509Ref) -> Option<String> {
     cert.subject_name()
         .entries_by_nid(Nid::COMMONNAME)
@@ -488,7 +511,7 @@ fn extract_subject_cn(cert: &X509Ref) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openssl-backend"))]
 mod tests {
     use super::*;
 

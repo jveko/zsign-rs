@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-openssl = "0.10"
-openssl-sys = "0.9"
+openssl = { version = "0.10", optional = true }
+openssl-sys = { version = "0.9", optional = true }
 goblin = "0.8"
 zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd", "time"] }
 plist = "1.7"
@@ -20,16 +20,21 @@ secrecy = "0.8"
 rayon = "1.10"
 
 # RustCrypto for pure Rust crypto (stable versions from apple-codesign)
-cryptographic-message-syntax = "0.28"
-x509-certificate = "0.25"
+cryptographic-message-syntax = { version = "0.28", optional = true }
+x509-certificate = { version = "0.25", optional = true }
 der = { version = "0.7", features = ["alloc", "oid", "pem"] }
 const-oid = { version = "0.9", features = ["db"] }
-rsa = { version = "0.9", features = ["sha2"] }
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"] }
+rsa = { version = "0.9", features = ["sha2"], optional = true }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"], optional = true }
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
-p12 = "0.6"
+p12 = { version = "0.6", optional = true }
 signature = { version = "2.2", features = ["std"] }
 rand = "0.8"
 spki = { version = "0.7", features = ["pem"] }
-bcder = "0.7"
-ring = "0.17"
+bcder = { version = "0.7", optional = true }
+ring = { version = "0.17", optional = true }
+
+[features]
+default = ["openssl-backend"]
+openssl-backend = ["dep:openssl", "dep:openssl-sys"]
+pure-rust = ["dep:cryptographic-message-syntax", "dep:x509-certificate", "dep:rsa", "dep:p256", "dep:p12", "dep:bcder", "dep:ring"]

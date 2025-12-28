@@ -1,14 +1,22 @@
 //! Certificate, private key, and provisioning profile loading
 
 use crate::{Error, Result};
+#[cfg(feature = "openssl-backend")]
 use openssl::pkcs12::Pkcs12;
+#[cfg(feature = "openssl-backend")]
 use openssl::pkey::{PKey, Private};
+#[cfg(feature = "openssl-backend")]
 use openssl::x509::X509;
+#[cfg(feature = "openssl-backend")]
 use secrecy::{ExposeSecret, SecretString};
+#[cfg(feature = "openssl-backend")]
 use std::fs;
+#[cfg(feature = "openssl-backend")]
 use std::path::Path;
+#[cfg(feature = "openssl-backend")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "openssl-backend")]
 static PROVIDERS: OnceLock<(Option<openssl::provider::Provider>, Option<openssl::provider::Provider>)> = OnceLock::new();
 
 // =============================================================================
@@ -122,6 +130,7 @@ pub const APPLE_WWDR_G3_ISSUER_HASH: u32 = 0x9b16b75c;
 /// load both legacy and default providers.
 ///
 /// This is a no-op on OpenSSL < 3.0 where providers don't exist.
+#[cfg(feature = "openssl-backend")]
 fn try_load_legacy_provider() {
     PROVIDERS.get_or_init(|| {
         let default = openssl::provider::Provider::load(None, "default").ok();
@@ -131,6 +140,7 @@ fn try_load_legacy_provider() {
 }
 
 /// Signing assets: certificate, private key, and optionally provisioning profile
+#[cfg(feature = "openssl-backend")]
 pub struct SigningAssets {
     /// X.509 certificate
     pub certificate: X509,
@@ -144,6 +154,7 @@ pub struct SigningAssets {
     pub entitlements: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "openssl-backend")]
 impl SigningAssets {
     /// Load from separate certificate and private key files
     ///
@@ -380,6 +391,7 @@ impl SigningAssets {
 }
 
 #[cfg(test)]
+#[cfg(feature = "openssl-backend")]
 mod tests {
     use super::*;
     use openssl::ec::{EcGroup, EcKey};

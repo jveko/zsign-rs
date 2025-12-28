@@ -9,19 +9,28 @@ pub mod extract;
 pub use archive::{create_ipa, CompressionLevel};
 pub use extract::{extract_ipa, validate_ipa};
 
+#[cfg(feature = "openssl-backend")]
 use crate::bundle::CodeResourcesBuilder;
+#[cfg(feature = "openssl-backend")]
 use crate::crypto::SigningAssets;
+#[cfg(feature = "openssl-backend")]
 use crate::macho::{sign_macho, MachOFile};
+#[cfg(feature = "openssl-backend")]
 use crate::{Error, Result};
+#[cfg(feature = "openssl-backend")]
 use std::fs;
+#[cfg(feature = "openssl-backend")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "openssl-backend")]
 use tempfile::TempDir;
+#[cfg(feature = "openssl-backend")]
 use walkdir::WalkDir;
 
 /// IPA signing workflow that combines extract, sign, and repack operations.
 ///
 /// This struct provides a high-level interface for signing IPA files,
 /// handling the complete workflow of extraction, bundle signing, and repacking.
+#[cfg(feature = "openssl-backend")]
 pub struct IpaSigner {
     /// Signing assets (certificate, private key, entitlements)
     assets: SigningAssets,
@@ -31,6 +40,7 @@ pub struct IpaSigner {
     provisioning_profile_path: Option<PathBuf>,
 }
 
+#[cfg(feature = "openssl-backend")]
 impl IpaSigner {
     /// Create a new IPA signer with the given signing assets.
     pub fn new(assets: SigningAssets) -> Self {
@@ -556,7 +566,9 @@ impl IpaSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
