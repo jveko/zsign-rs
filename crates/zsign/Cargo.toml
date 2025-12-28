@@ -18,3 +18,18 @@ tempfile = "3.10"
 base64 = "0.22"
 secrecy = "0.8"
 rayon = "1.10"
+
+# RustCrypto for pure Rust crypto (stable versions from apple-codesign)
+cryptographic-message-syntax = "0.28"
+x509-certificate = "0.25"
+der = { version = "0.7", features = ["alloc", "oid", "pem"] }
+const-oid = { version = "0.9", features = ["db"] }
+rsa = { version = "0.9", features = ["sha2"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"] }
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
+p12 = "0.6"
+signature = { version = "2.2", features = ["std"] }
+rand = "0.8"
+spki = { version = "0.7", features = ["pem"] }
+bcder = "0.7"
+ring = "0.17"
