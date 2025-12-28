@@ -7,6 +7,28 @@ use openssl::x509::X509;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::path::Path;
+use std::sync::Once;
+
+static LEGACY_PROVIDER_INIT: Once = Once::new();
+static mut LEGACY_PROVIDER: Option<openssl::provider::Provider> = None;
+static mut DEFAULT_PROVIDER: Option<openssl::provider::Provider> = None;
+
+/// Try to load OpenSSL legacy provider for RC2/3DES support in older P12 files.
+/// This is required for OpenSSL 3.x to handle Apple Keychain exports.
+/// We must load BOTH default and legacy providers to have all algorithms available.
+/// The providers are kept alive in static storage to prevent them from being dropped.
+fn try_load_legacy_provider() {
+    LEGACY_PROVIDER_INIT.call_once(|| {
+        unsafe {
+            if let Ok(p) = openssl::provider::Provider::load(None, "default") {
+                DEFAULT_PROVIDER = Some(p);
+            }
+            if let Ok(p) = openssl::provider::Provider::load(None, "legacy") {
+                LEGACY_PROVIDER = Some(p);
+            }
+        }
+    });
+}
 
 /// Signing assets: certificate, private key, and optionally provisioning profile
 pub struct SigningAssets {
@@ -14,6 +36,8 @@ pub struct SigningAssets {
     pub certificate: X509,
     /// Private key
     pub private_key: PKey<Private>,
+    /// Certificate chain (intermediate CAs, not including the signing cert)
+    pub cert_chain: Vec<X509>,
     /// Team ID extracted from certificate
     pub team_id: Option<String>,
     /// Entitlements from provisioning profile
@@ -53,6 +77,7 @@ impl SigningAssets {
         Ok(Self {
             certificate,
             private_key,
+            cert_chain: Vec::new(),
             team_id,
             entitlements: None,
         })
@@ -66,6 +91,8 @@ impl SigningAssets {
         p12_path: impl AsRef<Path>,
         password: Option<&SecretString>,
     ) -> Result<Self> {
+        try_load_legacy_provider();
+
         let p12_data = fs::read(p12_path)?;
 
         let pkcs12 = Pkcs12::from_der(&p12_data)
@@ -83,6 +110,9 @@ impl SigningAssets {
         let private_key = parsed.pkey
             .ok_or_else(|| Error::Certificate("No private key in PKCS#12".into()))?;
 
+        // Extract certificate chain from P12 (intermediate CAs)
+        let cert_chain = parsed.ca.map(|stack| stack.into_iter().collect()).unwrap_or_default();
+
         let team_id = Self::extract_team_id(&certificate);
 
         // Validate that private key matches certificate
@@ -91,6 +121,7 @@ impl SigningAssets {
         Ok(Self {
             certificate,
             private_key,
+            cert_chain,
             team_id,
             entitlements: None,
         })
@@ -312,6 +343,130 @@ more binary data here..."#;
         assert!(
             err_msg.contains("does not match"),
             "Error message should indicate key mismatch: {}", err_msg
+        );
+    }
+
+    #[test]
+    fn test_legacy_provider_loads_without_panic() {
+        super::try_load_legacy_provider();
+    }
+
+    #[test]
+    fn test_legacy_provider_is_idempotent() {
+        super::try_load_legacy_provider();
+        super::try_load_legacy_provider();
+        super::try_load_legacy_provider();
+    }
+
+    #[test]
+    fn test_from_p12_with_generated_pkcs12() {
+        use openssl::pkcs12::Pkcs12;
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let private_key = generate_test_ec_key();
+        let certificate = generate_test_cert(&private_key);
+
+        let pkcs12 = Pkcs12::builder()
+            .name("test")
+            .pkey(&private_key)
+            .cert(&certificate)
+            .build2("testpass")
+            .expect("Failed to build PKCS#12");
+
+        let p12_der = pkcs12.to_der().expect("Failed to serialize PKCS#12");
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        temp_file.write_all(&p12_der).expect("Failed to write P12");
+
+        let password = secrecy::SecretString::from("testpass".to_string());
+        let result = SigningAssets::from_p12(temp_file.path(), Some(&password));
+
+        assert!(result.is_ok(), "Should load generated PKCS#12: {:?}", result.err());
+
+        let assets = result.unwrap();
+        assert!(assets.private_key.public_eq(&private_key.public_key_to_pem().map(|_| private_key.clone()).unwrap()));
+    }
+
+    #[test]
+    fn test_from_p12_wrong_password() {
+        use openssl::pkcs12::Pkcs12;
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let private_key = generate_test_ec_key();
+        let certificate = generate_test_cert(&private_key);
+
+        let pkcs12 = Pkcs12::builder()
+            .name("test")
+            .pkey(&private_key)
+            .cert(&certificate)
+            .build2("correctpass")
+            .expect("Failed to build PKCS#12");
+
+        let p12_der = pkcs12.to_der().expect("Failed to serialize PKCS#12");
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        temp_file.write_all(&p12_der).expect("Failed to write P12");
+
+        let wrong_password = secrecy::SecretString::from("wrongpass".to_string());
+        let result = SigningAssets::from_p12(temp_file.path(), Some(&wrong_password));
+
+        assert!(result.is_err(), "Should fail with wrong password");
+        let err = result.err().unwrap();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("PKCS#12") || err_msg.contains("mac verify"),
+            "Error should mention PKCS#12 or MAC verification: {}", err_msg
+        );
+    }
+
+    #[test]
+    fn test_from_p12_empty_password() {
+        use openssl::pkcs12::Pkcs12;
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let private_key = generate_test_ec_key();
+        let certificate = generate_test_cert(&private_key);
+
+        let pkcs12 = Pkcs12::builder()
+            .name("test")
+            .pkey(&private_key)
+            .cert(&certificate)
+            .build2("")
+            .expect("Failed to build PKCS#12 with empty password");
+
+        let p12_der = pkcs12.to_der().expect("Failed to serialize PKCS#12");
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        temp_file.write_all(&p12_der).expect("Failed to write P12");
+
+        let result = SigningAssets::from_p12(temp_file.path(), None);
+        assert!(result.is_ok(), "Should load PKCS#12 with empty password: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_from_p12_file_not_found() {
+        let result = SigningAssets::from_p12("/nonexistent/path/to/file.p12", None);
+        assert!(result.is_err(), "Should fail for nonexistent file");
+    }
+
+    #[test]
+    fn test_from_p12_invalid_data() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        temp_file.write_all(b"this is not valid pkcs12 data").expect("Failed to write");
+
+        let result = SigningAssets::from_p12(temp_file.path(), None);
+        assert!(result.is_err(), "Should fail for invalid PKCS#12 data");
+        let err = result.err().unwrap();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("PKCS#12") || err_msg.contains("Invalid"),
+            "Error should mention PKCS#12: {}", err_msg
         );
     }
 }

@@ -61,6 +61,12 @@ extern "C" {
         sk: *const stack_st_CMS_SignerInfo,
         idx: c_int,
     ) -> *mut CMS_SignerInfo;
+
+    // Add certificate to CMS
+    pub fn CMS_add1_cert(cms: *mut CMS_ContentInfo, cert: *mut X509) -> c_int;
+
+    // Sign signer info (sets signatureAlgorithm properly)
+    pub fn CMS_SignerInfo_sign(si: *mut CMS_SignerInfo) -> c_int;
 }
 
 // Apple OIDs for code signing

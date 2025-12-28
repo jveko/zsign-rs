@@ -11,7 +11,7 @@ pub use extract::{extract_ipa, validate_ipa};
 
 use crate::bundle::CodeResourcesBuilder;
 use crate::crypto::SigningAssets;
-use crate::macho::{sign_macho, write_signed_macho_in_place, MachOFile};
+use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,10 +105,11 @@ impl IpaSigner {
     ///
     /// Signs all Mach-O binaries and generates CodeResources.
     ///
-    /// The signing workflow uses depth-first order for nested bundles:
-    /// 1. Collect all bundles (main app, frameworks, plugins) with their depths
-    /// 2. Sort by depth (deepest first)
-    /// 3. Sign each bundle in order so nested bundles are fully signed before
+    /// The signing workflow follows C++ zsign order:
+    /// 1. Find and sign ALL standalone .dylib files first (with empty params)
+    /// 2. Collect all bundles (main app, frameworks, plugins) with their depths
+    /// 3. Sort by depth (deepest first)
+    /// 4. Sign each bundle in order so nested bundles are fully signed before
     ///    their parent includes them in CodeResources
     ///
     /// For each bundle, the signing order is:
@@ -116,7 +117,14 @@ impl IpaSigner {
     /// 2. Copy provisioning profile to bundle (main app only)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
-        // Collect all bundles with their depths
+        // Step 1: Find and sign ALL standalone .dylib files first
+        // C++ zsign signs these BEFORE processing bundle folders
+        let dylibs = self.find_standalone_dylibs(bundle_path)?;
+        for dylib_path in &dylibs {
+            self.sign_standalone_dylib(dylib_path)?;
+        }
+
+        // Step 2: Collect all bundles with their depths
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
 
         // Sort by depth (deepest first) to ensure nested bundles are signed
@@ -192,23 +200,100 @@ impl IpaSigner {
         depth
     }
 
+    /// Find all standalone .dylib files recursively in the bundle.
+    ///
+    /// This matches C++ zsign behavior: find ALL .dylib files and sign them
+    /// BEFORE processing bundle folders. These are signed with empty parameters
+    /// (no bundleId, no InfoPlist hash, no CodeResources).
+    fn find_standalone_dylibs(&self, bundle_path: &Path) -> Result<Vec<PathBuf>> {
+        let mut dylibs = Vec::new();
+
+        for entry in WalkDir::new(bundle_path)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+
+            // Only look for .dylib files
+            if !path.is_file() {
+                continue;
+            }
+
+            if let Some(ext) = path.extension() {
+                if ext == "dylib" {
+                    // Skip files inside _CodeSignature directories
+                    if !path
+                        .components()
+                        .any(|c| c.as_os_str() == "_CodeSignature")
+                    {
+                        dylibs.push(path.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        Ok(dylibs)
+    }
+
+    /// Sign a standalone .dylib file with empty parameters.
+    ///
+    /// C++ zsign signs dylibs with: macho.Sign(asset, force, "", "", "", "")
+    /// This means: no bundleId, no InfoPlist hash, no CodeResources.
+    fn sign_standalone_dylib(&self, dylib_path: &Path) -> Result<()> {
+        let macho = MachOFile::open(dylib_path)?;
+
+        // Use the dylib filename as identifier (without extension)
+        let identifier = dylib_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dylib")
+            .to_string();
+
+        // Sign with empty parameters: no Info.plist hash, no CodeResources
+        // This matches C++ zsign behavior for standalone dylibs
+        let signed_binary = sign_macho(
+            &macho,
+            &identifier,
+            self.assets.team_id.as_deref(),
+            None, // No entitlements for dylibs
+            &self.assets.certificate,
+            &self.assets.private_key,
+            &self.assets.cert_chain,
+            None, // No Info.plist data
+            None, // No CodeResources
+        )?;
+
+        // Write signed binary
+        fs::write(dylib_path, signed_binary)?;
+
+        Ok(())
+    }
+
     /// Sign a single bundle (binaries + CodeResources).
     ///
     /// This handles one bundle at a time. Called in depth-first order.
+    /// 
+    /// The correct signing order is:
+    /// 1. Sign all binaries EXCEPT the main executable (no CodeResources yet)
+    /// 2. Generate CodeResources (which hashes the signed binaries)
+    /// 3. Sign the main executable WITH the CodeResources hash
     fn sign_single_bundle(&self, bundle_path: &Path, copy_provisioning_profile: bool) -> Result<()> {
         // Get bundle identifier from Info.plist
         let identifier = self.get_bundle_identifier(bundle_path)?;
+        let main_executable = self.get_main_executable(bundle_path)?;
 
-        // Step 1: Find and sign all Mach-O binaries in-place (immediate children only)
-        // This must happen BEFORE CodeResources generation so hashes are correct
+        // Step 1: Find all Mach-O binaries
         let binaries = self.find_immediate_macho_binaries(bundle_path)?;
 
-        for binary_path in binaries {
-            self.sign_binary(&binary_path, &identifier)?;
+        // Step 2: Sign all binaries EXCEPT the main executable
+        for binary_path in &binaries {
+            if binary_path != &main_executable {
+                self.sign_binary(binary_path, &identifier, None)?;
+            }
         }
 
-        // Step 2: Copy provisioning profile to bundle as embedded.mobileprovision
-        // This is only done for the main app bundle, not nested frameworks/plugins
+        // Step 3: Copy provisioning profile to bundle as embedded.mobileprovision
         if copy_provisioning_profile {
             if let Some(ref profile_path) = self.provisioning_profile_path {
                 let embedded_path = bundle_path.join("embedded.mobileprovision");
@@ -222,9 +307,20 @@ impl IpaSigner {
             }
         }
 
-        // Step 3: Generate CodeResources
-        // This must happen LAST so all file hashes (signed binaries + profile) are correct
+        // Step 4: Generate CodeResources (hashes all current files including signed binaries)
         self.generate_code_resources(bundle_path)?;
+
+        // Step 5: Read CodeResources and sign main executable with its hash
+        let code_resources_path = bundle_path.join("_CodeSignature/CodeResources");
+        let code_resources_data = if code_resources_path.exists() {
+            Some(fs::read(&code_resources_path)?)
+        } else {
+            None
+        };
+
+        if main_executable.exists() {
+            self.sign_binary(&main_executable, &identifier, code_resources_data.as_deref())?;
+        }
 
         Ok(())
     }
@@ -375,12 +471,19 @@ impl IpaSigner {
         Ok(is_macho)
     }
 
+    /// Empty entitlements plist for non-executable binaries (dylibs, frameworks).
+    /// C++ zsign uses this for non-executables instead of full entitlements.
+    const EMPTY_ENTITLEMENTS: &'static [u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
+
     /// Sign a single Mach-O binary.
     ///
     /// Generates a code signature and embeds it directly into the binary,
     /// modifying the LC_CODE_SIGNATURE load command and appending the
     /// SuperBlob signature data.
-    fn sign_binary(&self, binary_path: &Path, identifier: &str) -> Result<()> {
+    ///
+    /// For non-executable binaries (dylibs, frameworks), empty entitlements are used
+    /// instead of the full entitlements. This matches the behavior of the C++ zsign.
+    fn sign_binary(&self, binary_path: &Path, identifier: &str, code_resources: Option<&[u8]>) -> Result<()> {
         let macho = MachOFile::open(binary_path)?;
 
         // Read Info.plist for the bundle containing this binary
@@ -395,27 +498,39 @@ impl IpaSigner {
             None
         };
 
-        // Generate code signature
-        let signature = sign_macho(
+        // Check if this is an executable (MH_EXECUTE) or non-executable (dylib, framework).
+        // Non-executables use empty entitlements per C++ zsign behavior (archo.cpp lines 340-343).
+        let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
+        let entitlements_to_use: Option<&[u8]> = if is_executable {
+            // Executables get full entitlements
+            self.assets.entitlements.as_deref()
+        } else {
+            // Non-executables (dylibs, frameworks) get empty entitlements
+            Some(Self::EMPTY_ENTITLEMENTS)
+        };
+
+        // Generate code signature and get complete signed binary
+        let signed_binary = sign_macho(
             &macho,
             identifier,
             self.assets.team_id.as_deref(),
-            self.assets.entitlements.as_deref(),
+            entitlements_to_use,
             &self.assets.certificate,
             &self.assets.private_key,
+            &self.assets.cert_chain,
             info_data.as_deref(),
-            None, // CodeResources hash will be added later
+            code_resources,
         )?;
 
-        // Embed signature directly into the binary
-        write_signed_macho_in_place(binary_path, &signature)?;
+        // Write signed binary directly
+        fs::write(binary_path, signed_binary)?;
 
         Ok(())
     }
 
     /// Generate CodeResources plist for the bundle.
     fn generate_code_resources(&self, bundle_path: &Path) -> Result<()> {
-        let code_resources = CodeResourcesBuilder::new(bundle_path).build()?;
+        let code_resources = CodeResourcesBuilder::new(bundle_path).scan()?.build()?;
 
         let codesig_dir = bundle_path.join("_CodeSignature");
         fs::create_dir_all(&codesig_dir)?;

@@ -2,6 +2,7 @@
 
 pub mod code_directory;
 pub mod constants;
+pub mod der;
 pub mod superblob;
 
 pub use code_directory::CodeDirectoryBuilder;

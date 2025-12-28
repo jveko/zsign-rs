@@ -20,6 +20,8 @@ pub struct CodeResourcesBuilder {
     files: BTreeMap<String, FileEntry>,
     /// Custom exclusion patterns
     exclusions: Vec<String>,
+    /// Main executable name (excluded from CodeResources as it has embedded signature)
+    main_executable: Option<String>,
 }
 
 /// Entry for a file in CodeResources
@@ -135,11 +137,26 @@ fn standard_rules2() -> Dictionary {
 impl CodeResourcesBuilder {
     /// Create a new CodeResources builder for the given bundle path
     pub fn new(bundle_path: impl AsRef<Path>) -> Self {
+        let bundle_path = bundle_path.as_ref().to_path_buf();
+
+        // Try to read the main executable name from Info.plist
+        let main_executable = Self::read_main_executable(&bundle_path);
+
         Self {
-            bundle_path: bundle_path.as_ref().to_path_buf(),
+            bundle_path,
             files: BTreeMap::new(),
             exclusions: Vec::new(),
+            main_executable,
         }
+    }
+
+    /// Read the main executable name from Info.plist (CFBundleExecutable)
+    fn read_main_executable(bundle_path: &Path) -> Option<String> {
+        let info_plist_path = bundle_path.join("Info.plist");
+        let data = fs::read(&info_plist_path).ok()?;
+        let plist: plist::Value = plist::from_bytes(&data).ok()?;
+        let dict = plist.as_dictionary()?;
+        dict.get("CFBundleExecutable")?.as_string().map(|s| s.to_string())
     }
 
     /// Add a custom exclusion pattern
@@ -158,6 +175,13 @@ impl CodeResourcesBuilder {
         // Exclude CodeResources file itself
         if relative_path == "_CodeSignature/CodeResources" {
             return true;
+        }
+
+        // Exclude the main executable (it has its own embedded signature)
+        if let Some(ref main_exec) = self.main_executable {
+            if relative_path == main_exec {
+                return true;
+            }
         }
 
         // Check if this is a nested bundle (will be handled separately)

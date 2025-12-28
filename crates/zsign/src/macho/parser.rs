@@ -38,6 +38,7 @@ pub struct MachOFile {
 }
 
 /// A single architecture slice
+#[derive(Clone)]
 pub struct ArchSlice {
     /// Offset in file
     pub offset: usize,
@@ -218,6 +219,16 @@ impl MachOFile {
     pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] {
         let start = slice.offset;
         let end = start + slice.code_length;
+        &self.data.as_ref()[start..end]
+    }
+
+    /// Get the full slice data (including any existing signature area).
+    ///
+    /// This returns the complete slice as it appears in the file,
+    /// useful for preparing code bytes before signing.
+    pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] {
+        let start = slice.offset;
+        let end = start + slice.size;
         &self.data.as_ref()[start..end]
     }
 }

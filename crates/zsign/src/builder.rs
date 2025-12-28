@@ -5,7 +5,7 @@
 
 use crate::crypto::SigningAssets;
 use crate::ipa::{CompressionLevel, IpaSigner};
-use crate::macho::{sign_macho, write_signed_macho, MachOFile};
+use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
@@ -152,19 +152,20 @@ impl ZSign {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        let signature = sign_macho(
+        let signed_binary = sign_macho(
             &macho,
             identifier,
             assets.team_id.as_deref(),
             assets.entitlements.as_deref(),
             &assets.certificate,
             &assets.private_key,
+            &assets.cert_chain,
             None, // info_plist
             None, // code_resources
         )?;
 
-        // Write the complete signed binary with embedded signature
-        write_signed_macho(input.as_ref(), output.as_ref(), &signature)?;
+        // Write the complete signed binary
+        std::fs::write(output.as_ref(), signed_binary)?;
 
         Ok(())
     }

@@ -262,9 +262,9 @@ pub fn build_adhoc_signature_blob() -> Vec<u8> {
 /// ```
 #[derive(Debug, Default)]
 pub struct SuperBlobBuilder {
-    /// SHA-1 CodeDirectory (slot 0x0000)
+    /// SHA-1 CodeDirectory (slot 0x0000) - primary, CMS signs this
     code_directory_sha1: Option<Vec<u8>>,
-    /// SHA-256 CodeDirectory (slot 0x1000)
+    /// SHA-256 CodeDirectory (slot 0x1000) - alternate for iOS 11+
     code_directory_sha256: Option<Vec<u8>>,
     /// Requirements blob (slot 0x0002)
     requirements: Option<Vec<u8>>,
@@ -284,7 +284,8 @@ impl SuperBlobBuilder {
 
     /// Set the SHA-1 CodeDirectory blob.
     ///
-    /// This goes in slot `CSSLOT_CODEDIRECTORY` (0x0000).
+    /// SHA-1 is the primary CodeDirectory in slot `CSSLOT_CODEDIRECTORY` (0x0000).
+    /// The CMS signature signs this CodeDirectory.
     pub fn code_directory_sha1(mut self, cd: Vec<u8>) -> Self {
         self.code_directory_sha1 = Some(cd);
         self
@@ -292,7 +293,8 @@ impl SuperBlobBuilder {
 
     /// Set the SHA-256 CodeDirectory blob.
     ///
-    /// This goes in slot `CSSLOT_ALTERNATE_CODEDIRECTORIES` (0x1000).
+    /// SHA-256 goes in the alternate slot `CSSLOT_ALTERNATE_CODEDIRECTORIES` (0x1000).
+    /// This is used by iOS 11+ for verification.
     pub fn code_directory_sha256(mut self, cd: Vec<u8>) -> Self {
         self.code_directory_sha256 = Some(cd);
         self
@@ -334,12 +336,12 @@ impl SuperBlobBuilder {
 
     /// Build the SuperBlob with all configured components.
     ///
-    /// Components are ordered by slot type:
-    /// 1. CodeDirectory SHA-1 (0x0000)
+    /// Components are ordered by slot type (matching Apple codesign/zsign):
+    /// 1. CodeDirectory SHA-1 (0x0000) - primary slot, CMS signs this
     /// 2. Requirements (0x0002)
     /// 3. Entitlements (0x0005) - if present
     /// 4. DER Entitlements (0x0007) - if present
-    /// 5. CodeDirectory SHA-256 (0x1000)
+    /// 5. CodeDirectory SHA-256 (0x1000) - alternate slot for iOS 11+
     /// 6. CMS Signature (0x10000) - if present
     ///
     /// # Returns
@@ -348,7 +350,7 @@ impl SuperBlobBuilder {
     pub fn build(self) -> Vec<u8> {
         let mut entries = Vec::new();
 
-        // Slot 0x0000: CodeDirectory SHA-1 (required)
+        // Slot 0x0000: CodeDirectory SHA-1 (primary - CMS signs this one)
         if let Some(cd_sha1) = self.code_directory_sha1 {
             entries.push(BlobEntry::new(CSSLOT_CODEDIRECTORY, cd_sha1));
         }
@@ -367,7 +369,7 @@ impl SuperBlobBuilder {
             entries.push(BlobEntry::new(CSSLOT_DER_ENTITLEMENTS, der_ent));
         }
 
-        // Slot 0x1000: CodeDirectory SHA-256 (recommended for iOS 12+)
+        // Slot 0x1000: CodeDirectory SHA-256 (alternate for iOS 11+)
         if let Some(cd_sha256) = self.code_directory_sha256 {
             entries.push(BlobEntry::new(CSSLOT_ALTERNATE_CODEDIRECTORIES, cd_sha256));
         }
@@ -617,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_superblob_builder_slot_ordering() {
-        // Verify slots are added in correct order
+        // Verify slots are added in correct order regardless of method call order
         let cd_sha1 = vec![0x01; 10];
         let cd_sha256 = vec![0x02; 10];
         let ent = build_entitlements_blob(b"");
@@ -625,15 +627,15 @@ mod tests {
         let sig = build_signature_blob(&[]);
 
         let superblob = SuperBlobBuilder::new()
-            .code_directory_sha256(cd_sha256) // Added second, should be slot 0x1000
-            .cms_signature(sig) // Added last, should be slot 0x10000
-            .code_directory_sha1(cd_sha1) // Added third, should be slot 0x0000
-            .der_entitlements(der_ent) // Added fourth, should be slot 0x0007
-            .entitlements(ent) // Added fifth, should be slot 0x0005
+            .code_directory_sha256(cd_sha256) // SHA-256 → slot 0x1000 (alternate)
+            .cms_signature(sig) // CMS → slot 0x10000
+            .code_directory_sha1(cd_sha1) // SHA-1 → slot 0x0000 (primary)
+            .der_entitlements(der_ent) // DER ent → slot 0x0007
+            .entitlements(ent) // Ent → slot 0x0005
             .build();
 
         // Regardless of insertion order, slots should be ordered:
-        // 0x0000, 0x0002, 0x0005, 0x0007, 0x1000, 0x10000
+        // 0x0000 (SHA-1), 0x0002, 0x0005, 0x0007, 0x1000 (SHA-256), 0x10000
         let slot0 = u32::from_be_bytes([superblob[12], superblob[13], superblob[14], superblob[15]]);
         assert_eq!(slot0, CSSLOT_CODEDIRECTORY); // 0x0000
 

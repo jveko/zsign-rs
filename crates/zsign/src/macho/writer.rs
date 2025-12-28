@@ -23,6 +23,12 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 /// Size of LC_CODE_SIGNATURE command
 const LINKEDIT_DATA_COMMAND_SIZE: u32 = 16;
 
+/// Page size for code signing (4KB)
+const PAGE_SIZE: usize = 4096;
+
+/// Extra padding for code signature space (16KB)
+const CODE_SIGN_PADDING: usize = 16384;
+
 /// Writes a signed Mach-O binary with the signature embedded.
 ///
 /// This function takes the original binary data and a signature blob,
@@ -73,6 +79,210 @@ pub fn write_signed_macho_in_place(binary_path: impl AsRef<Path>, signature: &[u
     Ok(())
 }
 
+/// Calculates the required new binary length for a signature to fit.
+///
+/// Uses the formula from C++ zsign:
+/// `newLength = codeLength + ByteAlign(((codeLength/4096)+1) * (20+32), 4096) + 16384`
+///
+/// This calculates:
+/// - Number of pages + 1 (for safety margin)
+/// - Multiplied by hash slot size (20 bytes SHA1 + 32 bytes SHA256)
+/// - Aligned to 4KB page boundary
+/// - Plus 16KB extra padding
+///
+/// # Arguments
+///
+/// * `code_length` - The length of code (before signature)
+///
+/// # Returns
+///
+/// The new total binary length with sufficient space for the signature.
+pub fn calculate_signature_space(code_length: usize) -> usize {
+    let pages = code_length / PAGE_SIZE;
+    let hash_slot_size = 20 + 32; // SHA1 + SHA256 hash sizes
+    let sig_space = align_to((pages + 1) * hash_slot_size, PAGE_SIZE);
+    code_length + sig_space + CODE_SIGN_PADDING
+}
+
+/// Reallocates code signature space in a Mach-O binary.
+///
+/// When the signature doesn't fit in the existing space, this function creates
+/// a new binary with an expanded __LINKEDIT segment to accommodate the signature.
+///
+/// The function:
+/// 1. Calculates the required new length using `calculate_signature_space`
+/// 2. Updates the __LINKEDIT segment's vmsize and filesize
+/// 3. Updates or adds LC_CODE_SIGNATURE load command
+/// 4. Expands the binary with zero padding
+///
+/// # Arguments
+///
+/// * `data` - The original Mach-O binary data
+/// * `code_length` - The code length (everything before signature)
+///
+/// # Returns
+///
+/// A new `Vec<u8>` containing the reallocated binary with sufficient signature space.
+pub fn realloc_code_sign_space(data: &[u8], code_length: usize) -> Result<Vec<u8>> {
+    let mach =
+        Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
+
+    match mach {
+        Mach::Binary(macho) => realloc_code_sign_space_single(data, &macho, code_length),
+        Mach::Fat(_) => {
+            Err(Error::MachO("Use realloc_code_sign_space_slice for FAT binaries".into()))
+        }
+    }
+}
+
+/// Reallocates code signature space for a single slice of a FAT binary or single-arch binary.
+///
+/// # Arguments
+///
+/// * `slice_data` - The slice data (or full binary for single-arch)
+/// * `code_length` - The code length for this slice
+///
+/// # Returns
+///
+/// A new `Vec<u8>` containing the reallocated slice with sufficient signature space.
+pub fn realloc_code_sign_space_slice(slice_data: &[u8], code_length: usize) -> Result<Vec<u8>> {
+    let mach = Mach::parse(slice_data)
+        .map_err(|e| Error::MachO(format!("Failed to parse Mach-O slice: {}", e)))?;
+
+    match mach {
+        Mach::Binary(macho) => realloc_code_sign_space_single(slice_data, &macho, code_length),
+        Mach::Fat(_) => Err(Error::MachO("Expected single-arch binary, got FAT".into())),
+    }
+}
+
+/// Reallocates code signature space for a single-architecture Mach-O.
+fn realloc_code_sign_space_single(
+    data: &[u8],
+    macho: &MachO,
+    code_length: usize,
+) -> Result<Vec<u8>> {
+    let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
+    if !is_64 {
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
+    }
+
+    let new_length = calculate_signature_space(code_length);
+
+    // Don't reallocate if new length isn't larger
+    if new_length <= data.len() {
+        return Ok(data.to_vec());
+    }
+
+    let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
+    let mut linkedit_cmd: Option<(usize, SegmentCommand64)> = None;
+    let mut max_load_cmd_end: usize = 0;
+
+    for lc in &macho.load_commands {
+        let lc_end = lc.offset + lc.command.cmdsize();
+        if lc_end > max_load_cmd_end {
+            max_load_cmd_end = lc_end;
+        }
+
+        match &lc.command {
+            CommandVariant::CodeSignature(cs) => {
+                code_sig_cmd = Some((lc.offset, *cs));
+            }
+            CommandVariant::Segment64(seg) => {
+                if seg.segname.starts_with(b"__LINKEDIT") {
+                    linkedit_cmd = Some((lc.offset, *seg));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Start with code portion of the binary
+    let mut output = data[..code_length].to_vec();
+
+    // Determine endianness
+    let is_big_endian = data.len() >= 4
+        && (data[0..4] == [0xfe, 0xed, 0xfa, 0xce]
+            || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
+            || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
+
+    // Update __LINKEDIT segment
+    if let Some((offset, seg)) = linkedit_cmd {
+        // Calculate new sizes
+        let linkedit_fileoff = seg.fileoff as usize;
+        let old_vmsize = seg.vmsize;
+        let size_increase = new_length - data.len();
+        let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;
+        let new_filesize = (new_length - linkedit_fileoff) as u64;
+
+        // Update vmsize at offset 32 (u64)
+        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian);
+        // Update filesize at offset 48 (u64)
+        write_u64(&mut output, offset + 48, new_filesize, is_big_endian);
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
+    }
+
+    // Update or add LC_CODE_SIGNATURE
+    let sig_datasize = (new_length - code_length) as u32;
+
+    if let Some((offset, _)) = code_sig_cmd {
+        // Update existing LC_CODE_SIGNATURE datasize
+        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian);
+        write_u32(&mut output, offset + 12, sig_datasize, is_big_endian);
+    } else {
+        // Add new LC_CODE_SIGNATURE command
+        let first_segment_offset = find_first_segment_offset(macho);
+        let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
+        let new_load_commands_end = max_load_cmd_end + new_cmd_size;
+
+        if new_load_commands_end > first_segment_offset {
+            // Check if there's space for the new load command
+            // Count available free space
+            let header_size = if is_64 { 32 } else { 28 };
+            let current_sizeofcmds = read_u32(&output, 20, is_big_endian) as usize;
+            let available_space = first_segment_offset - (header_size + current_sizeofcmds);
+
+            if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
+                return Err(Error::MachO(
+                    "No space for LC_CODE_SIGNATURE in load commands area".into(),
+                ));
+            }
+        }
+
+        // Write the new LC_CODE_SIGNATURE command
+        write_u32(&mut output, max_load_cmd_end, LC_CODE_SIGNATURE, is_big_endian);
+        write_u32(&mut output, max_load_cmd_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian);
+        write_u32(&mut output, max_load_cmd_end + 8, code_length as u32, is_big_endian);
+        write_u32(&mut output, max_load_cmd_end + 12, sig_datasize, is_big_endian);
+
+        // Update header's ncmds and sizeofcmds (offset 16 and 20 for 64-bit)
+        let current_ncmds = read_u32(&output, 16, is_big_endian);
+        let current_sizeofcmds = read_u32(&output, 20, is_big_endian);
+        write_u32(&mut output, 16, current_ncmds + 1, is_big_endian);
+        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian);
+    }
+
+    // Pad output to new_length with zeros
+    output.resize(new_length, 0);
+
+    Ok(output)
+}
+
+/// Checks if the current binary has enough space for the given signature size.
+///
+/// # Arguments
+///
+/// * `data` - The Mach-O binary data
+/// * `signature_size` - The required signature size
+///
+/// # Returns
+///
+/// `true` if there is enough space, `false` if reallocation is needed.
+pub fn has_enough_signature_space(data: &[u8], code_length: usize, signature_size: usize) -> bool {
+    let available_space = data.len().saturating_sub(code_length);
+    available_space >= signature_size
+}
+
 /// Embeds a code signature into Mach-O binary data.
 ///
 /// For single-architecture binaries, embeds the signature directly.
@@ -94,14 +304,21 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
                 .ok_or_else(|| Error::MachO("Empty FAT binary".into()))?
                 .map_err(|e| Error::MachO(format!("Failed to read FAT arch: {}", e)))?;
 
+            let offset = first_arch.offset as usize;
+            let size = first_arch.size as usize;
+            let slice_data = &data[offset..offset + size];
+            
+            let first_macho = MachO::parse(slice_data, 0)
+                .map_err(|e| Error::MachO(format!("Failed to parse first slice: {}", e)))?;
+
             let signed_slice = SignedSlice {
                 slice_index: 0,
                 offset: first_arch.offset as usize,
                 original_size: first_arch.size as usize,
-                signature: signature.to_vec(),
+                signed_data: embed_signature_single(slice_data, &first_macho, signature)?,
             };
 
-            embed_signature_fat_impl(data, &fat, &[signed_slice])
+            embed_fat_from_signed_slices(data, &fat, &[signed_slice])
         }
     }
 }
@@ -114,7 +331,7 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
 /// # Arguments
 ///
 /// * `data` - The original FAT binary data
-/// * `signed_slices` - Signatures for each architecture slice (from `sign_macho_all_slices`)
+/// * `signed_slices` - SignedSlice structs containing complete signed binary data
 ///
 /// # Returns
 ///
@@ -124,23 +341,22 @@ pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result
         Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
 
     match mach {
-        Mach::Binary(macho) => {
+        Mach::Binary(_) => {
             if signed_slices.is_empty() {
                 return Err(Error::MachO("No signed slices provided".into()));
             }
-            embed_signature_single(data, &macho, &signed_slices[0].signature)
+            Ok(signed_slices[0].signed_data.clone())
         }
-        Mach::Fat(fat) => embed_signature_fat_impl(data, &fat, signed_slices),
+        Mach::Fat(fat) => embed_fat_from_signed_slices(data, &fat, signed_slices),
     }
 }
 
-/// Implementation of FAT binary signature embedding.
-fn embed_signature_fat_impl(
+/// Reassemble a FAT binary from already-signed slice data.
+fn embed_fat_from_signed_slices(
     data: &[u8],
     fat: &MultiArch,
     signed_slices: &[SignedSlice],
 ) -> Result<Vec<u8>> {
-    // Collect architecture information
     let arches: Vec<FatArch> = fat
         .iter_arches()
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -150,59 +366,38 @@ fn embed_signature_fat_impl(
         return Err(Error::MachO("Empty FAT binary".into()));
     }
 
-    // Sign each slice and collect the results
-    let mut signed_slice_data: Vec<Vec<u8>> = Vec::with_capacity(arches.len());
-
+    // Collect signed data for each slice
+    let mut slice_data_vec: Vec<Vec<u8>> = Vec::with_capacity(arches.len());
+    
     for (i, arch) in arches.iter().enumerate() {
-        let offset = arch.offset as usize;
-        let size = arch.size as usize;
-        let slice_data = &data[offset..offset + size];
-
         // Find the corresponding signed slice
-        let signature = signed_slices
-            .iter()
-            .find(|s| s.slice_index == i)
-            .map(|s| s.signature.as_slice())
-            .unwrap_or(&[]);
-
-        if signature.is_empty() {
-            // No signature for this slice, keep it as-is
-            signed_slice_data.push(slice_data.to_vec());
+        if let Some(signed) = signed_slices.iter().find(|s| s.slice_index == i) {
+            slice_data_vec.push(signed.signed_data.clone());
         } else {
-            // Parse and sign this slice
-            let macho = MachO::parse(slice_data, 0)
-                .map_err(|e| Error::MachO(format!("Failed to parse slice {}: {}", i, e)))?;
-
-            let signed = embed_signature_single(slice_data, &macho, signature)?;
-            signed_slice_data.push(signed);
+            // No signature for this slice, keep original
+            let offset = arch.offset as usize;
+            let size = arch.size as usize;
+            slice_data_vec.push(data[offset..offset + size].to_vec());
         }
     }
 
-    // Calculate new offsets with proper alignment
-    // FAT header: 8 bytes + (20 bytes per arch)
-    let fat_header_size = 8 + (arches.len() * 20);
-
-    // Start slices after header, aligned to page boundary
-    let mut current_offset = align_to(fat_header_size, 0x4000);
+    // Calculate new offsets with alignment
+    let header_size = 8 + arches.len() * 20;
     let mut new_offsets: Vec<(u32, u32)> = Vec::with_capacity(arches.len());
+    let mut current_offset = align_to(header_size, 0x4000) as u32;
 
-    for (i, signed_data) in signed_slice_data.iter().enumerate() {
-        // Align to the arch's specified alignment (usually page size)
-        let alignment = 1u32 << arches[i].align;
-        current_offset = align_to(current_offset, alignment as usize);
-
-        new_offsets.push((current_offset as u32, signed_data.len() as u32));
-        current_offset += signed_data.len();
+    for slice_data in &slice_data_vec {
+        let size = slice_data.len() as u32;
+        new_offsets.push((current_offset, size));
+        current_offset = align_to((current_offset + size) as usize, 0x4000) as u32;
     }
 
     // Build the new FAT binary
-    let total_size = current_offset;
+    let total_size = new_offsets.last().map(|(o, s)| *o + *s).unwrap_or(0) as usize;
     let mut output = vec![0u8; total_size];
 
-    // Write FAT header (always big-endian)
-    // Magic: 0xCAFEBABE
+    // Write FAT header (big-endian)
     output[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
-    // Number of architectures
     output[4..8].copy_from_slice(&(arches.len() as u32).to_be_bytes());
 
     // Write fat_arch entries
@@ -210,22 +405,17 @@ fn embed_signature_fat_impl(
         let entry_offset = 8 + (i * 20);
         let (new_offset, new_size) = new_offsets[i];
 
-        // cputype
         write_u32_be(&mut output, entry_offset, arch.cputype as u32);
-        // cpusubtype
         write_u32_be(&mut output, entry_offset + 4, arch.cpusubtype as u32);
-        // offset (new)
         write_u32_be(&mut output, entry_offset + 8, new_offset);
-        // size (new)
         write_u32_be(&mut output, entry_offset + 12, new_size);
-        // align
         write_u32_be(&mut output, entry_offset + 16, arch.align);
     }
 
-    // Write each signed slice at its new offset
-    for (i, signed_data) in signed_slice_data.iter().enumerate() {
+    // Write each slice at its new offset
+    for (i, slice_data) in slice_data_vec.iter().enumerate() {
         let (offset, _) = new_offsets[i];
-        output[offset as usize..offset as usize + signed_data.len()].copy_from_slice(signed_data);
+        output[offset as usize..offset as usize + slice_data.len()].copy_from_slice(slice_data);
     }
 
     Ok(output)
@@ -494,8 +684,114 @@ fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) ->
 }
 
 /// Aligns a value up to the specified alignment.
-fn align_to(value: usize, alignment: usize) -> usize {
+pub fn align_to(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+/// Prepares code bytes for signing by updating load commands to reflect the final signature.
+///
+/// This function must be called BEFORE hashing the code, because the hash includes
+/// the Mach-O header and load commands. The LC_CODE_SIGNATURE and __LINKEDIT segment
+/// are updated in-place to point to where the signature will be embedded.
+///
+/// # Arguments
+///
+/// * `data` - The original Mach-O binary data
+/// * `estimated_signature_size` - Estimated size of the signature blob
+///
+/// # Returns
+///
+/// A tuple of:
+/// * The prepared code bytes (with updated load commands)
+/// * The signature offset where the signature should be placed
+/// * The code length that was used
+pub fn prepare_code_for_signing(data: &[u8], estimated_signature_size: usize) -> Result<(Vec<u8>, usize, usize)> {
+    let mach = Mach::parse(data)
+        .map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
+
+    match mach {
+        Mach::Binary(macho) => prepare_code_single(data, &macho, estimated_signature_size),
+        Mach::Fat(_) => {
+            Err(Error::MachO("Use prepare_code_for_signing_slice for FAT binaries".into()))
+        }
+    }
+}
+
+/// Prepares a single slice of a FAT binary for signing.
+///
+/// Similar to `prepare_code_for_signing` but works on a slice of a FAT binary.
+pub fn prepare_code_for_signing_slice(
+    slice_data: &[u8],
+    estimated_signature_size: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let mach = Mach::parse(slice_data)
+        .map_err(|e| Error::MachO(format!("Failed to parse Mach-O slice: {}", e)))?;
+
+    match mach {
+        Mach::Binary(macho) => prepare_code_single(slice_data, &macho, estimated_signature_size),
+        Mach::Fat(_) => Err(Error::MachO("Expected single-arch binary, got FAT".into())),
+    }
+}
+
+/// Prepares code bytes for a single-architecture Mach-O.
+fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usize) -> Result<(Vec<u8>, usize, usize)> {
+    let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
+    if !is_64 {
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
+    }
+
+    let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
+    let mut linkedit_cmd: Option<(usize, SegmentCommand64)> = None;
+    let mut max_load_cmd_end: usize = 0;
+
+    for lc in &macho.load_commands {
+        let lc_end = lc.offset + lc.command.cmdsize();
+        if lc_end > max_load_cmd_end {
+            max_load_cmd_end = lc_end;
+        }
+
+        match &lc.command {
+            CommandVariant::CodeSignature(cs) => {
+                code_sig_cmd = Some((lc.offset, *cs));
+            }
+            CommandVariant::Segment64(seg) => {
+                if seg.segname.starts_with(b"__LINKEDIT") {
+                    linkedit_cmd = Some((lc.offset, *seg));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let code_length = if let Some((_, cs)) = code_sig_cmd {
+        cs.dataoff as usize
+    } else {
+        find_code_end(macho, data.len())
+    };
+
+    let sig_offset = align_to(code_length, 16);
+    let sig_size = estimated_signature_size as u32;
+
+    let mut prepared = data[..code_length].to_vec();
+
+    if let Some((offset, _)) = code_sig_cmd {
+        update_linkedit_data_command(&mut prepared, offset, sig_offset as u32, sig_size)?;
+    } else {
+        add_code_signature_command(
+            &mut prepared,
+            macho,
+            max_load_cmd_end,
+            sig_offset as u32,
+            sig_size,
+        )?;
+    }
+
+    if let Some((offset, seg)) = linkedit_cmd {
+        let new_filesize = (sig_offset + estimated_signature_size) as u64 - seg.fileoff;
+        update_linkedit_segment(&mut prepared, offset, new_filesize)?;
+    }
+
+    Ok((prepared, sig_offset, code_length))
 }
 
 /// Reads a u32 from a byte slice at the given offset.
@@ -564,5 +860,45 @@ mod tests {
         let signature = vec![0u8; 1000];
         let result = embed_signature(&data, &signature);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_signature_space() {
+        // Test with various code lengths
+        // Formula: code_length + align_to((pages+1)*52, 4096) + 16384
+
+        // 4KB code (1 page)
+        let code_length = 4096;
+        let result = calculate_signature_space(code_length);
+        // pages = 1, (1+1)*52 = 104 -> align to 4096 = 4096
+        // total = 4096 + 4096 + 16384 = 24576
+        assert_eq!(result, 24576);
+
+        // 1MB code (256 pages)
+        let code_length = 1024 * 1024;
+        let result = calculate_signature_space(code_length);
+        // pages = 256, (256+1)*52 = 13364 -> align to 4096 = 16384
+        // total = 1MB + 16384 + 16384 = 1081344
+        assert_eq!(result, 1081344);
+
+        // 10MB code
+        let code_length = 10 * 1024 * 1024;
+        let result = calculate_signature_space(code_length);
+        // pages = 2560, (2560+1)*52 = 133172 -> align to 4096 = 135168
+        // total = 10MB + 135168 + 16384 = 10637312
+        assert_eq!(result, 10637312);
+    }
+
+    #[test]
+    fn test_has_enough_signature_space() {
+        // Data has 1000 bytes after code_length
+        assert!(has_enough_signature_space(&[0u8; 2000], 1000, 500));
+        assert!(has_enough_signature_space(&[0u8; 2000], 1000, 1000));
+        assert!(!has_enough_signature_space(&[0u8; 2000], 1000, 1001));
+        assert!(!has_enough_signature_space(&[0u8; 2000], 1000, 2000));
+
+        // Edge case: code_length equals data length
+        assert!(!has_enough_signature_space(&[0u8; 1000], 1000, 1));
+        assert!(has_enough_signature_space(&[0u8; 1000], 1000, 0));
     }
 }
