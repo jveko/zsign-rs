@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
-use zsign::ZSign;
+use zsign::{PureRustCredentials, ZSignPure};
 
 #[derive(Parser)]
 #[command(name = "zsign")]
@@ -13,11 +13,11 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Certificate file (PEM or DER)
+    /// Certificate file (PEM format)
     #[arg(short = 'c', long)]
     certificate: Option<PathBuf>,
 
-    /// Private key file (PEM or DER)
+    /// Private key file (PEM format)
     #[arg(short = 'k', long)]
     private_key: Option<PathBuf>,
 
@@ -43,25 +43,15 @@ struct Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let mut signer = ZSign::new();
+    let credentials = load_credentials(&cli)?;
 
-    if let Some(cert) = cli.certificate {
-        signer = signer.certificate(cert);
-    }
-    if let Some(key) = cli.private_key {
-        signer = signer.private_key(key);
-    }
-    if let Some(p12) = cli.pkcs12 {
-        signer = signer.pkcs12(p12);
-    }
+    let mut signer = ZSignPure::new()
+        .credentials(credentials)
+        .compression_level(cli.zip_level);
+
     if let Some(profile) = cli.profile {
         signer = signer.provisioning_profile(profile);
     }
-    if let Some(password) = cli.password {
-        signer = signer.password(password);
-    }
-
-    signer = signer.compression_level(cli.zip_level);
 
     let output = cli.output.unwrap_or_else(|| {
         let mut out = cli.input.clone();
@@ -69,8 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out
     });
 
-    // Detect input type and sign
-    let ext = cli.input.extension()
+    let ext = cli
+        .input
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
@@ -82,11 +73,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             signer.sign_bundle(&cli.input)?;
         }
         _ => {
-            // Assume Mach-O
             signer.sign_macho(&cli.input, &output)?;
         }
     }
 
     println!("Signed: {}", output.display());
     Ok(())
+}
+
+fn load_credentials(cli: &Cli) -> Result<PureRustCredentials, Box<dyn std::error::Error>> {
+    if let Some(ref p12_path) = cli.pkcs12 {
+        let p12_data = std::fs::read(p12_path)?;
+        let password = cli.password.as_deref().unwrap_or("");
+        let creds = PureRustCredentials::from_p12(&p12_data, password)?;
+        return Ok(creds);
+    }
+
+    if let (Some(ref cert_path), Some(ref key_path)) = (&cli.certificate, &cli.private_key) {
+        let cert_data = std::fs::read(cert_path)?;
+        let key_data = std::fs::read(key_path)?;
+        let creds = PureRustCredentials::from_pem(&cert_data, &key_data, None)?;
+        return Ok(creds);
+    }
+
+    Err("Must provide either --pkcs12 or both --certificate and --private-key".into())
 }
