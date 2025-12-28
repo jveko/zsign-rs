@@ -35,6 +35,6 @@ bcder = { version = "0.7", optional = true }
 ring = { version = "0.17", optional = true }
 
 [features]
-default = ["openssl-backend"]
+default = ["pure-rust"]
 openssl-backend = ["dep:openssl", "dep:openssl-sys"]
 pure-rust = ["dep:cryptographic-message-syntax", "dep:x509-certificate", "dep:rsa", "dep:p256", "dep:p12", "dep:bcder", "dep:ring"]
