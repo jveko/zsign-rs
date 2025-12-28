@@ -1037,4 +1037,53 @@ mod tests {
         // Should fall back to empty requirements (12 bytes)
         assert_eq!(req_len, 12);
     }
+
+    #[test]
+    fn test_superblob_4byte_alignment() {
+        // Create blobs with odd sizes to test alignment
+        let entries = vec![
+            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xab; 101]),  // 101 bytes (odd)
+            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xcd; 13]),     // 13 bytes (odd)
+            BlobEntry::new(CSSLOT_ENTITLEMENTS, vec![0xef; 50]),     // 50 bytes (even but not aligned)
+        ];
+
+        let blob = build_superblob(entries);
+
+        // Header: 12 bytes, Index: 3*8 = 24 bytes, total header = 36 bytes
+        // Offset of first blob = 36 (aligned)
+        // Offset of second blob = 36 + 101 + padding = 36 + 104 = 140 (must be 4-byte aligned)
+        // Offset of third blob = 140 + 13 + padding = 140 + 16 = 156 (must be 4-byte aligned)
+        
+        // Check second entry offset is 4-byte aligned
+        let offset2 = u32::from_be_bytes([blob[24], blob[25], blob[26], blob[27]]);
+        assert_eq!(offset2 % 4, 0, "Second blob offset {} not 4-byte aligned", offset2);
+
+        // Check third entry offset is 4-byte aligned  
+        let offset3 = u32::from_be_bytes([blob[32], blob[33], blob[34], blob[35]]);
+        assert_eq!(offset3 % 4, 0, "Third blob offset {} not 4-byte aligned", offset3);
+    }
+
+    #[test]
+    fn test_superblob_alignment_padding_bytes() {
+        // Verify padding bytes are zeros
+        let entries = vec![
+            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xAB; 5]),  // 5 bytes, needs 3 padding
+            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xCD; 4]),   // 4 bytes, aligned
+        ];
+
+        let blob = build_superblob(entries);
+        
+        // Header: 12 + 2*8 = 28 bytes
+        // First blob at 28, length 5
+        // Padding: 3 bytes at offsets 33, 34, 35
+        // Second blob at 36
+        
+        // Check padding bytes are zero
+        assert_eq!(blob[33], 0x00, "Padding byte 1 should be zero");
+        assert_eq!(blob[34], 0x00, "Padding byte 2 should be zero");
+        assert_eq!(blob[35], 0x00, "Padding byte 3 should be zero");
+        
+        // Check second blob starts correctly
+        assert_eq!(blob[36], 0xCD, "Second blob data should start at aligned offset");
+    }
 }

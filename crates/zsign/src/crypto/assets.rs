@@ -310,6 +310,10 @@ impl SigningAssets {
         let mut buf = Vec::new();
         plist::to_writer_xml(&mut buf, entitlements)
             .map_err(|e| Error::ProvisioningProfile(format!("Failed to serialize: {}", e)))?;
+        
+        // Add trailing newline to match C++ zsign behavior
+        // C++ zsign uses style_write_plist which adds "\n" after </plist>
+        buf.push(b'\n');
 
         Ok(buf)
     }

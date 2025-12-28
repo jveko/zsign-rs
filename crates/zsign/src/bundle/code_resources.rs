@@ -35,101 +35,93 @@ struct FileEntry {
 }
 
 /// Standard exclusion rules for CodeResources
+/// C++ Reference: bundle.cpp:195-201
 fn standard_rules() -> Dictionary {
     let mut rules = Dictionary::new();
-
-    // Exclude _CodeSignature
-    rules.insert("^_CodeSignature/".to_string(), Value::Boolean(false));
-
-    // Exclude ResourceRules.plist (deprecated)
-    rules.insert("^ResourceRules\\.plist$".to_string(), Value::Boolean(true));
 
     // Everything else is included by default
     rules.insert("^.*".to_string(), Value::Boolean(true));
 
+    // .lproj directories are optional
+    let mut lproj = Dictionary::new();
+    lproj.insert("optional".to_string(), Value::Boolean(true));
+    lproj.insert("weight".to_string(), Value::Real(1000.0));
+    rules.insert("^.*\\.lproj/".to_string(), Value::Dictionary(lproj));
+
+    // locversion.plist is omitted
+    let mut locversion = Dictionary::new();
+    locversion.insert("omit".to_string(), Value::Boolean(true));
+    locversion.insert("weight".to_string(), Value::Real(1100.0));
+    rules.insert("^.*\\.lproj/locversion.plist$".to_string(), Value::Dictionary(locversion));
+
+    // Base.lproj has higher weight
+    let mut base_lproj = Dictionary::new();
+    base_lproj.insert("weight".to_string(), Value::Real(1010.0));
+    rules.insert("^Base\\.lproj/".to_string(), Value::Dictionary(base_lproj));
+
+    // version.plist is included
+    rules.insert("^version.plist$".to_string(), Value::Boolean(true));
+
     rules
 }
 
-/// Modern rules2 for CodeResources (more comprehensive)
+/// Modern rules2 for CodeResources
+/// C++ Reference: bundle.cpp:203-217
 fn standard_rules2() -> Dictionary {
     let mut rules2 = Dictionary::new();
 
-    // Exclude _CodeSignature directory
-    let mut code_sig = Dictionary::new();
-    code_sig.insert("omit".to_string(), Value::Boolean(true));
-    code_sig.insert("weight".to_string(), Value::Real(2000.0));
-    rules2.insert("^_CodeSignature/".to_string(), Value::Dictionary(code_sig));
+    // Default rule for everything else
+    rules2.insert("^.*".to_string(), Value::Boolean(true));
 
-    // Exclude CodeResources itself
-    let mut code_res = Dictionary::new();
-    code_res.insert("omit".to_string(), Value::Boolean(true));
-    code_res.insert("weight".to_string(), Value::Real(2000.0));
-    rules2.insert(
-        "^_CodeSignature/CodeResources$".to_string(),
-        Value::Dictionary(code_res),
-    );
+    // .dSYM directories
+    let mut dsym = Dictionary::new();
+    dsym.insert("weight".to_string(), Value::Real(11.0));
+    rules2.insert(".*\\.dSYM($|/)".to_string(), Value::Dictionary(dsym));
 
-    // Nested bundles are handled separately
-    let mut nested = Dictionary::new();
-    nested.insert("nested".to_string(), Value::Boolean(true));
-    nested.insert("weight".to_string(), Value::Real(10.0));
-    rules2.insert("^.*\\.app/".to_string(), Value::Dictionary(nested.clone()));
-    rules2.insert(
-        "^.*\\.framework/".to_string(),
-        Value::Dictionary(nested.clone()),
-    );
-    rules2.insert(
-        "^.*\\.appex/".to_string(),
-        Value::Dictionary(nested.clone()),
-    );
+    // .DS_Store files are omitted
+    let mut ds_store = Dictionary::new();
+    ds_store.insert("omit".to_string(), Value::Boolean(true));
+    ds_store.insert("weight".to_string(), Value::Real(2000.0));
+    rules2.insert("^(.*/)?\\.DS_Store$".to_string(), Value::Dictionary(ds_store));
 
-    // PlugIns directory with nested bundles
-    let mut plugins = Dictionary::new();
-    plugins.insert("nested".to_string(), Value::Boolean(true));
-    plugins.insert("weight".to_string(), Value::Real(10.0));
-    rules2.insert("^PlugIns/".to_string(), Value::Dictionary(plugins));
+    // .lproj directories are optional
+    let mut lproj = Dictionary::new();
+    lproj.insert("optional".to_string(), Value::Boolean(true));
+    lproj.insert("weight".to_string(), Value::Real(1000.0));
+    rules2.insert("^.*\\.lproj/".to_string(), Value::Dictionary(lproj));
 
-    // Frameworks directory with nested bundles
-    let mut frameworks = Dictionary::new();
-    frameworks.insert("nested".to_string(), Value::Boolean(true));
-    frameworks.insert("weight".to_string(), Value::Real(10.0));
-    rules2.insert("^Frameworks/".to_string(), Value::Dictionary(frameworks));
+    // locversion.plist is omitted
+    let mut locversion = Dictionary::new();
+    locversion.insert("omit".to_string(), Value::Boolean(true));
+    locversion.insert("weight".to_string(), Value::Real(1100.0));
+    rules2.insert("^.*\\.lproj/locversion.plist$".to_string(), Value::Dictionary(locversion));
 
-    // SC_Info (Store Container info) - optional
-    let mut sc_info = Dictionary::new();
-    sc_info.insert("omit".to_string(), Value::Boolean(true));
-    sc_info.insert("weight".to_string(), Value::Real(1000.0));
-    rules2.insert("^SC_Info/".to_string(), Value::Dictionary(sc_info));
+    // Base.lproj has higher weight
+    let mut base_lproj = Dictionary::new();
+    base_lproj.insert("weight".to_string(), Value::Real(1010.0));
+    rules2.insert("^Base\\.lproj/".to_string(), Value::Dictionary(base_lproj));
 
-    // Info.plist is always included with high weight
+    // Info.plist is omitted from files2
     let mut info_plist = Dictionary::new();
+    info_plist.insert("omit".to_string(), Value::Boolean(true));
     info_plist.insert("weight".to_string(), Value::Real(20.0));
     rules2.insert("^Info\\.plist$".to_string(), Value::Dictionary(info_plist));
 
-    // PkgInfo
+    // PkgInfo is omitted from files2
     let mut pkg_info = Dictionary::new();
+    pkg_info.insert("omit".to_string(), Value::Boolean(true));
     pkg_info.insert("weight".to_string(), Value::Real(20.0));
     rules2.insert("^PkgInfo$".to_string(), Value::Dictionary(pkg_info));
 
-    // ResourceRules.plist (deprecated, omit)
-    let mut resource_rules = Dictionary::new();
-    resource_rules.insert("omit".to_string(), Value::Boolean(true));
-    resource_rules.insert("weight".to_string(), Value::Real(100.0));
-    rules2.insert(
-        "^ResourceRules\\.plist$".to_string(),
-        Value::Dictionary(resource_rules),
-    );
-
-    // embedded.mobileprovision
+    // embedded.provisionprofile (note: different from mobileprovision)
     let mut provision = Dictionary::new();
     provision.insert("weight".to_string(), Value::Real(20.0));
-    rules2.insert(
-        "^embedded\\.mobileprovision$".to_string(),
-        Value::Dictionary(provision),
-    );
+    rules2.insert("^embedded\\.provisionprofile$".to_string(), Value::Dictionary(provision));
 
-    // Default rule for everything else
-    rules2.insert("^.*".to_string(), Value::Boolean(true));
+    // version.plist
+    let mut version_plist = Dictionary::new();
+    version_plist.insert("weight".to_string(), Value::Real(20.0));
+    rules2.insert("^version\\.plist$".to_string(), Value::Dictionary(version_plist));
 
     rules2
 }
@@ -184,10 +176,10 @@ impl CodeResourcesBuilder {
             }
         }
 
-        // Check if this is a nested bundle (will be handled separately)
-        if self.is_nested_bundle(relative_path) {
-            return true;
-        }
+        // NOTE: C++ zsign does NOT exclude nested bundle files from CodeResources
+        // All files including Frameworks/*.framework/*, PlugIns/*.appex/* are included
+        // The nested bundles are signed separately, but their files still appear in parent's CodeResources
+        // Reference: C++ zsign bundle.cpp:127-193 - no nested bundle exclusion
 
         // Check custom exclusions
         for pattern in &self.exclusions {
@@ -200,13 +192,15 @@ impl CodeResourcesBuilder {
     }
 
     /// Check if the path is inside a nested bundle
+    /// 
+    /// NOTE: This function is no longer used because C++ zsign does NOT exclude
+    /// nested bundle files from CodeResources. Keeping for potential future use.
+    #[allow(dead_code)]
     fn is_nested_bundle(&self, relative_path: &str) -> bool {
         let bundle_extensions = [".app/", ".framework/", ".appex/", ".xctest/"];
 
         for ext in &bundle_extensions {
-            // Check if there's a nested bundle in the path
             if let Some(pos) = relative_path.find(ext) {
-                // Only count as nested if it's not at the root
                 if pos > 0 {
                     return true;
                 }
@@ -333,15 +327,35 @@ impl CodeResourcesBuilder {
         let mut root = Dictionary::new();
 
         // Build "files" dictionary (legacy, SHA-1 only)
+        // C++ Reference: bundle.cpp:177-184
+        // For .lproj files, use dict with hash+optional; for others, use plain hash
         let mut files = Dictionary::new();
         for (path, entry) in &self.files {
-            files.insert(path.clone(), Value::Data(entry.sha1.to_vec()));
+            if path.contains(".lproj/") {
+                // .lproj files get a dict with hash and optional flag
+                let mut file_dict = Dictionary::new();
+                file_dict.insert("hash".to_string(), Value::Data(entry.sha1.to_vec()));
+                file_dict.insert("optional".to_string(), Value::Boolean(true));
+                files.insert(path.clone(), Value::Dictionary(file_dict));
+            } else {
+                // Other files just get the hash directly
+                files.insert(path.clone(), Value::Data(entry.sha1.to_vec()));
+            }
         }
         root.insert("files".to_string(), Value::Dictionary(files));
 
         // Build "files2" dictionary (modern, SHA-1 + SHA-256)
+        // C++ Reference: bundle.cpp:186-192
+        // Omits .DS_Store, Info.plist, PkgInfo from files2
+        // Adds optional flag for .lproj files
         let mut files2 = Dictionary::new();
         for (path, entry) in &self.files {
+            // C++ zsign omits these from files2 (but includes in files)
+            // Reference: bundle.cpp:173-175
+            if path == "Info.plist" || path == "PkgInfo" || path.ends_with(".DS_Store") {
+                continue;
+            }
+            
             let mut file_dict = Dictionary::new();
 
             // Add SHA-1 hash
@@ -350,8 +364,9 @@ impl CodeResourcesBuilder {
             // Add SHA-256 hash
             file_dict.insert("hash2".to_string(), Value::Data(entry.sha256.to_vec()));
 
-            // Add optional flag if set
-            if entry.optional {
+            // Add optional flag for .lproj files
+            // C++ Reference: bundle.cpp:189-191
+            if path.contains(".lproj/") {
                 file_dict.insert("optional".to_string(), Value::Boolean(true));
             }
 
@@ -475,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exclusion_of_nested_bundles() {
+    fn test_inclusion_of_nested_bundle_files() {
         // Create a temporary bundle with a nested framework
         let temp_dir = tempdir().unwrap();
         let bundle_path = temp_dir.path().join("Test.app");
@@ -496,34 +511,84 @@ mod tests {
         let mut builder = CodeResourcesBuilder::new(&bundle_path);
         builder.scan().unwrap();
 
-        // Verify nested bundle files are excluded (they should be signed separately)
+        // C++ zsign includes nested bundle files in parent's CodeResources
+        // Reference: C++ zsign bundle.cpp:127-193 - no nested bundle exclusion
         let file_paths: Vec<_> = builder.files().map(|(p, _, _)| p.clone()).collect();
 
         // Main Info.plist should be included
         assert!(file_paths.contains(&"Info.plist".to_string()));
 
-        // Nested framework files should be excluded
-        assert!(!file_paths.iter().any(|p| p.contains(".framework/")));
+        // Nested framework files should also be included (matching C++ zsign behavior)
+        assert!(file_paths.iter().any(|p| p.contains(".framework/")));
+        assert!(file_paths.contains(&"Frameworks/Test.framework/Test".to_string()));
+        assert!(file_paths.contains(&"Frameworks/Test.framework/Info.plist".to_string()));
     }
 
     #[test]
     fn test_rules_structure() {
         let rules = standard_rules();
 
-        // Verify key rules exist
-        assert!(rules.contains_key("^_CodeSignature/"));
+        // Verify key rules exist (matching C++ zsign bundle.cpp:195-201)
         assert!(rules.contains_key("^.*"));
+        assert!(rules.contains_key("^.*\\.lproj/"));
+        assert!(rules.contains_key("^.*\\.lproj/locversion.plist$"));
+        assert!(rules.contains_key("^Base\\.lproj/"));
+        assert!(rules.contains_key("^version.plist$"));
     }
 
     #[test]
     fn test_rules2_structure() {
         let rules2 = standard_rules2();
 
-        // Verify key rules2 exist
-        assert!(rules2.contains_key("^_CodeSignature/"));
-        assert!(rules2.contains_key("^.*\\.framework/"));
-        assert!(rules2.contains_key("^Frameworks/"));
-        assert!(rules2.contains_key("^PlugIns/"));
+        // Verify key rules2 exist (matching C++ zsign bundle.cpp:203-217)
+        assert!(rules2.contains_key("^.*"));
+        assert!(rules2.contains_key(".*\\.dSYM($|/)"));
+        assert!(rules2.contains_key("^(.*/)?\\.DS_Store$"));
+        assert!(rules2.contains_key("^.*\\.lproj/"));
         assert!(rules2.contains_key("^Info\\.plist$"));
+        assert!(rules2.contains_key("^PkgInfo$"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_with_symlinks() {
+        use std::os::unix::fs::symlink;
+        
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+
+        // Create a target file
+        let target_file = bundle_path.join("RealFile.txt");
+        fs::write(&target_file, b"real content").unwrap();
+
+        // Create a symlink to the file
+        let link_path = bundle_path.join("LinkToFile.txt");
+        symlink("RealFile.txt", &link_path).unwrap();
+
+        // Create Frameworks structure with symlinks (typical iOS pattern)
+        let framework_dir = bundle_path.join("Frameworks/Test.framework/Versions/A");
+        fs::create_dir_all(&framework_dir).unwrap();
+        fs::write(framework_dir.join("Test"), b"binary").unwrap();
+        
+        // Create Current -> A symlink
+        let current_link = bundle_path.join("Frameworks/Test.framework/Versions/Current");
+        symlink("A", &current_link).unwrap();
+        
+        // Create root symlinks
+        let root_binary = bundle_path.join("Frameworks/Test.framework/Test");
+        symlink("Versions/Current/Test", &root_binary).unwrap();
+
+        // Scan the bundle
+        let mut builder = CodeResourcesBuilder::new(&bundle_path);
+        builder.scan().unwrap();
+
+        // Build the plist and check for symlink entries
+        let plist_data = builder.build().unwrap();
+        let plist_str = String::from_utf8(plist_data).unwrap();
+
+        // Symlinks should have a <key>symlink</key> entry in files2
+        assert!(plist_str.contains("<key>symlink</key>"), 
+            "Symlink entries should have symlink key in plist");
     }
 }

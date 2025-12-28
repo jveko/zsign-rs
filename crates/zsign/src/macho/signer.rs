@@ -247,12 +247,11 @@ fn sign_slice_complete(
         (slice_data.to_vec(), slice.clone(), true)
     };
 
-    // Determine the original binary size to preserve (if not reallocated)
-    let original_binary_size = if preserve_original_size {
-        Some(working_slice_data.len())
-    } else {
-        None
-    };
+    // Determine the target binary size
+    // When reallocated: use the reallocated size (formula-based padding)
+    // When not reallocated: use original size (preserve existing space)
+    // C++ zsign always pads to formula-based size when reallocating (archo.cpp:629)
+    let target_binary_size = Some(working_slice_data.len());
 
     // === PASS 2: Prepare code with actual size and rebuild ===
     // When preserving original size, pass the original signature space size
@@ -295,7 +294,7 @@ fn sign_slice_complete(
     )?;
 
     // === Embed signature into prepared code ===
-    let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, original_binary_size);
+    let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, target_binary_size);
 
     Ok(SignedSlice {
         slice_index: 0,

@@ -73,11 +73,27 @@ fn encode_value(value: &Value) -> Vec<u8> {
                 output.push(1); // length
                 output.push(0); // value
             } else {
-                // Calculate number of bytes needed
-                let bytes_needed = ((64 - val.leading_zeros() as usize) + 7) / 8;
+                // Calculate number of bytes needed for the value
+                let leading_zeros = val.leading_zeros() as usize;
+                let significant_bits = 64 - leading_zeros;
+                let mut bytes_needed = (significant_bits + 7) / 8;
+
+                // Check if MSB of the encoded value is 1 (would be negative in signed DER)
+                // This happens when significant_bits is exactly a multiple of 8
+                let needs_sign_pad = (val >> ((bytes_needed * 8) - 1)) & 1 == 1;
+
+                if needs_sign_pad {
+                    bytes_needed += 1;
+                }
+
                 encode_length(&mut output, bytes_needed);
 
-                // Value bytes in big-endian order
+                if needs_sign_pad {
+                    output.push(0x00);
+                    bytes_needed -= 1;
+                }
+
+                // Write remaining bytes in big-endian order
                 for i in (0..bytes_needed).rev() {
                     output.push(((val >> (i * 8)) & 0xFF) as u8);
                 }
@@ -255,5 +271,32 @@ mod tests {
 
         // Empty dict: SET with 0 content
         assert_eq!(der, vec![0x31, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_integer_high_bit() {
+        // 128 = 0x80, needs leading zero to avoid negative interpretation
+        let value = Value::Integer(128.into());
+        let der = encode_value(&value);
+        // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x00, 0x80
+        assert_eq!(der, vec![0x02, 0x02, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn test_encode_integer_256() {
+        // 256 = 0x0100, MSB is 0x01 so no leading zero needed
+        let value = Value::Integer(256.into());
+        let der = encode_value(&value);
+        // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x01, 0x00
+        assert_eq!(der, vec![0x02, 0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_integer_255() {
+        // 255 = 0xFF, needs leading zero
+        let value = Value::Integer(255.into());
+        let der = encode_value(&value);
+        // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x00, 0xFF
+        assert_eq!(der, vec![0x02, 0x02, 0x00, 0xFF]);
     }
 }
