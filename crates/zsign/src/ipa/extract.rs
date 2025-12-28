@@ -6,7 +6,8 @@ use crate::{Error, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Write};
+use std::borrow::Cow;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zip::ZipArchive;
@@ -178,7 +179,7 @@ fn find_app_bundle(dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
 
     if !payload_dir.exists() {
         return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
-            "No Payload directory found in IPA",
+            Cow::Borrowed("No Payload directory found in IPA"),
         )));
     }
 
@@ -197,7 +198,7 @@ fn find_app_bundle(dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
     }
 
     Err(Error::Zip(zip::result::ZipError::InvalidArchive(
-        "No .app bundle found in Payload/",
+        Cow::Borrowed("No .app bundle found in Payload/"),
     )))
 }
 
@@ -222,7 +223,7 @@ pub fn validate_ipa(ipa_path: impl AsRef<Path>) -> Result<()> {
     // ZIP magic: PK\x03\x04 or PK\x05\x06 (empty) or PK\x07\x08 (spanned)
     if &magic[0..2] != b"PK" {
         return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
-            "Not a valid ZIP/IPA file",
+            Cow::Borrowed("Not a valid ZIP/IPA file"),
         )));
     }
 
