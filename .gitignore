@@ -32,3 +32,4 @@ Thumbs.db
 .claude
 
 tmp
+crates/zsign/tests/
