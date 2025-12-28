@@ -18,14 +18,15 @@
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
 };
-use crate::codesign::constants::CS_EXECSEG_MAIN_BINARY;
+use crate::codesign::constants::{CS_EXECSEG_ALLOW_UNSIGNED, CS_EXECSEG_MAIN_BINARY};
 use crate::codesign::der::plist_to_der;
 use crate::codesign::superblob::{
-    build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob,
+    build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob_full,
     build_signature_blob, SuperBlobBuilder,
 };
 use crate::crypto::cms;
 use crate::Result;
+use openssl::nid::Nid;
 use openssl::pkey::{PKeyRef, Private};
 use openssl::x509::{X509, X509Ref};
 use sha1::{Digest, Sha1};
@@ -151,7 +152,9 @@ fn sign_slice_complete(
     code_resources: Option<&[u8]>,
 ) -> Result<SignedSlice> {
     // Pre-compute hashes that don't depend on code (same for both passes)
-    let requirements = build_requirements_blob();
+    // Extract subject CN from certificate for requirements blob
+    let subject_cn = extract_subject_cn(cert).unwrap_or_default();
+    let requirements = build_requirements_blob_full(identifier, &subject_cn);
     let requirements_hash_sha1 = sha1_hash(&requirements);
     let requirements_hash_sha256 = sha256_hash(&requirements);
 
@@ -199,6 +202,7 @@ fn sign_slice_complete(
         slice,
         identifier,
         team_id,
+        entitlements,
         &requirements,
         &requirements_hash_sha1,
         &requirements_hash_sha256,
@@ -271,6 +275,7 @@ fn sign_slice_complete(
         &working_slice,
         identifier,
         team_id,
+        entitlements,
         &requirements,
         &requirements_hash_sha1,
         &requirements_hash_sha256,
@@ -341,6 +346,7 @@ fn build_superblob(
     slice: &ArchSlice,
     identifier: &str,
     team_id: Option<&str>,
+    entitlements: Option<&[u8]>,
     requirements: &[u8],
     requirements_hash_sha1: &[u8],
     requirements_hash_sha256: &[u8],
@@ -360,13 +366,13 @@ fn build_superblob(
 ) -> Result<Vec<u8>> {
     // Build CodeDirectory (SHA-1)
     let cd_sha1 = build_code_directory(
-        identifier, team_id, code, slice,
+        identifier, team_id, code, slice, entitlements,
         requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
     );
 
     // Build CodeDirectory (SHA-256)
     let cd_sha256 = build_code_directory(
-        identifier, team_id, code, slice,
+        identifier, team_id, code, slice, entitlements,
         requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
     );
 
@@ -403,6 +409,7 @@ fn build_code_directory(
     team_id: Option<&str>,
     code: &[u8],
     slice: &ArchSlice,
+    entitlements: Option<&[u8]>,
     requirements_hash: &[u8],
     info_hash: &Option<Vec<u8>>,
     resources_hash: &Option<Vec<u8>>,
@@ -410,14 +417,24 @@ fn build_code_directory(
     der_entitlements_hash: &Option<Vec<u8>>,
     is_sha1: bool,
 ) -> Vec<u8> {
-    // Compute exec_seg_flags based on binary type
+    // Compute exec_seg_flags based on binary type and entitlements
     // C++ zsign sets CS_EXECSEG_MAIN_BINARY for executable binaries
-    // TODO: Also check for get-task-allow entitlement to add CS_EXECSEG_ALLOW_UNSIGNED
-    let exec_seg_flags = if slice.is_executable {
-        CS_EXECSEG_MAIN_BINARY
-    } else {
-        0
-    };
+    // and adds CS_EXECSEG_ALLOW_UNSIGNED if get-task-allow entitlement is present
+    let mut exec_seg_flags: u64 = 0;
+
+    if slice.is_executable {
+        exec_seg_flags = CS_EXECSEG_MAIN_BINARY;
+    }
+
+    // Check for get-task-allow entitlement (C++ reference: archo.cpp:387-390)
+    // If entitlements contain <key>get-task-allow</key>, add both flags
+    if let Some(ent_data) = entitlements {
+        if let Ok(ent_str) = std::str::from_utf8(ent_data) {
+            if ent_str.contains("<key>get-task-allow</key>") {
+                exec_seg_flags |= CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED;
+            }
+        }
+    }
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code.to_vec())
         .requirements_hash(requirements_hash.to_vec())
@@ -458,6 +475,17 @@ fn sha256_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().to_vec()
+}
+
+/// Extract the Common Name (CN) from a certificate's subject.
+///
+/// Returns the CN value if found, or None if not present.
+fn extract_subject_cn(cert: &X509Ref) -> Option<String> {
+    cert.subject_name()
+        .entries_by_nid(Nid::COMMONNAME)
+        .next()
+        .and_then(|entry| entry.data().as_utf8().ok())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]

@@ -15,8 +15,8 @@ use super::assets::{
     APPLE_WWDR_ISSUER_HASH, APPLE_WWDR_G3_ISSUER_HASH,
 };
 use super::cms_ffi::{
-    CMS_SignerInfo, CMS_add1_signer, CMS_add1_cert, CMS_final, CMS_sign,
-    CMS_signed_add1_attr_by_OBJ,
+    CMS_SignerInfo, CMS_add1_signer, CMS_final, CMS_sign,
+    CMS_signed_add1_attr_by_OBJ, CMS_add1_cert,
     APPLE_CDHASH_V2_OID,
 };
 
@@ -70,21 +70,14 @@ unsafe fn pkey_as_ptr(pkey: &PKeyRef<Private>) -> *mut EVP_PKEY {
 /// This matches the behavior of C++ zsign which hardcodes these certificates
 /// and adds them to the CMS signature chain automatically.
 fn get_apple_ca_chain(cert: &X509Ref) -> Result<Vec<X509>> {
-    use openssl::hash::{hash, MessageDigest};
+    // Use OpenSSL's X509_issuer_name_hash directly to match C++ zsign
+    extern "C" {
+        fn X509_issuer_name_hash(x: *const openssl_sys::X509) -> std::ffi::c_ulong;
+    }
 
-    // Get the issuer name hash to determine which WWDR CA to use
-    let issuer = cert.issuer_name();
-    let issuer_der = issuer.to_der()
-        .map_err(|e| Error::Signing(format!("Failed to encode issuer name: {}", e)))?;
-
-    // Hash with SHA-1 (X509_issuer_name_hash uses SHA-1)
-    let digest = hash(MessageDigest::sha1(), &issuer_der)
-        .map_err(|e| Error::Signing(format!("Failed to hash issuer name: {}", e)))?;
-
-    // Take first 4 bytes as little-endian u32
-    let bytes: [u8; 4] = digest[..4].try_into()
-        .map_err(|_| Error::Signing("Hash too short".into()))?;
-    let issuer_hash = u32::from_le_bytes(bytes);
+    let issuer_hash = unsafe {
+        X509_issuer_name_hash(x509_as_ptr(cert))
+    } as u32;
 
     // Select the appropriate WWDR certificate based on issuer hash
     let wwdr_cert = if issuer_hash == APPLE_WWDR_ISSUER_HASH {
@@ -138,38 +131,19 @@ pub fn sign_with_apple_attrs(
         }
 
         // Create CMS with PARTIAL flag to add attributes later
+        // With CMS_PARTIAL, we use CMS_add1_cert to add certificates explicitly
+        // (the cert stack passed to CMS_sign doesn't work with PARTIAL flag)
         let flags = CMS_PARTIAL | CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
         let cms = CMS_sign(
             ptr::null_mut(),
             ptr::null_mut(),
+            ptr::null_mut(), // Don't use cert stack with CMS_PARTIAL
             ptr::null_mut(),
-            bio,
             flags,
         );
         if cms.is_null() {
             BIO_free(bio);
             return Err(Error::Signing("CMS_sign failed".into()));
-        }
-
-        // Add user-provided certificate chain to CMS (intermediate CAs)
-        for chain_cert in cert_chain {
-            let chain_cert_ptr = x509_as_ptr(chain_cert.as_ref());
-            if CMS_add1_cert(cms, chain_cert_ptr) != 1 {
-                CMS_ContentInfo_free(cms);
-                BIO_free(bio);
-                return Err(Error::Signing("Failed to add certificate chain".into()));
-            }
-        }
-
-        // Add Apple CA chain (WWDR CA + Root CA) automatically
-        // This matches C++ zsign behavior which hardcodes these certificates
-        for apple_cert in &apple_ca_chain {
-            let apple_cert_ptr = x509_as_ptr(apple_cert.as_ref());
-            if CMS_add1_cert(cms, apple_cert_ptr) != 1 {
-                CMS_ContentInfo_free(cms);
-                BIO_free(bio);
-                return Err(Error::Signing("Failed to add Apple CA certificate".into()));
-            }
         }
 
         // Add signer with SHA256
@@ -181,6 +155,38 @@ pub fn sign_with_apple_attrs(
             CMS_ContentInfo_free(cms);
             BIO_free(bio);
             return Err(Error::Signing("CMS_add1_signer failed".into()));
+        }
+
+        // Add certificates to CMS using CMS_add1_cert
+        // This is required when using CMS_PARTIAL flag
+        // Order: Apple CA chain first (WWDR + Root), then signing cert
+        
+        // Add Apple CA chain (WWDR CA + Root CA)
+        for apple_cert in &apple_ca_chain {
+            let apple_cert_ptr = x509_as_ptr(apple_cert.as_ref());
+            if CMS_add1_cert(cms, apple_cert_ptr) != 1 {
+                CMS_ContentInfo_free(cms);
+                BIO_free(bio);
+                return Err(Error::Signing("Failed to add Apple CA to CMS".into()));
+            }
+        }
+
+        // Add user-provided certificate chain (intermediate CAs)
+        for chain_cert in cert_chain {
+            let chain_cert_ptr = x509_as_ptr(chain_cert.as_ref());
+            if CMS_add1_cert(cms, chain_cert_ptr) != 1 {
+                CMS_ContentInfo_free(cms);
+                BIO_free(bio);
+                return Err(Error::Signing("Failed to add cert chain to CMS".into()));
+            }
+        }
+
+        // Add the signing certificate itself
+        // CMS_add1_signer adds the cert to signerInfos but NOT to the certificates field
+        if CMS_add1_cert(cms, cert_ptr) != 1 {
+            CMS_ContentInfo_free(cms);
+            BIO_free(bio);
+            return Err(Error::Signing("Failed to add signing cert to CMS".into()));
         }
 
         // Add Apple CDHash v1 attribute (OID 1.2.840.113635.100.9.1)
@@ -252,6 +258,9 @@ pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
     let mut buf = Vec::new();
     plist::to_writer_xml(&mut buf, &Value::Dictionary(dict))
         .expect("plist serialization failed");
+    // Add trailing newline to match C++ zsign behavior
+    // C++ zsign json.cpp:3263: m_strdoc += "</plist>" + m_line; (m_line = "\n")
+    buf.push(b'\n');
     buf
 }
 

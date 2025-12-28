@@ -50,9 +50,20 @@ impl IpaSigner {
     /// Set the provisioning profile path to embed as embedded.mobileprovision.
     ///
     /// iOS apps require a provisioning profile to launch on device.
-    /// This copies the profile to the bundle as `embedded.mobileprovision`.
+    /// This copies the profile to the bundle as `embedded.mobileprovision`
+    /// and extracts entitlements from the profile for signing.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
-        self.provisioning_profile_path = Some(path.as_ref().to_path_buf());
+        let path = path.as_ref();
+        self.provisioning_profile_path = Some(path.to_path_buf());
+        
+        // Also extract entitlements from the provisioning profile
+        // This is critical for proper code signing (e.g., exec_seg_flags)
+        if let Ok(profile_data) = fs::read(path) {
+            if let Ok(entitlements) = SigningAssets::extract_entitlements_from_profile(&profile_data) {
+                self.assets.entitlements = Some(entitlements);
+            }
+        }
+        
         self
     }
 

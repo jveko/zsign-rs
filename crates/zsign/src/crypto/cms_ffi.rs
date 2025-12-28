@@ -67,6 +67,16 @@ extern "C" {
 
     // Sign signer info (sets signatureAlgorithm properly)
     pub fn CMS_SignerInfo_sign(si: *mut CMS_SignerInfo) -> c_int;
+
+    // STACK_OF(X509) functions for building certificate chains
+    // These are needed to pass certs to CMS_sign() like C++ zsign does
+    // In OpenSSL 3, sk_X509_* are macros that wrap OPENSSL_sk_* functions
+    #[link_name = "OPENSSL_sk_new_null"]
+    pub fn sk_X509_new_null() -> *mut stack_st_X509;
+    #[link_name = "OPENSSL_sk_push"]
+    pub fn sk_X509_push(sk: *mut stack_st_X509, x509: *mut X509) -> c_int;
+    #[link_name = "OPENSSL_sk_free"]
+    pub fn sk_X509_free(sk: *mut stack_st_X509);
 }
 
 // Apple OIDs for code signing
