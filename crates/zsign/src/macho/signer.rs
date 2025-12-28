@@ -218,7 +218,7 @@ fn sign_slice_complete(
 
     // === Check if reallocation is needed ===
     // If there's not enough space in the current binary, reallocate
-    let (working_slice_data, working_slice) = if !has_enough_signature_space(slice_data, slice.code_length, preliminary_sig.len()) {
+    let (working_slice_data, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, preliminary_sig.len()) {
         // Reallocate the binary with more signature space
         let reallocated = realloc_code_sign_space_slice(slice_data, slice.code_length)?;
 
@@ -235,13 +235,30 @@ fn sign_slice_complete(
             code_length: slice.code_length,
         };
 
-        (reallocated, new_slice)
+        // When reallocating, use the new size (don't preserve old size)
+        (reallocated, new_slice, false)
     } else {
-        (slice_data.to_vec(), slice.clone())
+        // Original binary has enough space - preserve its size
+        (slice_data.to_vec(), slice.clone(), true)
+    };
+
+    // Determine the original binary size to preserve (if not reallocated)
+    let original_binary_size = if preserve_original_size {
+        Some(working_slice_data.len())
+    } else {
+        None
     };
 
     // === PASS 2: Prepare code with actual size and rebuild ===
-    let (prepared_code, sig_offset, _) = prepare_code_for_signing_slice(&working_slice_data, preliminary_sig.len())?;
+    // When preserving original size, pass the original signature space size
+    let sig_space_size = if preserve_original_size {
+        // Use the original reserved space size if it's larger
+        let original_sig_space = slice_data.len().saturating_sub(slice.code_length);
+        original_sig_space.max(preliminary_sig.len())
+    } else {
+        preliminary_sig.len()
+    };
+    let (prepared_code, sig_offset, _) = prepare_code_for_signing_slice(&working_slice_data, sig_space_size)?;
 
     // Pad prepared_code to sig_offset so CodeDirectory hashes all bytes up to signature
     // This is critical: codeLimit must equal sig_offset, and we need hashes for all pages
@@ -272,7 +289,7 @@ fn sign_slice_complete(
     )?;
 
     // === Embed signature into prepared code ===
-    let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset);
+    let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, original_binary_size);
 
     Ok(SignedSlice {
         slice_index: 0,
@@ -283,8 +300,19 @@ fn sign_slice_complete(
 }
 
 /// Embed signature into already-prepared code bytes.
-fn embed_signature_into_prepared(prepared_code: &[u8], signature: &[u8], sig_offset: usize) -> Vec<u8> {
-    let mut output = Vec::with_capacity(sig_offset + signature.len());
+///
+/// If `original_binary_size` is provided and is larger than the signed output,
+/// the output will be padded with zeros to preserve the original size.
+/// This is important for preserving reserved signature space in the binary.
+fn embed_signature_into_prepared(
+    prepared_code: &[u8],
+    signature: &[u8],
+    sig_offset: usize,
+    original_binary_size: Option<usize>,
+) -> Vec<u8> {
+    let min_size = sig_offset + signature.len();
+    let final_size = original_binary_size.map(|orig| orig.max(min_size)).unwrap_or(min_size);
+    let mut output = Vec::with_capacity(final_size);
 
     // Copy prepared code (already has updated load commands)
     output.extend_from_slice(prepared_code);
@@ -296,6 +324,11 @@ fn embed_signature_into_prepared(prepared_code: &[u8], signature: &[u8], sig_off
 
     // Append signature
     output.extend_from_slice(signature);
+
+    // Preserve original binary size if it was larger (maintain reserved signature space)
+    if output.len() < final_size {
+        output.resize(final_size, 0);
+    }
 
     output
 }
