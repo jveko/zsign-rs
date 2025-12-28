@@ -34,6 +34,40 @@ extern "C" {
 const BIO_CTRL_RESET: c_int = 1;
 const BIO_CTRL_INFO: c_int = 3;
 
+/// RAII wrapper for OpenSSL BIO pointers
+struct ScopedBio(*mut BIO);
+
+impl Drop for ScopedBio {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { BIO_free(self.0) };
+        }
+    }
+}
+
+impl ScopedBio {
+    fn as_ptr(&self) -> *mut BIO {
+        self.0
+    }
+}
+
+/// RAII wrapper for OpenSSL CMS_ContentInfo pointers
+struct ScopedCms(*mut CMS_ContentInfo);
+
+impl Drop for ScopedCms {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CMS_ContentInfo_free(self.0) };
+        }
+    }
+}
+
+impl ScopedCms {
+    fn as_ptr(&self) -> *mut CMS_ContentInfo {
+        self.0
+    }
+}
+
 // Helper functions for BIO operations
 unsafe fn bio_reset(bio: *mut BIO) -> c_int {
     BIO_ctrl(bio, BIO_CTRL_RESET, 0, ptr::null_mut()) as c_int
@@ -124,25 +158,22 @@ pub fn sign_with_apple_attrs(
     let apple_ca_chain = get_apple_ca_chain(cert)?;
 
     unsafe {
-        // Create BIO for data
-        let bio = BIO_new_mem_buf(data.as_ptr() as *const _, data.len() as c_int);
-        if bio.is_null() {
+        // Create BIO for data - wrapped in RAII
+        let bio = ScopedBio(BIO_new_mem_buf(data.as_ptr() as *const _, data.len() as c_int));
+        if bio.as_ptr().is_null() {
             return Err(Error::Signing("Failed to create BIO".into()));
         }
 
-        // Create CMS with PARTIAL flag to add attributes later
-        // With CMS_PARTIAL, we use CMS_add1_cert to add certificates explicitly
-        // (the cert stack passed to CMS_sign doesn't work with PARTIAL flag)
+        // Create CMS with PARTIAL flag - wrapped in RAII
         let flags = CMS_PARTIAL | CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
-        let cms = CMS_sign(
+        let cms = ScopedCms(CMS_sign(
             ptr::null_mut(),
             ptr::null_mut(),
-            ptr::null_mut(), // Don't use cert stack with CMS_PARTIAL
+            ptr::null_mut(),
             ptr::null_mut(),
             flags,
-        );
-        if cms.is_null() {
-            BIO_free(bio);
+        ));
+        if cms.as_ptr().is_null() {
             return Err(Error::Signing("CMS_sign failed".into()));
         }
 
@@ -150,88 +181,62 @@ pub fn sign_with_apple_attrs(
         let cert_ptr = x509_as_ptr(cert);
         let pkey_ptr = pkey_as_ptr(pkey);
 
-        let signer_info = CMS_add1_signer(cms, cert_ptr, pkey_ptr, EVP_sha256(), flags);
+        let signer_info = CMS_add1_signer(cms.as_ptr(), cert_ptr, pkey_ptr, EVP_sha256(), flags);
         if signer_info.is_null() {
-            CMS_ContentInfo_free(cms);
-            BIO_free(bio);
             return Err(Error::Signing("CMS_add1_signer failed".into()));
         }
 
-        // Add certificates to CMS using CMS_add1_cert
-        // This is required when using CMS_PARTIAL flag
-        // Order: Apple CA chain first (WWDR + Root), then signing cert
-        
         // Add Apple CA chain (WWDR CA + Root CA)
         for apple_cert in &apple_ca_chain {
             let apple_cert_ptr = x509_as_ptr(apple_cert.as_ref());
-            if CMS_add1_cert(cms, apple_cert_ptr) != 1 {
-                CMS_ContentInfo_free(cms);
-                BIO_free(bio);
+            if CMS_add1_cert(cms.as_ptr(), apple_cert_ptr) != 1 {
                 return Err(Error::Signing("Failed to add Apple CA to CMS".into()));
             }
         }
 
-        // Add user-provided certificate chain (intermediate CAs)
+        // Add user-provided certificate chain
         for chain_cert in cert_chain {
             let chain_cert_ptr = x509_as_ptr(chain_cert.as_ref());
-            if CMS_add1_cert(cms, chain_cert_ptr) != 1 {
-                CMS_ContentInfo_free(cms);
-                BIO_free(bio);
+            if CMS_add1_cert(cms.as_ptr(), chain_cert_ptr) != 1 {
                 return Err(Error::Signing("Failed to add cert chain to CMS".into()));
             }
         }
 
         // Add the signing certificate itself
-        // CMS_add1_signer adds the cert to signerInfos but NOT to the certificates field
-        if CMS_add1_cert(cms, cert_ptr) != 1 {
-            CMS_ContentInfo_free(cms);
-            BIO_free(bio);
+        if CMS_add1_cert(cms.as_ptr(), cert_ptr) != 1 {
             return Err(Error::Signing("Failed to add signing cert to CMS".into()));
         }
 
-        // Add Apple CDHash v1 attribute (OID 1.2.840.113635.100.9.1)
-        // This contains the plist with cdhashes array
+        // Add Apple CDHash v1 attribute - now safe to use ? operator
         let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
         add_apple_attribute(signer_info, super::cms_ffi::APPLE_CDHASH_OID, &cdhash_plist)?;
 
-        // Add Apple CDHash v2 attribute (OID 1.2.840.113635.100.9.2)
-        // This contains a SEQUENCE with AlgorithmIdentifier + hash
+        // Add Apple CDHash v2 attribute - now safe to use ? operator
         let cdhash_v2_value = build_cdhash_v2_attribute(cdhash_sha256);
         add_apple_attribute_sequence(signer_info, APPLE_CDHASH_V2_OID, &cdhash_v2_value)?;
 
         // Finalize CMS
-        bio_reset(bio);
-        if CMS_final(cms, bio, ptr::null_mut(), flags) != 1 {
-            CMS_ContentInfo_free(cms);
-            BIO_free(bio);
+        bio_reset(bio.as_ptr());
+        if CMS_final(cms.as_ptr(), bio.as_ptr(), ptr::null_mut(), flags) != 1 {
             return Err(Error::Signing("CMS_final failed".into()));
         }
 
         // Serialize to DER
-        let out_bio = BIO_new(BIO_s_mem());
-        if out_bio.is_null() {
-            CMS_ContentInfo_free(cms);
-            BIO_free(bio);
+        let out_bio = ScopedBio(BIO_new(BIO_s_mem()));
+        if out_bio.as_ptr().is_null() {
             return Err(Error::Signing("Failed to create output BIO".into()));
         }
 
-        if i2d_CMS_bio(out_bio, cms) != 1 {
-            CMS_ContentInfo_free(cms);
-            BIO_free(bio);
-            BIO_free(out_bio);
+        if i2d_CMS_bio(out_bio.as_ptr(), cms.as_ptr()) != 1 {
             return Err(Error::Signing("Failed to serialize CMS".into()));
         }
 
         // Read DER data
         let mut buf_ptr: *mut u8 = ptr::null_mut();
-        let len = bio_get_mem_data(out_bio, &mut buf_ptr);
+        let len = bio_get_mem_data(out_bio.as_ptr(), &mut buf_ptr);
         let der = std::slice::from_raw_parts(buf_ptr, len as usize).to_vec();
 
-        // Cleanup
-        CMS_ContentInfo_free(cms);
-        BIO_free(bio);
-        BIO_free(out_bio);
-
+        // RAII wrappers will automatically clean up bio, cms, out_bio on drop
         Ok(der)
     }
 }
@@ -291,6 +296,11 @@ fn build_cdhash_v2_attribute(cdhash_sha256: &[u8; 32]) -> Vec<u8> {
     
     // Wrap both in outer SEQUENCE: SEQUENCE { OBJECT, OCTET STRING }
     let inner_len = oid.len() + hash_octet.len();
+    
+    // Assert length fits in single byte (DER short form)
+    // This is a compile-time invariant since OID (11 bytes) + hash (34 bytes) = 45 bytes
+    assert!(inner_len <= 127, "CDHash v2 attribute inner length {} exceeds 127 bytes", inner_len);
+    
     let mut result = Vec::new();
     result.push(0x30); // SEQUENCE tag
     result.push(inner_len as u8);

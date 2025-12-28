@@ -127,8 +127,8 @@ pub fn create_ipa(
     zip.add_directory("Payload/", options)
         .map_err(|e| Error::Zip(e))?;
 
-    // Walk the app bundle and add all files
-    for entry in WalkDir::new(app_bundle_path) {
+    // Walk the app bundle and add all files - don't follow symlinks
+    for entry in WalkDir::new(app_bundle_path).follow_links(false) {
         let entry = entry.map_err(|e| {
             Error::Io(io::Error::new(
                 io::ErrorKind::Other,
@@ -153,7 +153,10 @@ pub fn create_ipa(
             format!("Payload/{}/{}", app_name, relative_path.display())
         };
 
-        if path.is_dir() {
+        // Use symlink_metadata to check the entry type without following links
+        let metadata = fs::symlink_metadata(path)?;
+
+        if metadata.is_dir() {
             // Add directory entry
             let dir_path = if archive_path.ends_with('/') {
                 archive_path
@@ -162,21 +165,25 @@ pub fn create_ipa(
             };
             zip.add_directory(&dir_path, options)
                 .map_err(|e| Error::Zip(e))?;
+        } else if metadata.file_type().is_symlink() {
+            // Handle symlink using the zip crate's add_symlink method
+            let target = fs::read_link(path)?;
+            let target_str = target.to_string_lossy();
+
+            zip.add_symlink(&archive_path, target_str, options)
+                .map_err(|e| Error::Zip(e))?;
         } else {
-            // Get file permissions for Unix
+            // Regular file
             #[cfg(unix)]
             let options = {
                 use std::os::unix::fs::PermissionsExt;
-                let metadata = fs::metadata(path)?;
                 let mode = metadata.permissions().mode();
                 options.unix_permissions(mode)
             };
 
-            // Add file entry
             zip.start_file(&archive_path, options)
                 .map_err(|e| Error::Zip(e))?;
 
-            // Write file contents
             let mut file = File::open(path)?;
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
@@ -316,5 +323,55 @@ mod tests {
         assert_eq!(CompressionLevel::MAX.level(), 9);
         assert_eq!(CompressionLevel::new(15).level(), 9); // Clamped
         assert_eq!(CompressionLevel::from(5).level(), 5);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_ipa_preserves_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let app_dir = temp_dir.path().join("Test.app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Create framework structure with symlinks
+        let framework_versions = app_dir.join("Frameworks/Test.framework/Versions/A");
+        fs::create_dir_all(&framework_versions).unwrap();
+        fs::write(framework_versions.join("Test"), b"binary").unwrap();
+
+        // Create symlinks
+        let versions_dir = app_dir.join("Frameworks/Test.framework/Versions");
+        symlink("A", versions_dir.join("Current")).unwrap();
+        symlink(
+            "Versions/Current/Test",
+            app_dir.join("Frameworks/Test.framework/Test"),
+        )
+        .unwrap();
+
+        fs::write(app_dir.join("Info.plist"), b"<plist></plist>").unwrap();
+
+        // Create IPA
+        let output_ipa = temp_dir.path().join("output.ipa");
+        let result = create_ipa(&app_dir, &output_ipa, CompressionLevel::DEFAULT);
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        // Verify symlinks in archive
+        let file = File::open(&output_ipa).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+
+        let mut found_symlink = false;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).unwrap();
+            if entry.name().contains("Versions/Current") {
+                if let Some(mode) = entry.unix_mode() {
+                    // Check if S_IFLNK bit is set
+                    if (mode & 0o170000) == 0o120000 {
+                        found_symlink = true;
+                    }
+                }
+            }
+        }
+
+        assert!(found_symlink, "Symlink should be preserved in ZIP");
     }
 }

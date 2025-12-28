@@ -7,6 +7,7 @@
 //! with all iOS versions (iOS 12+ requires SHA-256, but SHA-1 is kept for legacy support).
 
 use super::constants::*;
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -35,19 +36,19 @@ const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 ///
 /// ```ignore
 /// let code_data = vec![0u8; 8192]; // 2 pages of code
-/// let cd = CodeDirectoryBuilder::new("com.example.app", code_data)
+/// let cd = CodeDirectoryBuilder::new("com.example.app", &code_data)
 ///     .team_id("TEAMID1234")
 ///     .exec_seg_limit(65536)
 ///     .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
 ///     .build_sha256();
 /// ```
-pub struct CodeDirectoryBuilder {
+pub struct CodeDirectoryBuilder<'a> {
     /// Bundle identifier (e.g., "com.example.app")
     identifier: String,
     /// Team identifier (None for adhoc signing)
     team_id: Option<String>,
     /// Code bytes to hash (executable content)
-    code: Vec<u8>,
+    code: &'a [u8],
     /// Info.plist hash (special slot -1)
     info_hash: Option<Vec<u8>>,
     /// CodeResources hash (special slot -3)
@@ -66,14 +67,14 @@ pub struct CodeDirectoryBuilder {
     flags: u32,
 }
 
-impl CodeDirectoryBuilder {
+impl<'a> CodeDirectoryBuilder<'a> {
     /// Create a new CodeDirectory builder.
     ///
     /// # Arguments
     ///
     /// * `identifier` - Bundle identifier (e.g., "com.example.app")
     /// * `code` - The executable code bytes to hash
-    pub fn new(identifier: impl Into<String>, code: Vec<u8>) -> Self {
+    pub fn new(identifier: impl Into<String>, code: &'a [u8]) -> Self {
         Self {
             identifier: identifier.into(),
             team_id: None,
@@ -353,34 +354,49 @@ impl CodeDirectoryBuilder {
         slots
     }
 
-    /// Hash all code pages.
+    /// Hash all code pages in parallel.
     ///
     /// The code is divided into 4KB pages, and each page is hashed
-    /// with the specified hash algorithm.
+    /// with the specified hash algorithm using parallel processing.
     fn hash_code_pages(&self, hash_type: u8) -> Vec<u8> {
-        let mut result = Vec::new();
-
         if self.code.is_empty() {
-            return result;
+            return Vec::new();
         }
 
-        for chunk in self.code.chunks(PAGE_SIZE) {
-            let hash = match hash_type {
-                CS_HASHTYPE_SHA1 => {
-                    let mut hasher = Sha1::new();
-                    hasher.update(chunk);
-                    hasher.finalize().to_vec()
+        let hash_size = match hash_type {
+            CS_HASHTYPE_SHA1 => CS_SHA1_LEN,
+            CS_HASHTYPE_SHA256 => CS_SHA256_LEN,
+            _ => panic!("Unsupported hash type: {}", hash_type),
+        };
+
+        // Collect chunks with their indices for ordered parallel processing
+        let chunks: Vec<_> = self.code.chunks(PAGE_SIZE).collect();
+        
+        // Parallel hash computation
+        let hashes: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                match hash_type {
+                    CS_HASHTYPE_SHA1 => {
+                        let mut hasher = Sha1::new();
+                        hasher.update(chunk);
+                        hasher.finalize().to_vec()
+                    }
+                    CS_HASHTYPE_SHA256 => {
+                        let mut hasher = Sha256::new();
+                        hasher.update(chunk);
+                        hasher.finalize().to_vec()
+                    }
+                    _ => unreachable!(),
                 }
-                CS_HASHTYPE_SHA256 => {
-                    let mut hasher = Sha256::new();
-                    hasher.update(chunk);
-                    hasher.finalize().to_vec()
-                }
-                _ => panic!("Unsupported hash type: {}", hash_type),
-            };
+            })
+            .collect();
+
+        // Flatten results in order
+        let mut result = Vec::with_capacity(hashes.len() * hash_size);
+        for hash in hashes {
             result.extend(&hash);
         }
-
         result
     }
 }
@@ -418,7 +434,7 @@ mod tests {
     #[test]
     fn test_code_directory_header_sha256() {
         let code = vec![0u8; 8192]; // 2 pages
-        let cd = CodeDirectoryBuilder::new("com.example.app", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("com.example.app", &code).build_sha256();
 
         // Check magic
         assert_eq!(&cd[0..4], &CSMAGIC_CODEDIRECTORY.to_be_bytes());
@@ -433,7 +449,7 @@ mod tests {
     #[test]
     fn test_code_directory_header_sha1() {
         let code = vec![0u8; 8192]; // 2 pages
-        let cd = CodeDirectoryBuilder::new("com.example.app", code).build_sha1();
+        let cd = CodeDirectoryBuilder::new("com.example.app", &code).build_sha1();
 
         // Check magic
         assert_eq!(&cd[0..4], &CSMAGIC_CODEDIRECTORY.to_be_bytes());
@@ -448,7 +464,7 @@ mod tests {
     #[test]
     fn test_code_directory_with_team_id() {
         let code = vec![0u8; 4096]; // 1 page
-        let cd = CodeDirectoryBuilder::new("com.example.app", code)
+        let cd = CodeDirectoryBuilder::new("com.example.app", &code)
             .team_id("TEAM123456")
             .build_sha256();
 
@@ -470,7 +486,7 @@ mod tests {
     fn test_code_directory_identifier() {
         let code = vec![0u8; 4096];
         let identifier = "com.example.myapp";
-        let cd = CodeDirectoryBuilder::new(identifier, code).build_sha256();
+        let cd = CodeDirectoryBuilder::new(identifier, &code).build_sha256();
 
         // Find identifier in the blob
         let cd_str = String::from_utf8_lossy(&cd);
@@ -481,7 +497,7 @@ mod tests {
     fn test_code_directory_page_count() {
         // Test with exactly 2 pages
         let code = vec![0u8; 8192];
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         // nCodeSlots is at offset 28
         let n_code_slots = u32::from_be_bytes([cd[28], cd[29], cd[30], cd[31]]);
@@ -492,7 +508,7 @@ mod tests {
     fn test_code_directory_partial_page() {
         // Test with 1.5 pages (should round up to 2 code slots)
         let code = vec![0u8; 6144]; // 4096 + 2048
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         let n_code_slots = u32::from_be_bytes([cd[28], cd[29], cd[30], cd[31]]);
         assert_eq!(n_code_slots, 2);
@@ -501,7 +517,7 @@ mod tests {
     #[test]
     fn test_code_directory_code_limit() {
         let code = vec![0u8; 12345];
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         // codeLimit is at offset 32
         let code_limit = u32::from_be_bytes([cd[32], cd[33], cd[34], cd[35]]);
@@ -511,7 +527,7 @@ mod tests {
     #[test]
     fn test_code_directory_exec_seg() {
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code)
+        let cd = CodeDirectoryBuilder::new("test", &code)
             .exec_seg_limit(65536)
             .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
             .build_sha256();
@@ -532,7 +548,7 @@ mod tests {
     #[test]
     fn test_code_directory_special_slots_minimal() {
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         // nSpecialSlots is at offset 24
         let n_special_slots = u32::from_be_bytes([cd[24], cd[25], cd[26], cd[27]]);
@@ -542,7 +558,7 @@ mod tests {
     #[test]
     fn test_code_directory_special_slots_with_entitlements() {
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code)
+        let cd = CodeDirectoryBuilder::new("test", &code)
             .entitlements_hash(vec![0u8; 32])
             .build_sha256();
 
@@ -554,7 +570,7 @@ mod tests {
     fn test_code_directory_special_slots_with_der_entitlements() {
         let code = vec![0u8; 4096];
         // DER entitlements slots -6/-7 are only included for executables (CS_EXECSEG_MAIN_BINARY set)
-        let cd = CodeDirectoryBuilder::new("test", code)
+        let cd = CodeDirectoryBuilder::new("test", &code)
             .entitlements_hash(vec![0u8; 32])
             .der_entitlements_hash(vec![0u8; 32])
             .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
@@ -569,7 +585,7 @@ mod tests {
         // Dylibs/frameworks should NOT have slots -6/-7 even if DER entitlements hash is set
         // (exec_seg_flags does not have CS_EXECSEG_MAIN_BINARY set)
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code)
+        let cd = CodeDirectoryBuilder::new("test", &code)
             .entitlements_hash(vec![0u8; 32])
             .der_entitlements_hash(vec![0u8; 32])
             .exec_seg_flags(0) // Not an executable
@@ -583,7 +599,7 @@ mod tests {
     #[test]
     fn test_code_directory_flags() {
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code)
+        let cd = CodeDirectoryBuilder::new("test", &code)
             .flags(CS_ADHOC)
             .build_sha256();
 
@@ -595,7 +611,7 @@ mod tests {
     #[test]
     fn test_cdhash_computation() {
         let code = vec![0u8; 4096];
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         let cdhash = compute_cdhash_sha256(&cd);
         assert_eq!(cdhash.len(), 32);
@@ -608,7 +624,7 @@ mod tests {
     #[test]
     fn test_code_directory_empty_code() {
         let code = vec![];
-        let cd = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         // Should still have valid header
         assert_eq!(&cd[0..4], &CSMAGIC_CODEDIRECTORY.to_be_bytes());
@@ -626,8 +642,8 @@ mod tests {
     fn test_dual_hashing() {
         // Verify that SHA-1 and SHA-256 produce different but valid results
         let code = vec![0xab; 8192];
-        let cd_sha1 = CodeDirectoryBuilder::new("test", code.clone()).build_sha1();
-        let cd_sha256 = CodeDirectoryBuilder::new("test", code).build_sha256();
+        let cd_sha1 = CodeDirectoryBuilder::new("test", &code).build_sha1();
+        let cd_sha256 = CodeDirectoryBuilder::new("test", &code).build_sha256();
 
         // Both should have same magic
         assert_eq!(&cd_sha1[0..4], &cd_sha256[0..4]);

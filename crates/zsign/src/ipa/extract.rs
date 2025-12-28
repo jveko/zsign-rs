@@ -3,10 +3,23 @@
 //! Extracts IPA archives to temporary directories and locates the .app bundle.
 
 use crate::{Error, Result};
+use memmap2::Mmap;
+use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zip::ZipArchive;
+
+/// Entry metadata for parallel extraction
+struct ExtractEntry {
+    index: usize,
+    outpath: PathBuf,
+    is_dir: bool,
+    is_symlink: bool,
+    #[cfg(unix)]
+    unix_mode: Option<u32>,
+}
 
 /// Extract an IPA file to a destination directory.
 ///
@@ -41,48 +54,117 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
         )));
     }
 
-    // Open ZIP archive
+    // Memory-map the IPA file for faster reading
     let file = File::open(ipa_path)?;
-    let mut archive = ZipArchive::new(file)
-        .map_err(|e| Error::Zip(e))?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = Arc::new(mmap);
+
+    // Open ZIP archive from memory-mapped data
+    let cursor = Cursor::new(&mmap[..]);
+    let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
 
     // Create destination directory if it doesn't exist
     fs::create_dir_all(dest_dir)?;
 
-    // Extract all files
+    // First pass: collect entry metadata and create directories
+    let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
+    let mut dirs_to_create: Vec<PathBuf> = Vec::new();
+
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)
-            .map_err(|e| Error::Zip(e))?;
+        let file = archive.by_index(i).map_err(Error::Zip)?;
 
         let outpath = match file.enclosed_name() {
             Some(path) => dest_dir.join(path),
-            None => continue, // Skip files with invalid names
+            None => continue,
         };
 
+        #[cfg(unix)]
+        let unix_mode = file.unix_mode();
+
+        #[cfg(unix)]
+        let is_symlink = unix_mode
+            .map(|mode| (mode & 0o170000) == 0o120000)
+            .unwrap_or(false);
+
+        #[cfg(not(unix))]
+        let is_symlink = false;
+
         if file.is_dir() {
-            fs::create_dir_all(&outpath)?;
+            dirs_to_create.push(outpath.clone());
+            entries.push(ExtractEntry {
+                index: i,
+                outpath,
+                is_dir: true,
+                is_symlink: false,
+                #[cfg(unix)]
+                unix_mode,
+            });
         } else {
-            // Create parent directories if needed
+            // Collect parent directories
             if let Some(parent) = outpath.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
+                if !dirs_to_create.contains(&parent.to_path_buf()) {
+                    dirs_to_create.push(parent.to_path_buf());
                 }
             }
+            entries.push(ExtractEntry {
+                index: i,
+                outpath,
+                is_dir: false,
+                is_symlink,
+                #[cfg(unix)]
+                unix_mode,
+            });
+        }
+    }
 
-            // Extract file
-            let mut outfile = File::create(&outpath)?;
+    // Create all directories first (sequential, fast)
+    for dir in &dirs_to_create {
+        fs::create_dir_all(dir)?;
+    }
+
+    // Filter to only files (not directories)
+    let file_entries: Vec<_> = entries.into_iter().filter(|e| !e.is_dir).collect();
+
+    // Parallel extraction of files
+    file_entries
+        .par_iter()
+        .try_for_each(|entry| -> Result<()> {
+            // Each thread gets its own cursor into the mmap
+            let cursor = Cursor::new(&mmap[..]);
+            let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
+            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
+
+            #[cfg(unix)]
+            if entry.is_symlink {
+                // Handle symlink
+                let mut target = String::new();
+                file.read_to_string(&mut target)?;
+
+                if entry.outpath.exists() || entry.outpath.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(&entry.outpath);
+                }
+
+                use std::os::unix::fs::symlink;
+                symlink(&target, &entry.outpath)?;
+                return Ok(());
+            }
+
+            // Regular file extraction
+            let mut outfile = File::create(&entry.outpath)?;
             io::copy(&mut file, &mut outfile)?;
 
             // Set file permissions on Unix
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Some(mode) = file.unix_mode() {
-                    fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                if let Some(mode) = entry.unix_mode {
+                    let perms = mode & 0o7777;
+                    fs::set_permissions(&entry.outpath, fs::Permissions::from_mode(perms))?;
                 }
             }
-        }
-    }
+
+            Ok(())
+        })?;
 
     // Find .app bundle in Payload/
     find_app_bundle(dest_dir)
@@ -245,5 +327,56 @@ mod tests {
 
         let result = find_app_bundle(temp_dir.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_with_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("symlink_test.ipa");
+        
+        // Create IPA with symlinks
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        
+        // Add directories
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.add_directory("Payload/Test.app/Frameworks/", options).unwrap();
+        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/", options).unwrap();
+        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/Versions/", options).unwrap();
+        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/Versions/A/", options).unwrap();
+        
+        // Real file
+        zip.start_file("Payload/Test.app/Frameworks/Test.framework/Versions/A/Test", options).unwrap();
+        zip.write_all(b"binary content").unwrap();
+        
+        // Symlink: Versions/Current -> A (use add_symlink to properly set file type)
+        zip.add_symlink(
+            "Payload/Test.app/Frameworks/Test.framework/Versions/Current",
+            "A",
+            options,
+        ).unwrap();
+        
+        zip.start_file("Payload/Test.app/Info.plist", options).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>").unwrap();
+        
+        zip.finish().unwrap();
+        
+        // Extract and verify
+        let extract_dir = temp_dir.path().join("extracted");
+        let result = extract_ipa(&ipa_path, &extract_dir);
+        assert!(result.is_ok(), "Extraction failed: {:?}", result.err());
+        
+        // Check if symlink was preserved
+        let symlink_path = extract_dir.join("Payload/Test.app/Frameworks/Test.framework/Versions/Current");
+        let metadata = std::fs::symlink_metadata(&symlink_path);
+        
+        if let Ok(meta) = metadata {
+            assert!(meta.file_type().is_symlink(), "Current should be a symlink");
+            let target = std::fs::read_link(&symlink_path).unwrap();
+            assert_eq!(target.to_str().unwrap(), "A");
+        }
     }
 }

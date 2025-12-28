@@ -7,13 +7,14 @@ edition = "2021"
 openssl = "0.10"
 openssl-sys = "0.9"
 goblin = "0.8"
-zip = "2.1"
+zip = { version = "2.1", default-features = false, features = ["deflate-zlib-ng", "zstd", "time"] }
 plist = "1.7"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = { version = "0.10", features = ["asm"] }
+sha2 = { version = "0.10", features = ["asm"] }
 thiserror = "1.0"
 memmap2 = "0.9"
 walkdir = "2.5"
 tempfile = "3.10"
 base64 = "0.22"
 secrecy = "0.8"
+rayon = "1.10"

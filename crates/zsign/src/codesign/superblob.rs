@@ -109,13 +109,19 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
     // Index: count * (type(4) + offset(4)) = count * 8 bytes
     let header_size = SUPERBLOB_HEADER_SIZE + (count * INDEX_ENTRY_SIZE);
 
-    // Calculate offsets for each blob
+    // Calculate offsets for each blob with 4-byte alignment
     let mut offsets = Vec::with_capacity(entries.len());
     let mut current_offset = header_size;
 
     for entry in &entries {
         offsets.push(current_offset);
         current_offset += entry.data.len() as u32;
+        
+        // Pad to 4-byte alignment for next blob
+        let remainder = current_offset % 4;
+        if remainder != 0 {
+            current_offset += 4 - remainder;
+        }
     }
 
     let total_length = current_offset;
@@ -134,9 +140,22 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
         buf.extend(&offsets[i].to_be_bytes());
     }
 
-    // Blob data
-    for entry in entries {
+    // Blob data with padding
+    for (i, entry) in entries.iter().enumerate() {
         buf.extend(&entry.data);
+        
+        // Add padding to reach the next offset (or total length for last entry)
+        let next_offset = if i + 1 < entries.len() {
+            offsets[i + 1]
+        } else {
+            total_length
+        };
+        
+        let current_pos = buf.len() as u32;
+        if next_offset > current_pos {
+            let padding = (next_offset - current_pos) as usize;
+            buf.extend(std::iter::repeat(0u8).take(padding));
+        }
     }
 
     buf
@@ -607,13 +626,13 @@ mod tests {
         let offset1 = u32::from_be_bytes([blob[16], blob[17], blob[18], blob[19]]);
         assert_eq!(offset1, 36);
 
-        // Second entry offset = 36 + 50 = 86
+        // Second entry offset = 36 + 50 + 2 padding = 88 (4-byte aligned)
         let offset2 = u32::from_be_bytes([blob[24], blob[25], blob[26], blob[27]]);
-        assert_eq!(offset2, 86);
+        assert_eq!(offset2, 88);
 
-        // Third entry offset = 86 + 30 = 116
+        // Third entry offset = 88 + 30 + 2 padding = 120 (4-byte aligned)
         let offset3 = u32::from_be_bytes([blob[32], blob[33], blob[34], blob[35]]);
-        assert_eq!(offset3, 116);
+        assert_eq!(offset3, 120);
     }
 
     #[test]

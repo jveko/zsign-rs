@@ -14,6 +14,15 @@ pub enum Error {
     #[error("Invalid certificate: {0}")]
     Certificate(String),
 
+    #[error("Invalid password for private key or PKCS#12")]
+    InvalidPassword,
+
+    #[error("Missing credentials: {0}")]
+    MissingCredentials(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
     #[error("Invalid provisioning profile: {0}")]
     ProvisioningProfile(String),
 
@@ -26,6 +35,9 @@ pub enum Error {
     #[error("Zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
 
-    #[error("Goblin error: {0}")]
+    #[error("Binary parsing error: {0}")]
     Goblin(String),
+
+    #[error("Symlink handling not supported on this platform")]
+    SymlinkNotSupported,
 }

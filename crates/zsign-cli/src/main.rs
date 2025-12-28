@@ -32,6 +32,12 @@ struct Cli {
     /// Password for private key or PKCS#12
     #[arg(long)]
     password: Option<String>,
+
+    /// ZIP compression level (0-9, default: 6)
+    /// 0 = no compression (fastest, matches C++ zsign default)
+    /// 9 = maximum compression (slowest, smallest file)
+    #[arg(short = 'z', long, default_value = "6")]
+    zip_level: u32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,6 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(password) = cli.password {
         signer = signer.password(password);
     }
+
+    signer = signer.compression_level(cli.zip_level);
 
     let output = cli.output.unwrap_or_else(|| {
         let mut out = cli.input.clone();

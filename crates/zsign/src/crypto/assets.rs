@@ -7,11 +7,9 @@ use openssl::x509::X509;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-static LEGACY_PROVIDER_INIT: Once = Once::new();
-static mut LEGACY_PROVIDER: Option<openssl::provider::Provider> = None;
-static mut DEFAULT_PROVIDER: Option<openssl::provider::Provider> = None;
+static PROVIDERS: OnceLock<(Option<openssl::provider::Provider>, Option<openssl::provider::Provider>)> = OnceLock::new();
 
 // =============================================================================
 // Apple CA Certificates (hardcoded for CMS signature chain)
@@ -117,20 +115,18 @@ pub const APPLE_WWDR_ISSUER_HASH: u32 = 0x817d2f7a;
 /// Issuer name hash for the Apple WWDR CA G3
 pub const APPLE_WWDR_G3_ISSUER_HASH: u32 = 0x9b16b75c;
 
-/// Try to load OpenSSL legacy provider for RC2/3DES support in older P12 files.
-/// This is required for OpenSSL 3.x to handle Apple Keychain exports.
-/// We must load BOTH default and legacy providers to have all algorithms available.
-/// The providers are kept alive in static storage to prevent them from being dropped.
+/// Try to load OpenSSL legacy provider for PKCS#12 with legacy algorithms.
+///
+/// Some older PKCS#12 files use legacy algorithms (RC2, 3DES) that require
+/// the OpenSSL legacy provider on OpenSSL 3.0+. This function attempts to
+/// load both legacy and default providers.
+///
+/// This is a no-op on OpenSSL < 3.0 where providers don't exist.
 fn try_load_legacy_provider() {
-    LEGACY_PROVIDER_INIT.call_once(|| {
-        unsafe {
-            if let Ok(p) = openssl::provider::Provider::load(None, "default") {
-                DEFAULT_PROVIDER = Some(p);
-            }
-            if let Ok(p) = openssl::provider::Provider::load(None, "legacy") {
-                LEGACY_PROVIDER = Some(p);
-            }
-        }
+    PROVIDERS.get_or_init(|| {
+        let default = openssl::provider::Provider::load(None, "default").ok();
+        let legacy = openssl::provider::Provider::load(None, "legacy").ok();
+        (default, legacy)
     });
 }
 

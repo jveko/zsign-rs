@@ -29,6 +29,7 @@ use crate::Result;
 use openssl::nid::Nid;
 use openssl::pkey::{PKeyRef, Private};
 use openssl::x509::{X509, X509Ref};
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -363,16 +364,16 @@ fn build_superblob(
     pkey: &PKeyRef<Private>,
     cert_chain: &[X509],
 ) -> Result<Vec<u8>> {
-    // Build CodeDirectory (SHA-1)
-    let cd_sha1 = build_code_directory(
-        identifier, team_id, code, slice, entitlements,
-        requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
-    );
-
-    // Build CodeDirectory (SHA-256)
-    let cd_sha256 = build_code_directory(
-        identifier, team_id, code, slice, entitlements,
-        requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
+    // Build CodeDirectory (SHA-1) and (SHA-256) in parallel
+    let (cd_sha1, cd_sha256) = rayon::join(
+        || build_code_directory(
+            identifier, team_id, code, slice, entitlements,
+            requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
+        ),
+        || build_code_directory(
+            identifier, team_id, code, slice, entitlements,
+            requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
+        ),
     );
 
     // Generate CMS signature
@@ -435,7 +436,7 @@ fn build_code_directory(
         }
     }
 
-    let mut builder = CodeDirectoryBuilder::new(identifier, code.to_vec())
+    let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
         .exec_seg_limit(slice.text_segment_size)
         .exec_seg_flags(exec_seg_flags);

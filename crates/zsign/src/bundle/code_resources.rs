@@ -10,6 +10,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 /// Builder for generating CodeResources plist
@@ -26,12 +27,14 @@ pub struct CodeResourcesBuilder {
 
 /// Entry for a file in CodeResources
 struct FileEntry {
-    /// SHA-1 hash (20 bytes)
+    /// SHA-1 hash (20 bytes) - for files, hash of content; for symlinks, hash of target path
     sha1: [u8; 20],
-    /// SHA-256 hash (32 bytes)
+    /// SHA-256 hash (32 bytes) - for files, hash of content; for symlinks, hash of target path
     sha256: [u8; 32],
     /// Whether this is optional (can be missing)
     optional: bool,
+    /// If this is a symlink, contains the target path
+    symlink_target: Option<String>,
 }
 
 /// Standard exclusion rules for CodeResources
@@ -131,8 +134,14 @@ impl CodeResourcesBuilder {
     pub fn new(bundle_path: impl AsRef<Path>) -> Self {
         let bundle_path = bundle_path.as_ref().to_path_buf();
 
-        // Try to read the main executable name from Info.plist
-        let main_executable = Self::read_main_executable(&bundle_path);
+        // Log warning if Info.plist can't be read (but don't fail construction)
+        let main_executable = match Self::read_main_executable(&bundle_path) {
+            Ok(exec) => exec,
+            Err(e) => {
+                eprintln!("Warning: Failed to read main executable from Info.plist: {}", e);
+                None
+            }
+        };
 
         Self {
             bundle_path,
@@ -143,12 +152,26 @@ impl CodeResourcesBuilder {
     }
 
     /// Read the main executable name from Info.plist (CFBundleExecutable)
-    fn read_main_executable(bundle_path: &Path) -> Option<String> {
+    fn read_main_executable(bundle_path: &Path) -> Result<Option<String>> {
         let info_plist_path = bundle_path.join("Info.plist");
-        let data = fs::read(&info_plist_path).ok()?;
-        let plist: plist::Value = plist::from_bytes(&data).ok()?;
-        let dict = plist.as_dictionary()?;
-        dict.get("CFBundleExecutable")?.as_string().map(|s| s.to_string())
+        
+        if !info_plist_path.exists() {
+            // Info.plist not existing is OK for some bundle types
+            return Ok(None);
+        }
+        
+        let data = fs::read(&info_plist_path)?;
+        
+        let plist: plist::Value = plist::from_bytes(&data)?;
+        
+        let dict = plist.as_dictionary()
+            .ok_or_else(|| Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Info.plist is not a dictionary")
+            ))?;
+        
+        Ok(dict.get("CFBundleExecutable")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string()))
     }
 
     /// Add a custom exclusion pattern
@@ -214,33 +237,48 @@ impl CodeResourcesBuilder {
     pub fn scan(&mut self) -> Result<&mut Self> {
         let bundle_path = self.bundle_path.clone();
 
-        for entry in WalkDir::new(&bundle_path)
+        // Collect all entries first (WalkDir is not Send, so we collect to Vec)
+        let entries: Vec<_> = WalkDir::new(&bundle_path)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
+            .collect();
 
-            // Skip directories
-            if !path.is_file() {
-                continue;
-            }
+        // Process entries in parallel
+        let results: Vec<_> = entries
+            .par_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(path).ok()?;
+                let is_symlink = metadata.file_type().is_symlink();
 
-            // Get relative path from bundle root
-            let relative_path = path
-                .strip_prefix(&bundle_path)
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-                .to_string_lossy()
-                .to_string();
+                if !is_symlink && metadata.is_dir() {
+                    return None;
+                }
 
-            // Check if should be excluded
-            if self.should_exclude(&relative_path) {
-                continue;
-            }
+                let relative_path = path
+                    .strip_prefix(&bundle_path)
+                    .ok()?
+                    .to_string_lossy()
+                    .to_string();
 
-            // Hash the file
-            let file_entry = self.hash_file(path)?;
-            self.files.insert(relative_path, file_entry);
+                if self.should_exclude(&relative_path) {
+                    return None;
+                }
+
+                let file_entry = if is_symlink {
+                    self.hash_symlink(path).ok()?
+                } else {
+                    self.hash_file(path).ok()?
+                };
+
+                Some((relative_path, file_entry))
+            })
+            .collect();
+
+        // Insert results sequentially (BTreeMap is not thread-safe)
+        for (path, entry) in results {
+            self.files.insert(path, entry);
         }
 
         Ok(self)
@@ -267,7 +305,47 @@ impl CodeResourcesBuilder {
             sha1,
             sha256,
             optional: false,
+            symlink_target: None,
         })
+    }
+
+    /// Hash a symlink by hashing its target path
+    #[cfg(unix)]
+    fn hash_symlink(&self, path: &Path) -> Result<FileEntry> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let target = fs::read_link(path)?;
+        let target_bytes = target.as_os_str().as_bytes();
+
+        let mut sha1_hasher = Sha1::new();
+        sha1_hasher.update(target_bytes);
+        let sha1_result = sha1_hasher.finalize();
+
+        let mut sha256_hasher = Sha256::new();
+        sha256_hasher.update(target_bytes);
+        let sha256_result = sha256_hasher.finalize();
+
+        let mut sha1 = [0u8; 20];
+        let mut sha256 = [0u8; 32];
+        sha1.copy_from_slice(&sha1_result);
+        sha256.copy_from_slice(&sha256_result);
+
+        Ok(FileEntry {
+            sha1,
+            sha256,
+            optional: false,
+            symlink_target: Some(target.to_string_lossy().to_string()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn hash_symlink(&self, _path: &Path) -> Result<FileEntry> {
+        // On non-Unix platforms, symlinks are rare in iOS bundles
+        // Return an error or handle as regular file
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Symlink handling not supported on this platform",
+        )))
     }
 
     /// Hash data directly (for testing or inline content)
@@ -301,6 +379,7 @@ impl CodeResourcesBuilder {
                 sha1,
                 sha256,
                 optional: false,
+                symlink_target: None,
             },
         );
     }
@@ -318,6 +397,7 @@ impl CodeResourcesBuilder {
                 sha1,
                 sha256,
                 optional: true,
+                symlink_target: None,
             },
         );
     }
@@ -331,6 +411,11 @@ impl CodeResourcesBuilder {
         // For .lproj files, use dict with hash+optional; for others, use plain hash
         let mut files = Dictionary::new();
         for (path, entry) in &self.files {
+            // Skip symlinks in legacy files dict (they weren't supported in old format)
+            if entry.symlink_target.is_some() {
+                continue;
+            }
+
             if path.contains(".lproj/") {
                 // .lproj files get a dict with hash and optional flag
                 let mut file_dict = Dictionary::new();
@@ -355,14 +440,19 @@ impl CodeResourcesBuilder {
             if path == "Info.plist" || path == "PkgInfo" || path.ends_with(".DS_Store") {
                 continue;
             }
-            
+
             let mut file_dict = Dictionary::new();
 
-            // Add SHA-1 hash
-            file_dict.insert("hash".to_string(), Value::Data(entry.sha1.to_vec()));
+            // If this is a symlink, add symlink target instead of hashes
+            if let Some(ref target) = entry.symlink_target {
+                file_dict.insert("symlink".to_string(), Value::String(target.clone()));
+            } else {
+                // Add SHA-1 hash
+                file_dict.insert("hash".to_string(), Value::Data(entry.sha1.to_vec()));
 
-            // Add SHA-256 hash
-            file_dict.insert("hash2".to_string(), Value::Data(entry.sha256.to_vec()));
+                // Add SHA-256 hash
+                file_dict.insert("hash2".to_string(), Value::Data(entry.sha256.to_vec()));
+            }
 
             // Add optional flag for .lproj files
             // C++ Reference: bundle.cpp:189-191

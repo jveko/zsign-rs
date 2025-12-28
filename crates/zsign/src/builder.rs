@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 ///     .provisioning_profile("profile.mobileprovision")
 ///     .sign_macho("input", "output")?;
 /// ```
+#[derive(Clone)]
 pub struct ZSign {
     certificate: Option<PathBuf>,
     private_key: Option<PathBuf>,
@@ -98,11 +99,44 @@ impl ZSign {
         self
     }
 
+    /// Validate the builder configuration.
+    ///
+    /// Returns an error if:
+    /// - Both PKCS#12 and PEM credentials are specified
+    /// - Neither PKCS#12 nor PEM credentials are specified
+    /// - Only one of certificate/private_key is specified (need both)
+    pub fn validate(&self) -> Result<()> {
+        let has_p12 = self.pkcs12.is_some();
+        let has_pem = self.certificate.is_some() || self.private_key.is_some();
+
+        if has_p12 && has_pem {
+            return Err(Error::Config(
+                "Cannot specify both PKCS#12 and PEM certificate/key".into(),
+            ));
+        }
+
+        if !has_p12 && !has_pem {
+            return Err(Error::MissingCredentials(
+                "Must specify either PKCS#12 or certificate/key pair".into(),
+            ));
+        }
+
+        if has_pem && (self.certificate.is_none() || self.private_key.is_none()) {
+            return Err(Error::MissingCredentials(
+                "Both certificate and private key must be specified".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Load signing assets from configured paths.
     ///
     /// Uses PKCS#12 if configured, otherwise uses separate certificate and private key.
     /// Optionally loads provisioning profile for entitlements.
     fn load_assets(&self) -> Result<SigningAssets> {
+        self.validate()?;
+
         let mut assets = if let Some(ref p12) = self.pkcs12 {
             SigningAssets::from_p12(p12, self.password.as_ref())?
         } else {
@@ -280,9 +314,8 @@ mod tests {
         let zsign = ZSign::new();
         let result = zsign.sign_ipa("input.ipa", "output.ipa");
         assert!(result.is_err());
-        // Now fails because no credentials are configured (not "not implemented")
-        if let Err(Error::Certificate(msg)) = result {
-            assert!(msg.contains("No certificate configured"));
+        if let Err(Error::MissingCredentials(msg)) = result {
+            assert!(msg.contains("Must specify either PKCS#12 or certificate/key pair"));
         }
     }
 
@@ -299,6 +332,30 @@ mod tests {
         assert!(result.is_err());
         if let Err(Error::Signing(msg)) = result {
             assert!(msg.contains("not yet implemented"));
+        }
+    }
+
+    #[test]
+    fn test_validate_both_p12_and_pem() {
+        let zsign = ZSign::new()
+            .pkcs12("/path/to/cert.p12")
+            .certificate("/path/to/cert.pem");
+
+        let result = zsign.validate();
+        assert!(result.is_err());
+        if let Err(Error::Config(msg)) = result {
+            assert!(msg.contains("Cannot specify both"));
+        }
+    }
+
+    #[test]
+    fn test_validate_missing_private_key() {
+        let zsign = ZSign::new().certificate("/path/to/cert.pem");
+
+        let result = zsign.validate();
+        assert!(result.is_err());
+        if let Err(Error::MissingCredentials(msg)) = result {
+            assert!(msg.contains("Both certificate and private key"));
         }
     }
 }
