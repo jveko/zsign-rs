@@ -29,7 +29,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::borrow::Cow;
-use std::io::{self, Cursor, Read};
+use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zip::ZipArchive;
@@ -186,8 +186,9 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
                 return Ok(());
             }
 
-            // Regular file extraction
-            let mut outfile = File::create(&entry.outpath)?;
+            // Regular file extraction with buffered writer
+            let outfile = File::create(&entry.outpath)?;
+            let mut outfile = BufWriter::new(outfile);
             io::copy(&mut file, &mut outfile)?;
 
             // Set file permissions on Unix

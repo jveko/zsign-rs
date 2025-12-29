@@ -23,7 +23,7 @@
 
 use crate::{Error, Result};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::Path;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
@@ -249,10 +249,9 @@ pub fn create_ipa(
             zip.start_file(&archive_path, options)
                 .map_err(Error::Zip)?;
 
+            // Stream file directly without loading into memory
             let mut file = File::open(path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-            zip.write_all(&buffer)?;
+            io::copy(&mut file, &mut zip)?;
         }
     }
 
