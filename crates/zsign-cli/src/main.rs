@@ -1,3 +1,8 @@
+//! Command-line interface for zsign iOS code signing tool.
+//!
+//! Provides a CLI for signing Mach-O binaries, app bundles, and IPA files
+//! using PKCS#12 or PEM-format certificates.
+
 use clap::Parser;
 use std::path::PathBuf;
 use zsign::{SigningCredentials, ZSign};
