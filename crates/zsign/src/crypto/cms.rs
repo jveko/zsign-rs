@@ -1,244 +1,79 @@
-//! Safe wrapper for CMS signing with Apple custom attributes
+//! CMS signing with Apple CDHash attributes
+//!
+//! Uses cryptographic-message-syntax crate for CMS signature generation.
 
 use crate::{Error, Result};
-use openssl::pkey::{PKeyRef, Private};
-use openssl::x509::{X509, X509Ref};
-use openssl_sys::{
-    ASN1_OBJECT_free, BIO, BIO_new, BIO_new_mem_buf, BIO_s_mem, CMS_ContentInfo,
-    CMS_ContentInfo_free, EVP_sha256, OBJ_txt2obj, X509 as X509_sys, EVP_PKEY,
-};
-use std::ffi::c_int;
-use std::ptr;
-
-use super::assets::{
-    APPLE_ROOT_CA_CERT, APPLE_WWDR_CA_CERT, APPLE_WWDR_CA_G3_CERT,
-    APPLE_WWDR_ISSUER_HASH, APPLE_WWDR_G3_ISSUER_HASH,
-};
-use super::cms_ffi::{
-    CMS_SignerInfo, CMS_add1_signer, CMS_final, CMS_sign,
-    CMS_signed_add1_attr_by_OBJ, CMS_add1_cert,
-    APPLE_CDHASH_V2_OID,
+use bcder::{encode::Values, Captured, Mode, OctetString, Oid};
+use cryptographic_message_syntax::{SignedDataBuilder, SignerBuilder};
+use x509_certificate::{
+    rfc5652::AttributeValue,
+    CapturedX509Certificate, KeyInfoSigner,
 };
 
-// Use the constants from cms_ffi to avoid ambiguity
-use super::cms_ffi::{CMS_BINARY, CMS_DETACHED, CMS_NOSMIMECAP, CMS_PARTIAL};
+/// Apple CDHash v1 OID: 1.2.840.113635.100.9.1
+/// Contains plist with SHA-1 and SHA-256 hashes
+pub const APPLE_CDHASH_OID: &[u8] = &[
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x09, 0x01,
+];
 
-// BIO functions that need to be declared
-extern "C" {
-    fn BIO_free(a: *mut BIO) -> c_int;
-    fn BIO_ctrl(bp: *mut BIO, cmd: c_int, larg: isize, parg: *mut std::ffi::c_void) -> isize;
-    fn i2d_CMS_bio(bio: *mut BIO, cms: *mut CMS_ContentInfo) -> c_int;
-}
+/// Apple CDHash v2 OID: 1.2.840.113635.100.9.2
+/// Contains SEQUENCE { OID sha256, OCTET STRING hash }
+pub const APPLE_CDHASH_V2_OID: &[u8] = &[
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x09, 0x02,
+];
 
-// BIO_CTRL constants
-const BIO_CTRL_RESET: c_int = 1;
-const BIO_CTRL_INFO: c_int = 3;
-
-/// RAII wrapper for OpenSSL BIO pointers
-struct ScopedBio(*mut BIO);
-
-impl Drop for ScopedBio {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { BIO_free(self.0) };
-        }
-    }
-}
-
-impl ScopedBio {
-    fn as_ptr(&self) -> *mut BIO {
-        self.0
-    }
-}
-
-/// RAII wrapper for OpenSSL CMS_ContentInfo pointers
-struct ScopedCms(*mut CMS_ContentInfo);
-
-impl Drop for ScopedCms {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CMS_ContentInfo_free(self.0) };
-        }
-    }
-}
-
-impl ScopedCms {
-    fn as_ptr(&self) -> *mut CMS_ContentInfo {
-        self.0
-    }
-}
-
-// Helper functions for BIO operations
-unsafe fn bio_reset(bio: *mut BIO) -> c_int {
-    BIO_ctrl(bio, BIO_CTRL_RESET, 0, ptr::null_mut()) as c_int
-}
-
-unsafe fn bio_get_mem_data(bio: *mut BIO, pp: *mut *mut u8) -> isize {
-    BIO_ctrl(bio, BIO_CTRL_INFO, 0, pp as *mut std::ffi::c_void)
-}
-
-/// Get raw X509 pointer from X509Ref
-///
-/// # Safety
-/// The returned pointer is only valid as long as the X509Ref is valid.
-unsafe fn x509_as_ptr(x509: &X509Ref) -> *mut X509_sys {
-    // X509Ref contains a reference to the underlying X509 structure
-    // We need to cast through the reference to get the raw pointer
-    x509 as *const X509Ref as *const X509_sys as *mut X509_sys
-}
-
-/// Get raw EVP_PKEY pointer from PKeyRef
-///
-/// # Safety
-/// The returned pointer is only valid as long as the PKeyRef is valid.
-unsafe fn pkey_as_ptr(pkey: &PKeyRef<Private>) -> *mut EVP_PKEY {
-    pkey as *const PKeyRef<Private> as *const EVP_PKEY as *mut EVP_PKEY
-}
-
-/// Get the Apple CA certificates for the CMS signature chain.
-///
-/// Returns a vector containing:
-/// 1. The appropriate Apple WWDR CA (based on the signing certificate's issuer hash)
-/// 2. The Apple Root CA
-///
-/// This matches the behavior of C++ zsign which hardcodes these certificates
-/// and adds them to the CMS signature chain automatically.
-fn get_apple_ca_chain(cert: &X509Ref) -> Result<Vec<X509>> {
-    // Use OpenSSL's X509_issuer_name_hash directly to match C++ zsign
-    extern "C" {
-        fn X509_issuer_name_hash(x: *const openssl_sys::X509) -> std::ffi::c_ulong;
-    }
-
-    let issuer_hash = unsafe {
-        X509_issuer_name_hash(x509_as_ptr(cert))
-    } as u32;
-
-    // Select the appropriate WWDR certificate based on issuer hash
-    let wwdr_cert = if issuer_hash == APPLE_WWDR_ISSUER_HASH {
-        X509::from_pem(APPLE_WWDR_CA_CERT.as_bytes())
-    } else if issuer_hash == APPLE_WWDR_G3_ISSUER_HASH {
-        X509::from_pem(APPLE_WWDR_CA_G3_CERT.as_bytes())
-    } else {
-        // Unknown issuer - this may be a self-signed or ad-hoc certificate
-        // In this case, skip adding Apple CA chain (same as C++ zsign behavior)
-        return Ok(Vec::new());
-    }.map_err(|e| Error::Signing(format!("Failed to parse Apple WWDR CA: {}", e)))?;
-
-    let root_cert = X509::from_pem(APPLE_ROOT_CA_CERT.as_bytes())
-        .map_err(|e| Error::Signing(format!("Failed to parse Apple Root CA: {}", e)))?;
-
-    Ok(vec![wwdr_cert, root_cert])
-}
+/// SHA-256 OID: 2.16.840.1.101.3.4.2.1
+const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 
 /// Generate CMS signature with Apple CDHash attributes
 ///
 /// # Arguments
 ///
-/// * `data` - The data to sign (CodeDirectory blob)
-/// * `cert` - The signing certificate
-/// * `pkey` - The private key
-/// * `cert_chain` - Optional certificate chain (intermediate CAs)
+/// * `data` - The CodeDirectory data to sign
+/// * `signing_key` - The private key implementing KeyInfoSigner trait
+/// * `signing_cert` - The signing certificate as CapturedX509Certificate
+/// * `cert_chain` - Certificate chain (intermediate CAs)
 /// * `cdhash_sha1` - SHA-1 CDHash for Apple attribute
 /// * `cdhash_sha256` - SHA-256 CDHash for Apple attribute
-///
-/// # Apple CA Chain
-///
-/// This function automatically adds the Apple WWDR and Root CA certificates
-/// to the CMS signature chain, matching the behavior of C++ zsign. The
-/// appropriate WWDR CA is selected based on the signing certificate's issuer.
-pub fn sign_with_apple_attrs(
+pub fn sign_with_apple_attrs<K: KeyInfoSigner>(
     data: &[u8],
-    cert: &X509Ref,
-    pkey: &PKeyRef<Private>,
-    cert_chain: &[X509],
+    signing_key: &K,
+    signing_cert: &CapturedX509Certificate,
+    cert_chain: &[CapturedX509Certificate],
     cdhash_sha1: &[u8; 20],
     cdhash_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
-    // Get Apple CA chain (WWDR + Root CA) based on the signing certificate's issuer
-    let apple_ca_chain = get_apple_ca_chain(cert)?;
+    let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
+    let cdhash_v2_value = build_cdhash_v2_attribute(cdhash_sha256);
 
-    unsafe {
-        // Create BIO for data - wrapped in RAII
-        let bio = ScopedBio(BIO_new_mem_buf(data.as_ptr() as *const _, data.len() as c_int));
-        if bio.as_ptr().is_null() {
-            return Err(Error::Signing("Failed to create BIO".into()));
-        }
+    let cdhash_v1_oid = Oid(cryptographic_message_syntax::Bytes::copy_from_slice(APPLE_CDHASH_OID));
+    let cdhash_v2_oid = Oid(cryptographic_message_syntax::Bytes::copy_from_slice(APPLE_CDHASH_V2_OID));
 
-        // Create CMS with PARTIAL flag - wrapped in RAII
-        let flags = CMS_PARTIAL | CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP;
-        let cms = ScopedCms(CMS_sign(
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            flags,
-        ));
-        if cms.as_ptr().is_null() {
-            return Err(Error::Signing("CMS_sign failed".into()));
-        }
+    let cdhash_v1_attr_value = AttributeValue::new(Captured::from_values(
+        Mode::Der,
+        OctetString::encode_slice(&cdhash_plist),
+    ));
 
-        // Add signer with SHA256
-        let cert_ptr = x509_as_ptr(cert);
-        let pkey_ptr = pkey_as_ptr(pkey);
+    let cdhash_v2_attr_value =
+        AttributeValue::new(Captured::from_values(Mode::Der, CdHashV2Encoder(&cdhash_v2_value)));
 
-        let signer_info = CMS_add1_signer(cms.as_ptr(), cert_ptr, pkey_ptr, EVP_sha256(), flags);
-        if signer_info.is_null() {
-            return Err(Error::Signing("CMS_add1_signer failed".into()));
-        }
+    let signer = SignerBuilder::new(signing_key, signing_cert.clone())
+        .signed_attribute(cdhash_v1_oid, vec![cdhash_v1_attr_value])
+        .signed_attribute(cdhash_v2_oid, vec![cdhash_v2_attr_value]);
 
-        // Add Apple CA chain (WWDR CA + Root CA)
-        for apple_cert in &apple_ca_chain {
-            let apple_cert_ptr = x509_as_ptr(apple_cert.as_ref());
-            if CMS_add1_cert(cms.as_ptr(), apple_cert_ptr) != 1 {
-                return Err(Error::Signing("Failed to add Apple CA to CMS".into()));
-            }
-        }
+    let mut builder = SignedDataBuilder::default()
+        .content_external(data.to_vec())
+        .signer(signer);
 
-        // Add user-provided certificate chain
-        for chain_cert in cert_chain {
-            let chain_cert_ptr = x509_as_ptr(chain_cert.as_ref());
-            if CMS_add1_cert(cms.as_ptr(), chain_cert_ptr) != 1 {
-                return Err(Error::Signing("Failed to add cert chain to CMS".into()));
-            }
-        }
-
-        // Add the signing certificate itself
-        if CMS_add1_cert(cms.as_ptr(), cert_ptr) != 1 {
-            return Err(Error::Signing("Failed to add signing cert to CMS".into()));
-        }
-
-        // Add Apple CDHash v1 attribute - now safe to use ? operator
-        let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
-        add_apple_attribute(signer_info, super::cms_ffi::APPLE_CDHASH_OID, &cdhash_plist)?;
-
-        // Add Apple CDHash v2 attribute - now safe to use ? operator
-        let cdhash_v2_value = build_cdhash_v2_attribute(cdhash_sha256);
-        add_apple_attribute_sequence(signer_info, APPLE_CDHASH_V2_OID, &cdhash_v2_value)?;
-
-        // Finalize CMS
-        bio_reset(bio.as_ptr());
-        if CMS_final(cms.as_ptr(), bio.as_ptr(), ptr::null_mut(), flags) != 1 {
-            return Err(Error::Signing("CMS_final failed".into()));
-        }
-
-        // Serialize to DER
-        let out_bio = ScopedBio(BIO_new(BIO_s_mem()));
-        if out_bio.as_ptr().is_null() {
-            return Err(Error::Signing("Failed to create output BIO".into()));
-        }
-
-        if i2d_CMS_bio(out_bio.as_ptr(), cms.as_ptr()) != 1 {
-            return Err(Error::Signing("Failed to serialize CMS".into()));
-        }
-
-        // Read DER data
-        let mut buf_ptr: *mut u8 = ptr::null_mut();
-        let len = bio_get_mem_data(out_bio.as_ptr(), &mut buf_ptr);
-        let der = std::slice::from_raw_parts(buf_ptr, len as usize).to_vec();
-
-        // RAII wrappers will automatically clean up bio, cms, out_bio on drop
-        Ok(der)
+    for cert in cert_chain {
+        builder = builder.certificate(cert.clone());
     }
+
+    let der = builder
+        .build_der()
+        .map_err(|e| Error::Signing(format!("Failed to build CMS signature: {}", e)))?;
+
+    Ok(der)
 }
 
 /// Build CDHash plist for Apple attribute
@@ -253,18 +88,13 @@ pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
     dict.insert(
         "cdhashes".to_string(),
         Value::Array(vec![
-            // SHA-1 CDHash (20 bytes)
             Value::Data(sha1.to_vec()),
-            // SHA-256 CDHash truncated to 20 bytes (matches zsign behavior)
             Value::Data(sha256[..20].to_vec()),
         ]),
     );
 
     let mut buf = Vec::new();
-    plist::to_writer_xml(&mut buf, &Value::Dictionary(dict))
-        .expect("plist serialization failed");
-    // Add trailing newline to match C++ zsign behavior
-    // C++ zsign json.cpp:3263: m_strdoc += "</plist>" + m_line; (m_line = "\n")
+    plist::to_writer_xml(&mut buf, &Value::Dictionary(dict)).expect("plist serialization failed");
     buf.push(b'\n');
     buf
 }
@@ -276,106 +106,38 @@ pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
 /// - OCTET STRING containing the 32-byte SHA-256 CDHash
 ///
 /// Format: SEQUENCE { OBJECT sha256, OCTET STRING hash }
-/// This matches the format used by Apple's codesign and zsign.
 fn build_cdhash_v2_attribute(cdhash_sha256: &[u8; 32]) -> Vec<u8> {
-    // SHA-256 OID: 2.16.840.1.101.3.4.2.1
-    // DER encoded: 60 86 48 01 65 03 04 02 01
-    let sha256_oid: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-    
-    // Build OBJECT IDENTIFIER for sha256
     let mut oid = Vec::new();
-    oid.push(0x06); // OBJECT IDENTIFIER tag
-    oid.push(sha256_oid.len() as u8);
-    oid.extend_from_slice(&sha256_oid);
-    
-    // Build OCTET STRING with CDHash
+    oid.push(0x06);
+    oid.push(SHA256_OID.len() as u8);
+    oid.extend_from_slice(SHA256_OID);
+
     let mut hash_octet = Vec::new();
-    hash_octet.push(0x04); // OCTET STRING tag
+    hash_octet.push(0x04);
     hash_octet.push(cdhash_sha256.len() as u8);
     hash_octet.extend_from_slice(cdhash_sha256);
-    
-    // Wrap both in outer SEQUENCE: SEQUENCE { OBJECT, OCTET STRING }
+
     let inner_len = oid.len() + hash_octet.len();
-    
-    // Assert length fits in single byte (DER short form)
-    // This is a compile-time invariant since OID (11 bytes) + hash (34 bytes) = 45 bytes
-    assert!(inner_len <= 127, "CDHash v2 attribute inner length {} exceeds 127 bytes", inner_len);
-    
+
     let mut result = Vec::new();
-    result.push(0x30); // SEQUENCE tag
+    result.push(0x30);
     result.push(inner_len as u8);
     result.extend_from_slice(&oid);
     result.extend_from_slice(&hash_octet);
-    
+
     result
 }
 
-/// Add Apple custom attribute to signer info as OCTET STRING
-///
-/// Helper function to add attributes with custom OIDs to the CMS signer info.
-/// Used for Apple-specific code signing attributes like CDHash.
-unsafe fn add_apple_attribute(
-    signer_info: *mut CMS_SignerInfo,
-    oid: &str,
-    data: &[u8],
-) -> Result<()> {
-    // Create ASN1_OBJECT from OID string
-    let oid_cstr =
-        std::ffi::CString::new(oid).map_err(|_| Error::Signing("Invalid OID string".into()))?;
+struct CdHashV2Encoder<'a>(&'a [u8]);
 
-    let obj = OBJ_txt2obj(oid_cstr.as_ptr(), 1);
-    if obj.is_null() {
-        return Err(Error::Signing(format!("Failed to create OID: {}", oid)));
+impl<'a> Values for CdHashV2Encoder<'a> {
+    fn encoded_len(&self, _mode: Mode) -> usize {
+        self.0.len()
     }
 
-    // V_ASN1_OCTET_STRING = 4
-    let ret = CMS_signed_add1_attr_by_OBJ(
-        signer_info,
-        obj,
-        4, // V_ASN1_OCTET_STRING
-        data.as_ptr() as *const _,
-        data.len() as i32,
-    );
-
-    ASN1_OBJECT_free(obj);
-
-    if ret != 1 {
-        return Err(Error::Signing("Failed to add Apple attribute".into()));
+    fn write_encoded<W: std::io::Write>(&self, _mode: Mode, target: &mut W) -> std::result::Result<(), std::io::Error> {
+        target.write_all(self.0)
     }
-    Ok(())
-}
-
-/// Add Apple custom attribute to signer info as SEQUENCE
-///
-/// This is used for CDHash v2 which requires a pre-encoded SEQUENCE value.
-unsafe fn add_apple_attribute_sequence(
-    signer_info: *mut CMS_SignerInfo,
-    oid: &str,
-    data: &[u8],
-) -> Result<()> {
-    let oid_cstr =
-        std::ffi::CString::new(oid).map_err(|_| Error::Signing("Invalid OID string".into()))?;
-
-    let obj = OBJ_txt2obj(oid_cstr.as_ptr(), 1);
-    if obj.is_null() {
-        return Err(Error::Signing(format!("Failed to create OID: {}", oid)));
-    }
-
-    // V_ASN1_SEQUENCE = 16
-    let ret = CMS_signed_add1_attr_by_OBJ(
-        signer_info,
-        obj,
-        16, // V_ASN1_SEQUENCE
-        data.as_ptr() as *const _,
-        data.len() as i32,
-    );
-
-    ASN1_OBJECT_free(obj);
-
-    if ret != 1 {
-        return Err(Error::Signing("Failed to add Apple SEQUENCE attribute".into()));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -397,7 +159,6 @@ mod tests {
 
     #[test]
     fn test_build_cdhash_plist_with_real_hashes() {
-        // Test with actual hash values
         let sha1: [u8; 20] = [
             0x2f, 0xd4, 0xe1, 0xc6, 0x7a, 0x2d, 0x28, 0xfc, 0xed, 0x84, 0x9e, 0xe1, 0xbb, 0x76,
             0xe7, 0x39, 0x1b, 0x93, 0xeb, 0x12,
@@ -410,14 +171,40 @@ mod tests {
 
         let plist = build_cdhash_plist(&sha1, &sha256);
 
-        // Parse the plist back to verify structure
         let parsed: plist::Value = plist::from_bytes(&plist).unwrap();
         let dict = parsed.as_dictionary().unwrap();
         let cdhashes = dict.get("cdhashes").unwrap().as_array().unwrap();
 
         assert_eq!(cdhashes.len(), 2);
         assert_eq!(cdhashes[0].as_data().unwrap(), sha1);
-        // SHA-256 is truncated to 20 bytes in the plist (matches zsign behavior)
         assert_eq!(cdhashes[1].as_data().unwrap(), &sha256[..20]);
+    }
+
+    #[test]
+    fn test_build_cdhash_v2_attribute() {
+        let sha256: [u8; 32] = [
+            0xd7, 0xa8, 0xfb, 0xb3, 0x07, 0xd7, 0x80, 0x94, 0x69, 0xca, 0x9a, 0xbc, 0xb0, 0x08,
+            0x2e, 0x4f, 0x8d, 0x56, 0x51, 0xe4, 0x6d, 0x3c, 0xdb, 0x76, 0x2d, 0x02, 0xd0, 0xbf,
+            0x37, 0xc9, 0xe5, 0x92,
+        ];
+
+        let attr = build_cdhash_v2_attribute(&sha256);
+
+        assert_eq!(attr[0], 0x30);
+        assert!(attr.len() > 0);
+        assert!(attr.windows(SHA256_OID.len()).any(|w| w == SHA256_OID));
+        assert!(attr.windows(sha256.len()).any(|w| w == sha256));
+    }
+
+    #[test]
+    fn test_apple_cdhash_oid_encoding() {
+        assert_eq!(APPLE_CDHASH_OID.len(), 9);
+        assert_eq!(APPLE_CDHASH_OID[0], 0x2a);
+    }
+
+    #[test]
+    fn test_apple_cdhash_v2_oid_encoding() {
+        assert_eq!(APPLE_CDHASH_V2_OID.len(), 9);
+        assert_eq!(APPLE_CDHASH_V2_OID[8], 0x02);
     }
 }
