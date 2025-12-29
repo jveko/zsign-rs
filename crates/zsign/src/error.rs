@@ -26,10 +26,6 @@ pub enum Error {
     #[error("Invalid provisioning profile: {0}")]
     ProvisioningProfile(String),
 
-    #[cfg(feature = "openssl-backend")]
-    #[error("OpenSSL error: {0}")]
-    OpenSsl(#[from] openssl::error::ErrorStack),
-
     #[error("Plist error: {0}")]
     Plist(#[from] plist::Error),
 
