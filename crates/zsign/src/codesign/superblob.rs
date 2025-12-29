@@ -1,10 +1,11 @@
-//! SuperBlob assembly for Apple code signatures
+//! SuperBlob assembly for Apple code signatures.
 //!
-//! The SuperBlob is the top-level container for all code signature components.
-//! It contains a header followed by an index of blob entries, each pointing
-//! to embedded blobs (CodeDirectory, requirements, entitlements, CMS signature, etc.)
+//! The [`SuperBlobBuilder`] and [`build_superblob`] function create the top-level container
+//! for all code signature components. It contains a header followed by an index of blob
+//! entries, each pointing to embedded blobs ([`CodeDirectoryBuilder`](super::CodeDirectoryBuilder),
+//! requirements, entitlements, CMS signature, etc.)
 //!
-//! ## Structure
+//! # Structure
 //!
 //! ```text
 //! ┌────────────────────────────────────┐
@@ -31,7 +32,7 @@
 //! └────────────────────────────────────┘
 //! ```
 //!
-//! ## Slot Types
+//! # Slot Types
 //!
 //! - `CSSLOT_CODEDIRECTORY` (0x0000): SHA-1 CodeDirectory
 //! - `CSSLOT_REQUIREMENTS` (0x0002): Code requirements
@@ -39,23 +40,52 @@
 //! - `CSSLOT_DER_ENTITLEMENTS` (0x0007): DER entitlements
 //! - `CSSLOT_ALTERNATE_CODEDIRECTORIES` (0x1000): SHA-256 CodeDirectory
 //! - `CSSLOT_SIGNATURESLOT` (0x10000): CMS signature
+//!
+//! # Examples
+//!
+//! ```
+//! use zsign::codesign::{SuperBlobBuilder, CodeDirectoryBuilder};
+//!
+//! let code = vec![0u8; 4096];
+//! let cd_sha1 = CodeDirectoryBuilder::new("com.example", &code).build_sha1();
+//! let cd_sha256 = CodeDirectoryBuilder::new("com.example", &code).build_sha256();
+//!
+//! let superblob = SuperBlobBuilder::new()
+//!     .code_directory_sha1(cd_sha1)
+//!     .code_directory_sha256(cd_sha256)
+//!     .build();
+//!
+//! assert!(!superblob.is_empty());
+//! ```
 
 use super::constants::*;
 
-/// Size of the SuperBlob header in bytes (magic + length + count)
+/// Size of the SuperBlob header in bytes (magic + length + count).
 const SUPERBLOB_HEADER_SIZE: u32 = 12;
 
-/// Size of each index entry in bytes (slot_type + offset)
+/// Size of each index entry in bytes (slot_type + offset).
 const INDEX_ENTRY_SIZE: u32 = 8;
 
-/// A blob entry for inclusion in a SuperBlob.
+/// A blob entry for inclusion in a [`SuperBlobBuilder`].
 ///
 /// Each entry represents a component of the code signature,
 /// identified by its slot type and containing the raw blob data.
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::BlobEntry;
+/// use zsign::codesign::constants::CSSLOT_CODEDIRECTORY;
+///
+/// let blob_data = vec![0u8; 100];
+/// let entry = BlobEntry::new(CSSLOT_CODEDIRECTORY, blob_data);
+/// assert_eq!(entry.slot_type, CSSLOT_CODEDIRECTORY);
+/// ```
 #[derive(Debug, Clone)]
 pub struct BlobEntry {
     /// The slot type identifying this blob's purpose.
-    /// See `CSSLOT_*` constants for standard slot types.
+    ///
+    /// See `CSSLOT_CODEDIRECTORY` and other `CSSLOT_*` constants for standard slot types.
     pub slot_type: u32,
     /// The raw blob data, including its own magic and length header.
     pub data: Vec<u8>,
@@ -73,34 +103,37 @@ impl BlobEntry {
     }
 }
 
-/// Build a SuperBlob containing all signature components.
+/// Build a [`SuperBlobBuilder`] containing all signature components.
 ///
 /// The SuperBlob is the top-level container for iOS/macOS code signatures.
 /// It contains multiple embedded blobs, each identified by a slot type.
 ///
+/// For a more ergonomic API, consider using [`SuperBlobBuilder`] instead.
+///
 /// # Arguments
 ///
-/// * `entries` - A vector of `BlobEntry` items to include in the SuperBlob
+/// * `entries` - A vector of [`BlobEntry`] items to include in the SuperBlob
 ///
 /// # Returns
 ///
 /// A `Vec<u8>` containing the serialized SuperBlob with all embedded blobs.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```ignore
-/// use zsign::codesign::superblob::{build_superblob, BlobEntry};
+/// ```
+/// use zsign::codesign::{build_superblob, BlobEntry};
 /// use zsign::codesign::constants::*;
 ///
+/// let code_directory = vec![0u8; 100]; // placeholder
+/// let requirements = vec![0u8; 12]; // empty requirements
+///
 /// let entries = vec![
-///     BlobEntry::new(CSSLOT_CODEDIRECTORY, code_directory_sha1),
+///     BlobEntry::new(CSSLOT_CODEDIRECTORY, code_directory),
 ///     BlobEntry::new(CSSLOT_REQUIREMENTS, requirements),
-///     BlobEntry::new(CSSLOT_ENTITLEMENTS, entitlements),
-///     BlobEntry::new(CSSLOT_ALTERNATE_CODEDIRECTORIES, code_directory_sha256),
-///     BlobEntry::new(CSSLOT_SIGNATURESLOT, cms_signature),
 /// ];
 ///
 /// let superblob = build_superblob(entries);
+/// assert!(!superblob.is_empty());
 /// ```
 pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
     let count = entries.len() as u32;
@@ -163,7 +196,8 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
 
 /// Build an entitlements blob from XML plist data.
 ///
-/// Wraps the plist data with a standard blob header.
+/// Wraps the plist data with a standard blob header using
+/// `CSMAGIC_EMBEDDED_ENTITLEMENTS`.
 ///
 /// # Arguments
 ///
@@ -172,6 +206,16 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
 /// # Returns
 ///
 /// A `Vec<u8>` containing the entitlements blob with magic and length header.
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::build_entitlements_blob;
+///
+/// let plist = b"<?xml version=\"1.0\"?><plist><dict></dict></plist>";
+/// let blob = build_entitlements_blob(plist);
+/// assert!(blob.len() > plist.len());
+/// ```
 pub fn build_entitlements_blob(plist_data: &[u8]) -> Vec<u8> {
     let total_len = 8 + plist_data.len() as u32;
     let mut buf = Vec::with_capacity(total_len as usize);
@@ -185,15 +229,26 @@ pub fn build_entitlements_blob(plist_data: &[u8]) -> Vec<u8> {
 
 /// Build a DER entitlements blob.
 ///
-/// Wraps the DER-encoded entitlements with a standard blob header.
+/// Wraps the DER-encoded entitlements with a standard blob header using
+/// `CSMAGIC_EMBEDDED_DER_ENTITLEMENTS`.
 ///
 /// # Arguments
 ///
-/// * `der_data` - The DER-encoded entitlements data
+/// * `der_data` - The DER-encoded entitlements data (see [`der::plist_to_der`](super::der::plist_to_der))
 ///
 /// # Returns
 ///
 /// A `Vec<u8>` containing the DER entitlements blob with magic and length header.
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::build_der_entitlements_blob;
+///
+/// let der_data = vec![0x31, 0x00]; // minimal empty SET
+/// let blob = build_der_entitlements_blob(&der_data);
+/// assert_eq!(blob.len(), 8 + der_data.len());
+/// ```
 pub fn build_der_entitlements_blob(der_data: &[u8]) -> Vec<u8> {
     let total_len = 8 + der_data.len() as u32;
     let mut buf = Vec::with_capacity(total_len as usize);
@@ -222,11 +277,20 @@ fn pad_to_alignment(data: &[u8], alignment: usize) -> Vec<u8> {
 /// Build a minimal empty requirements blob.
 ///
 /// This creates the simplest valid requirements blob with no requirements.
-/// Used when no specific code signing requirements are needed.
+/// Used when no specific code signing requirements are needed (e.g., ad-hoc signing).
 ///
 /// # Returns
 ///
 /// A `Vec<u8>` containing an empty requirements blob (12 bytes).
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::build_requirements_blob;
+///
+/// let blob = build_requirements_blob();
+/// assert_eq!(blob.len(), 12);
+/// ```
 pub fn build_requirements_blob() -> Vec<u8> {
     // Minimal requirements: just a wrapper with count=0
     let mut buf = Vec::with_capacity(12);
@@ -241,8 +305,7 @@ pub fn build_requirements_blob() -> Vec<u8> {
 /// Build a full requirements blob with bundle ID and certificate subject CN.
 ///
 /// This generates a designated requirement expression matching the C++ zsign
-/// implementation (SlotBuildRequirements in signing.cpp). The expression
-/// validates:
+/// implementation. The expression validates:
 /// 1. The bundle identifier matches
 /// 2. The signing certificate subject CN matches
 /// 3. The certificate chain is anchored to Apple
@@ -255,6 +318,7 @@ pub fn build_requirements_blob() -> Vec<u8> {
 /// # Returns
 ///
 /// A `Vec<u8>` containing the complete requirements blob.
+/// Returns an empty requirements blob (12 bytes) if either argument is empty.
 ///
 /// # Structure
 ///
@@ -372,7 +436,8 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
 
 /// Build a CMS signature wrapper blob.
 ///
-/// Wraps the CMS signature data with a standard blob header.
+/// Wraps the CMS signature data with a standard blob header using
+/// `CSMAGIC_BLOBWRAPPER`.
 ///
 /// # Arguments
 ///
@@ -381,6 +446,16 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
 /// # Returns
 ///
 /// A `Vec<u8>` containing the signature blob with magic and length header.
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::build_signature_blob;
+///
+/// let cms_data = vec![0x30, 0x00]; // minimal placeholder
+/// let blob = build_signature_blob(&cms_data);
+/// assert_eq!(blob.len(), 8 + cms_data.len());
+/// ```
 pub fn build_signature_blob(cms_data: &[u8]) -> Vec<u8> {
     let total_len = 8 + cms_data.len() as u32;
     let mut buf = Vec::with_capacity(total_len as usize);
@@ -400,6 +475,15 @@ pub fn build_signature_blob(cms_data: &[u8]) -> Vec<u8> {
 /// # Returns
 ///
 /// A `Vec<u8>` containing an empty signature blob (8 bytes, header only).
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::superblob::build_adhoc_signature_blob;
+///
+/// let blob = build_adhoc_signature_blob();
+/// assert_eq!(blob.len(), 8);
+/// ```
 pub fn build_adhoc_signature_blob() -> Vec<u8> {
     let mut buf = Vec::with_capacity(8);
 
@@ -414,16 +498,21 @@ pub fn build_adhoc_signature_blob() -> Vec<u8> {
 /// This provides a more ergonomic API for building SuperBlobs
 /// with the standard components for iOS code signing.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```ignore
+/// ```
+/// use zsign::codesign::{SuperBlobBuilder, CodeDirectoryBuilder};
+///
+/// let code = vec![0u8; 4096];
+/// let cd_sha1 = CodeDirectoryBuilder::new("com.example", &code).build_sha1();
+/// let cd_sha256 = CodeDirectoryBuilder::new("com.example", &code).build_sha256();
+///
 /// let superblob = SuperBlobBuilder::new()
 ///     .code_directory_sha1(cd_sha1)
 ///     .code_directory_sha256(cd_sha256)
-///     .requirements(requirements)
-///     .entitlements(entitlements_plist)
-///     .cms_signature(cms_data)
 ///     .build();
+///
+/// assert!(!superblob.is_empty());
 /// ```
 #[derive(Debug, Default)]
 pub struct SuperBlobBuilder {

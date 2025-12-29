@@ -1,29 +1,47 @@
-//! CodeDirectory blob builder for Apple code signing
+//! CodeDirectory blob builder for Apple code signing.
 //!
-//! The CodeDirectory is the core data structure for iOS/macOS code signatures.
-//! It contains hashes of the code pages and special slots (Info.plist, entitlements, etc.)
+//! The [`CodeDirectoryBuilder`] is the core data structure for iOS/macOS code signatures.
+//! It contains hashes of the code pages and special slots (Info.plist, entitlements, etc.).
 //!
 //! This module implements dual hashing with both SHA-1 and SHA-256 for compatibility
 //! with all iOS versions (iOS 12+ requires SHA-256, but SHA-1 is kept for legacy support).
+//!
+//! # Special Slots
+//!
+//! Special slots are stored in reverse order with negative indices:
+//!
+//! | Slot | Index | Content |
+//! |------|-------|---------|
+//! | Info.plist | -1 | Hash of the app's Info.plist |
+//! | Requirements | -2 | Hash of the code requirements blob |
+//! | CodeResources | -3 | Hash of the CodeResources plist |
+//! | Application | -4 | Application-specific (unused) |
+//! | Entitlements | -5 | Hash of XML entitlements blob |
+//! | Rep-specific | -6 | Reserved (included when slot -7 is present) |
+//! | DER Entitlements | -7 | Hash of DER entitlements blob (executables only) |
+//!
+//! # Examples
+//!
+//! ```
+//! use zsign::codesign::CodeDirectoryBuilder;
+//!
+//! let code_data = vec![0u8; 8192]; // 2 pages of code
+//! let cd = CodeDirectoryBuilder::new("com.example.app", &code_data)
+//!     .team_id("TEAMID1234")
+//!     .build_sha256();
+//!
+//! assert!(!cd.is_empty());
+//! ```
 
 use super::constants::*;
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
-// Special slot indices (negative, stored in reverse order)
-// Slot -1: Info.plist
-// Slot -2: Requirements
-// Slot -3: CodeResources
-// Slot -4: Application-specific (unused)
-// Slot -5: XML Entitlements
-// Slot -6: Rep-specific (unused, but included when -7 is present)
-// Slot -7: DER Entitlements (only for executable binaries)
-
-/// CodeDirectory header size for version 0x20400 (with exec segment fields)
+/// CodeDirectory header size for version 0x20400 (with exec segment fields).
 const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 
-/// Builder for creating CodeDirectory blobs.
+/// Builder for creating [`CodeDirectory`](https://developer.apple.com/documentation/technotes/tn3126-inside-code-signing-code-requirements) blobs.
 ///
 /// The CodeDirectory contains:
 /// - Magic number and version
@@ -32,15 +50,20 @@ const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 /// - Bundle identifier and team ID
 /// - Exec segment information for iOS 12+
 ///
-/// # Example
+/// # Examples
 ///
-/// ```ignore
+/// ```
+/// use zsign::codesign::CodeDirectoryBuilder;
+/// use zsign::codesign::constants::CS_EXECSEG_MAIN_BINARY;
+///
 /// let code_data = vec![0u8; 8192]; // 2 pages of code
 /// let cd = CodeDirectoryBuilder::new("com.example.app", &code_data)
 ///     .team_id("TEAMID1234")
 ///     .exec_seg_limit(65536)
 ///     .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
 ///     .build_sha256();
+///
+/// assert!(!cd.is_empty());
 /// ```
 pub struct CodeDirectoryBuilder<'a> {
     /// Bundle identifier (e.g., "com.example.app")
@@ -401,7 +424,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
     }
 }
 
-/// Compute the CDHash (hash of the CodeDirectory blob).
+/// Compute the CDHash (hash of the [`CodeDirectoryBuilder`] blob) using SHA-1.
 ///
 /// The CDHash is used in CMS signatures to bind the signature to the code.
 pub fn compute_cdhash_sha1(code_directory: &[u8]) -> [u8; 20] {
@@ -410,7 +433,10 @@ pub fn compute_cdhash_sha1(code_directory: &[u8]) -> [u8; 20] {
     hasher.finalize().into()
 }
 
-/// Compute the CDHash (hash of the CodeDirectory blob) using SHA-256.
+/// Compute the CDHash (hash of the [`CodeDirectoryBuilder`] blob) using SHA-256.
+///
+/// The CDHash is used in CMS signatures to bind the signature to the code.
+/// SHA-256 CDHash is preferred for iOS 12+.
 pub fn compute_cdhash_sha256(code_directory: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(code_directory);

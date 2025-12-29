@@ -1,30 +1,48 @@
-//! DER (Distinguished Encoding Rules) encoder for plist entitlements
+//! DER (Distinguished Encoding Rules) encoder for plist entitlements.
 //!
 //! This module converts XML plist entitlements to DER format as required by
 //! iOS/macOS code signing for slot -7 (DER entitlements).
 //!
 //! The encoding uses the following ASN.1 DER tags:
-//! - 0x01: BOOLEAN
-//! - 0x02: INTEGER
-//! - 0x0c: UTF8String
-//! - 0x30: SEQUENCE (for arrays)
-//! - 0x31: SET (for dictionaries)
+//! - `0x01`: BOOLEAN
+//! - `0x02`: INTEGER
+//! - `0x0c`: UTF8String
+//! - `0x30`: SEQUENCE (for arrays)
+//! - `0x31`: SET (for dictionaries)
+//!
+//! # Examples
+//!
+//! ```
+//! use zsign::codesign::der::plist_to_der;
+//!
+//! let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+//! <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+//! <plist version="1.0">
+//! <dict>
+//!     <key>get-task-allow</key>
+//!     <true/>
+//! </dict>
+//! </plist>"#;
+//!
+//! let der = plist_to_der(xml).unwrap();
+//! assert!(!der.is_empty());
+//! ```
 
 use plist::Value;
 
-/// DER tag for BOOLEAN
+/// DER tag for BOOLEAN.
 const DER_TAG_BOOLEAN: u8 = 0x01;
 
-/// DER tag for INTEGER
+/// DER tag for INTEGER.
 const DER_TAG_INTEGER: u8 = 0x02;
 
-/// DER tag for UTF8String
+/// DER tag for UTF8String.
 const DER_TAG_UTF8STRING: u8 = 0x0c;
 
-/// DER tag for SEQUENCE (used for arrays)
+/// DER tag for SEQUENCE (used for arrays).
 const DER_TAG_SEQUENCE: u8 = 0x30;
 
-/// DER tag for SET (used for dictionaries)
+/// DER tag for SET (used for dictionaries).
 const DER_TAG_SET: u8 = 0x31;
 
 /// Encode a length value in DER format.
@@ -174,7 +192,31 @@ fn encode_value(value: &Value) -> Vec<u8> {
 ///
 /// # Returns
 ///
-/// The DER-encoded entitlements data, or None if parsing/encoding fails.
+/// The DER-encoded entitlements data, or `None` if parsing/encoding fails.
+///
+/// # Errors
+///
+/// Returns `None` if:
+/// - The XML plist cannot be parsed
+/// - The resulting DER encoding is empty
+///
+/// # Examples
+///
+/// ```
+/// use zsign::codesign::der::plist_to_der;
+///
+/// let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+/// <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+/// <plist version="1.0">
+/// <dict>
+///     <key>get-task-allow</key>
+///     <true/>
+/// </dict>
+/// </plist>"#;
+///
+/// let der = plist_to_der(xml);
+/// assert!(der.is_some());
+/// ```
 pub fn plist_to_der(plist_xml: &[u8]) -> Option<Vec<u8>> {
     // Parse the plist
     let value: Value = plist::from_bytes(plist_xml).ok()?;

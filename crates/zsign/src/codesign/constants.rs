@@ -1,7 +1,29 @@
-//! Apple code signing constants and magic numbers
+//! Apple code signing constants and magic numbers.
 //!
 //! These constants define the binary format for Apple code signatures,
-//! including SuperBlob structures, CodeDirectory formats, and hash types.
+//! including [`SuperBlob`](super::SuperBlobBuilder) structures, CodeDirectory formats, and hash types.
+//!
+//! # Magic Numbers
+//!
+//! All Apple code signature blobs start with a 4-byte magic number in big-endian format.
+//! The magic numbers all begin with `0xfade`:
+//!
+//! - [`CSMAGIC_EMBEDDED_SIGNATURE`] (`0xfade0cc0`): SuperBlob container
+//! - [`CSMAGIC_CODEDIRECTORY`] (`0xfade0c02`): CodeDirectory blob
+//! - [`CSMAGIC_REQUIREMENTS`] (`0xfade0c01`): Requirements blob
+//! - [`CSMAGIC_EMBEDDED_ENTITLEMENTS`] (`0xfade7171`): XML entitlements
+//! - [`CSMAGIC_EMBEDDED_DER_ENTITLEMENTS`] (`0xfade7172`): DER entitlements
+//!
+//! # Slot Types
+//!
+//! Slot types identify components within a SuperBlob:
+//!
+//! - [`CSSLOT_CODEDIRECTORY`] (`0x0000`): Primary SHA-1 CodeDirectory
+//! - [`CSSLOT_REQUIREMENTS`] (`0x0002`): Code requirements
+//! - [`CSSLOT_ENTITLEMENTS`] (`0x0005`): XML entitlements
+//! - [`CSSLOT_DER_ENTITLEMENTS`] (`0x0007`): DER entitlements
+//! - [`CSSLOT_ALTERNATE_CODEDIRECTORIES`] (`0x1000`): SHA-256 CodeDirectory
+//! - [`CSSLOT_SIGNATURESLOT`] (`0x10000`): CMS signature
 
 // =============================================================================
 // SuperBlob Magic Numbers
