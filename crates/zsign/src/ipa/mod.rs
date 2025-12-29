@@ -1,6 +1,54 @@
-//! IPA handling module.
+//! IPA file handling for iOS app signing.
 //!
-//! Provides functionality for extracting, signing, and repacking IPA files.
+//! This module provides functionality for working with IPA (iOS App Store Package) files:
+//!
+//! - **Extraction**: Unpacking IPA archives via [`extract_ipa`] and validation with [`validate_ipa`]
+//! - **Signing**: Signing all Mach-O binaries with [`IpaSigner`]
+//! - **Archiving**: Repacking signed bundles via [`create_ipa`] with configurable [`CompressionLevel`]
+//!
+//! # IPA Structure
+//!
+//! An IPA file is a ZIP archive containing:
+//! ```text
+//! Payload/
+//!   └── AppName.app/
+//!       ├── Info.plist
+//!       ├── AppName (main executable)
+//!       ├── embedded.mobileprovision
+//!       ├── _CodeSignature/
+//!       │   └── CodeResources
+//!       └── Frameworks/
+//!           └── *.framework/
+//! ```
+//!
+//! # Examples
+//!
+//! ## Complete signing workflow
+//!
+//! ```no_run
+//! use zsign::ipa::IpaSigner;
+//! use zsign::crypto::SigningCredentials;
+//!
+//! let credentials = SigningCredentials::from_p12("cert.p12", "password")?;
+//! let signer = IpaSigner::new(&credentials)
+//!     .provisioning_profile("profile.mobileprovision");
+//!
+//! signer.sign("input.ipa", "output.ipa")?;
+//! # Ok::<(), zsign::Error>(())
+//! ```
+//!
+//! ## Manual extraction and repacking
+//!
+//! ```no_run
+//! use zsign::ipa::{extract_ipa, create_ipa, CompressionLevel};
+//!
+//! // Extract IPA to inspect or modify contents
+//! let app_bundle = extract_ipa("input.ipa", "output_dir")?;
+//!
+//! // Repack into a new IPA with maximum compression
+//! create_ipa(&app_bundle, "output.ipa", CompressionLevel::MAX)?;
+//! # Ok::<(), zsign::Error>(())
+//! ```
 
 pub mod archive;
 pub mod extract;
@@ -17,10 +65,43 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-/// IPA signing workflow.
+/// High-level IPA signing workflow.
 ///
-/// This struct provides a high-level interface for signing IPA files,
-/// handling the complete workflow of extraction, bundle signing, and repacking.
+/// Provides a builder-style interface for signing IPA files, handling
+/// extraction, bundle signing, and repacking automatically.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign::ipa::IpaSigner;
+/// use zsign::crypto::SigningCredentials;
+///
+/// let credentials = SigningCredentials::from_p12("cert.p12", "password")?;
+///
+/// // Basic signing
+/// IpaSigner::new(&credentials)
+///     .sign("input.ipa", "output.ipa")?;
+///
+/// // With provisioning profile and custom compression
+/// use zsign::ipa::CompressionLevel;
+/// IpaSigner::new(&credentials)
+///     .provisioning_profile("dev.mobileprovision")
+///     .compression_level(CompressionLevel::MAX)
+///     .sign("input.ipa", "output.ipa")?;
+/// # Ok::<(), zsign::Error>(())
+/// ```
+///
+/// # Workflow
+///
+/// The signing process involves these steps:
+/// 1. Extract IPA via [`extract_ipa`]
+/// 2. Sign all Mach-O binaries in the `.app` bundle
+/// 3. Embed provisioning profile (if provided)
+/// 4. Generate `_CodeSignature/CodeResources`
+/// 5. Repack via [`create_ipa`]
+///
+/// For manual control over extraction/repacking, use [`extract_ipa`] and
+/// [`create_ipa`] directly.
 pub struct IpaSigner<'a> {
     /// Reference to signing credentials
     credentials: &'a SigningCredentials,
@@ -33,7 +114,11 @@ pub struct IpaSigner<'a> {
 }
 
 impl<'a> IpaSigner<'a> {
-    /// Create a new IPA signer with the given signing credentials.
+    /// Creates a new IPA signer with the given signing credentials.
+    ///
+    /// Uses [`CompressionLevel::DEFAULT`] for output compression.
+    /// Configure with [`Self::compression_level`] and [`Self::provisioning_profile`]
+    /// before calling [`Self::sign`].
     pub fn new(credentials: &'a SigningCredentials) -> Self {
         Self {
             credentials,
@@ -43,17 +128,24 @@ impl<'a> IpaSigner<'a> {
         }
     }
 
-    /// Set the compression level for the output IPA.
+    /// Sets the compression level for the output IPA.
+    ///
+    /// See [`CompressionLevel`] for available options.
     pub fn compression_level(mut self, level: CompressionLevel) -> Self {
         self.compression_level = level;
         self
     }
 
-    /// Set the provisioning profile path to embed as embedded.mobileprovision.
+    /// Sets the provisioning profile to embed as `embedded.mobileprovision`.
     ///
     /// iOS apps require a provisioning profile to launch on device.
-    /// This copies the profile to the bundle as `embedded.mobileprovision`
-    /// and extracts entitlements from the profile for signing.
+    /// This copies the profile to the bundle and extracts entitlements
+    /// from the profile for code signing.
+    ///
+    /// # Errors
+    ///
+    /// Silently ignores errors reading the profile file; entitlements will
+    /// be `None` if the profile cannot be read or parsed.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         self.provisioning_profile_path = Some(path.to_path_buf());
@@ -67,15 +159,15 @@ impl<'a> IpaSigner<'a> {
         self
     }
 
-    /// Sign an IPA file.
+    /// Signs an IPA file.
     ///
     /// This performs the complete signing workflow:
-    /// 1. Extract IPA to a temporary directory
-    /// 2. Find the .app bundle in Payload/
+    /// 1. Extract IPA to a temporary directory via [`extract_ipa`]
+    /// 2. Find the `.app` bundle in `Payload/`
     /// 3. Sign all Mach-O binaries in-place
-    /// 4. Copy provisioning profile to bundle
-    /// 5. Generate CodeResources (hashes include signed binaries and profile)
-    /// 6. Repack into a new IPA
+    /// 4. Copy provisioning profile to bundle (if set via [`Self::provisioning_profile`])
+    /// 5. Generate `CodeResources` (hashes include signed binaries and profile)
+    /// 6. Repack into a new IPA via [`create_ipa`]
     ///
     /// # Arguments
     ///
@@ -84,7 +176,9 @@ impl<'a> IpaSigner<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if any step of the signing workflow fails.
+    /// Returns [`Error::Io`] if files cannot be read or written.
+    /// Returns [`Error::Zip`] if the IPA archive is invalid.
+    /// Returns [`Error::Signing`] if code signing fails.
     pub fn sign(&self, input_ipa: impl AsRef<Path>, output_ipa: impl AsRef<Path>) -> Result<()> {
         let input_ipa = input_ipa.as_ref();
         let output_ipa = output_ipa.as_ref();

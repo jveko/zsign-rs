@@ -1,6 +1,25 @@
-//! IPA archiving functionality.
+//! IPA archive creation.
 //!
-//! Creates IPA archives from signed .app bundles with proper compression.
+//! Creates IPA (ZIP) archives from `.app` bundles with the standard `Payload/` structure.
+//!
+//! For the reverse operation, see the [`extract`](super::extract) module.
+//!
+//! # Features
+//!
+//! - Configurable compression via [`CompressionLevel`]
+//! - Preserves Unix file permissions and symlinks
+//! - Creates proper directory structure for iOS deployment
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use zsign::ipa::{create_ipa, CompressionLevel};
+//! use std::path::Path;
+//!
+//! let app_bundle = Path::new("Payload/MyApp.app");
+//! create_ipa(app_bundle, "output.ipa", CompressionLevel::DEFAULT)?;
+//! # Ok::<(), zsign::Error>(())
+//! ```
 
 use crate::{Error, Result};
 use std::fs::{self, File};
@@ -10,28 +29,58 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-/// Compression level for IPA creation.
+/// ZIP compression level for IPA creation.
+///
+/// Controls the trade-off between compression speed and output file size.
+/// Use the provided constants for common use cases, or [`CompressionLevel::new`]
+/// for custom levels.
+///
+/// # Examples
+///
+/// ```
+/// use zsign::ipa::CompressionLevel;
+///
+/// // Use predefined levels
+/// let fast = CompressionLevel::NONE;      // No compression
+/// let balanced = CompressionLevel::DEFAULT; // Level 6
+/// let small = CompressionLevel::MAX;      // Maximum compression
+///
+/// // Or create a custom level (clamped to 0-9)
+/// let custom = CompressionLevel::new(3);
+/// assert_eq!(custom.level(), 3);
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct CompressionLevel(u32);
 
 impl CompressionLevel {
-    /// No compression (fastest, largest file size).
+    /// No compression (level 0).
+    ///
+    /// Fastest creation, largest file size. Useful when the IPA will be
+    /// recompressed or when speed is critical.
     pub const NONE: CompressionLevel = CompressionLevel(0);
 
-    /// Default compression (balanced speed and size).
+    /// Default compression (level 6).
+    ///
+    /// Balanced trade-off between compression speed and output size.
+    /// Recommended for most use cases.
     pub const DEFAULT: CompressionLevel = CompressionLevel(6);
 
-    /// Maximum compression (slowest, smallest file size).
+    /// Maximum compression (level 9).
+    ///
+    /// Smallest file size, slowest creation. Use when minimizing
+    /// file size is important.
     pub const MAX: CompressionLevel = CompressionLevel(9);
 
-    /// Create a compression level from 0-9.
+    /// Creates a compression level from 0-9.
     ///
-    /// Values are clamped to the valid range.
+    /// Values greater than 9 are clamped to 9.
+    #[must_use]
     pub fn new(level: u32) -> Self {
         CompressionLevel(level.min(9))
     }
 
-    /// Get the compression level value.
+    /// Returns the compression level value (0-9).
+    #[must_use]
     pub fn level(&self) -> u32 {
         self.0
     }
@@ -49,23 +98,40 @@ impl From<u32> for CompressionLevel {
     }
 }
 
-/// Create an IPA file from a signed .app bundle.
+/// Creates an IPA file from a signed `.app` bundle.
 ///
-/// The app bundle is placed inside a Payload/ directory in the archive,
-/// which is the standard IPA structure.
+/// The app bundle is placed inside a `Payload/` directory in the archive,
+/// following the standard IPA structure expected by iOS.
+///
+/// For the reverse operation, see [`extract_ipa`](super::extract_ipa).
 ///
 /// # Arguments
 ///
-/// * `app_bundle_path` - Path to the .app bundle directory
+/// * `app_bundle_path` - Path to the `.app` bundle directory
 /// * `output_path` - Path for the output IPA file
-/// * `compression_level` - ZIP compression level (0-9)
+/// * `compression_level` - ZIP compression level (see [`CompressionLevel`])
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign::ipa::{create_ipa, CompressionLevel};
+///
+/// // Create with default compression
+/// create_ipa("MyApp.app", "output.ipa", CompressionLevel::DEFAULT)?;
+///
+/// // Create with no compression for faster processing
+/// create_ipa("MyApp.app", "fast.ipa", CompressionLevel::NONE)?;
+/// # Ok::<(), zsign::Error>(())
+/// ```
 ///
 /// # Errors
 ///
-/// Returns an error if:
+/// Returns [`Error::Io`] if:
 /// - The app bundle doesn't exist or is not a directory
-/// - Output file cannot be created
-/// - Any file cannot be read or written
+/// - The output file cannot be created
+/// - Any file cannot be read during archiving
+///
+/// Returns [`Error::Zip`] if the ZIP archive cannot be written.
 pub fn create_ipa(
     app_bundle_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,

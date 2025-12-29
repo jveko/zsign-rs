@@ -1,6 +1,28 @@
-//! IPA extraction functionality.
+//! IPA archive extraction.
 //!
-//! Extracts IPA archives to temporary directories and locates the .app bundle.
+//! Extracts IPA (ZIP) archives and locates the `.app` bundle inside `Payload/`.
+//!
+//! For the reverse operation, see the [`archive`](super::archive) module.
+//!
+//! # Features
+//!
+//! - Memory-mapped file access for performance
+//! - Parallel file extraction using rayon
+//! - Preserves Unix symlinks and file permissions
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use zsign::ipa::{extract_ipa, validate_ipa};
+//!
+//! // Validate before extracting
+//! validate_ipa("app.ipa")?;
+//!
+//! // Extract and get the path to the .app bundle
+//! let app_bundle = extract_ipa("app.ipa", "output_dir")?;
+//! println!("Extracted to: {}", app_bundle.display());
+//! # Ok::<(), zsign::Error>(())
+//! ```
 
 use crate::{Error, Result};
 use memmap2::Mmap;
@@ -12,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zip::ZipArchive;
 
-/// Entry metadata for parallel extraction
+/// Metadata for a ZIP entry during parallel extraction.
 struct ExtractEntry {
     index: usize,
     outpath: PathBuf,
@@ -22,10 +44,12 @@ struct ExtractEntry {
     unix_mode: Option<u32>,
 }
 
-/// Extract an IPA file to a destination directory.
+/// Extracts an IPA file to a destination directory.
 ///
-/// IPA files are ZIP archives containing a Payload/ directory with the .app bundle.
-/// This function extracts all contents and returns the path to the .app bundle.
+/// IPA files are ZIP archives containing a `Payload/` directory with the `.app` bundle.
+/// This function extracts all contents and returns the path to the `.app` bundle.
+///
+/// For the reverse operation, see [`create_ipa`](super::create_ipa).
 ///
 /// # Arguments
 ///
@@ -34,15 +58,27 @@ struct ExtractEntry {
 ///
 /// # Returns
 ///
-/// Returns the path to the extracted .app bundle inside Payload/.
+/// Returns the path to the extracted `.app` bundle inside `Payload/`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign::ipa::extract_ipa;
+///
+/// let app_bundle = extract_ipa("MyApp.ipa", "extracted")?;
+/// assert!(app_bundle.join("Info.plist").exists());
+/// # Ok::<(), zsign::Error>(())
+/// ```
 ///
 /// # Errors
 ///
-/// Returns an error if:
+/// Returns [`Error::Io`] if:
 /// - The IPA file cannot be opened or read
-/// - The IPA is not a valid ZIP archive
-/// - No .app bundle is found in Payload/
 /// - Extraction fails due to I/O errors
+///
+/// Returns [`Error::Zip`] if:
+/// - The IPA is not a valid ZIP archive
+/// - No `.app` bundle is found in `Payload/`
 pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
     let ipa_path = ipa_path.as_ref();
     let dest_dir = dest_dir.as_ref();
@@ -171,9 +207,9 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
     find_app_bundle(dest_dir)
 }
 
-/// Find the .app bundle inside a Payload/ directory.
+/// Finds the `.app` bundle inside a `Payload/` directory.
 ///
-/// Searches for a directory with .app extension in the Payload/ subdirectory.
+/// Searches for a directory with `.app` extension in the `Payload/` subdirectory.
 fn find_app_bundle(dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
     let payload_dir = dest_dir.as_ref().join("Payload");
 
@@ -202,9 +238,25 @@ fn find_app_bundle(dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
     )))
 }
 
-/// Validate that a path is a valid IPA file.
+/// Validates that a path is a valid IPA file.
 ///
-/// Checks that the file exists and has a ZIP signature.
+/// Performs a quick check that the file exists and has a ZIP signature.
+/// Use before [`extract_ipa`] to fail fast on invalid files.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign::ipa::validate_ipa;
+///
+/// validate_ipa("app.ipa")?;
+/// println!("IPA is valid");
+/// # Ok::<(), zsign::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the file doesn't exist or cannot be read.
+/// Returns [`Error::Zip`] if the file is not a valid ZIP archive.
 pub fn validate_ipa(ipa_path: impl AsRef<Path>) -> Result<()> {
     let ipa_path = ipa_path.as_ref();
 
