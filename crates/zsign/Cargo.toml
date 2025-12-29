@@ -1,10 +1,10 @@
 [package]
-name = "zsign"
+name = "zsign-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["jveko"]
 description = "Cross-platform iOS code signing library - Rust port of zsign"
-documentation = "https://docs.rs/zsign"
+documentation = "https://docs.rs/zsign-rs"
 readme = "../../README.md"
 homepage = "https://github.com/jveko/zsign-rs"
 repository = "https://github.com/jveko/zsign-rs"

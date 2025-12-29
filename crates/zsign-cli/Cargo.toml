@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-zsign = { path = "../zsign", default-features = true }
+zsign-rs = { path = "../zsign", default-features = true }
 clap = { version = "4.5", features = ["derive"] }

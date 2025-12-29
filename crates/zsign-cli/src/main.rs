@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use zsign::{SigningCredentials, ZSign};
+use zsign_rs::{SigningCredentials, ZSign};
 
 #[derive(Parser)]
 #[command(name = "zsign")]
