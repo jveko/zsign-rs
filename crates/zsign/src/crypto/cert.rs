@@ -1,6 +1,6 @@
-//! Pure Rust certificate and key handling
+//! Certificate and key handling
 //!
-//! Replaces OpenSSL X509/PKey with pure Rust equivalents using x509-certificate and p12 crates.
+//! Provides signing credentials loading from PEM and PKCS#12 files.
 
 use crate::{Error, Result};
 use p256::ecdsa::SigningKey as EcdsaSigningKey;
@@ -8,13 +8,14 @@ use rsa::RsaPrivateKey;
 use x509_certificate::X509Certificate;
 
 /// Signing key that can be either RSA or ECDSA
+#[allow(clippy::large_enum_variant)]
 pub enum SigningKeyType {
     Rsa(RsaPrivateKey),
     Ecdsa(EcdsaSigningKey),
 }
 
-/// Pure Rust signing credentials
-pub struct PureRustCredentials {
+/// Signing credentials (certificate, private key, certificate chain)
+pub struct SigningCredentials {
     /// X.509 certificate
     pub certificate: X509Certificate,
     /// Signing key
@@ -25,7 +26,7 @@ pub struct PureRustCredentials {
     pub team_id: Option<String>,
 }
 
-impl PureRustCredentials {
+impl SigningCredentials {
     /// Load from PEM-encoded certificate and private key
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8], password: Option<&str>) -> Result<Self> {
         use pkcs8::DecodePrivateKey;
@@ -38,18 +39,16 @@ impl PureRustCredentials {
 
         let signing_key = if let Some(_pass) = password {
             return Err(Error::Certificate(
-                "Encrypted PEM keys are not yet supported in pure Rust mode. Use unencrypted keys or PKCS#12.".into(),
+                "Encrypted PEM keys are not yet supported. Use unencrypted keys or PKCS#12.".into(),
             ));
+        } else if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_pem(key_str) {
+            SigningKeyType::Rsa(rsa_key)
+        } else if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_pem(key_str) {
+            SigningKeyType::Ecdsa(ecdsa_key)
         } else {
-            if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_pem(key_str) {
-                SigningKeyType::Rsa(rsa_key)
-            } else if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_pem(key_str) {
-                SigningKeyType::Ecdsa(ecdsa_key)
-            } else {
-                return Err(Error::Certificate(
-                    "Failed to parse private key as RSA or ECDSA".into(),
-                ));
-            }
+            return Err(Error::Certificate(
+                "Failed to parse private key as RSA or ECDSA".into(),
+            ));
         };
 
         let team_id = extract_team_id(&certificate);
@@ -145,8 +144,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_rust_credentials_struct_exists() {
-        fn check_field_types(_creds: &PureRustCredentials) {
+    fn test_signing_credentials_struct_exists() {
+        fn check_field_types(_creds: &SigningCredentials) {
             let _cert: &X509Certificate = &_creds.certificate;
             let _key: &SigningKeyType = &_creds.signing_key;
             let _chain: &Vec<X509Certificate> = &_creds.cert_chain;
@@ -157,13 +156,13 @@ mod tests {
 
     #[test]
     fn test_from_pem_invalid_cert() {
-        let result = PureRustCredentials::from_pem(b"not a cert", b"not a key", None);
+        let result = SigningCredentials::from_pem(b"not a cert", b"not a key", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_from_p12_invalid_data() {
-        let result = PureRustCredentials::from_p12(b"not valid p12 data", "password");
+        let result = SigningCredentials::from_p12(b"not valid p12 data", "password");
         assert!(result.is_err());
     }
 
