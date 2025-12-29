@@ -1,6 +1,30 @@
-//! CMS signing with Apple CDHash attributes
+//! CMS (Cryptographic Message Syntax) signature generation.
 //!
-//! Uses cryptographic-message-syntax crate for CMS signature generation.
+//! This module generates PKCS#7/CMS signatures with Apple-specific CDHash
+//! (Code Directory Hash) attributes required for iOS code signing. These
+//! signatures are embedded in the `LC_CODE_SIGNATURE` Mach-O load command.
+//!
+//! # CDHash Attributes
+//!
+//! Apple code signatures include two proprietary signed attributes:
+//!
+//! - **CDHash v1** ([`APPLE_CDHASH_OID`]): XML plist containing SHA-1 and SHA-256 hashes
+//! - **CDHash v2** ([`APPLE_CDHASH_V2_OID`]): DER-encoded ASN.1 sequence with hash algorithm and value
+//!
+//! # Examples
+//!
+//! ```ignore
+//! use zsign::crypto::cms::sign_with_apple_attrs;
+//!
+//! let signature = sign_with_apple_attrs(
+//!     &code_directory_der,
+//!     &signing_key,
+//!     &signing_cert,
+//!     &cert_chain,
+//!     &cdhash_sha1,
+//!     &cdhash_sha256,
+//! )?;
+//! ```
 
 use crate::{Error, Result};
 use bcder::{encode::Values, Captured, Mode, OctetString, Oid};
@@ -10,31 +34,88 @@ use x509_certificate::{
     CapturedX509Certificate, KeyInfoSigner,
 };
 
-/// Apple CDHash v1 OID: 1.2.840.113635.100.9.1
-/// Contains plist with SHA-1 and SHA-256 hashes
+/// Apple CDHash v1 attribute OID: `1.2.840.113635.100.9.1`
+///
+/// This OID identifies the first generation of Apple's CDHash signed attribute.
+/// The attribute value is an XML plist containing a `cdhashes` array with
+/// SHA-1 and truncated SHA-256 (20 bytes) hash values.
+///
+/// # ASN.1 Encoding
+///
+/// ```text
+/// OBJECT IDENTIFIER ::= { iso(1) member-body(2) us(840) apple(113635)
+///                         appleDataSecurity(100) codeSign(9) cdhash(1) }
+/// ```
+///
+/// # Wire Format
+///
+/// The raw bytes represent the OID in DER encoding (without tag and length).
 pub const APPLE_CDHASH_OID: &[u8] = &[
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x09, 0x01,
 ];
 
-/// Apple CDHash v2 OID: 1.2.840.113635.100.9.2
-/// Contains SEQUENCE { OID sha256, OCTET STRING hash }
+/// Apple CDHash v2 attribute OID: `1.2.840.113635.100.9.2`
+///
+/// This OID identifies the second generation of Apple's CDHash signed attribute.
+/// The attribute value is a DER-encoded ASN.1 SEQUENCE containing the hash
+/// algorithm OID and the full hash value (not truncated).
+///
+/// # ASN.1 Encoding
+///
+/// ```text
+/// OBJECT IDENTIFIER ::= { iso(1) member-body(2) us(840) apple(113635)
+///                         appleDataSecurity(100) codeSign(9) cdhash2(2) }
+/// ```
+///
+/// # Wire Format
+///
+/// The raw bytes represent the OID in DER encoding (without tag and length).
 pub const APPLE_CDHASH_V2_OID: &[u8] = &[
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x09, 0x02,
 ];
 
-/// SHA-256 OID: 2.16.840.1.101.3.4.2.1
+/// SHA-256 algorithm OID: `2.16.840.1.101.3.4.2.1`
+///
+/// Standard OID identifying the SHA-256 hash algorithm, used in CDHash v2
+/// attributes to specify the hash algorithm.
 const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 
-/// Generate CMS signature with Apple CDHash attributes
+/// Generates a CMS signature with Apple CDHash attributes.
+///
+/// Creates a PKCS#7/CMS signed data structure containing the CodeDirectory
+/// signature with Apple-specific CDHash v1 and v2 signed attributes.
 ///
 /// # Arguments
 ///
-/// * `data` - The CodeDirectory data to sign
-/// * `signing_key` - The private key implementing KeyInfoSigner trait
-/// * `signing_cert` - The signing certificate as CapturedX509Certificate
-/// * `cert_chain` - Certificate chain (intermediate CAs)
-/// * `cdhash_sha1` - SHA-1 CDHash for Apple attribute
-/// * `cdhash_sha256` - SHA-256 CDHash for Apple attribute
+/// * `data` - The CodeDirectory DER bytes to sign
+/// * `signing_key` - Private key implementing [`KeyInfoSigner`]
+/// * `signing_cert` - X.509 certificate corresponding to the signing key
+/// * `cert_chain` - Intermediate CA certificates for chain verification
+/// * `cdhash_sha1` - 20-byte SHA-1 hash of the CodeDirectory
+/// * `cdhash_sha256` - 32-byte SHA-256 hash of the CodeDirectory
+///
+/// # Returns
+///
+/// DER-encoded CMS SignedData structure ready for embedding in the binary.
+///
+/// # Errors
+///
+/// Returns [`Error::Signing`] if CMS signature construction fails.
+///
+/// # Examples
+///
+/// ```ignore
+/// use zsign::crypto::cms::sign_with_apple_attrs;
+///
+/// let cms_signature = sign_with_apple_attrs(
+///     &code_directory_bytes,
+///     &signing_key,
+///     &signing_cert,
+///     &intermediate_certs,
+///     &sha1_hash,
+///     &sha256_hash,
+/// )?;
+/// ```
 pub fn sign_with_apple_attrs<K: KeyInfoSigner>(
     data: &[u8],
     signing_key: &K,
@@ -76,11 +157,20 @@ pub fn sign_with_apple_attrs<K: KeyInfoSigner>(
     Ok(der)
 }
 
-/// Build CDHash plist for Apple attribute
+/// Builds the CDHash v1 plist for the Apple signed attribute.
 ///
-/// Creates an XML plist with a "cdhashes" array containing SHA-1 and SHA-256 CDHashes.
-/// Both hashes are 20 bytes (SHA-256 is truncated to match SHA-1 length).
-/// This is used for the Apple CDHash v1 attribute (OID 1.2.840.113635.100.9.1).
+/// Creates an XML plist with a `cdhashes` array containing SHA-1 and SHA-256
+/// hashes. The SHA-256 hash is truncated to 20 bytes to match SHA-1 length,
+/// as required by the Apple CDHash v1 format.
+///
+/// # Arguments
+///
+/// * `sha1` - 20-byte SHA-1 hash of the CodeDirectory
+/// * `sha256` - 32-byte SHA-256 hash of the CodeDirectory (will be truncated)
+///
+/// # Returns
+///
+/// UTF-8 encoded XML plist bytes with trailing newline.
 pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
     use plist::{Dictionary, Value};
 
@@ -99,13 +189,19 @@ pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
     buf
 }
 
-/// Build the CDHash v2 attribute value.
+/// Builds the CDHash v2 attribute value as DER-encoded ASN.1.
 ///
-/// This creates a DER-encoded SEQUENCE containing:
-/// - OBJECT IDENTIFIER for SHA-256 (2.16.840.1.101.3.4.2.1)
-/// - OCTET STRING containing the 32-byte SHA-256 CDHash
+/// Returns a SEQUENCE containing the SHA-256 algorithm OID and the full
+/// 32-byte hash value.
 ///
-/// Format: SEQUENCE { OBJECT sha256, OCTET STRING hash }
+/// # ASN.1 Structure
+///
+/// ```text
+/// CDHashV2 ::= SEQUENCE {
+///     algorithm  OBJECT IDENTIFIER,
+///     hash       OCTET STRING
+/// }
+/// ```
 fn build_cdhash_v2_attribute(cdhash_sha256: &[u8; 32]) -> Vec<u8> {
     let mut oid = Vec::new();
     oid.push(0x06);
@@ -128,6 +224,7 @@ fn build_cdhash_v2_attribute(cdhash_sha256: &[u8; 32]) -> Vec<u8> {
     result
 }
 
+/// Wrapper for encoding raw bytes as ASN.1 DER values.
 struct CdHashV2Encoder<'a>(&'a [u8]);
 
 impl<'a> Values for CdHashV2Encoder<'a> {

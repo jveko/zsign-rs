@@ -1,7 +1,44 @@
-//! Apple CA certificates for CMS signature chain
+//! Embedded Apple CA certificates for CMS signature chain verification.
+//!
+//! This module contains the Apple Root CA and Apple Worldwide Developer Relations
+//! (WWDR) intermediate CA certificates. These certificates are required to build
+//! valid signature chains for iOS code signing.
+//!
+//! # Certificate Hierarchy
+//!
+//! ```text
+//! Apple Root CA
+//! └── Apple WWDR CA (legacy) or Apple WWDR CA G3
+//!     └── Developer Signing Certificate
+//! ```
+//!
+//! # Usage
+//!
+//! These certificates are embedded at compile time and used internally by the
+//! signing verification process. They can also be used to build certificate
+//! chains for CMS signature generation.
+//!
+//! # Examples
+//!
+//! ```
+//! use zsign::crypto::assets::APPLE_ROOT_CA_CERT;
+//! use x509_certificate::X509Certificate;
+//!
+//! let cert = X509Certificate::from_pem(APPLE_ROOT_CA_CERT.as_bytes())
+//!     .expect("embedded certificate should be valid");
+//! ```
 
-/// Apple Worldwide Developer Relations Certification Authority (original, expires 2023)
-/// Issuer name hash: 0x817d2f7a
+/// Apple Worldwide Developer Relations CA (legacy).
+///
+/// This is the legacy WWDR intermediate CA certificate used for older
+/// iOS development certificates. New certificates should use the G3 variant.
+///
+/// # Certificate Details
+///
+/// - **Subject**: Apple Worldwide Developer Relations Certification Authority
+/// - **Issuer**: Apple Root CA
+/// - **Valid**: 2013-02-07 to 2023-02-07
+/// - **Issuer Name Hash**: `0x817d2f7a` (see [`APPLE_WWDR_ISSUER_HASH`])
 pub const APPLE_WWDR_CA_CERT: &str = "\
 -----BEGIN CERTIFICATE-----
 MIIEIjCCAwqgAwIBAgIIAd68xDltoBAwDQYJKoZIhvcNAQEFBQAwYjELMAkGA1UE
@@ -30,8 +67,17 @@ tGwPDBUf
 -----END CERTIFICATE-----
 ";
 
-/// Apple Worldwide Developer Relations Certification Authority G3 (expires 2030)
-/// Issuer name hash: 0x9b16b75c
+/// Apple Worldwide Developer Relations CA G3.
+///
+/// This is the current WWDR intermediate CA certificate (Generation 3) used
+/// for modern iOS development certificates issued after 2020.
+///
+/// # Certificate Details
+///
+/// - **Subject**: Apple Worldwide Developer Relations Certification Authority, G3
+/// - **Issuer**: Apple Root CA
+/// - **Valid**: 2020-02-19 to 2030-02-20
+/// - **Issuer Name Hash**: `0x9b16b75c` (see [`APPLE_WWDR_G3_ISSUER_HASH`])
 pub const APPLE_WWDR_CA_G3_CERT: &str = "\
 -----BEGIN CERTIFICATE-----
 MIIEUTCCAzmgAwIBAgIQfK9pCiW3Of57m0R6wXjF7jANBgkqhkiG9w0BAQsFADBi
@@ -61,8 +107,21 @@ UDSdlTs=
 -----END CERTIFICATE-----
 ";
 
-/// Apple Root CA (expires 2035)
-/// This is the root of the Apple certificate hierarchy
+/// Apple Root CA certificate.
+///
+/// This is the root of the Apple certificate hierarchy. All valid Apple code
+/// signing certificate chains must terminate at this root CA.
+///
+/// # Certificate Details
+///
+/// - **Subject**: Apple Root CA
+/// - **Issuer**: Apple Root CA (self-signed)
+/// - **Valid**: 2006-04-25 to 2035-02-09
+///
+/// # Usage
+///
+/// Used during signature verification to validate that the signing certificate
+/// chain is anchored to a trusted Apple root.
 pub const APPLE_ROOT_CA_CERT: &str = "\
 -----BEGIN CERTIFICATE-----
 MIIEuzCCA6OgAwIBAgIBAjANBgkqhkiG9w0BAQUFADBiMQswCQYDVQQGEwJVUzET
@@ -94,8 +153,18 @@ UKqK1drk/NAJBzewdXUh
 -----END CERTIFICATE-----
 ";
 
-/// Issuer name hash for the original Apple WWDR CA
+/// Issuer name hash for Apple WWDR CA (legacy).
+///
+/// This 32-bit hash identifies the legacy Apple WWDR CA certificate issuer.
+/// Used for certificate chain matching during signature verification.
+///
+/// Corresponds to [`APPLE_WWDR_CA_CERT`].
 pub const APPLE_WWDR_ISSUER_HASH: u32 = 0x817d2f7a;
 
-/// Issuer name hash for the Apple WWDR CA G3
+/// Issuer name hash for Apple WWDR CA G3.
+///
+/// This 32-bit hash identifies the Apple WWDR CA G3 certificate issuer.
+/// Used for certificate chain matching during signature verification.
+///
+/// Corresponds to [`APPLE_WWDR_CA_G3_CERT`].
 pub const APPLE_WWDR_G3_ISSUER_HASH: u32 = 0x9b16b75c;
