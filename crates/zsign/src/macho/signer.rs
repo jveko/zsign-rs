@@ -1,69 +1,40 @@
 //! Mach-O signing implementation
 //!
-//! This module provides the core signing functionality for Mach-O binaries,
-//! building CodeDirectory structures with page hashes and assembling them
-//! into a SuperBlob with all required signature components.
-//!
-//! ## Signing Flow
-//!
-//! The signing process uses a two-pass approach to ensure page hashes are correct:
-//!
-//! 1. **Pass 1**: Build preliminary signature to measure its size
-//! 2. **Pass 2**: Prepare code with actual signature size (updating load commands),
-//!    rebuild signature with correct hashes, and embed into the prepared code
-//!
-//! This is necessary because page 0 contains the Mach-O header and load commands,
-//! which must reflect the final signature offset and size.
+//! This module provides signing functionality for Mach-O binaries.
 
-#[cfg(feature = "openssl-backend")]
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
 };
-#[cfg(feature = "openssl-backend")]
 use crate::codesign::constants::{CS_EXECSEG_ALLOW_UNSIGNED, CS_EXECSEG_MAIN_BINARY};
-#[cfg(feature = "openssl-backend")]
 use crate::codesign::der::plist_to_der;
-#[cfg(feature = "openssl-backend")]
 use crate::codesign::superblob::{
     build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob_full,
     build_signature_blob, SuperBlobBuilder,
 };
-#[cfg(feature = "openssl-backend")]
 use crate::crypto::cms;
-#[cfg(feature = "openssl-backend")]
+use crate::crypto::{SigningCredentials, cert::SigningKeyType};
 use crate::Result;
-#[cfg(feature = "openssl-backend")]
-use openssl::nid::Nid;
-#[cfg(feature = "openssl-backend")]
-use openssl::pkey::{PKeyRef, Private};
-#[cfg(feature = "openssl-backend")]
-use openssl::x509::{X509, X509Ref};
-#[cfg(feature = "openssl-backend")]
-use rayon::prelude::*;
-#[cfg(feature = "openssl-backend")]
 use sha1::{Digest, Sha1};
-#[cfg(feature = "openssl-backend")]
 use sha2::Sha256;
+use x509_certificate::{CapturedX509Certificate, signing::InMemorySigningKeyPair};
 
-#[cfg(feature = "openssl-backend")]
 use super::parser::{ArchSlice, MachOFile};
-#[cfg(feature = "openssl-backend")]
 use super::writer::{has_enough_signature_space, prepare_code_for_signing_slice, realloc_code_sign_space_slice};
 
-/// Represents a signed architecture slice with its complete binary data.
+/// Represents a signed architecture slice with its metadata.
 #[derive(Debug, Clone)]
 pub struct SignedSlice {
-    /// Index of the slice in the original Mach-O file
+    /// Index of this slice in the original FAT binary
     pub slice_index: usize,
-    /// Offset of the slice in the original file
+    /// Original offset in the FAT binary
     pub offset: usize,
-    /// Size of the original slice (before signature)
+    /// Original size before signing
     pub original_size: usize,
-    /// The complete signed binary data (code + embedded signature)
+    /// Complete signed binary data for this slice
     pub signed_data: Vec<u8>,
 }
 
-/// Sign a Mach-O binary and return the complete signed binary data.
+/// Sign a Mach-O binary.
 ///
 /// This function builds a complete code signature and embeds it into the binary.
 /// Returns the complete signed binary ready to be written to disk.
@@ -72,26 +43,19 @@ pub struct SignedSlice {
 ///
 /// * `macho` - The parsed Mach-O file to sign
 /// * `identifier` - Bundle identifier (e.g., "com.example.app")
-/// * `team_id` - Team identifier (None for ad-hoc signing)
 /// * `entitlements` - Optional entitlements plist data (XML format)
-/// * `cert` - X.509 signing certificate
-/// * `pkey` - Private key corresponding to the certificate
-/// * `cert_chain` - Certificate chain (intermediate CAs)
+/// * `credentials` - Signing credentials
 /// * `info_plist` - Optional Info.plist data for hashing
 /// * `code_resources` - Optional CodeResources data for hashing
 ///
 /// # Returns
 ///
 /// A `Vec<u8>` containing the complete signed binary.
-#[cfg(feature = "openssl-backend")]
 pub fn sign_macho(
     macho: &MachOFile,
     identifier: &str,
-    team_id: Option<&str>,
     entitlements: Option<&[u8]>,
-    cert: &X509Ref,
-    pkey: &PKeyRef<Private>,
-    cert_chain: &[X509],
+    credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
@@ -102,11 +66,8 @@ pub fn sign_macho(
         slice_data,
         slice,
         identifier,
-        team_id,
         entitlements,
-        cert,
-        pkey,
-        cert_chain,
+        credentials,
         info_plist,
         code_resources,
     )?;
@@ -114,19 +75,15 @@ pub fn sign_macho(
     Ok(signed.signed_data)
 }
 
-/// Sign all slices of a Mach-O binary (including FAT/Universal binaries).
+/// Sign all slices of a Mach-O binary.
 ///
 /// Returns a `SignedSlice` for each architecture containing the complete
 /// signed binary data ready for reassembly.
-#[cfg(feature = "openssl-backend")]
 pub fn sign_macho_all_slices(
     macho: &MachOFile,
     identifier: &str,
-    team_id: Option<&str>,
     entitlements: Option<&[u8]>,
-    cert: &X509Ref,
-    pkey: &PKeyRef<Private>,
-    cert_chain: &[X509],
+    credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<Vec<SignedSlice>> {
@@ -139,11 +96,8 @@ pub fn sign_macho_all_slices(
             slice_data,
             slice,
             identifier,
-            team_id,
             entitlements,
-            cert,
-            pkey,
-            cert_chain,
+            credentials,
             info_plist,
             code_resources,
         )?;
@@ -156,22 +110,18 @@ pub fn sign_macho_all_slices(
 }
 
 /// Sign a single slice and return complete signed binary data.
-#[cfg(feature = "openssl-backend")]
 fn sign_slice_complete(
     slice_data: &[u8],
     slice: &ArchSlice,
     identifier: &str,
-    team_id: Option<&str>,
     entitlements: Option<&[u8]>,
-    cert: &X509Ref,
-    pkey: &PKeyRef<Private>,
-    cert_chain: &[X509],
+    credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<SignedSlice> {
-    // Pre-compute hashes that don't depend on code (same for both passes)
-    // Extract subject CN from certificate for requirements blob
-    let subject_cn = extract_subject_cn(cert).unwrap_or_default();
+    let team_id = credentials.team_id.as_deref();
+
+    let subject_cn = extract_subject_cn(&credentials.certificate).unwrap_or_default();
     let requirements = build_requirements_blob_full(identifier, &subject_cn);
     let requirements_hash_sha1 = sha1_hash(&requirements);
     let requirements_hash_sha256 = sha256_hash(&requirements);
@@ -183,8 +133,6 @@ fn sign_slice_complete(
         (None, None, None)
     };
 
-    // Build DER entitlements only for executables (slot -7)
-    // Non-executables should not have DER entitlements (only 5 special slots)
     let (der_entitlements_blob, der_ent_hash_sha1, der_ent_hash_sha256) =
         if slice.is_executable {
             if let Some(ent) = entitlements {
@@ -234,18 +182,13 @@ fn sign_slice_complete(
         &info_hash_sha256,
         &res_hash_sha1,
         &res_hash_sha256,
-        cert,
-        pkey,
-        cert_chain,
+        credentials,
     )?;
 
     // === Check if reallocation is needed ===
-    // If there's not enough space in the current binary, reallocate
     let (working_slice_data, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, preliminary_sig.len()) {
-        // Reallocate the binary with more signature space
         let reallocated = realloc_code_sign_space_slice(slice_data, slice.code_length)?;
 
-        // Create a new slice descriptor for the reallocated binary
         let new_slice = ArchSlice {
             offset: slice.offset,
             size: reallocated.len(),
@@ -258,23 +201,15 @@ fn sign_slice_complete(
             code_length: slice.code_length,
         };
 
-        // When reallocating, use the new size (don't preserve old size)
         (reallocated, new_slice, false)
     } else {
-        // Original binary has enough space - preserve its size
         (slice_data.to_vec(), slice.clone(), true)
     };
 
-    // Determine the target binary size
-    // When reallocated: use the reallocated size (formula-based padding)
-    // When not reallocated: use original size (preserve existing space)
-    // C++ zsign always pads to formula-based size when reallocating (archo.cpp:629)
     let target_binary_size = Some(working_slice_data.len());
 
     // === PASS 2: Prepare code with actual size and rebuild ===
-    // When preserving original size, pass the original signature space size
     let sig_space_size = if preserve_original_size {
-        // Use the original reserved space size if it's larger
         let original_sig_space = slice_data.len().saturating_sub(slice.code_length);
         original_sig_space.max(preliminary_sig.len())
     } else {
@@ -282,8 +217,6 @@ fn sign_slice_complete(
     };
     let (prepared_code, sig_offset, _) = prepare_code_for_signing_slice(&working_slice_data, sig_space_size)?;
 
-    // Pad prepared_code to sig_offset so CodeDirectory hashes all bytes up to signature
-    // This is critical: codeLimit must equal sig_offset, and we need hashes for all pages
     let mut code_for_hashing = prepared_code.clone();
     code_for_hashing.resize(sig_offset, 0);
 
@@ -306,9 +239,7 @@ fn sign_slice_complete(
         &info_hash_sha256,
         &res_hash_sha1,
         &res_hash_sha256,
-        cert,
-        pkey,
-        cert_chain,
+        credentials,
     )?;
 
     // === Embed signature into prepared code ===
@@ -322,12 +253,6 @@ fn sign_slice_complete(
     })
 }
 
-/// Embed signature into already-prepared code bytes.
-///
-/// If `original_binary_size` is provided and is larger than the signed output,
-/// the output will be padded with zeros to preserve the original size.
-/// This is important for preserving reserved signature space in the binary.
-#[cfg(feature = "openssl-backend")]
 fn embed_signature_into_prepared(
     prepared_code: &[u8],
     signature: &[u8],
@@ -338,18 +263,14 @@ fn embed_signature_into_prepared(
     let final_size = original_binary_size.map(|orig| orig.max(min_size)).unwrap_or(min_size);
     let mut output = Vec::with_capacity(final_size);
 
-    // Copy prepared code (already has updated load commands)
     output.extend_from_slice(prepared_code);
 
-    // Pad to signature offset if needed
     while output.len() < sig_offset {
         output.push(0);
     }
 
-    // Append signature
     output.extend_from_slice(signature);
 
-    // Preserve original binary size if it was larger (maintain reserved signature space)
     if output.len() < final_size {
         output.resize(final_size, 0);
     }
@@ -357,8 +278,7 @@ fn embed_signature_into_prepared(
     output
 }
 
-/// Build a complete SuperBlob signature from code and hashes.
-#[cfg(feature = "openssl-backend")]
+/// Build a complete SuperBlob signature.
 #[allow(clippy::too_many_arguments)]
 fn build_superblob(
     code: &[u8],
@@ -379,31 +299,32 @@ fn build_superblob(
     info_hash_sha256: &Option<Vec<u8>>,
     res_hash_sha1: &Option<Vec<u8>>,
     res_hash_sha256: &Option<Vec<u8>>,
-    cert: &X509Ref,
-    pkey: &PKeyRef<Private>,
-    cert_chain: &[X509],
+    credentials: &SigningCredentials,
 ) -> Result<Vec<u8>> {
-    // Build CodeDirectory (SHA-1) and (SHA-256) in parallel
-    let (cd_sha1, cd_sha256) = rayon::join(
-        || build_code_directory(
-            identifier, team_id, code, slice, entitlements,
-            requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
-        ),
-        || build_code_directory(
-            identifier, team_id, code, slice, entitlements,
-            requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
-        ),
+    let cd_sha1 = build_code_directory(
+        identifier, team_id, code, slice, entitlements,
+        requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
+    );
+    let cd_sha256 = build_code_directory(
+        identifier, team_id, code, slice, entitlements,
+        requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
     );
 
-    // Generate CMS signature
-    // Note: CMS signs the SHA-1 CodeDirectory (for compatibility), not SHA-256
-    // The CDHashes in attributes reference both CDs
     let cdhash_sha1: [u8; 20] = compute_cdhash_sha1(&cd_sha1);
     let cdhash_sha256: [u8; 32] = compute_cdhash_sha256(&cd_sha256);
-    let cms_data = cms::sign_with_apple_attrs(&cd_sha1, cert, pkey, cert_chain, &cdhash_sha1, &cdhash_sha256)?;
+
+    let (signing_key, signing_cert, cert_chain) = convert_credentials_for_cms(credentials)?;
+
+    let cms_data = cms::sign_with_apple_attrs(
+        &cd_sha1,
+        &signing_key,
+        &signing_cert,
+        &cert_chain,
+        &cdhash_sha1,
+        &cdhash_sha256,
+    )?;
     let signature_blob = build_signature_blob(&cms_data);
 
-    // Assemble SuperBlob
     let mut builder = SuperBlobBuilder::new()
         .code_directory_sha1(cd_sha1)
         .code_directory_sha256(cd_sha256)
@@ -414,7 +335,6 @@ fn build_superblob(
         builder = builder.entitlements(ent_blob.clone());
     }
 
-    // Add DER entitlements only for executables (slot -7)
     if let Some(der_ent_blob) = der_entitlements_blob {
         builder = builder.der_entitlements(der_ent_blob.clone());
     }
@@ -423,7 +343,7 @@ fn build_superblob(
 }
 
 /// Build a CodeDirectory blob with the specified hash type.
-#[cfg(feature = "openssl-backend")]
+#[allow(clippy::too_many_arguments)]
 fn build_code_directory(
     identifier: &str,
     team_id: Option<&str>,
@@ -437,17 +357,12 @@ fn build_code_directory(
     der_entitlements_hash: &Option<Vec<u8>>,
     is_sha1: bool,
 ) -> Vec<u8> {
-    // Compute exec_seg_flags based on binary type and entitlements
-    // C++ zsign sets CS_EXECSEG_MAIN_BINARY for executable binaries
-    // and adds CS_EXECSEG_ALLOW_UNSIGNED if get-task-allow entitlement is present
     let mut exec_seg_flags: u64 = 0;
 
     if slice.is_executable {
         exec_seg_flags = CS_EXECSEG_MAIN_BINARY;
     }
 
-    // Check for get-task-allow entitlement (C++ reference: archo.cpp:387-390)
-    // If entitlements contain <key>get-task-allow</key>, add both flags
     if let Some(ent_data) = entitlements {
         if let Ok(ent_str) = std::str::from_utf8(ent_data) {
             if ent_str.contains("<key>get-task-allow</key>") {
@@ -473,7 +388,6 @@ fn build_code_directory(
     if let Some(hash) = entitlements_hash {
         builder = builder.entitlements_hash(hash.clone());
     }
-    // Add DER entitlements hash for slot -7 (executables only)
     if let Some(hash) = der_entitlements_hash {
         builder = builder.der_entitlements_hash(hash.clone());
     }
@@ -485,33 +399,72 @@ fn build_code_directory(
     }
 }
 
-#[cfg(feature = "openssl-backend")]
+/// Convert SigningCredentials to types needed by cms::sign_with_apple_attrs
+fn convert_credentials_for_cms(
+    credentials: &SigningCredentials,
+) -> Result<(InMemorySigningKeyPair, CapturedX509Certificate, Vec<CapturedX509Certificate>)> {
+    use crate::Error;
+
+    let cert_der = credentials.certificate.encode_der()
+        .map_err(|e| Error::Certificate(format!("Failed to encode certificate to DER: {}", e)))?;
+
+    let signing_cert = CapturedX509Certificate::from_der(cert_der)
+        .map_err(|e| Error::Certificate(format!("Failed to parse certificate for CMS: {}", e)))?;
+
+    let signing_key = match &credentials.signing_key {
+        SigningKeyType::Rsa(rsa_key) => {
+            use pkcs8::EncodePrivateKey;
+            let key_der = rsa_key.to_pkcs8_der()
+                .map_err(|e| Error::Certificate(format!("Failed to encode RSA key to PKCS8: {}", e)))?;
+            InMemorySigningKeyPair::from_pkcs8_der(key_der.as_bytes())
+                .map_err(|e| Error::Certificate(format!("Failed to create signing key pair from RSA: {}", e)))?
+        }
+        SigningKeyType::Ecdsa(ecdsa_key) => {
+            use pkcs8::EncodePrivateKey;
+            let key_der = ecdsa_key.to_pkcs8_der()
+                .map_err(|e| Error::Certificate(format!("Failed to encode ECDSA key to PKCS8: {}", e)))?;
+            InMemorySigningKeyPair::from_pkcs8_der(key_der.as_bytes())
+                .map_err(|e| Error::Certificate(format!("Failed to create signing key pair from ECDSA: {}", e)))?
+        }
+    };
+
+    let cert_chain: Vec<CapturedX509Certificate> = credentials
+        .cert_chain
+        .iter()
+        .filter_map(|cert| {
+            cert.encode_der().ok().and_then(|der| {
+                CapturedX509Certificate::from_der(der).ok()
+            })
+        })
+        .collect();
+
+    Ok((signing_key, signing_cert, cert_chain))
+}
+
+/// Extract the Common Name (CN) from a certificate's subject.
+fn extract_subject_cn(cert: &x509_certificate::X509Certificate) -> Option<String> {
+    let subject = cert.subject_name();
+    for atav in subject.iter_common_name() {
+        if let Ok(value) = atav.to_string() {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn sha1_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha1::new();
     hasher.update(data);
     hasher.finalize().to_vec()
 }
 
-#[cfg(feature = "openssl-backend")]
 fn sha256_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().to_vec()
 }
 
-/// Extract the Common Name (CN) from a certificate's subject.
-///
-/// Returns the CN value if found, or None if not present.
-#[cfg(feature = "openssl-backend")]
-fn extract_subject_cn(cert: &X509Ref) -> Option<String> {
-    cert.subject_name()
-        .entries_by_nid(Nid::COMMONNAME)
-        .next()
-        .and_then(|entry| entry.data().as_utf8().ok())
-        .map(|s| s.to_string())
-}
-
-#[cfg(all(test, feature = "openssl-backend"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
