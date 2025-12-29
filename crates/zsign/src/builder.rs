@@ -1,18 +1,11 @@
 //! ZSign builder API
 //!
 //! Provides a builder pattern interface for iOS code signing operations.
-//! Supports signing Mach-O binaries, IPA files, and app bundles.
 
-#[cfg(feature = "openssl-backend")]
-use crate::crypto::SigningAssets;
-#[cfg(feature = "openssl-backend")]
+use crate::crypto::SigningCredentials;
 use crate::ipa::{CompressionLevel, IpaSigner};
-#[cfg(feature = "openssl-backend")]
 use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
-#[cfg(feature = "openssl-backend")]
-use secrecy::SecretString;
-#[cfg(feature = "openssl-backend")]
 use std::path::{Path, PathBuf};
 
 /// iOS code signing tool with builder pattern API.
@@ -20,63 +13,37 @@ use std::path::{Path, PathBuf};
 /// # Example
 ///
 /// ```ignore
-/// use zsign::ZSign;
+/// use zsign::{ZSign, SigningCredentials};
+///
+/// let credentials = SigningCredentials::from_p12(&p12_data, "password")?;
 ///
 /// ZSign::new()
-///     .pkcs12("certificate.p12")
-///     .password("secret")
+///     .credentials(credentials)
 ///     .provisioning_profile("profile.mobileprovision")
 ///     .sign_macho("input", "output")?;
 /// ```
-#[cfg(feature = "openssl-backend")]
-#[derive(Clone)]
 pub struct ZSign {
-    certificate: Option<PathBuf>,
-    private_key: Option<PathBuf>,
-    pkcs12: Option<PathBuf>,
+    credentials: Option<SigningCredentials>,
     provisioning_profile: Option<PathBuf>,
-    password: Option<SecretString>,
     compression_level: CompressionLevel,
 }
 
-#[cfg(feature = "openssl-backend")]
 impl ZSign {
     /// Create a new ZSign builder.
     pub fn new() -> Self {
         Self {
-            certificate: None,
-            private_key: None,
-            pkcs12: None,
+            credentials: None,
             provisioning_profile: None,
-            password: None,
             compression_level: CompressionLevel::DEFAULT,
         }
     }
 
-    /// Set certificate file path (PEM or DER format).
+    /// Set signing credentials (certificate, private key, cert chain).
     ///
-    /// Use together with `private_key()` for PEM-based signing.
-    /// Alternatively, use `pkcs12()` for PKCS#12 files that contain both.
-    pub fn certificate(mut self, path: impl AsRef<Path>) -> Self {
-        self.certificate = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Set private key file path (PEM or DER format).
-    ///
-    /// Use together with `certificate()` for PEM-based signing.
-    /// Alternatively, use `pkcs12()` for PKCS#12 files that contain both.
-    pub fn private_key(mut self, path: impl AsRef<Path>) -> Self {
-        self.private_key = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Set PKCS#12 file path (.p12 format).
-    ///
-    /// PKCS#12 files contain both the certificate and private key.
-    /// Use `password()` to set the decryption password.
-    pub fn pkcs12(mut self, path: impl AsRef<Path>) -> Self {
-        self.pkcs12 = Some(path.as_ref().to_path_buf());
+    /// Use `SigningCredentials::from_p12()` or `SigningCredentials::from_pem()`
+    /// to create credentials from certificate files.
+    pub fn credentials(mut self, credentials: SigningCredentials) -> Self {
+        self.credentials = Some(credentials);
         self
     }
 
@@ -86,14 +53,6 @@ impl ZSign {
     /// embedded in the signed binary.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
         self.provisioning_profile = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Set password for private key or PKCS#12 file.
-    ///
-    /// The password is stored securely and will be zeroized when dropped.
-    pub fn password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(SecretString::new(password.into()));
         self
     }
 
@@ -108,61 +67,22 @@ impl ZSign {
 
     /// Validate the builder configuration.
     ///
-    /// Returns an error if:
-    /// - Both PKCS#12 and PEM credentials are specified
-    /// - Neither PKCS#12 nor PEM credentials are specified
-    /// - Only one of certificate/private_key is specified (need both)
+    /// Returns an error if credentials are not set.
     pub fn validate(&self) -> Result<()> {
-        let has_p12 = self.pkcs12.is_some();
-        let has_pem = self.certificate.is_some() || self.private_key.is_some();
-
-        if has_p12 && has_pem {
-            return Err(Error::Config(
-                "Cannot specify both PKCS#12 and PEM certificate/key".into(),
-            ));
-        }
-
-        if !has_p12 && !has_pem {
+        if self.credentials.is_none() {
             return Err(Error::MissingCredentials(
-                "Must specify either PKCS#12 or certificate/key pair".into(),
+                "Credentials must be set using .credentials()".into(),
             ));
         }
-
-        if has_pem && (self.certificate.is_none() || self.private_key.is_none()) {
-            return Err(Error::MissingCredentials(
-                "Both certificate and private key must be specified".into(),
-            ));
-        }
-
         Ok(())
     }
 
-    /// Load signing assets from configured paths.
-    ///
-    /// Uses PKCS#12 if configured, otherwise uses separate certificate and private key.
-    /// Optionally loads provisioning profile for entitlements.
-    fn load_assets(&self) -> Result<SigningAssets> {
+    /// Get a reference to the credentials, loading entitlements from provisioning profile if set.
+    fn get_credentials_with_entitlements(&self) -> Result<&SigningCredentials> {
         self.validate()?;
-
-        let mut assets = if let Some(ref p12) = self.pkcs12 {
-            SigningAssets::from_p12(p12, self.password.as_ref())?
-        } else {
-            let cert = self
-                .certificate
-                .as_ref()
-                .ok_or_else(|| Error::Certificate("No certificate configured".into()))?;
-            let key = self
-                .private_key
-                .as_ref()
-                .ok_or_else(|| Error::Certificate("No private key configured".into()))?;
-            SigningAssets::from_pem(cert, key, self.password.as_ref())?
-        };
-
-        if let Some(ref profile) = self.provisioning_profile {
-            assets = assets.with_provisioning_profile(profile)?;
-        }
-
-        Ok(assets)
+        self.credentials
+            .as_ref()
+            .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))
     }
 
     /// Sign a Mach-O binary.
@@ -178,34 +98,31 @@ impl ZSign {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Signing assets cannot be loaded
+    /// - Credentials are not set
     /// - Input file cannot be parsed as Mach-O
     /// - Signing fails
     /// - Output file cannot be written
     pub fn sign_macho(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
-        let assets = self.load_assets()?;
+        let credentials = self.get_credentials_with_entitlements()?;
         let macho = MachOFile::open(input.as_ref())?;
 
-        // Get bundle ID from file name as fallback
         let identifier = input
             .as_ref()
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
+        let entitlements = self.load_entitlements_from_profile()?;
+
         let signed_binary = sign_macho(
             &macho,
             identifier,
-            assets.team_id.as_deref(),
-            assets.entitlements.as_deref(),
-            &assets.certificate,
-            &assets.private_key,
-            &assets.cert_chain,
-            None, // info_plist
-            None, // code_resources
+            entitlements.as_deref(),
+            credentials,
+            None,
+            None,
         )?;
 
-        // Write the complete signed binary
         std::fs::write(output.as_ref(), signed_binary)?;
 
         Ok(())
@@ -224,20 +141,21 @@ impl ZSign {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Signing assets cannot be loaded
+    /// - Credentials are not set
     /// - IPA extraction fails
     /// - Bundle signing fails
     /// - IPA repacking fails
-    pub fn sign_ipa(
-        &self,
-        input: impl AsRef<Path>,
-        output: impl AsRef<Path>,
-    ) -> Result<()> {
-        let assets = self.load_assets()?;
-        let mut signer = IpaSigner::new(assets)
-            .compression_level(self.compression_level);
+    pub fn sign_ipa(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
+        self.validate()?;
 
-        // Pass provisioning profile path to IpaSigner for embedding as embedded.mobileprovision
+        let credentials = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))?;
+
+        let mut signer =
+            IpaSigner::new(credentials).compression_level(self.compression_level);
+
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
         }
@@ -251,70 +169,86 @@ impl ZSign {
     pub fn sign_bundle(&self, _bundle_path: impl AsRef<Path>) -> Result<()> {
         Err(Error::Signing("Bundle signing not yet implemented".into()))
     }
+
+    /// Load entitlements from provisioning profile if set.
+    fn load_entitlements_from_profile(&self) -> Result<Option<Vec<u8>>> {
+        if let Some(ref profile_path) = self.provisioning_profile {
+            let profile_data = std::fs::read(profile_path)?;
+            if let Some(entitlements) = extract_entitlements_from_profile(&profile_data) {
+                return Ok(Some(entitlements));
+            }
+        }
+        Ok(None)
+    }
 }
 
-#[cfg(feature = "openssl-backend")]
 impl Default for ZSign {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(all(test, feature = "openssl-backend"))]
+/// Extract entitlements from a provisioning profile (mobileprovision file).
+///
+/// Provisioning profiles are CMS-signed XML plists. This extracts the
+/// Entitlements dictionary and converts it back to XML plist format.
+fn extract_entitlements_from_profile(profile_data: &[u8]) -> Option<Vec<u8>> {
+    let plist_start = profile_data
+        .windows(6)
+        .position(|w| w == b"<?xml ")?;
+
+    let plist_end = profile_data
+        .windows(8)
+        .rposition(|w| w == b"</plist>")?
+        + 8;
+
+    if plist_start >= plist_end {
+        return None;
+    }
+
+    let plist_slice = &profile_data[plist_start..plist_end];
+
+    let plist: plist::Value = plist::from_bytes(plist_slice).ok()?;
+    let dict = plist.as_dictionary()?;
+    let entitlements = dict.get("Entitlements")?;
+
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, entitlements).ok()?;
+    Some(buf)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
 
     #[test]
     fn test_zsign_builder_default() {
         let zsign = ZSign::default();
-        assert!(zsign.certificate.is_none());
-        assert!(zsign.private_key.is_none());
-        assert!(zsign.pkcs12.is_none());
+        assert!(zsign.credentials.is_none());
         assert!(zsign.provisioning_profile.is_none());
-        assert!(zsign.password.is_none());
     }
 
     #[test]
     fn test_zsign_builder_chain() {
         let zsign = ZSign::new()
-            .certificate("/path/to/cert.pem")
-            .private_key("/path/to/key.pem")
-            .password("secret");
+            .provisioning_profile("/path/to/profile.mobileprovision")
+            .compression_level(9);
 
-        assert_eq!(
-            zsign.certificate,
-            Some(PathBuf::from("/path/to/cert.pem"))
-        );
-        assert_eq!(
-            zsign.private_key,
-            Some(PathBuf::from("/path/to/key.pem"))
-        );
-        assert!(zsign.password.is_some());
-        assert_eq!(zsign.password.as_ref().unwrap().expose_secret(), "secret");
-    }
-
-    #[test]
-    fn test_zsign_builder_pkcs12() {
-        let zsign = ZSign::new()
-            .pkcs12("/path/to/cert.p12")
-            .password("p12secret")
-            .provisioning_profile("/path/to/profile.mobileprovision");
-
-        assert_eq!(zsign.pkcs12, Some(PathBuf::from("/path/to/cert.p12")));
-        assert!(zsign.password.is_some());
-        assert_eq!(zsign.password.as_ref().unwrap().expose_secret(), "p12secret");
         assert_eq!(
             zsign.provisioning_profile,
             Some(PathBuf::from("/path/to/profile.mobileprovision"))
         );
+        assert_eq!(zsign.compression_level.level(), 9);
     }
 
     #[test]
-    fn test_load_assets_no_credentials() {
+    fn test_validate_no_credentials() {
         let zsign = ZSign::new();
-        let result = zsign.load_assets();
+        let result = zsign.validate();
         assert!(result.is_err());
+        if let Err(Error::MissingCredentials(msg)) = result {
+            assert!(msg.contains("Credentials must be set"));
+        }
     }
 
     #[test]
@@ -323,14 +257,8 @@ mod tests {
         let result = zsign.sign_ipa("input.ipa", "output.ipa");
         assert!(result.is_err());
         if let Err(Error::MissingCredentials(msg)) = result {
-            assert!(msg.contains("Must specify either PKCS#12 or certificate/key pair"));
+            assert!(msg.contains("Credentials must be set"));
         }
-    }
-
-    #[test]
-    fn test_compression_level_builder() {
-        let zsign = ZSign::new().compression_level(9);
-        assert_eq!(zsign.compression_level.level(), 9);
     }
 
     #[test]
@@ -340,30 +268,6 @@ mod tests {
         assert!(result.is_err());
         if let Err(Error::Signing(msg)) = result {
             assert!(msg.contains("not yet implemented"));
-        }
-    }
-
-    #[test]
-    fn test_validate_both_p12_and_pem() {
-        let zsign = ZSign::new()
-            .pkcs12("/path/to/cert.p12")
-            .certificate("/path/to/cert.pem");
-
-        let result = zsign.validate();
-        assert!(result.is_err());
-        if let Err(Error::Config(msg)) = result {
-            assert!(msg.contains("Cannot specify both"));
-        }
-    }
-
-    #[test]
-    fn test_validate_missing_private_key() {
-        let zsign = ZSign::new().certificate("/path/to/cert.pem");
-
-        let result = zsign.validate();
-        assert!(result.is_err());
-        if let Err(Error::MissingCredentials(msg)) = result {
-            assert!(msg.contains("Both certificate and private key"));
         }
     }
 }
