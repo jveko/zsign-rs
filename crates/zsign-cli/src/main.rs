@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
-use zsign::{PureRustCredentials, ZSignPure};
+use zsign::{SigningCredentials, ZSign};
 
 #[derive(Parser)]
 #[command(name = "zsign")]
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let credentials = load_credentials(&cli)?;
 
-    let mut signer = ZSignPure::new()
+    let mut signer = ZSign::new()
         .credentials(credentials)
         .compression_level(cli.zip_level);
 
@@ -81,18 +81,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_credentials(cli: &Cli) -> Result<PureRustCredentials, Box<dyn std::error::Error>> {
+fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
     if let Some(ref p12_path) = cli.pkcs12 {
         let p12_data = std::fs::read(p12_path)?;
         let password = cli.password.as_deref().unwrap_or("");
-        let creds = PureRustCredentials::from_p12(&p12_data, password)?;
+        let creds = SigningCredentials::from_p12(&p12_data, password)?;
         return Ok(creds);
     }
 
     if let (Some(ref cert_path), Some(ref key_path)) = (&cli.certificate, &cli.private_key) {
         let cert_data = std::fs::read(cert_path)?;
         let key_data = std::fs::read(key_path)?;
-        let creds = PureRustCredentials::from_pem(&cert_data, &key_data, None)?;
+        let creds = SigningCredentials::from_pem(&cert_data, &key_data, None)?;
         return Ok(creds);
     }
 
