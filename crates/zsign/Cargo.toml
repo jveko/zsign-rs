@@ -2,6 +2,15 @@
 name = "zsign"
 version = "0.1.0"
 edition = "2021"
+authors = ["jveko"]
+description = "Cross-platform iOS code signing library - Rust port of zsign"
+documentation = "https://docs.rs/zsign"
+readme = "../../README.md"
+homepage = "https://github.com/jveko/zsign-rs"
+repository = "https://github.com/jveko/zsign-rs"
+license = "MIT"
+keywords = ["ios", "codesign", "macho", "ipa", "signing"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
 
 [dependencies]
 goblin = "0.8"
