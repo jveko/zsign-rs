@@ -32,6 +32,7 @@ struct FileEntry {
     /// SHA-256 hash (32 bytes) - for files, hash of content; for symlinks, hash of target path
     sha256: [u8; 32],
     /// Whether this is optional (can be missing)
+    #[allow(dead_code)]
     optional: bool,
     /// If this is a symlink, contains the target path
     symlink_target: Option<String>,
@@ -473,7 +474,7 @@ impl CodeResourcesBuilder {
         // Serialize to XML plist
         let mut buf = Vec::new();
         plist::to_writer_xml(&mut buf, &Value::Dictionary(root))
-            .map_err(|e| Error::Plist(e))?;
+            .map_err(Error::Plist)?;
 
         Ok(buf)
     }

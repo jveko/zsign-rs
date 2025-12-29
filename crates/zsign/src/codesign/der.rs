@@ -36,7 +36,7 @@ fn encode_length(output: &mut Vec<u8>, length: usize) {
         output.push(length as u8);
     } else {
         // Calculate number of bytes needed for the length
-        let bytes_needed = ((64 - (length as u64).leading_zeros() as usize) + 7) / 8;
+        let bytes_needed = (64 - (length as u64).leading_zeros() as usize).div_ceil(8);
 
         // First byte: 0x80 | number of length bytes
         output.push(0x80 | bytes_needed as u8);
@@ -76,7 +76,7 @@ fn encode_value(value: &Value) -> Vec<u8> {
                 // Calculate number of bytes needed for the value
                 let leading_zeros = val.leading_zeros() as usize;
                 let significant_bits = 64 - leading_zeros;
-                let mut bytes_needed = (significant_bits + 7) / 8;
+                let mut bytes_needed = significant_bits.div_ceil(8);
 
                 // Check if MSB of the encoded value is 1 (would be negative in signed DER)
                 // This happens when significant_bits is exactly a multiple of 8

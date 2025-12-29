@@ -154,7 +154,7 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
         let current_pos = buf.len() as u32;
         if next_offset > current_pos {
             let padding = (next_offset - current_pos) as usize;
-            buf.extend(std::iter::repeat(0u8).take(padding));
+            buf.extend(std::iter::repeat_n(0u8, padding));
         }
     }
 
@@ -214,7 +214,7 @@ fn pad_to_alignment(data: &[u8], alignment: usize) -> Vec<u8> {
     let remainder = data.len() % alignment;
     if remainder != 0 {
         let padding_needed = alignment - remainder;
-        padded.extend(std::iter::repeat(0u8).take(padding_needed));
+        padded.extend(std::iter::repeat_n(0u8, padding_needed));
     }
     padded
 }

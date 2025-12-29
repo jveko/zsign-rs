@@ -405,8 +405,8 @@ fn embed_fat_from_signed_slices(
         let entry_offset = 8 + (i * 20);
         let (new_offset, new_size) = new_offsets[i];
 
-        write_u32_be(&mut output, entry_offset, arch.cputype as u32);
-        write_u32_be(&mut output, entry_offset + 4, arch.cpusubtype as u32);
+        write_u32_be(&mut output, entry_offset, arch.cputype);
+        write_u32_be(&mut output, entry_offset + 4, arch.cpusubtype);
         write_u32_be(&mut output, entry_offset + 8, new_offset);
         write_u32_be(&mut output, entry_offset + 12, new_size);
         write_u32_be(&mut output, entry_offset + 16, arch.align);

@@ -125,13 +125,12 @@ pub fn create_ipa(
 
     // Add Payload/ directory
     zip.add_directory("Payload/", options)
-        .map_err(|e| Error::Zip(e))?;
+        .map_err(Error::Zip)?;
 
     // Walk the app bundle and add all files - don't follow symlinks
     for entry in WalkDir::new(app_bundle_path).follow_links(false) {
         let entry = entry.map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::Other,
+            Error::Io(io::Error::other(
                 format!("Failed to walk directory: {}", e),
             ))
         })?;
@@ -164,14 +163,14 @@ pub fn create_ipa(
                 format!("{}/", archive_path)
             };
             zip.add_directory(&dir_path, options)
-                .map_err(|e| Error::Zip(e))?;
+                .map_err(Error::Zip)?;
         } else if metadata.file_type().is_symlink() {
             // Handle symlink using the zip crate's add_symlink method
             let target = fs::read_link(path)?;
             let target_str = target.to_string_lossy();
 
             zip.add_symlink(&archive_path, target_str, options)
-                .map_err(|e| Error::Zip(e))?;
+                .map_err(Error::Zip)?;
         } else {
             // Regular file
             #[cfg(unix)]
@@ -182,7 +181,7 @@ pub fn create_ipa(
             };
 
             zip.start_file(&archive_path, options)
-                .map_err(|e| Error::Zip(e))?;
+                .map_err(Error::Zip)?;
 
             let mut file = File::open(path)?;
             let mut buffer = Vec::new();
@@ -192,7 +191,7 @@ pub fn create_ipa(
     }
 
     // Finalize the archive
-    zip.finish().map_err(|e| Error::Zip(e))?;
+    zip.finish().map_err(Error::Zip)?;
 
     Ok(())
 }

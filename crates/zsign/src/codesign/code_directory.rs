@@ -195,7 +195,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
         let n_code_slots = if code_limit == 0 {
             0
         } else {
-            (code_limit as usize + PAGE_SIZE - 1) / PAGE_SIZE
+            (code_limit as usize).div_ceil(PAGE_SIZE)
         };
 
         // Determine number of special slots based on what's provided
