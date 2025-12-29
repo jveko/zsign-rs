@@ -1,6 +1,23 @@
-//! Mach-O signing implementation
+//! Mach-O code signing implementation.
 //!
-//! This module provides signing functionality for Mach-O binaries.
+//! Builds complete code signatures for Mach-O binaries including:
+//! - Code directories (SHA-1 and SHA-256)
+//! - Requirements blobs
+//! - Entitlements (XML and DER formats)
+//! - CMS signatures with Apple-specific attributes
+//!
+//! Supports both single-architecture and FAT/Universal binaries.
+//!
+//! # Key Functions
+//!
+//! - [`sign_macho`] - Sign a single-architecture binary
+//! - [`sign_macho_all_slices`] - Sign all slices of a FAT binary
+//!
+//! # Workflow
+//!
+//! 1. Parse binary with [`MachOFile`]
+//! 2. Sign with [`sign_macho`] or [`sign_macho_all_slices`]
+//! 3. For FAT binaries, reassemble with [`embed_signature_fat`](super::writer::embed_signature_fat)
 
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, CodeDirectoryBuilder,
@@ -21,36 +38,66 @@ use x509_certificate::{CapturedX509Certificate, signing::InMemorySigningKeyPair}
 use super::parser::{ArchSlice, MachOFile};
 use super::writer::{has_enough_signature_space, prepare_code_for_signing_slice, realloc_code_sign_space_slice};
 
-/// Represents a signed architecture slice with its metadata.
+/// A signed architecture slice with its metadata.
+///
+/// Contains the complete signed binary data for a single architecture,
+/// ready for embedding into a FAT binary using [`embed_signature_fat`](super::writer::embed_signature_fat)
+/// or writing directly to disk.
+///
+/// See [`sign_macho_all_slices`] for generating these from a FAT binary.
 #[derive(Debug, Clone)]
 pub struct SignedSlice {
-    /// Index of this slice in the original FAT binary
+    /// Index of this slice within the FAT binary (0 for single-arch).
     pub slice_index: usize,
-    /// Original offset in the FAT binary
+    /// Original byte offset within the FAT binary.
     pub offset: usize,
-    /// Original size before signing
+    /// Original size before signing.
     pub original_size: usize,
-    /// Complete signed binary data for this slice
+    /// Complete signed binary data for this slice.
     pub signed_data: Vec<u8>,
 }
 
-/// Sign a Mach-O binary.
+/// Signs a single-architecture Mach-O binary.
 ///
-/// This function builds a complete code signature and embeds it into the binary.
-/// Returns the complete signed binary ready to be written to disk.
+/// Builds a complete code signature and embeds it into the binary.
+/// For FAT binaries, use [`sign_macho_all_slices`] instead.
 ///
 /// # Arguments
 ///
-/// * `macho` - The parsed Mach-O file to sign
-/// * `identifier` - Bundle identifier (e.g., "com.example.app")
-/// * `entitlements` - Optional entitlements plist data (XML format)
-/// * `credentials` - Signing credentials
+/// * `macho` - Parsed Mach-O file (uses first slice)
+/// * `identifier` - Bundle identifier (e.g., `com.example.app`)
+/// * `entitlements` - Optional entitlements plist (XML format)
+/// * `credentials` - Signing certificate and key from [`SigningCredentials`]
 /// * `info_plist` - Optional Info.plist data for hashing
 /// * `code_resources` - Optional CodeResources data for hashing
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` containing the complete signed binary.
+/// The complete signed binary as a byte vector.
+///
+/// # Errors
+///
+/// Returns an error if signing fails due to invalid credentials or binary format.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign::macho::{MachOFile, sign_macho};
+/// use zsign::crypto::SigningCredentials;
+///
+/// let macho = MachOFile::open("path/to/binary")?;
+/// let credentials = SigningCredentials::from_p12("cert.p12", "password")?;
+///
+/// let signed = sign_macho(
+///     &macho,
+///     "com.example.app",
+///     None,  // entitlements
+///     &credentials,
+///     None,  // info_plist
+///     None,  // code_resources
+/// )?;
+/// # Ok::<(), zsign::Error>(())
+/// ```
 pub fn sign_macho(
     macho: &MachOFile,
     identifier: &str,
@@ -75,10 +122,17 @@ pub fn sign_macho(
     Ok(signed.signed_data)
 }
 
-/// Sign all slices of a Mach-O binary.
+/// Signs all architecture slices of a Mach-O binary.
 ///
-/// Returns a `SignedSlice` for each architecture containing the complete
-/// signed binary data ready for reassembly.
+/// Returns a [`SignedSlice`] for each architecture, suitable for reassembly
+/// into a FAT binary using [`embed_signature_fat`](super::writer::embed_signature_fat).
+///
+/// For single-architecture binaries, prefer [`sign_macho`] which returns the
+/// signed binary directly.
+///
+/// # Errors
+///
+/// Returns an error if signing fails for any slice.
 pub fn sign_macho_all_slices(
     macho: &MachOFile,
     identifier: &str,
@@ -109,7 +163,6 @@ pub fn sign_macho_all_slices(
     Ok(signed_slices)
 }
 
-/// Sign a single slice and return complete signed binary data.
 fn sign_slice_complete(
     slice_data: &[u8],
     slice: &ArchSlice,
@@ -161,7 +214,6 @@ fn sign_slice_complete(
         (None, None)
     };
 
-    // === PASS 1: Build preliminary signature to measure size ===
     let preliminary_code = &slice_data[..slice.code_length];
     let preliminary_sig = build_superblob(
         preliminary_code,
@@ -185,7 +237,6 @@ fn sign_slice_complete(
         credentials,
     )?;
 
-    // === Check if reallocation is needed ===
     let (working_slice_data, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, preliminary_sig.len()) {
         let reallocated = realloc_code_sign_space_slice(slice_data, slice.code_length)?;
 
@@ -208,7 +259,6 @@ fn sign_slice_complete(
 
     let target_binary_size = Some(working_slice_data.len());
 
-    // === PASS 2: Prepare code with actual size and rebuild ===
     let sig_space_size = if preserve_original_size {
         let original_sig_space = slice_data.len().saturating_sub(slice.code_length);
         original_sig_space.max(preliminary_sig.len())
@@ -242,7 +292,6 @@ fn sign_slice_complete(
         credentials,
     )?;
 
-    // === Embed signature into prepared code ===
     let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, target_binary_size);
 
     Ok(SignedSlice {
@@ -278,7 +327,6 @@ fn embed_signature_into_prepared(
     output
 }
 
-/// Build a complete SuperBlob signature.
 #[allow(clippy::too_many_arguments)]
 fn build_superblob(
     code: &[u8],
@@ -342,7 +390,6 @@ fn build_superblob(
     Ok(builder.build())
 }
 
-/// Build a CodeDirectory blob with the specified hash type.
 #[allow(clippy::too_many_arguments)]
 fn build_code_directory(
     identifier: &str,
@@ -399,7 +446,6 @@ fn build_code_directory(
     }
 }
 
-/// Convert SigningCredentials to types needed by cms::sign_with_apple_attrs
 fn convert_credentials_for_cms(
     credentials: &SigningCredentials,
 ) -> Result<(InMemorySigningKeyPair, CapturedX509Certificate, Vec<CapturedX509Certificate>)> {
@@ -441,7 +487,6 @@ fn convert_credentials_for_cms(
     Ok((signing_key, signing_cert, cert_chain))
 }
 
-/// Extract the Common Name (CN) from a certificate's subject.
 fn extract_subject_cn(cert: &x509_certificate::X509Certificate) -> Option<String> {
     let subject = cert.subject_name();
     for atav in subject.iter_common_name() {

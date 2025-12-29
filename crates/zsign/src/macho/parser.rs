@@ -1,4 +1,27 @@
-//! Mach-O file parsing and manipulation using goblin
+//! Mach-O binary parsing using goblin.
+//!
+//! Provides types and functions for parsing single-architecture and FAT/Universal
+//! Mach-O binaries. Supports both memory-mapped file access and in-memory parsing.
+//!
+//! # Key Types
+//!
+//! - [`MachOFile`] - Main entry point for parsing Mach-O binaries
+//! - [`ArchSlice`] - Represents a single architecture within a binary
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use zsign::macho::MachOFile;
+//!
+//! // Parse from file (memory-mapped)
+//! let macho = MachOFile::open("path/to/binary")?;
+//!
+//! // Iterate architecture slices
+//! for slice in macho.slices() {
+//!     println!("CPU type: {}, 64-bit: {}", slice.cpu_type, slice.is_64);
+//! }
+//! # Ok::<(), zsign::Error>(())
+//! ```
 
 use crate::{Error, Result};
 use goblin::mach::header::{MH_CIGAM_64, MH_EXECUTE, MH_MAGIC_64};
@@ -9,12 +32,10 @@ use std::fs::File;
 use std::path::Path;
 
 /// Backing storage for Mach-O data.
-///
-/// Supports both memory-mapped files (for large binaries) and in-memory data.
 enum MachOData {
-    /// Memory-mapped file data (zero-copy, efficient for large files)
+    /// Memory-mapped file data (zero-copy).
     Mmap(Mmap),
-    /// In-memory data (for programmatic use)
+    /// Heap-allocated data.
     Vec(Vec<u8>),
 }
 
@@ -27,54 +48,81 @@ impl AsRef<[u8]> for MachOData {
     }
 }
 
-/// Represents a parsed Mach-O file
+/// A parsed Mach-O binary.
+///
+/// Handles both single-architecture and FAT/Universal binaries. For FAT binaries,
+/// each architecture slice is accessible via [`slices()`](Self::slices).
+///
+/// # Creating a MachOFile
+///
+/// - [`MachOFile::open`] - Memory-mapped file access (recommended for large binaries)
+/// - [`MachOFile::parse`] - Parse from in-memory data
+///
+/// # Accessing Data
+///
+/// - [`data()`](Self::data) - Raw binary bytes
+/// - [`slices()`](Self::slices) - Architecture slices
+/// - [`code_bytes()`](Self::code_bytes) - Code region for signing
+/// - [`slice_data()`](Self::slice_data) - Complete slice including signature area
 pub struct MachOFile {
-    /// Raw file data (memory-mapped or in-memory)
     data: MachOData,
-    /// Is FAT binary
     is_fat: bool,
-    /// Architecture slices
     slices: Vec<ArchSlice>,
 }
 
-/// A single architecture slice
+/// A single architecture slice within a Mach-O binary.
+///
+/// For single-architecture binaries, offset is 0 and size is the file size.
+/// For FAT binaries, offset and size describe the slice's position within the FAT container.
 #[derive(Clone)]
 pub struct ArchSlice {
-    /// Offset in file
+    /// Byte offset of this slice within the file.
     pub offset: usize,
-    /// Size of slice
+    /// Size of the slice in bytes.
     pub size: usize,
-    /// CPU type
+    /// Mach-O CPU type constant (e.g., `CPU_TYPE_ARM64`).
     pub cpu_type: u32,
-    /// Is 64-bit
+    /// Whether this is a 64-bit architecture.
     pub is_64: bool,
-    /// Is executable (MH_EXECUTE)
+    /// Whether this is an executable (`MH_EXECUTE`).
     pub is_executable: bool,
-    /// Code signature offset (if exists)
+    /// File offset of the existing code signature, if present.
     pub code_sig_offset: Option<u32>,
-    /// Code signature size
+    /// Size of the existing code signature, if present.
     pub code_sig_size: Option<u32>,
-    /// __TEXT segment size (for execSegLimit)
+    /// Size of the `__TEXT` segment (used for `execSegLimit` in code signing).
     pub text_segment_size: u64,
-    /// Code length (to signature or end)
+    /// Length of code to be signed (excludes existing signature).
     pub code_length: usize,
 }
 
 impl MachOFile {
-    /// Open and parse a Mach-O file using memory mapping.
+    /// Opens and parses a Mach-O file using memory mapping.
     ///
-    /// Uses memory-mapped I/O for efficient handling of large binaries (2GB+).
-    /// The file is mapped into virtual memory rather than loaded entirely,
-    /// reducing memory usage significantly for large applications.
+    /// Memory-mapped I/O provides efficient access to large binaries without
+    /// loading the entire file into memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the file cannot be opened or memory-mapped.
+    /// Returns [`Error::MachO`] if the binary format is invalid.
     ///
     /// # Safety
     ///
-    /// The file must not be modified while it is memory-mapped. If you need
-    /// to modify the binary, use `parse()` with in-memory data instead.
+    /// The file must not be modified while mapped. For binaries that need
+    /// modification, use [`parse()`](Self::parse) with in-memory data.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::macho::MachOFile;
+    ///
+    /// let macho = MachOFile::open("/path/to/binary")?;
+    /// println!("Is FAT: {}", macho.is_fat());
+    /// # Ok::<(), zsign::Error>(())
+    /// ```
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path.as_ref())?;
-        // SAFETY: We assume the file is not modified while mapped.
-        // This is a standard assumption for code signing tools.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             Error::Io(std::io::Error::other(format!(
                 "Failed to memory-map file: {}",
@@ -84,16 +132,28 @@ impl MachOFile {
         Self::parse_data(MachOData::Mmap(mmap))
     }
 
-    /// Parse Mach-O from in-memory bytes.
+    /// Parses a Mach-O binary from in-memory data.
     ///
-    /// Use this method when working with data already in memory, such as
-    /// extracted archives or programmatically generated binaries.
-    /// For file-based parsing, prefer `open()` which uses memory mapping.
+    /// Use this when the binary data is already loaded into memory.
+    /// For file-based parsing, prefer [`open()`](Self::open).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MachO`] if the binary format is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::macho::MachOFile;
+    ///
+    /// let data = std::fs::read("/path/to/binary")?;
+    /// let macho = MachOFile::parse(data)?;
+    /// # Ok::<(), zsign::Error>(())
+    /// ```
     pub fn parse(data: Vec<u8>) -> Result<Self> {
         Self::parse_data(MachOData::Vec(data))
     }
 
-    /// Internal parsing implementation that works with any data backing.
     fn parse_data(data: MachOData) -> Result<Self> {
         let bytes = data.as_ref();
         let mach = Mach::parse(bytes)
@@ -156,7 +216,6 @@ impl MachOFile {
             }
         }
 
-        // Code length is up to signature or end of slice
         let slice_data = if base_offset == 0 {
             data
         } else {
@@ -194,38 +253,47 @@ impl MachOFile {
         })
     }
 
-    /// Get raw data as a byte slice.
+    /// Returns the raw binary data.
     ///
-    /// Returns the entire Mach-O binary data, whether it's memory-mapped
-    /// or held in-memory.
+    /// For FAT binaries, this includes all architecture slices.
+    /// Use [`slice_data()`](Self::slice_data) to access individual slices.
     pub fn data(&self) -> &[u8] {
         self.data.as_ref()
     }
 
-    /// Is FAT binary
+    /// Returns whether this is a FAT/Universal binary.
+    ///
+    /// FAT binaries contain multiple architecture slices (e.g., arm64 + x86_64).
+    /// Use [`slices()`](Self::slices) to iterate over them.
     pub fn is_fat(&self) -> bool {
         self.is_fat
     }
 
-    /// Get architecture slices
+    /// Returns the architecture slices.
+    ///
+    /// For single-architecture binaries, returns a single [`ArchSlice`].
+    /// For FAT binaries, returns one slice per architecture.
     pub fn slices(&self) -> &[ArchSlice] {
         &self.slices
     }
 
-    /// Get code bytes for a slice (up to signature).
+    /// Returns the code bytes for a slice (excluding any existing signature).
     ///
-    /// Returns the portion of the binary that should be hashed for
-    /// code signing, excluding any existing code signature.
+    /// This is the portion of the binary that gets hashed during code signing.
+    /// The returned bytes include the Mach-O header and load commands.
+    ///
+    /// See also: [`slice_data()`](Self::slice_data) for full slice including signature.
     pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] {
         let start = slice.offset;
         let end = start + slice.code_length;
         &self.data.as_ref()[start..end]
     }
 
-    /// Get the full slice data (including any existing signature area).
+    /// Returns the full slice data including any existing signature area.
     ///
-    /// This returns the complete slice as it appears in the file,
-    /// useful for preparing code bytes before signing.
+    /// Use this when preparing a slice for re-signing.
+    ///
+    /// See also: [`code_bytes()`](Self::code_bytes) for code region only.
     pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] {
         let start = slice.offset;
         let end = start + slice.size;
