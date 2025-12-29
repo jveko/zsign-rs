@@ -31,6 +31,7 @@ Thumbs.db
 .amp
 .claude
 
-tmp
-crates/zsign/tests/
+tmp/
 docs/
+bench.sh
+crates/zsign/tests/
