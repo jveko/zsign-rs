@@ -13,18 +13,18 @@ keywords = ["ios", "codesign", "macho", "ipa", "signing"]
 categories = ["command-line-utilities", "cryptography", "development-tools"]
 
 [dependencies]
-goblin = "0.8"
+goblin = "0.10"
 zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd", "time"] }
 plist = "1.7"
 sha1 = { version = "0.10", features = ["asm"] }
 sha2 = { version = "0.10", features = ["asm"] }
-thiserror = "1.0"
+thiserror = "2.0"
 memmap2 = "0.9"
 walkdir = "2.5"
 tempfile = "3.10"
 base64 = "0.22"
 secrecy = "0.8"
-rayon = "1.10"
+rayon = "1.11"
 
 # RustCrypto for pure Rust crypto
 cryptographic-message-syntax = "0.28"
