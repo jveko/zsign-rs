@@ -1,7 +1,29 @@
-//! CodeResources generation for iOS app bundle signing
+//! CodeResources generation for iOS app bundle signing.
 //!
-//! Generates the CodeResources plist that contains hashes of all files in the bundle.
-//! This is required for code signature verification.
+//! Generates the `_CodeSignature/CodeResources` plist containing cryptographic
+//! hashes of all files in an iOS/macOS app bundle. This file is required for
+//! code signature verification by the operating system.
+//!
+//! # Usage
+//!
+//! Use [`CodeResourcesBuilder`] to scan a bundle directory and generate the plist:
+//!
+//! ```no_run
+//! use zsign::bundle::CodeResourcesBuilder;
+//!
+//! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
+//! builder.scan()?;
+//! let plist_bytes = builder.build()?;
+//! std::fs::write("/path/to/MyApp.app/_CodeSignature/CodeResources", plist_bytes)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Exclusions
+//!
+//! The following are automatically excluded from hashing:
+//! - `_CodeSignature/` directory and contents
+//! - Main executable (has embedded signature via `CFBundleExecutable`)
+//! - Custom patterns added via [`CodeResourcesBuilder::exclude`]
 
 use crate::{Error, Result};
 use plist::{Dictionary, Value};
@@ -13,7 +35,29 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-/// Builder for generating CodeResources plist
+/// Builder for generating CodeResources plist files.
+///
+/// This builder scans an iOS/macOS app bundle, computes cryptographic hashes
+/// (SHA-1 and SHA-256) of all files, and produces the CodeResources plist
+/// required for code signing.
+///
+/// # Builder Pattern
+///
+/// ```no_run
+/// use zsign::bundle::CodeResourcesBuilder;
+///
+/// let plist = CodeResourcesBuilder::new("/path/to/App.app")
+///     .exclude("DebugResources/")
+///     .scan()?
+///     .build()?;
+/// # Ok::<(), zsign::Error>(())
+/// ```
+///
+/// # Automatic Exclusions
+///
+/// The builder automatically excludes:
+/// - `_CodeSignature/` directory (contains the signature itself)
+/// - The main executable specified in `Info.plist` (has embedded signature)
 pub struct CodeResourcesBuilder {
     /// Root bundle path
     bundle_path: PathBuf,
@@ -38,8 +82,9 @@ struct FileEntry {
     symlink_target: Option<String>,
 }
 
-/// Standard exclusion rules for CodeResources
-/// C++ Reference: bundle.cpp:195-201
+/// Standard exclusion rules for CodeResources (legacy format).
+///
+/// Defines patterns for file inclusion, optional files, and omitted files.
 fn standard_rules() -> Dictionary {
     let mut rules = Dictionary::new();
 
@@ -69,8 +114,10 @@ fn standard_rules() -> Dictionary {
     rules
 }
 
-/// Modern rules2 for CodeResources
-/// C++ Reference: bundle.cpp:203-217
+/// Modern rules2 for CodeResources.
+///
+/// Defines patterns for file inclusion with extended rules including
+/// .dSYM, .DS_Store, and embedded provisioning profile handling.
 fn standard_rules2() -> Dictionary {
     let mut rules2 = Dictionary::new();
 
@@ -131,7 +178,18 @@ fn standard_rules2() -> Dictionary {
 }
 
 impl CodeResourcesBuilder {
-    /// Create a new CodeResources builder for the given bundle path
+    /// Creates a new [`CodeResourcesBuilder`] for the given bundle path.
+    ///
+    /// Automatically reads `Info.plist` to determine the main executable
+    /// (which is excluded from hashing as it has an embedded signature).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
+    /// ```
     pub fn new(bundle_path: impl AsRef<Path>) -> Self {
         let bundle_path = bundle_path.as_ref().to_path_buf();
 
@@ -175,7 +233,19 @@ impl CodeResourcesBuilder {
             .map(|s| s.to_string()))
     }
 
-    /// Add a custom exclusion pattern
+    /// Adds a custom exclusion pattern.
+    ///
+    /// Files with paths starting with this pattern will be excluded from hashing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let builder = CodeResourcesBuilder::new("/path/to/App.app")
+    ///     .exclude("DebugResources/")
+    ///     .exclude("TestData/");
+    /// ```
     pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
         self.exclusions.push(pattern.into());
         self
@@ -200,10 +270,8 @@ impl CodeResourcesBuilder {
             }
         }
 
-        // NOTE: C++ zsign does NOT exclude nested bundle files from CodeResources
-        // All files including Frameworks/*.framework/*, PlugIns/*.appex/* are included
-        // The nested bundles are signed separately, but their files still appear in parent's CodeResources
-        // Reference: C++ zsign bundle.cpp:127-193 - no nested bundle exclusion
+        // Nested bundle files (Frameworks/*.framework/*, PlugIns/*.appex/*) are included
+        // in the parent's CodeResources. Nested bundles have separate signatures.
 
         // Check custom exclusions
         for pattern in &self.exclusions {
@@ -215,10 +283,9 @@ impl CodeResourcesBuilder {
         false
     }
 
-    /// Check if the path is inside a nested bundle
-    /// 
-    /// NOTE: This function is no longer used because C++ zsign does NOT exclude
-    /// nested bundle files from CodeResources. Keeping for potential future use.
+    /// Check if the path is inside a nested bundle.
+    ///
+    /// Detects paths within .app, .framework, .appex, or .xctest bundles.
     #[allow(dead_code)]
     fn is_nested_bundle(&self, relative_path: &str) -> bool {
         let bundle_extensions = [".app/", ".framework/", ".appex/", ".xctest/"];
@@ -234,7 +301,31 @@ impl CodeResourcesBuilder {
         false
     }
 
-    /// Walk the bundle and hash all files
+    /// Scans the bundle directory and hashes all files.
+    ///
+    /// Walks the bundle directory tree, computes SHA-1 and SHA-256 hashes for
+    /// each file (excluding directories and excluded paths), and stores them
+    /// for later plist generation.
+    ///
+    /// Files are processed in parallel using [`rayon`] for performance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bundle directory cannot be read
+    /// - A file cannot be read for hashing
+    /// - Symlink targets cannot be resolved (on Unix)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// builder.scan()?;
+    /// println!("Scanned {} files", builder.file_count());
+    /// # Ok::<(), zsign::Error>(())
+    /// ```
     pub fn scan(&mut self) -> Result<&mut Self> {
         let bundle_path = self.bundle_path.clone();
 
@@ -349,7 +440,19 @@ impl CodeResourcesBuilder {
         )))
     }
 
-    /// Hash data directly (for testing or inline content)
+    /// Computes SHA-1 and SHA-256 hashes of the given data.
+    ///
+    /// Utility method for hashing arbitrary byte slices.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let (sha1, sha256) = CodeResourcesBuilder::hash_data(b"Hello, World!");
+    /// assert_eq!(sha1.len(), 20);
+    /// assert_eq!(sha256.len(), 32);
+    /// ```
     pub fn hash_data(data: &[u8]) -> ([u8; 20], [u8; 32]) {
         let mut sha1_hasher = Sha1::new();
         sha1_hasher.update(data);
@@ -367,7 +470,20 @@ impl CodeResourcesBuilder {
         (sha1, sha256)
     }
 
-    /// Add a file entry manually (useful for adding nested bundle CodeResources)
+    /// Adds a file entry manually with pre-computed hashes.
+    ///
+    /// Useful for adding files with known hashes without reading from disk,
+    /// such as nested bundle CodeResources files.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// let (sha1, sha256) = CodeResourcesBuilder::hash_data(b"file content");
+    /// builder.add_file("Resources/data.bin", sha1, sha256);
+    /// ```
     pub fn add_file(
         &mut self,
         relative_path: impl Into<String>,
@@ -385,7 +501,10 @@ impl CodeResourcesBuilder {
         );
     }
 
-    /// Add an optional file entry
+    /// Adds an optional file entry with pre-computed hashes.
+    ///
+    /// Optional files are marked in the plist and may be missing from the bundle
+    /// without invalidating the signature. Commonly used for localization files.
     pub fn add_optional_file(
         &mut self,
         relative_path: impl Into<String>,
@@ -403,7 +522,28 @@ impl CodeResourcesBuilder {
         );
     }
 
-    /// Build the CodeResources plist
+    /// Builds the CodeResources plist as XML bytes.
+    ///
+    /// Generates the complete `_CodeSignature/CodeResources` plist containing:
+    /// - `files`: Legacy SHA-1 hashes for older iOS versions
+    /// - `files2`: Modern SHA-1 + SHA-256 hashes with metadata
+    /// - `rules` / `rules2`: Standard Apple inclusion/exclusion patterns
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if plist serialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign::bundle::CodeResourcesBuilder;
+    ///
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// builder.scan()?;
+    /// let plist_bytes = builder.build()?;
+    /// std::fs::write("/path/to/App.app/_CodeSignature/CodeResources", plist_bytes)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn build(&self) -> Result<Vec<u8>> {
         let mut root = Dictionary::new();
 
@@ -436,8 +576,7 @@ impl CodeResourcesBuilder {
         // Adds optional flag for .lproj files
         let mut files2 = Dictionary::new();
         for (path, entry) in &self.files {
-            // C++ zsign omits these from files2 (but includes in files)
-            // Reference: bundle.cpp:173-175
+            // Omit these from files2 (they are included in files)
             if path == "Info.plist" || path == "PkgInfo" || path.ends_with(".DS_Store") {
                 continue;
             }
@@ -455,8 +594,7 @@ impl CodeResourcesBuilder {
                 file_dict.insert("hash2".to_string(), Value::Data(entry.sha256.to_vec()));
             }
 
-            // Add optional flag for .lproj files
-            // C++ Reference: bundle.cpp:189-191
+            // Mark .lproj files as optional
             if path.contains(".lproj/") {
                 file_dict.insert("optional".to_string(), Value::Boolean(true));
             }
@@ -479,14 +617,16 @@ impl CodeResourcesBuilder {
         Ok(buf)
     }
 
-    /// Get the raw files map for inspection
+    /// Returns an iterator over all scanned files and their hashes.
+    ///
+    /// Each item contains the relative path, SHA-1 hash, and SHA-256 hash.
     pub fn files(&self) -> impl Iterator<Item = (&String, &[u8; 20], &[u8; 32])> {
         self.files
             .iter()
             .map(|(path, entry)| (path, &entry.sha1, &entry.sha256))
     }
 
-    /// Get the number of files that will be included
+    /// Returns the number of files that will be included in the plist.
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
@@ -602,8 +742,7 @@ mod tests {
         let mut builder = CodeResourcesBuilder::new(&bundle_path);
         builder.scan().unwrap();
 
-        // C++ zsign includes nested bundle files in parent's CodeResources
-        // Reference: C++ zsign bundle.cpp:127-193 - no nested bundle exclusion
+        // Nested framework files are included in parent's CodeResources
         let file_paths: Vec<_> = builder.files().map(|(p, _, _)| p.clone()).collect();
 
         // Main Info.plist should be included
@@ -619,7 +758,7 @@ mod tests {
     fn test_rules_structure() {
         let rules = standard_rules();
 
-        // Verify key rules exist (matching C++ zsign bundle.cpp:195-201)
+        // Verify expected rules exist
         assert!(rules.contains_key("^.*"));
         assert!(rules.contains_key("^.*\\.lproj/"));
         assert!(rules.contains_key("^.*\\.lproj/locversion.plist$"));
@@ -631,7 +770,7 @@ mod tests {
     fn test_rules2_structure() {
         let rules2 = standard_rules2();
 
-        // Verify key rules2 exist (matching C++ zsign bundle.cpp:203-217)
+        // Verify expected rules2 exist
         assert!(rules2.contains_key("^.*"));
         assert!(rules2.contains_key(".*\\.dSYM($|/)"));
         assert!(rules2.contains_key("^(.*/)?\\.DS_Store$"));
