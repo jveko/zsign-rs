@@ -34,4 +34,6 @@ Thumbs.db
 tmp/
 docs/
 bench.sh
+bench_results.json
+profile.json
 crates/zsign/tests/
