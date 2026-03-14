@@ -111,6 +111,8 @@ pub struct IpaSigner<'a> {
     provisioning_profile_path: Option<PathBuf>,
     /// Cached entitlements from provisioning profile
     entitlements: Option<Vec<u8>>,
+    /// Override bundle identifier for the main app bundle
+    bundle_id: Option<String>,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -125,6 +127,7 @@ impl<'a> IpaSigner<'a> {
             compression_level: CompressionLevel::DEFAULT,
             provisioning_profile_path: None,
             entitlements: None,
+            bundle_id: None,
         }
     }
 
@@ -151,11 +154,20 @@ impl<'a> IpaSigner<'a> {
         self.provisioning_profile_path = Some(path.to_path_buf());
 
         if let Ok(profile_data) = fs::read(path) {
-            if let Some(entitlements) = Self::extract_entitlements_from_profile(&profile_data) {
+            if let Some(entitlements) = zsign_core::extract_entitlements_from_profile(&profile_data) {
                 self.entitlements = Some(entitlements);
             }
         }
 
+        self
+    }
+
+    /// Sets a new bundle identifier for the main app bundle.
+    ///
+    /// When set, the `CFBundleIdentifier` in the main app's `Info.plist` will be
+    /// rewritten to this value before signing.
+    pub fn bundle_id(mut self, id: impl Into<String>) -> Self {
+        self.bundle_id = Some(id.into());
         self
     }
 
@@ -216,6 +228,10 @@ impl<'a> IpaSigner<'a> {
     /// 2. Copy provisioning profile to bundle (main app only)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
+        if let Some(ref new_id) = self.bundle_id {
+            self.rewrite_bundle_id(bundle_path, new_id)?;
+        }
+
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
         for dylib_path in &dylibs {
             self.sign_standalone_dylib(dylib_path)?;
@@ -363,7 +379,11 @@ impl<'a> IpaSigner<'a> {
 
         for binary_path in &binaries {
             if binary_path != &main_executable {
-                self.sign_binary(binary_path, &identifier, None)?;
+                let binary_identifier = binary_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&identifier);
+                self.sign_binary(binary_path, binary_identifier, None)?;
             }
         }
 
@@ -438,6 +458,37 @@ impl<'a> IpaSigner<'a> {
         }
 
         Ok(binaries)
+    }
+
+    /// Rewrite the `CFBundleIdentifier` in the main app's `Info.plist`.
+    fn rewrite_bundle_id(&self, bundle_path: &Path, new_id: &str) -> Result<()> {
+        let info_plist_path = bundle_path.join("Info.plist");
+
+        if !info_plist_path.exists() {
+            return Err(Error::Signing(format!(
+                "Info.plist not found in bundle: {}",
+                bundle_path.display()
+            )));
+        }
+
+        let plist_data = fs::read(&info_plist_path)?;
+        let mut plist: plist::Value = plist::from_bytes(&plist_data)
+            .map_err(|e| Error::Signing(format!("Failed to parse Info.plist: {}", e)))?;
+
+        if let Some(dict) = plist.as_dictionary_mut() {
+            dict.insert(
+                "CFBundleIdentifier".to_string(),
+                plist::Value::String(new_id.to_string()),
+            );
+        }
+
+        let mut buf = Vec::new();
+        plist::to_writer_xml(&mut buf, &plist)
+            .map_err(|e| Error::Signing(format!("Failed to serialize Info.plist: {}", e)))?;
+
+        fs::write(&info_plist_path, &buf)?;
+
+        Ok(())
     }
 
     /// Get the bundle identifier from Info.plist.
@@ -550,22 +601,29 @@ impl<'a> IpaSigner<'a> {
     ) -> Result<()> {
         let macho = MachOFile::open(binary_path)?;
 
-        let bundle_path = binary_path
-            .parent()
-            .ok_or_else(|| Error::Signing("Binary has no parent directory".into()))?;
-
-        let info_plist = bundle_path.join("Info.plist");
-        let info_data = if info_plist.exists() {
-            Some(fs::read(&info_plist)?)
-        } else {
-            None
-        };
-
         let is_executable = macho
             .slices()
             .first()
             .map(|s| s.is_executable)
             .unwrap_or(false);
+
+        // Only the main executable gets Info.plist in its CodeDirectory.
+        // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
+        // with "has entitlements but is not a main binary".
+        let info_data = if is_executable && code_resources.is_some() {
+            let bundle_path = binary_path
+                .parent()
+                .ok_or_else(|| Error::Signing("Binary has no parent directory".into()))?;
+            let info_plist = bundle_path.join("Info.plist");
+            if info_plist.exists() {
+                Some(fs::read(&info_plist)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let entitlements_to_use: Option<&[u8]> = if is_executable {
             self.entitlements.as_deref()
         } else {
@@ -599,32 +657,6 @@ impl<'a> IpaSigner<'a> {
         Ok(())
     }
 
-    /// Extract entitlements from a provisioning profile (mobileprovision file).
-    ///
-    /// Provisioning profiles are CMS-signed XML plists. This extracts the
-    /// Entitlements dictionary and converts it back to XML plist format.
-    fn extract_entitlements_from_profile(profile_data: &[u8]) -> Option<Vec<u8>> {
-        let plist_start = profile_data.windows(6).position(|w| w == b"<?xml ")?;
-
-        let plist_end = profile_data
-            .windows(8)
-            .rposition(|w| w == b"</plist>")?
-            + 8;
-
-        if plist_start >= plist_end {
-            return None;
-        }
-
-        let plist_slice = &profile_data[plist_start..plist_end];
-
-        let plist: plist::Value = plist::from_bytes(plist_slice).ok()?;
-        let dict = plist.as_dictionary()?;
-        let entitlements = dict.get("Entitlements")?;
-
-        let mut buf = Vec::new();
-        plist::to_writer_xml(&mut buf, entitlements).ok()?;
-        Some(buf)
-    }
 }
 
 #[cfg(test)]

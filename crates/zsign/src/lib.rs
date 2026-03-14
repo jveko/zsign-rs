@@ -39,15 +39,17 @@
 
 pub mod builder;
 pub mod bundle;
-pub mod codesign;
-pub mod crypto;
 pub mod error;
 pub mod ipa;
 pub mod macho;
 
-pub use builder::ZSign;
+// Re-export core modules that don't need native wrapping
+pub use zsign_core::{codesign, crypto, SigningCredentials};
+pub use zsign_core::provisioning::extract_entitlements_from_profile;
+
+// Re-export native wrapper types
 pub use bundle::CodeResourcesBuilder;
-pub use crypto::SigningCredentials;
+pub use builder::ZSign;
 pub use error::Error;
 pub use ipa::{create_ipa, extract_ipa, validate_ipa, CompressionLevel, IpaSigner};
 
