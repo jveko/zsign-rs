@@ -1,10 +1,12 @@
 [package]
 name = "zsign-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["jveko"]
 description = "WASM bindings for zsign iOS code signing"
 license = "MIT"
+repository = "https://github.com/jveko/zsign-rs"
+keywords = ["ios", "codesign", "wasm", "mach-o", "ipa"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
