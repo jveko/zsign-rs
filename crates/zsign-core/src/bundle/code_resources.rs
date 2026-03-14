@@ -73,9 +73,6 @@ struct FileEntry {
     sha1: [u8; 20],
     /// SHA-256 hash (32 bytes) - for files, hash of content; for symlinks, hash of target path
     sha256: [u8; 32],
-    /// Whether this is optional (can be missing)
-    #[allow(dead_code)]
-    optional: bool,
     /// If this is a symlink, contains the target path
     symlink_target: Option<String>,
 }
@@ -224,11 +221,11 @@ impl CodeResourcesBuilder {
     /// ```
     /// use zsign_core::bundle::CodeResourcesBuilder;
     ///
-    /// let builder = CodeResourcesBuilder::new()
-    ///     .exclude("DebugResources/")
-    ///     .exclude("TestData/");
+    /// let mut builder = CodeResourcesBuilder::new();
+    /// builder.exclude("DebugResources/");
+    /// builder.exclude("TestData/");
     /// ```
-    pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
+    pub fn exclude(&mut self, pattern: impl Into<String>) -> &mut Self {
         self.exclusions.push(pattern.into());
         self
     }
@@ -322,29 +319,8 @@ impl CodeResourcesBuilder {
         if self.should_exclude(&path) {
             return false;
         }
-        self.files.insert(path, FileEntry { sha1, sha256, optional: false, symlink_target: None });
+        self.files.insert(path, FileEntry { sha1, sha256, symlink_target: None });
         true
-    }
-
-    /// Adds an optional file entry with pre-computed hashes.
-    ///
-    /// Optional files are marked in the plist and may be missing from the bundle
-    /// without invalidating the signature. Commonly used for localization files.
-    pub fn add_optional_file(
-        &mut self,
-        relative_path: impl Into<String>,
-        sha1: [u8; 20],
-        sha256: [u8; 32],
-    ) {
-        self.files.insert(
-            relative_path.into(),
-            FileEntry {
-                sha1,
-                sha256,
-                optional: true,
-                symlink_target: None,
-            },
-        );
     }
 
     /// Adds a symlink entry with pre-computed hashes.
@@ -377,7 +353,6 @@ impl CodeResourcesBuilder {
             FileEntry {
                 sha1,
                 sha256,
-                optional: false,
                 symlink_target: Some(target.into()),
             },
         );
