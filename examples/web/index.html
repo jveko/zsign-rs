@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>zsign-wasm</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; background: #0f172a; color: #e2e8f0; padding: 2rem; max-width: 900px; margin: 0 auto; }
+      h1 { font-size: 1.3rem; margin-bottom: 0.5rem; color: #38bdf8; }
+      .subtitle { font-size: 0.8rem; color: #64748b; margin-bottom: 1.5rem; }
+      .drop-zone { border: 2px dashed #334155; border-radius: 8px; padding: 3rem 2rem; text-align: center; cursor: pointer; transition: all 0.2s; position: relative; }
+      .drop-zone:hover, .drop-zone.dragover { border-color: #38bdf8; background: #1e293b; }
+      .drop-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+      .drop-zone .icon { font-size: 2rem; margin-bottom: 0.5rem; }
+      .drop-zone .label { color: #94a3b8; font-size: 0.85rem; }
+      .drop-zone .hint { color: #475569; font-size: 0.75rem; margin-top: 0.25rem; }
+      .drop-zone.loaded { border-color: #6ee7b7; border-style: solid; }
+      .drop-zone.loaded .icon::after { content: ' ✓'; color: #6ee7b7; }
+
+      .config-section { margin-top: 1.5rem; display: none; }
+      .config-section.visible { display: block; }
+      .config-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+      .config-row label { flex: 0 0 200px; font-size: 0.8rem; color: #94a3b8; text-align: right; }
+      .config-row input[type="text"],
+      .config-row input[type="password"] {
+        flex: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px;
+        padding: 0.4rem 0.6rem; color: #e2e8f0; font-family: inherit; font-size: 0.8rem;
+        outline: none; transition: border-color 0.2s;
+      }
+      .config-row input[type="text"]:focus,
+      .config-row input[type="password"]:focus { border-color: #38bdf8; }
+      .config-row input[type="file"] { display: none; }
+      .file-btn {
+        flex: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px;
+        padding: 0.4rem 0.6rem; color: #94a3b8; font-family: inherit; font-size: 0.8rem;
+        cursor: pointer; text-align: left; transition: border-color 0.2s;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .file-btn:hover { border-color: #38bdf8; }
+      .file-btn.has-file { color: #6ee7b7; border-color: #6ee7b7; }
+
+      .sign-btn {
+        margin-top: 1rem; width: 100%; padding: 0.65rem; background: #1e293b;
+        border: 2px solid #334155; border-radius: 8px; color: #94a3b8;
+        font-family: inherit; font-size: 0.9rem; cursor: not-allowed;
+        transition: all 0.2s;
+      }
+      .sign-btn.ready { border-color: #38bdf8; color: #38bdf8; cursor: pointer; }
+      .sign-btn.ready:hover { background: #38bdf8; color: #0f172a; }
+      .sign-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      .download-btn {
+        display: none; margin-top: 1rem; width: 100%; padding: 0.65rem;
+        background: #065f46; border: 2px solid #6ee7b7; border-radius: 8px;
+        color: #6ee7b7; font-family: inherit; font-size: 0.9rem; cursor: pointer;
+        text-align: center; text-decoration: none; transition: all 0.2s;
+      }
+      .download-btn.visible { display: block; }
+      .download-btn:hover { background: #6ee7b7; color: #0f172a; }
+
+      #log { margin-top: 1.5rem; display: none; }
+      #log.visible { display: block; }
+      .log-line { font-size: 0.8rem; padding: 0.15rem 0; border-bottom: 1px solid #1e293b; display: flex; gap: 0.5rem; }
+      .log-line .ts { color: #475569; flex-shrink: 0; }
+      .log-line .msg { color: #cbd5e1; }
+      .log-line.ok .msg { color: #6ee7b7; }
+      .log-line.err .msg { color: #fca5a5; }
+      .log-line.section { margin-top: 0.75rem; border-bottom: none; }
+      .log-line.section .msg { color: #38bdf8; font-weight: bold; }
+      pre.output { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 0.75rem; font-size: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin-top: 0.5rem; max-height: 400px; overflow-y: auto; color: #94a3b8; }
+      .summary { background: #1e293b; border-radius: 8px; padding: 1rem; margin-top: 1rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; }
+      .stat { text-align: center; }
+      .stat .value { font-size: 1.3rem; color: #38bdf8; }
+      .stat .label { font-size: 0.7rem; color: #64748b; margin-top: 0.15rem; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>⚙️ zsign-wasm</h1>
+    <p class="subtitle">IPA bundle re-signing — like <code>zsign</code> CLI, but in the browser via WASM</p>
+
+    <div class="drop-zone" id="drop-zone">
+      <input type="file" id="file-input" accept=".ipa,.app,.zip" />
+      <div class="icon">📦</div>
+      <div class="label" id="drop-label">Drop an IPA file here</div>
+      <div class="hint">.ipa / .zip containing a .app bundle</div>
+    </div>
+
+    <div class="config-section" id="config-section">
+      <div class="config-row">
+        <label>Certificate (.p12):</label>
+        <input type="file" id="p12-input" accept=".p12,.pfx" />
+        <button class="file-btn" id="p12-btn" type="button">Choose file…</button>
+      </div>
+      <div class="config-row">
+        <label>Password:</label>
+        <input type="password" id="p12-password" placeholder="certificate password" />
+      </div>
+      <div class="config-row">
+        <label>Profile (.mobileprovision):</label>
+        <input type="file" id="profile-input" accept=".mobileprovision" />
+        <button class="file-btn" id="profile-btn" type="button">Choose file…</button>
+      </div>
+      <div class="config-row">
+        <label>Bundle ID:</label>
+        <input type="text" id="bundle-id" placeholder="com.example.app" />
+      </div>
+
+      <button class="sign-btn" id="sign-btn" disabled>🔏 Sign IPA</button>
+      <a class="download-btn" id="download-btn" href="#">⬇ Download signed IPA</a>
+    </div>
+
+    <div id="log">
+      <div id="log-lines"></div>
+      <div id="summary" class="summary hidden"></div>
+      <pre id="plist-output" class="output hidden"></pre>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

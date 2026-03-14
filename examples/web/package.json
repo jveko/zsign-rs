@@ -1,0 +1,20 @@
+{
+  "name": "zsign-wasm-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "zsign-wasm": "file:../../crates/zsign-wasm/pkg",
+    "@zip.js/zip.js": "^2.7.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "vite-plugin-wasm": "^3.4.1",
+    "vite-plugin-top-level-await": "^1.4.4"
+  }
+}
