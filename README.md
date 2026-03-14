@@ -6,42 +6,49 @@ A Rust implementation of [zsign](https://github.com/zhlynn/zsign) — a cross-pl
 
 ## Overview
 
-zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS, Linux, and Windows. It provides an alternative to Apple's official `codesign` utility, enabling iOS app signing outside of the macOS ecosystem.
+zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS, Linux, Windows, **and in the browser via WebAssembly**. It provides an alternative to Apple's official `codesign` utility, enabling iOS app signing outside of the macOS ecosystem.
 
 ### Features
 
 - **IPA Signing** — Re-sign existing IPA files with new certificates and provisioning profiles
 - **Bundle Signing** — Sign `.app` folders and nested bundles (frameworks, extensions)
 - **Mach-O Support** — Handle single-architecture and FAT/Universal binaries
-- **Cross-Platform** — Works on macOS, Linux, and Windows
+- **Cross-Platform** — Works on macOS, Linux, Windows, and WebAssembly
 - **Multiple Certificate Formats** — PKCS#12 (`.p12`) and PEM support
 - **Dual Hash Generation** — SHA-1 (legacy) and SHA-256 code directories
+- **Bundle ID Rewriting** — Change `CFBundleIdentifier` during signing
+- **WASM Support** — Pure-Rust crypto stack enables browser-based signing
 
 ## Architecture
 
 ```
 zsign-rs/
 ├── crates/
-│   ├── zsign/           # Core library
-│   │   ├── builder      # High-level signing API (ZSign)
-│   │   ├── bundle       # App bundle handling, CodeResources generation
-│   │   ├── codesign     # Code signature structures (CodeDirectory, SuperBlob)
-│   │   ├── crypto       # Certificate parsing, CMS signature generation
-│   │   ├── ipa          # IPA archive extraction and creation
-│   │   └── macho        # Mach-O binary parsing and signing
-│   └── zsign-cli/       # Command-line interface
+│   ├── zsign-core/       # WASM-compatible core (no filesystem, no threads)
+│   │   ├── codesign      # Code signature structures (CodeDirectory, SuperBlob)
+│   │   ├── crypto        # Certificate parsing, CMS signature generation
+│   │   ├── macho         # Mach-O parsing, signing, and binary writing
+│   │   ├── bundle        # CodeResources hash computation
+│   │   └── provisioning  # Entitlements extraction from profiles
+│   ├── zsign/            # Native library (filesystem, threading, IPA handling)
+│   │   ├── builder       # High-level signing API (ZSign)
+│   │   ├── bundle        # App bundle traversal with filesystem access
+│   │   ├── ipa           # IPA archive extraction and creation
+│   │   └── macho         # Re-exports from zsign-core
+│   ├── zsign-wasm/       # WebAssembly bindings (wasm-bindgen)
+│   └── zsign-cli/        # Command-line interface
+└── examples/
+    └── web/              # Browser-based signing demo (Vite)
 ```
 
-### Module Overview
+### Crate Overview
 
-| Module | Description |
-|--------|-------------|
-| `macho` | Parses Mach-O binaries, handles FAT archives, extracts load commands and segments |
-| `codesign` | Builds CodeDirectory blobs with page hashes, assembles SuperBlob containers |
-| `crypto` | Loads certificates/keys, generates CMS signatures with Apple-specific attributes |
-| `bundle` | Traverses app bundles, generates CodeResources plist with file hashes |
-| `ipa` | Extracts and creates IPA archives (ZIP format) |
-| `builder` | High-level `ZSign` API orchestrating the signing workflow |
+| Crate | Description |
+|-------|-------------|
+| `zsign-core` | Pure-Rust signing engine — Mach-O parsing, CodeDirectory/SuperBlob generation, CMS signatures. No filesystem or threading; compiles to `wasm32-unknown-unknown`. |
+| `zsign` | Native library wrapping `zsign-core` with filesystem access, parallel bundle traversal, and IPA archive handling. |
+| `zsign-wasm` | `wasm-bindgen` bindings exposing `zsign-core` to JavaScript — credential loading, Mach-O signing, CodeResources building with streaming hash support. |
+| `zsign-cli` | CLI tool using `clap` for signing IPAs, app bundles, and Mach-O binaries. |
 
 ## How iOS Code Signing Works
 
@@ -106,18 +113,38 @@ let credentials = SigningCredentials::from_p12(&p12_data, "password")?;
 ZSign::new()
     .credentials(credentials)
     .provisioning_profile("app.mobileprovision")
+    .bundle_id("com.example.myapp")     // optional: rewrite bundle ID
     .sign_ipa("input.ipa", "output.ipa")?;
 ```
 
 ### CLI
 
 ```bash
-zsign-cli sign \
-    --cert certificate.p12 \
+zsign-cli \
+    --pkcs12 certificate.p12 \
     --password "password" \
-    --provision app.mobileprovision \
+    --profile app.mobileprovision \
+    --bundle-id com.example.myapp \
     --output signed.ipa \
     input.ipa
+```
+
+### WASM (Browser)
+
+```javascript
+import init, { WasmSigner } from 'zsign-wasm';
+
+await init();
+
+const signer = new WasmSigner(p12Bytes, "password", profileBytes);
+signer.set_main_executable("App");
+
+// Hash resource files
+signer.hash_file("Assets.car", assetData);
+
+// Build CodeResources and sign the binary
+const codeResources = signer.build_code_resources();
+const signed = signer.sign_macho_fat(machoData, "com.example.app", infoPlist, codeResources);
 ```
 
 ## Building
@@ -128,6 +155,9 @@ cargo build --release
 
 # Run tests
 cargo test
+
+# Build WASM package (requires wasm-pack)
+wasm-pack build crates/zsign-wasm --target web
 
 # Generate documentation
 cargo doc --open
@@ -146,12 +176,13 @@ This project serves as a learning exercise for:
 
 | Concept | Implementation |
 |---------|----------------|
-| Mach-O Parsing | `macho::parser` — Load commands, segments, FAT headers |
-| Code Hashing | `codesign::code_directory` — Page hashing, special slots |
-| Blob Structures | `codesign::superblob` — Apple's nested blob format |
-| DER Encoding | `codesign::der` — Entitlements plist to DER conversion |
-| CMS Signatures | `crypto::cms` — Apple-specific signed attributes |
-| Certificate Handling | `crypto::cert` — PKCS#12, PEM, X.509 parsing |
+| Mach-O Parsing | `zsign-core::macho::parser` — Load commands, segments, FAT headers |
+| Code Hashing | `zsign-core::codesign::code_directory` — Page hashing, special slots |
+| Blob Structures | `zsign-core::codesign::superblob` — Apple's nested blob format |
+| DER Encoding | `zsign-core::codesign::der` — Entitlements plist to DER conversion |
+| CMS Signatures | `zsign-core::crypto::cms` — Apple-specific signed attributes |
+| Certificate Handling | `zsign-core::crypto::cert` — PKCS#12, PEM, X.509 parsing |
+| WASM Bindings | `zsign-wasm` — Browser-compatible signing via `wasm-bindgen` |
 
 ## References
 
