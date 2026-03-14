@@ -83,7 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             signer.sign_ipa(&cli.input, &output)?;
         }
         "app" => {
-            signer.sign_bundle(&cli.input)?;
+            eprintln!("Error: .app bundle signing is not yet implemented. Use IPA signing instead.");
+            std::process::exit(1);
         }
         _ => {
             signer.sign_macho(&cli.input, &output)?;
