@@ -148,8 +148,8 @@ fn realloc_code_sign_space_single(
         let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;
         let new_filesize = (new_length - linkedit_fileoff) as u64;
 
-        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian);
-        write_u64(&mut output, offset + 48, new_filesize, is_big_endian);
+        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
+        write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
@@ -157,8 +157,8 @@ fn realloc_code_sign_space_single(
     let sig_datasize = (new_length - code_length) as u32;
 
     if let Some((offset, _)) = code_sig_cmd {
-        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian);
-        write_u32(&mut output, offset + 12, sig_datasize, is_big_endian);
+        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
     } else {
         let first_segment_offset = find_first_segment_offset(macho);
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
@@ -166,7 +166,7 @@ fn realloc_code_sign_space_single(
 
         if new_load_commands_end > first_segment_offset {
             let header_size = if is_64 { 32 } else { 28 };
-            let current_sizeofcmds = read_u32(&output, 20, is_big_endian) as usize;
+            let current_sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
             let available_space = first_segment_offset - (header_size + current_sizeofcmds);
 
             if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
@@ -176,15 +176,15 @@ fn realloc_code_sign_space_single(
             }
         }
 
-        write_u32(&mut output, max_load_cmd_end, LC_CODE_SIGNATURE, is_big_endian);
-        write_u32(&mut output, max_load_cmd_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian);
-        write_u32(&mut output, max_load_cmd_end + 8, code_length as u32, is_big_endian);
-        write_u32(&mut output, max_load_cmd_end + 12, sig_datasize, is_big_endian);
+        write_u32(&mut output, max_load_cmd_end, LC_CODE_SIGNATURE, is_big_endian)?;
+        write_u32(&mut output, max_load_cmd_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+        write_u32(&mut output, max_load_cmd_end + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, max_load_cmd_end + 12, sig_datasize, is_big_endian)?;
 
-        let current_ncmds = read_u32(&output, 16, is_big_endian);
-        let current_sizeofcmds = read_u32(&output, 20, is_big_endian);
-        write_u32(&mut output, 16, current_ncmds + 1, is_big_endian);
-        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian);
+        let current_ncmds = read_u32(&output, 16, is_big_endian)?;
+        let current_sizeofcmds = read_u32(&output, 20, is_big_endian)?;
+        write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
+        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
     }
 
     output.resize(new_length, 0);
@@ -443,8 +443,8 @@ fn update_linkedit_data_command(
             || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
             || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
 
-    write_u32(data, dataoff_offset, dataoff, is_big_endian);
-    write_u32(data, datasize_offset, datasize, is_big_endian);
+    write_u32(data, dataoff_offset, dataoff, is_big_endian)?;
+    write_u32(data, datasize_offset, datasize, is_big_endian)?;
 
     Ok(())
 }
@@ -472,29 +472,29 @@ fn add_code_signature_command(
             || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
             || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
 
-    write_u32(data, load_commands_end, LC_CODE_SIGNATURE, is_big_endian);
+    write_u32(data, load_commands_end, LC_CODE_SIGNATURE, is_big_endian)?;
     write_u32(
         data,
         load_commands_end + 4,
         LINKEDIT_DATA_COMMAND_SIZE,
         is_big_endian,
-    );
-    write_u32(data, load_commands_end + 8, dataoff, is_big_endian);
-    write_u32(data, load_commands_end + 12, datasize, is_big_endian);
+    )?;
+    write_u32(data, load_commands_end + 8, dataoff, is_big_endian)?;
+    write_u32(data, load_commands_end + 12, datasize, is_big_endian)?;
 
     let ncmds_offset = 16;
     let sizeofcmds_offset = 20;
 
-    let current_ncmds = read_u32(data, ncmds_offset, is_big_endian);
-    let current_sizeofcmds = read_u32(data, sizeofcmds_offset, is_big_endian);
+    let current_ncmds = read_u32(data, ncmds_offset, is_big_endian)?;
+    let current_sizeofcmds = read_u32(data, sizeofcmds_offset, is_big_endian)?;
 
-    write_u32(data, ncmds_offset, current_ncmds + 1, is_big_endian);
+    write_u32(data, ncmds_offset, current_ncmds + 1, is_big_endian)?;
     write_u32(
         data,
         sizeofcmds_offset,
         current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE,
         is_big_endian,
-    );
+    )?;
 
     Ok(())
 }
@@ -534,15 +534,11 @@ fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) ->
             || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
             || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
 
-    write_u64(data, filesize_offset, new_filesize, is_big_endian);
+    write_u64(data, filesize_offset, new_filesize, is_big_endian)?;
 
-    let original_vmsize = if is_big_endian {
-        u64::from_be_bytes(data[vmsize_offset..vmsize_offset + 8].try_into().unwrap())
-    } else {
-        u64::from_le_bytes(data[vmsize_offset..vmsize_offset + 8].try_into().unwrap())
-    };
+    let original_vmsize = read_u64(data, vmsize_offset, is_big_endian)?;
     let aligned_vmsize = align_to(new_filesize as usize, 0x4000) as u64;
-    write_u64(data, vmsize_offset, aligned_vmsize.max(original_vmsize), is_big_endian);
+    write_u64(data, vmsize_offset, aligned_vmsize.max(original_vmsize), is_big_endian)?;
 
     Ok(())
 }
@@ -671,31 +667,46 @@ fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usi
     Ok((prepared, sig_offset, code_length))
 }
 
-fn read_u32(data: &[u8], offset: usize, big_endian: bool) -> u32 {
-    let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-    if big_endian {
-        u32::from_be_bytes(bytes)
-    } else {
-        u32::from_le_bytes(bytes)
-    }
+fn read_u32(data: &[u8], offset: usize, big_endian: bool) -> Result<u32> {
+    let end = offset.checked_add(4)
+        .ok_or_else(|| Error::MachO(format!("read_u32: offset {} overflow", offset)))?;
+    let bytes: [u8; 4] = data.get(offset..end)
+        .ok_or_else(|| Error::MachO(format!("read_u32: offset {} out of bounds (len={})", offset, data.len())))?
+        .try_into()
+        .map_err(|_| Error::MachO("read_u32: slice conversion failed".into()))?;
+    Ok(if big_endian { u32::from_be_bytes(bytes) } else { u32::from_le_bytes(bytes) })
 }
 
-fn write_u32(data: &mut [u8], offset: usize, value: u32, big_endian: bool) {
-    let bytes = if big_endian {
-        value.to_be_bytes()
-    } else {
-        value.to_le_bytes()
-    };
-    data[offset..offset + 4].copy_from_slice(&bytes);
+fn read_u64(data: &[u8], offset: usize, big_endian: bool) -> Result<u64> {
+    let end = offset.checked_add(8)
+        .ok_or_else(|| Error::MachO(format!("read_u64: offset {} overflow", offset)))?;
+    let bytes: [u8; 8] = data.get(offset..end)
+        .ok_or_else(|| Error::MachO(format!("read_u64: offset {} out of bounds (len={})", offset, data.len())))?
+        .try_into()
+        .map_err(|_| Error::MachO("read_u64: slice conversion failed".into()))?;
+    Ok(if big_endian { u64::from_be_bytes(bytes) } else { u64::from_le_bytes(bytes) })
 }
 
-fn write_u64(data: &mut [u8], offset: usize, value: u64, big_endian: bool) {
-    let bytes = if big_endian {
-        value.to_be_bytes()
-    } else {
-        value.to_le_bytes()
-    };
-    data[offset..offset + 8].copy_from_slice(&bytes);
+fn write_u32(data: &mut [u8], offset: usize, value: u32, big_endian: bool) -> Result<()> {
+    let bytes = if big_endian { value.to_be_bytes() } else { value.to_le_bytes() };
+    let end = offset.checked_add(4)
+        .ok_or_else(|| Error::MachO(format!("write_u32: offset {} overflow", offset)))?;
+    let data_len = data.len();
+    data.get_mut(offset..end)
+        .ok_or_else(|| Error::MachO(format!("write_u32: offset {} out of bounds (len={})", offset, data_len)))?
+        .copy_from_slice(&bytes);
+    Ok(())
+}
+
+fn write_u64(data: &mut [u8], offset: usize, value: u64, big_endian: bool) -> Result<()> {
+    let bytes = if big_endian { value.to_be_bytes() } else { value.to_le_bytes() };
+    let end = offset.checked_add(8)
+        .ok_or_else(|| Error::MachO(format!("write_u64: offset {} overflow", offset)))?;
+    let data_len = data.len();
+    data.get_mut(offset..end)
+        .ok_or_else(|| Error::MachO(format!("write_u64: offset {} out of bounds (len={})", offset, data_len)))?
+        .copy_from_slice(&bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -715,17 +726,35 @@ mod tests {
     #[test]
     fn test_read_write_u32_le() {
         let mut data = vec![0u8; 8];
-        write_u32(&mut data, 0, 0x12345678, false);
-        assert_eq!(read_u32(&data, 0, false), 0x12345678);
+        write_u32(&mut data, 0, 0x12345678, false).unwrap();
+        assert_eq!(read_u32(&data, 0, false).unwrap(), 0x12345678);
         assert_eq!(&data[0..4], &[0x78, 0x56, 0x34, 0x12]);
     }
 
     #[test]
     fn test_read_write_u32_be() {
         let mut data = vec![0u8; 8];
-        write_u32(&mut data, 0, 0x12345678, true);
-        assert_eq!(read_u32(&data, 0, true), 0x12345678);
+        write_u32(&mut data, 0, 0x12345678, true).unwrap();
+        assert_eq!(read_u32(&data, 0, true).unwrap(), 0x12345678);
         assert_eq!(&data[0..4], &[0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn test_read_u32_out_of_bounds() {
+        let data = vec![0u8; 2];
+        assert!(read_u32(&data, 0, false).is_err());
+    }
+
+    #[test]
+    fn test_write_u32_out_of_bounds() {
+        let mut data = vec![0u8; 2];
+        assert!(write_u32(&mut data, 0, 42, false).is_err());
+    }
+
+    #[test]
+    fn test_write_u64_out_of_bounds() {
+        let mut data = vec![0u8; 4];
+        assert!(write_u64(&mut data, 0, 42, false).is_err());
     }
 
     #[test]

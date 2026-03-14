@@ -107,7 +107,12 @@ impl MachOFile {
                     let arch = arch.map_err(|e| Error::MachO(format!("Fat arch {}: {}", i, e)))?;
                     let offset = arch.offset as usize;
                     let size = arch.size as usize;
-                    let slice_data = &bytes[offset..offset + size];
+                    let end = offset.checked_add(size)
+                        .ok_or_else(|| Error::MachO(format!("FAT slice {}: offset overflow", i)))?;
+                    if end > bytes.len() {
+                        return Err(Error::MachO(format!("FAT slice {}: extends beyond file (offset={}, size={}, file_len={})", i, offset, size, bytes.len())));
+                    }
+                    let slice_data = &bytes[offset..end];
 
                     let macho = MachO::parse(slice_data, 0)
                         .map_err(|e| Error::MachO(format!("Slice {}: {}", i, e)))?;
@@ -170,7 +175,12 @@ impl MachOFile {
                 })
                 .max()
                 .unwrap_or(data.len());
-            &data[base_offset..base_offset + end]
+            let slice_end = base_offset.checked_add(end)
+                .ok_or_else(|| Error::MachO(format!("parse_single: offset {} + size {} overflow", base_offset, end)))?;
+            if slice_end > data.len() {
+                return Err(Error::MachO(format!("parse_single: slice extends beyond data (offset={}, size={}, data_len={})", base_offset, end, data.len())));
+            }
+            &data[base_offset..slice_end]
         };
 
         let code_length = code_sig_offset
