@@ -39,6 +39,35 @@ use super::parser::{ArchSlice, MachOFile};
 use super::writer::SignedSlice;
 use super::writer::{has_enough_signature_space, prepare_code_for_signing_slice, realloc_code_sign_space_slice};
 
+/// Empty entitlements plist for non-executable binaries (dylibs, frameworks).
+pub const EMPTY_ENTITLEMENTS: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
+
+/// Signs any Mach-O binary (single-arch or FAT), returns signed bytes.
+///
+/// Automatically selects entitlements based on executable type:
+/// - Executables use the provided entitlements
+/// - Non-executables (dylibs, frameworks) use empty entitlements
+pub fn sign_any_macho(
+    macho: &MachOFile,
+    identifier: &str,
+    entitlements: Option<&[u8]>,
+    credentials: &SigningCredentials,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
+    let ent = if is_executable { entitlements } else { Some(EMPTY_ENTITLEMENTS) };
+
+    if macho.slices().len() == 1 {
+        sign_macho(macho, identifier, ent, credentials, info_plist, code_resources)
+    } else {
+        let signed_slices = sign_macho_all_slices(
+            macho, identifier, ent, credentials, info_plist, code_resources,
+        )?;
+        super::writer::embed_signature_fat(macho.data(), &signed_slices)
+    }
+}
+
 /// Signs a single-architecture Mach-O binary.
 ///
 /// Builds a complete code signature and embeds it into the binary.
@@ -176,12 +205,9 @@ fn sign_slice_complete(
     let (der_entitlements_blob, der_ent_hash_sha1, der_ent_hash_sha256) =
         if slice.is_executable {
             if let Some(ent) = entitlements {
-                if let Some(der_data) = plist_to_der(ent) {
-                    let blob = build_der_entitlements_blob(&der_data);
-                    (Some(blob.clone()), Some(sha1_hash(&blob)), Some(sha256_hash(&blob)))
-                } else {
-                    (None, None, None)
-                }
+                let der_data = plist_to_der(ent)?;
+                let blob = build_der_entitlements_blob(&der_data);
+                (Some(blob.clone()), Some(sha1_hash(&blob)), Some(sha256_hash(&blob)))
             } else {
                 (None, None, None)
             }
@@ -201,6 +227,19 @@ fn sign_slice_complete(
         (None, None)
     };
 
+    let hashes = SpecialSlotHashes {
+        requirements_sha1: requirements_hash_sha1,
+        requirements_sha256: requirements_hash_sha256,
+        entitlements_sha1: ent_hash_sha1,
+        entitlements_sha256: ent_hash_sha256,
+        der_entitlements_sha1: der_ent_hash_sha1,
+        der_entitlements_sha256: der_ent_hash_sha256,
+        info_sha1: info_hash_sha1,
+        info_sha256: info_hash_sha256,
+        resources_sha1: res_hash_sha1,
+        resources_sha256: res_hash_sha256,
+    };
+
     let preliminary_code = &slice_data[..slice.code_length];
     let preliminary_sig = build_superblob(
         preliminary_code,
@@ -209,18 +248,9 @@ fn sign_slice_complete(
         team_id,
         entitlements,
         &requirements,
-        &requirements_hash_sha1,
-        &requirements_hash_sha256,
+        &hashes,
         &entitlements_blob,
-        &ent_hash_sha1,
-        &ent_hash_sha256,
         &der_entitlements_blob,
-        &der_ent_hash_sha1,
-        &der_ent_hash_sha256,
-        &info_hash_sha1,
-        &info_hash_sha256,
-        &res_hash_sha1,
-        &res_hash_sha256,
         credentials,
     )?;
 
@@ -264,18 +294,9 @@ fn sign_slice_complete(
         team_id,
         entitlements,
         &requirements,
-        &requirements_hash_sha1,
-        &requirements_hash_sha256,
+        &hashes,
         &entitlements_blob,
-        &ent_hash_sha1,
-        &ent_hash_sha256,
         &der_entitlements_blob,
-        &der_ent_hash_sha1,
-        &der_ent_hash_sha256,
-        &info_hash_sha1,
-        &info_hash_sha256,
-        &res_hash_sha1,
-        &res_hash_sha256,
         credentials,
     )?;
 
@@ -287,6 +308,19 @@ fn sign_slice_complete(
         original_size: slice.size,
         signed_data,
     })
+}
+
+struct SpecialSlotHashes {
+    requirements_sha1: [u8; 20],
+    requirements_sha256: [u8; 32],
+    entitlements_sha1: Option<[u8; 20]>,
+    entitlements_sha256: Option<[u8; 32]>,
+    der_entitlements_sha1: Option<[u8; 20]>,
+    der_entitlements_sha256: Option<[u8; 32]>,
+    info_sha1: Option<[u8; 20]>,
+    info_sha256: Option<[u8; 32]>,
+    resources_sha1: Option<[u8; 20]>,
+    resources_sha256: Option<[u8; 32]>,
 }
 
 fn embed_signature_into_prepared(
@@ -314,7 +348,6 @@ fn embed_signature_into_prepared(
     output
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_superblob(
     code: &[u8],
     slice: &ArchSlice,
@@ -322,27 +355,16 @@ fn build_superblob(
     team_id: Option<&str>,
     entitlements: Option<&[u8]>,
     requirements: &[u8],
-    requirements_hash_sha1: &[u8],
-    requirements_hash_sha256: &[u8],
+    hashes: &SpecialSlotHashes,
     entitlements_blob: &Option<Vec<u8>>,
-    ent_hash_sha1: &Option<Vec<u8>>,
-    ent_hash_sha256: &Option<Vec<u8>>,
     der_entitlements_blob: &Option<Vec<u8>>,
-    der_ent_hash_sha1: &Option<Vec<u8>>,
-    der_ent_hash_sha256: &Option<Vec<u8>>,
-    info_hash_sha1: &Option<Vec<u8>>,
-    info_hash_sha256: &Option<Vec<u8>>,
-    res_hash_sha1: &Option<Vec<u8>>,
-    res_hash_sha256: &Option<Vec<u8>>,
     credentials: &SigningCredentials,
 ) -> Result<Vec<u8>> {
     let cd_sha1 = build_code_directory(
-        identifier, team_id, code, slice, entitlements,
-        requirements_hash_sha1, info_hash_sha1, res_hash_sha1, ent_hash_sha1, der_ent_hash_sha1, true,
+        identifier, team_id, code, slice, entitlements, hashes, true,
     );
     let cd_sha256 = build_code_directory(
-        identifier, team_id, code, slice, entitlements,
-        requirements_hash_sha256, info_hash_sha256, res_hash_sha256, ent_hash_sha256, der_ent_hash_sha256, false,
+        identifier, team_id, code, slice, entitlements, hashes, false,
     );
 
     let cdhash_sha1: [u8; 20] = compute_cdhash_sha1(&cd_sha1);
@@ -373,18 +395,13 @@ fn build_superblob(
     Ok(builder.build())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_code_directory(
     identifier: &str,
     team_id: Option<&str>,
     code: &[u8],
     slice: &ArchSlice,
     entitlements: Option<&[u8]>,
-    requirements_hash: &[u8],
-    info_hash: &Option<Vec<u8>>,
-    resources_hash: &Option<Vec<u8>>,
-    entitlements_hash: &Option<Vec<u8>>,
-    der_entitlements_hash: &Option<Vec<u8>>,
+    hashes: &SpecialSlotHashes,
     is_sha1: bool,
 ) -> Vec<u8> {
     let mut exec_seg_flags: u64 = 0;
@@ -394,12 +411,20 @@ fn build_code_directory(
     }
 
     if let Some(ent_data) = entitlements {
-        if let Ok(ent_str) = std::str::from_utf8(ent_data) {
-            if ent_str.contains("<key>get-task-allow</key>") {
-                exec_seg_flags |= CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED;
+        if let Ok(plist_val) = plist::from_bytes::<plist::Value>(ent_data) {
+            if let Some(dict) = plist_val.as_dictionary() {
+                if dict.get("get-task-allow").and_then(|v| v.as_boolean()) == Some(true) {
+                    exec_seg_flags |= CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED;
+                }
             }
         }
     }
+
+    let requirements_hash: &[u8] = if is_sha1 { &hashes.requirements_sha1 } else { &hashes.requirements_sha256 };
+    let info_hash: Option<&[u8]> = if is_sha1 { hashes.info_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.info_sha256.as_ref().map(|h| h.as_slice()) };
+    let resources_hash: Option<&[u8]> = if is_sha1 { hashes.resources_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.resources_sha256.as_ref().map(|h| h.as_slice()) };
+    let entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.entitlements_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.entitlements_sha256.as_ref().map(|h| h.as_slice()) };
+    let der_entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.der_entitlements_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.der_entitlements_sha256.as_ref().map(|h| h.as_slice()) };
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
@@ -410,16 +435,16 @@ fn build_code_directory(
         builder = builder.team_id(team);
     }
     if let Some(hash) = info_hash {
-        builder = builder.info_hash(hash.clone());
+        builder = builder.info_hash(hash.to_vec());
     }
     if let Some(hash) = resources_hash {
-        builder = builder.resources_hash(hash.clone());
+        builder = builder.resources_hash(hash.to_vec());
     }
     if let Some(hash) = entitlements_hash {
-        builder = builder.entitlements_hash(hash.clone());
+        builder = builder.entitlements_hash(hash.to_vec());
     }
     if let Some(hash) = der_entitlements_hash {
-        builder = builder.der_entitlements_hash(hash.clone());
+        builder = builder.der_entitlements_hash(hash.to_vec());
     }
 
     if is_sha1 {
@@ -429,16 +454,16 @@ fn build_code_directory(
     }
 }
 
-fn sha1_hash(data: &[u8]) -> Vec<u8> {
+fn sha1_hash(data: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(data);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
-fn sha256_hash(data: &[u8]) -> Vec<u8> {
+fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 #[cfg(test)]

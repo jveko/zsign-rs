@@ -59,7 +59,7 @@ pub use extract::{extract_ipa, validate_ipa};
 
 use crate::bundle::CodeResourcesBuilder;
 use crate::crypto::SigningCredentials;
-use crate::macho::{sign_macho, MachOFile};
+use crate::macho::{sign_any_macho, sign_macho, MachOFile};
 use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -156,8 +156,10 @@ impl<'a> IpaSigner<'a> {
         self.provisioning_profile_path = Some(path.to_path_buf());
 
         if let Ok(profile_data) = fs::read(path) {
-            if let Some(entitlements) = zsign_core::extract_entitlements_from_profile(&profile_data) {
-                self.entitlements = Some(entitlements);
+            match zsign_core::extract_entitlements_from_profile(&profile_data) {
+                Ok(Some(entitlements)) => self.entitlements = Some(entitlements),
+                Ok(None) => {}
+                Err(e) => eprintln!("Warning: Failed to extract entitlements: {}", e),
             }
         }
 
@@ -393,11 +395,11 @@ impl<'a> IpaSigner<'a> {
             if let Some(ref profile_path) = self.provisioning_profile_path {
                 let embedded_path = bundle_path.join("embedded.mobileprovision");
                 fs::copy(profile_path, &embedded_path).map_err(|e| {
-                    Error::Signing(format!(
+                    Error::Core(zsign_core::Error::Signing(format!(
                         "Failed to copy provisioning profile to {}: {}",
                         embedded_path.display(),
                         e
-                    ))
+                    )))
                 })?;
             }
         }
@@ -467,15 +469,15 @@ impl<'a> IpaSigner<'a> {
         let info_plist_path = bundle_path.join("Info.plist");
 
         if !info_plist_path.exists() {
-            return Err(Error::Signing(format!(
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Info.plist not found in bundle: {}",
                 bundle_path.display()
-            )));
+            ))));
         }
 
         let plist_data = fs::read(&info_plist_path)?;
         let mut plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Signing(format!("Failed to parse Info.plist: {}", e)))?;
+            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
 
         if let Some(dict) = plist.as_dictionary_mut() {
             dict.insert(
@@ -486,7 +488,7 @@ impl<'a> IpaSigner<'a> {
 
         let mut buf = Vec::new();
         plist::to_writer_xml(&mut buf, &plist)
-            .map_err(|e| Error::Signing(format!("Failed to serialize Info.plist: {}", e)))?;
+            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to serialize Info.plist: {}", e))))?;
 
         fs::write(&info_plist_path, &buf)?;
 
@@ -498,15 +500,15 @@ impl<'a> IpaSigner<'a> {
         let info_plist_path = bundle_path.join("Info.plist");
 
         if !info_plist_path.exists() {
-            return Err(Error::Signing(format!(
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Info.plist not found in bundle: {}",
                 bundle_path.display()
-            )));
+            ))));
         }
 
         let plist_data = fs::read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Signing(format!("Failed to parse Info.plist: {}", e)))?;
+            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
 
         let identifier = plist
             .as_dictionary()
@@ -538,7 +540,7 @@ impl<'a> IpaSigner<'a> {
 
         let plist_data = fs::read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Signing(format!("Failed to parse Info.plist: {}", e)))?;
+            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
 
         let executable_name = plist
             .as_dictionary()
@@ -583,10 +585,6 @@ impl<'a> IpaSigner<'a> {
         Ok(is_macho)
     }
 
-    /// Empty entitlements plist for non-executable binaries (dylibs, frameworks).
-    /// C++ zsign uses this for non-executables instead of full entitlements.
-    const EMPTY_ENTITLEMENTS: &'static [u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
-
     /// Sign a single Mach-O binary.
     ///
     /// Generates a code signature and embeds it directly into the binary,
@@ -615,7 +613,7 @@ impl<'a> IpaSigner<'a> {
         let info_data = if is_executable && code_resources.is_some() {
             let bundle_path = binary_path
                 .parent()
-                .ok_or_else(|| Error::Signing("Binary has no parent directory".into()))?;
+                .ok_or_else(|| Error::Core(zsign_core::Error::Signing("Binary has no parent directory".into())))?;
             let info_plist = bundle_path.join("Info.plist");
             if info_plist.exists() {
                 Some(fs::read(&info_plist)?)
@@ -626,16 +624,10 @@ impl<'a> IpaSigner<'a> {
             None
         };
 
-        let entitlements_to_use: Option<&[u8]> = if is_executable {
-            self.entitlements.as_deref()
-        } else {
-            Some(Self::EMPTY_ENTITLEMENTS)
-        };
-
-        let signed_binary = sign_macho(
+        let signed_binary = sign_any_macho(
             &macho,
             identifier,
-            entitlements_to_use,
+            self.entitlements.as_deref(),
             self.credentials,
             info_data.as_deref(),
             code_resources,

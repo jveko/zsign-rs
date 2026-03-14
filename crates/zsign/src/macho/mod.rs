@@ -90,3 +90,21 @@ pub fn sign_macho_all_slices(
         macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
     )?)
 }
+
+/// Signs any Mach-O binary (single-arch or FAT), returns signed bytes.
+///
+/// Automatically selects entitlements based on executable type:
+/// - Executables use the provided entitlements
+/// - Non-executables (dylibs, frameworks) use empty entitlements
+pub fn sign_any_macho(
+    macho: &MachOFile,
+    identifier: &str,
+    entitlements: Option<&[u8]>,
+    credentials: &zsign_core::crypto::SigningCredentials,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> crate::Result<Vec<u8>> {
+    Ok(zsign_core::macho::sign_any_macho(
+        macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
+    )?)
+}
