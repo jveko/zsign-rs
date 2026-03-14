@@ -155,6 +155,8 @@ impl SigningCredentials {
         let team_id = extract_team_id(&certificate);
         let cert_chain = build_apple_ca_chain(&certificate);
 
+        verify_key_matches_cert(&signing_key, &certificate)?;
+
         Ok(Self {
             certificate,
             signing_key,
@@ -235,6 +237,8 @@ impl SigningCredentials {
         }
 
         let team_id = extract_team_id(&certificate);
+
+        verify_key_matches_cert(&signing_key, &certificate)?;
 
         Ok(Self {
             certificate,
@@ -331,6 +335,45 @@ fn extract_issuer_cn(cert: &Certificate) -> Option<String> {
         }
     }
     None
+}
+
+/// Verifies that the private key matches the certificate's public key.
+///
+/// Compares the DER-encoded Subject Public Key Info from the certificate with
+/// the public key derived from the private key. Returns an error if they differ.
+fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<()> {
+    use der::Encode;
+    use spki::EncodePublicKey;
+
+    let cert_spki = &cert.tbs_certificate.subject_public_key_info;
+    let cert_pub_bytes = cert_spki
+        .to_der()
+        .map_err(|e| Error::Certificate(format!("Failed to encode cert public key: {}", e)))?;
+
+    let key_pub_bytes = match key {
+        SigningKeyType::Rsa(rsa_key) => rsa_key
+            .to_public_key()
+            .to_public_key_der()
+            .map_err(|e| Error::Certificate(format!("Failed to encode RSA public key: {}", e)))?
+            .to_vec(),
+        SigningKeyType::Ecdsa(ecdsa_key) => {
+            use p256::ecdsa::VerifyingKey;
+            let verifying_key = VerifyingKey::from(ecdsa_key);
+            verifying_key
+                .to_public_key_der()
+                .map_err(|e| {
+                    Error::Certificate(format!("Failed to encode ECDSA public key: {}", e))
+                })?
+                .to_vec()
+        }
+    };
+
+    if cert_pub_bytes != key_pub_bytes {
+        return Err(Error::Certificate(
+            "Private key does not match certificate's public key".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extracts the Apple Team ID from a certificate's Organizational Unit field.
