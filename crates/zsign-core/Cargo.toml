@@ -1,0 +1,38 @@
+[package]
+name = "zsign-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["jveko"]
+description = "Core iOS code signing library - WASM-compatible computation engine"
+license = "MIT"
+
+[dependencies]
+goblin = "0.10"
+plist = "1.7"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2.0"
+base64 = "0.22"
+der = { version = "0.7", features = ["alloc", "oid", "pem"] }
+const-oid = { version = "0.9", features = ["db"] }
+
+# RustCrypto x509/CMS — pure Rust, WASM-compatible
+x509-cert = { version = "0.2.5", features = ["pem"] }
+cms = { version = "0.2.3", features = ["builder"] }
+
+# Signing key types
+rsa = { version = "0.9", features = ["sha2"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"] }
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
+p12 = "0.6"
+signature = { version = "2.2", features = ["std"] }
+spki = { version = "0.7", features = ["pem"] }
+
+# WASM entropy support — getrandom is pulled transitively by rsa.
+# On wasm32, it needs the "js" feature to use crypto.getRandomValues().
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+x509-cert = { version = "0.2.5", features = ["pem", "builder"] }
+rand = "0.8"
