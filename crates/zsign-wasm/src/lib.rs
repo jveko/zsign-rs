@@ -18,8 +18,6 @@ use zsign_core::provisioning::extract_entitlements_from_profile;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
-const EMPTY_ENTITLEMENTS: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
-
 /// In-progress streaming hash state for a single file.
 struct StreamingHashState {
     sha1: Sha1,
@@ -62,9 +60,11 @@ impl WasmSigner {
         let credentials = SigningCredentials::from_p12(p12_bytes, p12_password)
             .map_err(|e| JsError::new(&e.to_string()))?;
 
-        let entitlements = profile_bytes
-            .as_deref()
-            .and_then(extract_entitlements_from_profile);
+        let entitlements = match profile_bytes.as_deref() {
+            Some(data) => extract_entitlements_from_profile(data)
+                .map_err(|e| JsError::new(&e.to_string()))?,
+            None => None,
+        };
 
         Ok(WasmSigner {
             credentials,
@@ -149,8 +149,9 @@ impl WasmSigner {
     }
 
     /// Extract entitlements from a provisioning profile.
-    pub fn extract_entitlements(profile_data: &[u8]) -> Option<Vec<u8>> {
+    pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsError> {
         extract_entitlements_from_profile(profile_data)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Parse a Mach-O binary and return metadata.
@@ -168,7 +169,7 @@ impl WasmSigner {
         self.credentials.team_id.clone()
     }
 
-    /// Sign a Mach-O binary. Returns the signed binary bytes.
+    /// Sign a Mach-O binary (single-arch or FAT). Returns the signed binary bytes.
     pub fn sign_macho(
         &self,
         data: Vec<u8>,
@@ -179,17 +180,10 @@ impl WasmSigner {
         let macho = zsign_core::macho::MachOFile::parse(data)
             .map_err(|e| JsError::new(&e.to_string()))?;
 
-        let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
-        let entitlements = if is_executable {
-            self.entitlements.as_deref()
-        } else {
-            Some(EMPTY_ENTITLEMENTS)
-        };
-
-        zsign_core::macho::sign_macho(
+        zsign_core::macho::sign_any_macho(
             &macho,
             identifier,
-            entitlements,
+            self.entitlements.as_deref(),
             &self.credentials,
             info_plist.as_deref(),
             code_resources.as_deref(),
@@ -198,6 +192,8 @@ impl WasmSigner {
     }
 
     /// Sign a FAT/Universal Mach-O binary. Returns the signed binary bytes.
+    ///
+    /// Delegates to `sign_macho` which handles both single and FAT binaries.
     pub fn sign_macho_fat(
         &self,
         data: Vec<u8>,
@@ -205,40 +201,7 @@ impl WasmSigner {
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, JsError> {
-        let macho = zsign_core::macho::MachOFile::parse(data)
-            .map_err(|e| JsError::new(&e.to_string()))?;
-
-        let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
-        let entitlements = if is_executable {
-            self.entitlements.as_deref()
-        } else {
-            Some(EMPTY_ENTITLEMENTS)
-        };
-
-        if macho.slices().len() == 1 {
-            return zsign_core::macho::sign_macho(
-                &macho,
-                identifier,
-                entitlements,
-                &self.credentials,
-                info_plist.as_deref(),
-                code_resources.as_deref(),
-            )
-            .map_err(|e| JsError::new(&e.to_string()));
-        }
-
-        let signed_slices = zsign_core::macho::sign_macho_all_slices(
-            &macho,
-            identifier,
-            entitlements,
-            &self.credentials,
-            info_plist.as_deref(),
-            code_resources.as_deref(),
-        )
-        .map_err(|e| JsError::new(&e.to_string()))?;
-
-        zsign_core::macho::embed_signature_fat(macho.data(), &signed_slices)
-            .map_err(|e| JsError::new(&e.to_string()))
+        self.sign_macho(data, identifier, info_plist, code_resources)
     }
 
     /// Parse an Info.plist (XML or binary) and return bundle ID and executable name.

@@ -30,4 +30,7 @@ pub enum Error {
 
     #[error("Binary parsing error: {0}")]
     Goblin(String),
+
+    #[error("DER encoding error: {0}")]
+    DerEncoding(String),
 }

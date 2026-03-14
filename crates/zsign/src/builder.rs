@@ -193,7 +193,7 @@ impl ZSign {
     }
 
     /// Gets a reference to the credentials after validation.
-    fn get_credentials_with_entitlements(&self) -> Result<&SigningCredentials> {
+    fn get_credentials(&self) -> Result<&SigningCredentials> {
         self.validate()?;
         self.credentials
             .as_ref()
@@ -227,7 +227,7 @@ impl ZSign {
     ///     .unwrap();
     /// ```
     pub fn sign_macho(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
-        let credentials = self.get_credentials_with_entitlements()?;
+        let credentials = self.get_credentials()?;
         let macho = MachOFile::open(input.as_ref())?;
 
         let identifier = input
@@ -309,17 +309,18 @@ impl ZSign {
     ///
     /// # Errors
     ///
-    /// Currently returns [`Error::Signing`] as this feature is not yet implemented.
+    /// Currently returns an error as this feature is not yet implemented.
     pub fn sign_bundle(&self, _bundle_path: impl AsRef<Path>) -> Result<()> {
-        Err(Error::Signing("Bundle signing not implemented".into()))
+        Err(Error::Core(zsign_core::Error::Signing("Bundle signing not implemented".into())))
     }
 
     /// Loads entitlements from the provisioning profile if set.
     fn load_entitlements_from_profile(&self) -> Result<Option<Vec<u8>>> {
         if let Some(ref profile_path) = self.provisioning_profile {
             let profile_data = std::fs::read(profile_path)?;
-            if let Some(entitlements) = extract_entitlements_from_profile(&profile_data) {
-                return Ok(Some(entitlements));
+            match extract_entitlements_from_profile(&profile_data)? {
+                Some(entitlements) => return Ok(Some(entitlements)),
+                None => return Ok(None),
             }
         }
         Ok(None)
@@ -381,7 +382,7 @@ mod tests {
         let zsign = ZSign::new();
         let result = zsign.sign_bundle("MyApp.app");
         assert!(result.is_err());
-        if let Err(Error::Signing(msg)) = result {
+        if let Err(Error::Core(zsign_core::Error::Signing(msg))) = result {
             assert!(msg.contains("not implemented"));
         }
     }

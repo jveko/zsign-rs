@@ -30,6 +30,8 @@
 
 use plist::Value;
 
+use crate::{Error, Result};
+
 /// DER tag for BOOLEAN.
 const DER_TAG_BOOLEAN: u8 = 0x01;
 
@@ -74,7 +76,7 @@ fn encode_length(output: &mut Vec<u8>, length: usize) {
 /// - String -> UTF8String
 /// - Array -> SEQUENCE
 /// - Dictionary -> SET of key-value pairs
-fn encode_value(value: &Value) -> Vec<u8> {
+fn encode_value(value: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
     match value {
@@ -126,7 +128,7 @@ fn encode_value(value: &Value) -> Vec<u8> {
             // Encode all elements first
             let mut array_content = Vec::new();
             for item in arr {
-                array_content.extend(encode_value(item));
+                array_content.extend(encode_value(item)?);
             }
 
             output.push(DER_TAG_SEQUENCE);
@@ -138,7 +140,7 @@ fn encode_value(value: &Value) -> Vec<u8> {
             let mut set_content = Vec::new();
 
             for (key, val) in dict {
-                let encoded_val = encode_value(val);
+                let encoded_val = encode_value(val)?;
 
                 // Each key-value pair is a SEQUENCE: { key_as_UTF8String, encoded_value }
                 // Encode the key as UTF8String
@@ -162,23 +164,20 @@ fn encode_value(value: &Value) -> Vec<u8> {
             output.extend(set_content);
         }
         Value::Data(_) => {
-            // Data type not supported in entitlements DER encoding
-            // This shouldn't appear in entitlements
+            return Err(Error::DerEncoding("Unsupported plist type: Data".into()));
         }
         Value::Date(_) => {
-            // Date type not supported in entitlements DER encoding
-            // This shouldn't appear in entitlements
+            return Err(Error::DerEncoding("Unsupported plist type: Date".into()));
         }
         Value::Real(_) => {
-            // Real/float type not supported in entitlements DER encoding
-            // This shouldn't appear in entitlements
+            return Err(Error::DerEncoding("Unsupported plist type: Real".into()));
         }
         _ => {
-            // Unknown type - skip
+            return Err(Error::DerEncoding("Unknown plist value type".into()));
         }
     }
 
-    output
+    Ok(output)
 }
 
 /// Convert XML plist entitlements to DER format.
@@ -192,13 +191,14 @@ fn encode_value(value: &Value) -> Vec<u8> {
 ///
 /// # Returns
 ///
-/// The DER-encoded entitlements data, or `None` if parsing/encoding fails.
+/// The DER-encoded entitlements data.
 ///
 /// # Errors
 ///
-/// Returns `None` if:
+/// Returns an error if:
 /// - The XML plist cannot be parsed
 /// - The resulting DER encoding is empty
+/// - An unsupported plist type is encountered (Data, Date, Real)
 ///
 /// # Examples
 ///
@@ -214,20 +214,21 @@ fn encode_value(value: &Value) -> Vec<u8> {
 /// </dict>
 /// </plist>"#;
 ///
-/// let der = plist_to_der(xml);
-/// assert!(der.is_some());
+/// let der = plist_to_der(xml).unwrap();
+/// assert!(!der.is_empty());
 /// ```
-pub fn plist_to_der(plist_xml: &[u8]) -> Option<Vec<u8>> {
+pub fn plist_to_der(plist_xml: &[u8]) -> Result<Vec<u8>> {
     // Parse the plist
-    let value: Value = plist::from_bytes(plist_xml).ok()?;
+    let value: Value = plist::from_bytes(plist_xml)
+        .map_err(|e| Error::DerEncoding(format!("Failed to parse plist: {}", e)))?;
 
     // Encode to DER
-    let der = encode_value(&value);
+    let der = encode_value(&value)?;
 
     if der.is_empty() {
-        None
+        Err(Error::DerEncoding("Empty DER output".into()))
     } else {
-        Some(der)
+        Ok(der)
     }
 }
 
@@ -253,28 +254,28 @@ mod tests {
     #[test]
     fn test_encode_boolean_true() {
         let value = Value::Boolean(true);
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         assert_eq!(der, vec![0x01, 0x01, 0x01]);
     }
 
     #[test]
     fn test_encode_boolean_false() {
         let value = Value::Boolean(false);
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         assert_eq!(der, vec![0x01, 0x01, 0x00]);
     }
 
     #[test]
     fn test_encode_string() {
         let value = Value::String("test".to_string());
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         assert_eq!(der, vec![0x0c, 0x04, b't', b'e', b's', b't']);
     }
 
     #[test]
     fn test_encode_integer() {
         let value = Value::Integer(42.into());
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         // 42 = 0x2A, fits in 1 byte
         assert_eq!(der, vec![0x02, 0x01, 0x2A]);
     }
@@ -291,7 +292,7 @@ mod tests {
 </plist>"#;
 
         let der = plist_to_der(xml);
-        assert!(der.is_some());
+        assert!(der.is_ok());
         let der = der.unwrap();
 
         // Should start with SET tag (0x31)
@@ -308,7 +309,7 @@ mod tests {
 </plist>"#;
 
         let der = plist_to_der(xml);
-        assert!(der.is_some());
+        assert!(der.is_ok());
         let der = der.unwrap();
 
         // Empty dict: SET with 0 content
@@ -316,10 +317,24 @@ mod tests {
     }
 
     #[test]
+    fn test_plist_to_der_unsupported_data_type() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>test-data</key>
+    <data>AQID</data>
+</dict>
+</plist>"#;
+        let result = plist_to_der(xml);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_encode_integer_high_bit() {
         // 128 = 0x80, needs leading zero to avoid negative interpretation
         let value = Value::Integer(128.into());
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x00, 0x80
         assert_eq!(der, vec![0x02, 0x02, 0x00, 0x80]);
     }
@@ -328,7 +343,7 @@ mod tests {
     fn test_encode_integer_256() {
         // 256 = 0x0100, MSB is 0x01 so no leading zero needed
         let value = Value::Integer(256.into());
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x01, 0x00
         assert_eq!(der, vec![0x02, 0x02, 0x01, 0x00]);
     }
@@ -337,7 +352,7 @@ mod tests {
     fn test_encode_integer_255() {
         // 255 = 0xFF, needs leading zero
         let value = Value::Integer(255.into());
-        let der = encode_value(&value);
+        let der = encode_value(&value).unwrap();
         // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x00, 0xFF
         assert_eq!(der, vec![0x02, 0x02, 0x00, 0xFF]);
     }
