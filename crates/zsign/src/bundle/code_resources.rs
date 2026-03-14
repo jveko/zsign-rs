@@ -42,8 +42,9 @@ use walkdir::WalkDir;
 /// ```no_run
 /// use zsign_rs::bundle::CodeResourcesBuilder;
 ///
-/// let plist = CodeResourcesBuilder::new("/path/to/App.app")
-///     .exclude("DebugResources/")
+/// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+/// builder.exclude("DebugResources/");
+/// let plist = builder
 ///     .scan()?
 ///     .build()?;
 /// # Ok::<(), zsign_rs::Error>(())
@@ -99,12 +100,12 @@ impl CodeResourcesBuilder {
     /// ```no_run
     /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
-    /// let builder = CodeResourcesBuilder::new("/path/to/App.app")
-    ///     .exclude("DebugResources/")
-    ///     .exclude("TestData/");
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// builder.exclude("DebugResources/");
+    /// builder.exclude("TestData/");
     /// ```
-    pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
-        self.inner = self.inner.exclude(pattern);
+    pub fn exclude(&mut self, pattern: impl Into<String>) -> &mut Self {
+        self.inner.exclude(pattern);
         self
     }
 
@@ -140,43 +141,47 @@ impl CodeResourcesBuilder {
         let entries: Vec<_> = WalkDir::new(&bundle_path)
             .follow_links(false)
             .into_iter()
-            .filter_map(|e| e.ok())
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to walk directory: {}", e))))?;
 
         // Process entries in parallel
         let results: Vec<_> = entries
             .par_iter()
-            .filter_map(|entry| {
+            .map(|entry| -> Result<Option<(String, [u8; 20], [u8; 32], Option<String>)>> {
                 let path = entry.path();
-                let metadata = fs::symlink_metadata(path).ok()?;
+                let metadata = fs::symlink_metadata(path)?;
                 let is_symlink = metadata.file_type().is_symlink();
 
                 if !is_symlink && metadata.is_dir() {
-                    return None;
+                    return Ok(None);
                 }
 
                 let relative_path = path
                     .strip_prefix(&bundle_path)
-                    .ok()?
+                    .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to strip prefix: {}", e))))?
                     .to_string_lossy()
                     .to_string();
 
                 if is_symlink {
-                    let symlink_result = Self::hash_symlink_entry(path)?;
-                    Some((relative_path, symlink_result.0, symlink_result.1, Some(symlink_result.2)))
+                    match Self::hash_symlink_entry(path) {
+                        Some((sha1, sha256, target)) => Ok(Some((relative_path, sha1, sha256, Some(target)))),
+                        None => Ok(None),
+                    }
                 } else {
-                    let data = fs::read(path).ok()?;
+                    let data = fs::read(path)?;
                     let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&data);
-                    Some((relative_path, sha1, sha256, None))
+                    Ok(Some((relative_path, sha1, sha256, None)))
                 }
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        for (path, sha1, sha256, symlink_target) in results {
-            if let Some(target) = symlink_target {
-                self.inner.add_symlink(path, target, sha1, sha256);
-            } else {
-                self.inner.add_file(path, sha1, sha256);
+        for result in results {
+            if let Some((path, sha1, sha256, symlink_target)) = result {
+                if let Some(target) = symlink_target {
+                    self.inner.add_symlink(path, target, sha1, sha256);
+                } else {
+                    self.inner.add_file(path, sha1, sha256);
+                }
             }
         }
 
