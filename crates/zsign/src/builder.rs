@@ -26,6 +26,7 @@
 //! - [`crate::ipa::IpaSigner`] - Lower-level IPA signing API
 
 use crate::crypto::SigningCredentials;
+use crate::extract_entitlements_from_profile;
 use crate::ipa::{CompressionLevel, IpaSigner};
 use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
@@ -77,6 +78,7 @@ pub struct ZSign {
     credentials: Option<SigningCredentials>,
     provisioning_profile: Option<PathBuf>,
     compression_level: CompressionLevel,
+    bundle_id: Option<String>,
 }
 
 impl ZSign {
@@ -94,6 +96,7 @@ impl ZSign {
             credentials: None,
             provisioning_profile: None,
             compression_level: CompressionLevel::DEFAULT,
+            bundle_id: None,
         }
     }
 
@@ -155,6 +158,14 @@ impl ZSign {
     /// ```
     pub fn compression_level(mut self, level: u32) -> Self {
         self.compression_level = CompressionLevel::new(level);
+        self
+    }
+
+    /// Sets the bundle identifier to rewrite in the main app's `Info.plist`.
+    ///
+    /// When set, the `CFBundleIdentifier` will be changed to this value before signing.
+    pub fn bundle_id(mut self, id: impl Into<String>) -> Self {
+        self.bundle_id = Some(id.into());
         self
     }
 
@@ -287,6 +298,10 @@ impl ZSign {
             signer = signer.provisioning_profile(profile_path);
         }
 
+        if let Some(ref id) = self.bundle_id {
+            signer = signer.bundle_id(id);
+        }
+
         signer.sign(input, output)
     }
 
@@ -315,36 +330,6 @@ impl Default for ZSign {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Extracts entitlements from a provisioning profile.
-///
-/// Provisioning profiles are CMS-signed XML plists. This extracts the
-/// `Entitlements` dictionary and converts it back to XML plist format
-/// suitable for embedding in a code signature.
-fn extract_entitlements_from_profile(profile_data: &[u8]) -> Option<Vec<u8>> {
-    let plist_start = profile_data
-        .windows(6)
-        .position(|w| w == b"<?xml ")?;
-
-    let plist_end = profile_data
-        .windows(8)
-        .rposition(|w| w == b"</plist>")?
-        + 8;
-
-    if plist_start >= plist_end {
-        return None;
-    }
-
-    let plist_slice = &profile_data[plist_start..plist_end];
-
-    let plist: plist::Value = plist::from_bytes(plist_slice).ok()?;
-    let dict = plist.as_dictionary()?;
-    let entitlements = dict.get("Entitlements")?;
-
-    let mut buf = Vec::new();
-    plist::to_writer_xml(&mut buf, entitlements).ok()?;
-    Some(buf)
 }
 
 #[cfg(test)]

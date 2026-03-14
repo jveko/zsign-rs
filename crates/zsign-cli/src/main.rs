@@ -43,6 +43,10 @@ struct Cli {
     /// 9 = maximum compression (slowest, smallest file)
     #[arg(short = 'z', long, default_value = "6")]
     zip_level: u32,
+
+    /// New bundle identifier to set in Info.plist
+    #[arg(short = 'b', long)]
+    bundle_id: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(profile) = cli.profile {
         signer = signer.provisioning_profile(profile);
+    }
+
+    if let Some(bundle_id) = cli.bundle_id {
+        signer = signer.bundle_id(bundle_id);
     }
 
     let output = cli.output.unwrap_or_else(|| {
