@@ -7,7 +7,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::{ZSign, SigningCredentials};
+//! use zsign_rs::{ZSign, SigningCredentials};
 //!
 //! let p12_data = std::fs::read("certificate.p12").unwrap();
 //! let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 /// Sign a Mach-O binary:
 ///
 /// ```no_run
-/// use zsign::{ZSign, SigningCredentials};
+/// use zsign_rs::{ZSign, SigningCredentials};
 ///
 /// let p12_data = std::fs::read("cert.p12").unwrap();
 /// let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();
@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 /// Sign an IPA with a provisioning profile:
 ///
 /// ```no_run
-/// use zsign::{ZSign, SigningCredentials};
+/// use zsign_rs::{ZSign, SigningCredentials};
 ///
 /// let p12_data = std::fs::read("cert.p12").unwrap();
 /// let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();
@@ -87,7 +87,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```
-    /// use zsign::ZSign;
+    /// use zsign_rs::ZSign;
     ///
     /// let zsign = ZSign::new();
     /// ```
@@ -107,7 +107,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::{ZSign, SigningCredentials};
+    /// use zsign_rs::{ZSign, SigningCredentials};
     ///
     /// let p12_data = std::fs::read("cert.p12").unwrap();
     /// let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();
@@ -132,7 +132,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```
-    /// use zsign::ZSign;
+    /// use zsign_rs::ZSign;
     ///
     /// let zsign = ZSign::new()
     ///     .provisioning_profile("app.mobileprovision");
@@ -152,7 +152,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```
-    /// use zsign::ZSign;
+    /// use zsign_rs::ZSign;
     ///
     /// let zsign = ZSign::new().compression_level(9);
     /// ```
@@ -178,7 +178,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```
-    /// use zsign::ZSign;
+    /// use zsign_rs::ZSign;
     ///
     /// let result = ZSign::new().validate();
     /// assert!(result.is_err()); // No credentials set
@@ -216,7 +216,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::{ZSign, SigningCredentials};
+    /// use zsign_rs::{ZSign, SigningCredentials};
     ///
     /// let p12_data = std::fs::read("cert.p12").unwrap();
     /// let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();
@@ -268,7 +268,7 @@ impl ZSign {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::{ZSign, SigningCredentials};
+    /// use zsign_rs::{ZSign, SigningCredentials};
     ///
     /// let p12_data = std::fs::read("cert.p12").unwrap();
     /// let credentials = SigningCredentials::from_p12(&p12_data, "password").unwrap();

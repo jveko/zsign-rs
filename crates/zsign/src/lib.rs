@@ -7,7 +7,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use zsign::{ZSign, SigningCredentials};
+//! use zsign_rs::{ZSign, SigningCredentials};
 //!
 //! // Load credentials from a PKCS#12 file
 //! let p12_data = std::fs::read("certificate.p12").unwrap();

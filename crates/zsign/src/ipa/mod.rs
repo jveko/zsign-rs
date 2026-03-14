@@ -26,28 +26,29 @@
 //! ## Complete signing workflow
 //!
 //! ```no_run
-//! use zsign::ipa::IpaSigner;
-//! use zsign::crypto::SigningCredentials;
+//! use zsign_rs::ipa::IpaSigner;
+//! use zsign_rs::crypto::SigningCredentials;
 //!
-//! let credentials = SigningCredentials::from_p12("cert.p12", "password")?;
+//! let p12_data = std::fs::read("cert.p12").unwrap();
+//! let credentials = SigningCredentials::from_p12(&p12_data, "password")?;
 //! let signer = IpaSigner::new(&credentials)
 //!     .provisioning_profile("profile.mobileprovision");
 //!
 //! signer.sign("input.ipa", "output.ipa")?;
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 //!
 //! ## Manual extraction and repacking
 //!
 //! ```no_run
-//! use zsign::ipa::{extract_ipa, create_ipa, CompressionLevel};
+//! use zsign_rs::ipa::{extract_ipa, create_ipa, CompressionLevel};
 //!
 //! // Extract IPA to inspect or modify contents
 //! let app_bundle = extract_ipa("input.ipa", "output_dir")?;
 //!
 //! // Repack into a new IPA with maximum compression
 //! create_ipa(&app_bundle, "output.ipa", CompressionLevel::MAX)?;
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 pub mod archive;
@@ -73,22 +74,23 @@ use walkdir::WalkDir;
 /// # Examples
 ///
 /// ```no_run
-/// use zsign::ipa::IpaSigner;
-/// use zsign::crypto::SigningCredentials;
+/// use zsign_rs::ipa::IpaSigner;
+/// use zsign_rs::crypto::SigningCredentials;
 ///
-/// let credentials = SigningCredentials::from_p12("cert.p12", "password")?;
+/// let p12_data = std::fs::read("cert.p12").unwrap();
+/// let credentials = SigningCredentials::from_p12(&p12_data, "password")?;
 ///
 /// // Basic signing
 /// IpaSigner::new(&credentials)
 ///     .sign("input.ipa", "output.ipa")?;
 ///
 /// // With provisioning profile and custom compression
-/// use zsign::ipa::CompressionLevel;
+/// use zsign_rs::ipa::CompressionLevel;
 /// IpaSigner::new(&credentials)
 ///     .provisioning_profile("dev.mobileprovision")
 ///     .compression_level(CompressionLevel::MAX)
 ///     .sign("input.ipa", "output.ipa")?;
-/// # Ok::<(), zsign::Error>(())
+/// # Ok::<(), zsign_rs::Error>(())
 /// ```
 ///
 /// # Workflow

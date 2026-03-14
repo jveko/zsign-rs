@@ -18,7 +18,7 @@ use thiserror::Error;
 /// # Examples
 ///
 /// ```no_run
-/// use zsign::{ZSign, Error};
+/// use zsign_rs::{ZSign, Error};
 ///
 /// let result = ZSign::new().sign_ipa("input.ipa", "output.ipa");
 /// match result {

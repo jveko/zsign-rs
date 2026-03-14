@@ -13,7 +13,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::ipa::{extract_ipa, validate_ipa};
+//! use zsign_rs::ipa::{extract_ipa, validate_ipa};
 //!
 //! // Validate before extracting
 //! validate_ipa("app.ipa")?;
@@ -21,7 +21,7 @@
 //! // Extract and get the path to the .app bundle
 //! let app_bundle = extract_ipa("app.ipa", "output_dir")?;
 //! println!("Extracted to: {}", app_bundle.display());
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 use crate::{Error, Result};
@@ -63,11 +63,11 @@ struct ExtractEntry {
 /// # Examples
 ///
 /// ```no_run
-/// use zsign::ipa::extract_ipa;
+/// use zsign_rs::ipa::extract_ipa;
 ///
 /// let app_bundle = extract_ipa("MyApp.ipa", "extracted")?;
 /// assert!(app_bundle.join("Info.plist").exists());
-/// # Ok::<(), zsign::Error>(())
+/// # Ok::<(), zsign_rs::Error>(())
 /// ```
 ///
 /// # Errors
@@ -247,11 +247,11 @@ fn find_app_bundle(dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
 /// # Examples
 ///
 /// ```no_run
-/// use zsign::ipa::validate_ipa;
+/// use zsign_rs::ipa::validate_ipa;
 ///
 /// validate_ipa("app.ipa")?;
 /// println!("IPA is valid");
-/// # Ok::<(), zsign::Error>(())
+/// # Ok::<(), zsign_rs::Error>(())
 /// ```
 ///
 /// # Errors

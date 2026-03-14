@@ -13,12 +13,12 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::ipa::{create_ipa, CompressionLevel};
+//! use zsign_rs::ipa::{create_ipa, CompressionLevel};
 //! use std::path::Path;
 //!
 //! let app_bundle = Path::new("Payload/MyApp.app");
 //! create_ipa(app_bundle, "output.ipa", CompressionLevel::DEFAULT)?;
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 use crate::{Error, Result};
@@ -38,7 +38,7 @@ use zip::{CompressionMethod, ZipWriter};
 /// # Examples
 ///
 /// ```
-/// use zsign::ipa::CompressionLevel;
+/// use zsign_rs::ipa::CompressionLevel;
 ///
 /// // Use predefined levels
 /// let fast = CompressionLevel::NONE;      // No compression
@@ -114,14 +114,14 @@ impl From<u32> for CompressionLevel {
 /// # Examples
 ///
 /// ```no_run
-/// use zsign::ipa::{create_ipa, CompressionLevel};
+/// use zsign_rs::ipa::{create_ipa, CompressionLevel};
 ///
 /// // Create with default compression
 /// create_ipa("MyApp.app", "output.ipa", CompressionLevel::DEFAULT)?;
 ///
 /// // Create with no compression for faster processing
 /// create_ipa("MyApp.app", "fast.ipa", CompressionLevel::NONE)?;
-/// # Ok::<(), zsign::Error>(())
+/// # Ok::<(), zsign_rs::Error>(())
 /// ```
 ///
 /// # Errors

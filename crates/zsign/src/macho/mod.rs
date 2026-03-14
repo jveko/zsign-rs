@@ -17,12 +17,12 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::macho::{MachOFile, sign_macho};
+//! use zsign_rs::macho::{MachOFile, sign_macho};
 //!
 //! let macho = MachOFile::open("path/to/binary")?;
 //! println!("Is FAT binary: {}", macho.is_fat());
 //! println!("Number of slices: {}", macho.slices().len());
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 pub mod parser;

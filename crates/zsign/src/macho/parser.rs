@@ -6,13 +6,13 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::macho::MachOFile;
+//! use zsign_rs::macho::MachOFile;
 //!
 //! let macho = MachOFile::open("path/to/binary")?;
 //! for slice in macho.slices() {
 //!     println!("CPU type: {}, 64-bit: {}", slice.cpu_type, slice.is_64);
 //! }
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 use crate::Result;

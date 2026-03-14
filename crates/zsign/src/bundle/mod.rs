@@ -25,12 +25,12 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zsign::bundle::CodeResourcesBuilder;
+//! use zsign_rs::bundle::CodeResourcesBuilder;
 //!
 //! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
 //! builder.scan()?;
 //! let plist_bytes = builder.build()?;
-//! # Ok::<(), zsign::Error>(())
+//! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
 pub mod code_resources;

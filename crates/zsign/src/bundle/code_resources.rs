@@ -9,7 +9,7 @@
 //! Use [`CodeResourcesBuilder`] to scan a bundle directory and generate the plist:
 //!
 //! ```no_run
-//! use zsign::bundle::CodeResourcesBuilder;
+//! use zsign_rs::bundle::CodeResourcesBuilder;
 //!
 //! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
 //! builder.scan()?;
@@ -40,13 +40,13 @@ use walkdir::WalkDir;
 /// # Builder Pattern
 ///
 /// ```no_run
-/// use zsign::bundle::CodeResourcesBuilder;
+/// use zsign_rs::bundle::CodeResourcesBuilder;
 ///
 /// let plist = CodeResourcesBuilder::new("/path/to/App.app")
 ///     .exclude("DebugResources/")
 ///     .scan()?
 ///     .build()?;
-/// # Ok::<(), zsign::Error>(())
+/// # Ok::<(), zsign_rs::Error>(())
 /// ```
 ///
 /// # Automatic Exclusions
@@ -70,7 +70,7 @@ impl CodeResourcesBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::bundle::CodeResourcesBuilder;
+    /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
     /// let builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
     /// ```
@@ -97,7 +97,7 @@ impl CodeResourcesBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::bundle::CodeResourcesBuilder;
+    /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
     /// let builder = CodeResourcesBuilder::new("/path/to/App.app")
     ///     .exclude("DebugResources/")
@@ -126,12 +126,12 @@ impl CodeResourcesBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use zsign::bundle::CodeResourcesBuilder;
+    /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
     /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
     /// builder.scan()?;
     /// println!("Scanned {} files", builder.file_count());
-    /// # Ok::<(), zsign::Error>(())
+    /// # Ok::<(), zsign_rs::Error>(())
     /// ```
     pub fn scan(&mut self) -> Result<&mut Self> {
         let bundle_path = self.bundle_path.clone();
