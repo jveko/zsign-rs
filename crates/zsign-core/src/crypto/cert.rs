@@ -42,11 +42,11 @@ use x509_cert::Certificate;
 /// * [`Ecdsa`](SigningKeyType::Ecdsa) - ECDSA P-256 private key (secp256r1)
 #[allow(clippy::large_enum_variant)]
 pub enum SigningKeyType {
-    /// RSA private key for signing operations.
+    /// RSA PKCS#1 v1.5 signing key with SHA-256 digest, pre-built for signing.
     ///
     /// RSA keys are the traditional choice for Apple code signing and are
     /// widely supported across all iOS versions.
-    Rsa(RsaPrivateKey),
+    Rsa(rsa::pkcs1v15::SigningKey<sha2::Sha256>),
 
     /// ECDSA P-256 (secp256r1) private key for signing operations.
     ///
@@ -143,7 +143,7 @@ impl SigningCredentials {
                 "Encrypted PEM keys are not yet supported. Use unencrypted keys or PKCS#12.".into(),
             ));
         } else if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_pem(key_str) {
-            SigningKeyType::Rsa(rsa_key)
+            SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key))
         } else if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_pem(key_str) {
             SigningKeyType::Ecdsa(ecdsa_key)
         } else {
@@ -252,7 +252,7 @@ impl SigningCredentials {
         use pkcs8::DecodePrivateKey;
 
         if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_der(der) {
-            return Ok(SigningKeyType::Rsa(rsa_key));
+            return Ok(SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key)));
         }
 
         if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_der(der) {
@@ -344,11 +344,14 @@ fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<(
         .map_err(|e| Error::Certificate(format!("Failed to encode cert public key: {}", e)))?;
 
     let key_pub_bytes = match key {
-        SigningKeyType::Rsa(rsa_key) => rsa_key
-            .to_public_key()
-            .to_public_key_der()
-            .map_err(|e| Error::Certificate(format!("Failed to encode RSA public key: {}", e)))?
-            .to_vec(),
+        SigningKeyType::Rsa(signing_key) => {
+            use signature::Keypair;
+            signing_key
+                .verifying_key()
+                .to_public_key_der()
+                .map_err(|e| Error::Certificate(format!("Failed to encode RSA public key: {}", e)))?
+                .to_vec()
+        }
         SigningKeyType::Ecdsa(ecdsa_key) => {
             use p256::ecdsa::VerifyingKey;
             let verifying_key = VerifyingKey::from(ecdsa_key);
@@ -385,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_signing_key_type_enum_exists() {
-        let _rsa: fn(RsaPrivateKey) -> SigningKeyType = SigningKeyType::Rsa;
+        let _rsa: fn(rsa::pkcs1v15::SigningKey<sha2::Sha256>) -> SigningKeyType = SigningKeyType::Rsa;
         let _ecdsa: fn(EcdsaSigningKey) -> SigningKeyType = SigningKeyType::Ecdsa;
     }
 

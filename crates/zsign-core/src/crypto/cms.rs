@@ -128,9 +128,8 @@ pub fn sign_code_directory(
     };
 
     match &credentials.signing_key {
-        SigningKeyType::Rsa(rsa_private_key) => {
-            let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_private_key.clone());
-            build_cms_signed_data(&signing_key, ctx)
+        SigningKeyType::Rsa(signing_key) => {
+            build_cms_signed_data(signing_key, ctx)
         }
         SigningKeyType::Ecdsa(ecdsa_key) => {
             build_cms_signed_data::<_, p256::ecdsa::DerSignature>(ecdsa_key, ctx)
@@ -468,7 +467,7 @@ mod tests {
 
         let credentials = SigningCredentials {
             certificate: cert,
-            signing_key: SigningKeyType::Rsa(rsa_key),
+            signing_key: SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<Sha256>::new(rsa_key)),
             cert_chain: vec![],
             team_id: Some("TESTTEAM".to_string()),
         };
