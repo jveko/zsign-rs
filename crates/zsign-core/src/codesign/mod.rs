@@ -48,7 +48,7 @@ pub mod constants;
 pub mod der;
 pub mod superblob;
 
-pub use code_directory::CodeDirectoryBuilder;
+pub use code_directory::{CodeDirectoryBuilder, DualPageHashes, hash_code_pages_dual};
 pub use superblob::{
     build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob,
     build_signature_blob, build_superblob, BlobEntry, SuperBlobBuilder,

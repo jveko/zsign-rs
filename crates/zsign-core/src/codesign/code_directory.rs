@@ -37,6 +37,49 @@ use super::constants::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
+/// Pre-computed page hashes for both SHA-1 and SHA-256.
+///
+/// Avoids hashing each code page twice by computing both algorithms
+/// in a single pass over the data.
+pub struct DualPageHashes {
+    /// SHA-1 hash of each 4KB code page, concatenated.
+    pub sha1: Vec<u8>,
+    /// SHA-256 hash of each 4KB code page, concatenated.
+    pub sha256: Vec<u8>,
+}
+
+/// Hash all code pages with both SHA-1 and SHA-256 in a single pass.
+///
+/// Each 4KB page is fed to both hashers simultaneously, avoiding
+/// duplicate iteration over the code bytes.
+pub fn hash_code_pages_dual(code: &[u8]) -> DualPageHashes {
+    if code.is_empty() {
+        return DualPageHashes {
+            sha1: Vec::new(),
+            sha256: Vec::new(),
+        };
+    }
+
+    let chunks: usize = code.len().div_ceil(PAGE_SIZE);
+    let mut sha1_hashes = Vec::with_capacity(chunks * CS_SHA1_LEN);
+    let mut sha256_hashes = Vec::with_capacity(chunks * CS_SHA256_LEN);
+
+    for chunk in code.chunks(PAGE_SIZE) {
+        let mut h1 = Sha1::new();
+        let mut h256 = Sha256::new();
+        h1.update(chunk);
+        h256.update(chunk);
+
+        sha1_hashes.extend_from_slice(&h1.finalize());
+        sha256_hashes.extend_from_slice(&h256.finalize());
+    }
+
+    DualPageHashes {
+        sha1: sha1_hashes,
+        sha256: sha256_hashes,
+    }
+}
+
 /// CodeDirectory header size for version 0x20400 (with exec segment fields).
 const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 
@@ -208,6 +251,102 @@ impl<'a> CodeDirectoryBuilder<'a> {
     /// SHA-256 is required for iOS 12+ and is the primary CodeDirectory.
     pub fn build_sha256(&self) -> Vec<u8> {
         self.build_internal(CS_HASHTYPE_SHA256, CS_SHA256_LEN)
+    }
+
+    /// Build a SHA-1 CodeDirectory blob using pre-computed page hashes.
+    ///
+    /// Use with [`hash_code_pages_dual`] to avoid redundant hashing.
+    pub fn build_sha1_from_hashes(&self, page_hashes: &[u8]) -> Vec<u8> {
+        self.build_from_hashes(CS_HASHTYPE_SHA1, CS_SHA1_LEN, page_hashes)
+    }
+
+    /// Build a SHA-256 CodeDirectory blob using pre-computed page hashes.
+    ///
+    /// Use with [`hash_code_pages_dual`] to avoid redundant hashing.
+    pub fn build_sha256_from_hashes(&self, page_hashes: &[u8]) -> Vec<u8> {
+        self.build_from_hashes(CS_HASHTYPE_SHA256, CS_SHA256_LEN, page_hashes)
+    }
+
+    /// Internal build function using pre-computed page hashes.
+    fn build_from_hashes(&self, hash_type: u8, hash_size: usize, page_hashes: &[u8]) -> Vec<u8> {
+        let code_limit = self.code.len() as u32;
+        let n_code_slots = if code_limit == 0 {
+            0
+        } else {
+            (code_limit as usize).div_ceil(PAGE_SIZE)
+        };
+
+        debug_assert_eq!(
+            page_hashes.len(),
+            n_code_slots * hash_size,
+            "page_hashes length mismatch: expected {} ({}×{}), got {}",
+            n_code_slots * hash_size, n_code_slots, hash_size, page_hashes.len()
+        );
+
+        let n_special_slots = self.count_special_slots();
+
+        let ident_offset = CODEDIRECTORY_HEADER_SIZE;
+        let ident_len = self.identifier.len() as u32 + 1;
+
+        let team_offset = if self.team_id.is_some() {
+            ident_offset + ident_len
+        } else {
+            0
+        };
+        let team_len = self
+            .team_id
+            .as_ref()
+            .map(|t| t.len() as u32 + 1)
+            .unwrap_or(0);
+
+        let hash_offset = ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
+        let total_len = hash_offset + (n_code_slots as u32 * hash_size as u32);
+
+        let mut buf = Vec::with_capacity(total_len as usize);
+
+        // Header (all fields are big-endian) — identical to build_internal
+        buf.extend(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+        buf.extend(&total_len.to_be_bytes());
+        buf.extend(&CODEDIRECTORY_VERSION.to_be_bytes());
+        buf.extend(&self.flags.to_be_bytes());
+        buf.extend(&hash_offset.to_be_bytes());
+        buf.extend(&ident_offset.to_be_bytes());
+        buf.extend(&(n_special_slots as u32).to_be_bytes());
+        buf.extend(&(n_code_slots as u32).to_be_bytes());
+        buf.extend(&code_limit.to_be_bytes());
+        buf.push(hash_size as u8);
+        buf.push(hash_type);
+        buf.push(0);
+        buf.push(PAGE_SIZE_LOG2);
+        buf.extend(&0u32.to_be_bytes());
+        buf.extend(&0u32.to_be_bytes());
+        buf.extend(&team_offset.to_be_bytes());
+        buf.extend(&0u32.to_be_bytes());
+        buf.extend(&0u64.to_be_bytes());
+        buf.extend(&0u64.to_be_bytes());
+        buf.extend(&self.exec_seg_limit.to_be_bytes());
+        buf.extend(&self.exec_seg_flags.to_be_bytes());
+
+        // Identifier
+        buf.extend(self.identifier.as_bytes());
+        buf.push(0);
+
+        // Team ID
+        if let Some(ref team) = self.team_id {
+            buf.extend(team.as_bytes());
+            buf.push(0);
+        }
+
+        // Special slots
+        let special_slots = self.build_special_slots(hash_size);
+        buf.extend(&special_slots);
+
+        // Code slots from pre-computed hashes
+        buf.extend_from_slice(page_hashes);
+
+        debug_assert_eq!(buf.len(), total_len as usize);
+
+        buf
     }
 
     /// Internal build function that handles both hash types.
@@ -679,5 +818,87 @@ mod tests {
 
         // SHA-256 blob should be larger due to larger hashes
         assert!(cd_sha256.len() > cd_sha1.len());
+    }
+
+    #[test]
+    fn test_dual_page_hashes_matches_individual() {
+        let code = vec![0xAB; 8192]; // 2 pages
+        let dual = hash_code_pages_dual(&code);
+
+        assert_eq!(dual.sha1.len(), 2 * CS_SHA1_LEN);
+        assert_eq!(dual.sha256.len(), 2 * CS_SHA256_LEN);
+    }
+
+    #[test]
+    fn test_build_from_hashes_matches_build_internal_sha256() {
+        let code = vec![0xCD; 12288]; // 3 pages
+        let dual = hash_code_pages_dual(&code);
+
+        let builder = CodeDirectoryBuilder::new("com.example.test", &code)
+            .team_id("TEAM123")
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
+            .exec_seg_limit(65536);
+
+        let from_internal = builder.build_sha256();
+        let from_hashes = builder.build_sha256_from_hashes(&dual.sha256);
+
+        assert_eq!(from_internal, from_hashes, "build_sha256_from_hashes must produce byte-identical output to build_sha256");
+    }
+
+    #[test]
+    fn test_build_from_hashes_matches_build_internal_sha1() {
+        let code = vec![0xCD; 12288]; // 3 pages
+        let dual = hash_code_pages_dual(&code);
+
+        let builder = CodeDirectoryBuilder::new("com.example.test", &code)
+            .team_id("TEAM123")
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
+            .exec_seg_limit(65536);
+
+        let from_internal = builder.build_sha1();
+        let from_hashes = builder.build_sha1_from_hashes(&dual.sha1);
+
+        assert_eq!(from_internal, from_hashes, "build_sha1_from_hashes must produce byte-identical output to build_sha1");
+    }
+
+    #[test]
+    fn test_dual_page_hashes_empty_code() {
+        let dual = hash_code_pages_dual(&[]);
+        assert!(dual.sha1.is_empty());
+        assert!(dual.sha256.is_empty());
+    }
+
+    #[test]
+    fn test_build_from_hashes_with_all_special_slots() {
+        let code = vec![0xEF; 16384]; // 4 pages
+        let dual = hash_code_pages_dual(&code);
+
+        let builder = CodeDirectoryBuilder::new("com.example.full", &code)
+            .team_id("TEAMFULL")
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
+            .exec_seg_limit(32768)
+            .requirements_hash(vec![0x11; 32])
+            .info_hash(vec![0x22; 32])
+            .resources_hash(vec![0x33; 32])
+            .entitlements_hash(vec![0x44; 32])
+            .der_entitlements_hash(vec![0x55; 32]);
+
+        let from_internal = builder.build_sha256();
+        let from_hashes = builder.build_sha256_from_hashes(&dual.sha256);
+
+        assert_eq!(from_internal, from_hashes);
+    }
+
+    #[test]
+    fn test_build_from_hashes_partial_page() {
+        let code = vec![0xAA; 6144]; // 1.5 pages
+        let dual = hash_code_pages_dual(&code);
+
+        let builder = CodeDirectoryBuilder::new("test.partial", &code);
+
+        let from_internal = builder.build_sha256();
+        let from_hashes = builder.build_sha256_from_hashes(&dual.sha256);
+
+        assert_eq!(from_internal, from_hashes);
     }
 }
