@@ -37,7 +37,7 @@ use sha2::Sha256;
 
 use super::parser::{ArchSlice, MachOFile};
 use super::writer::SignedSlice;
-use super::writer::{calculate_signature_space, has_enough_signature_space, prepare_code_in_place, realloc_code_sign_space_with_metadata};
+use super::writer::{align_to, calculate_signature_space, checked_u32, has_enough_signature_space, prepare_code_in_place, realloc_code_sign_space_with_metadata};
 
 /// Pre-computed signing inputs that are invariant across all slices of a binary.
 ///
@@ -230,18 +230,22 @@ pub fn sign_macho_all_slices(
         identifier, credentials, entitlements, is_executable, info_plist, code_resources,
     )?;
 
-    let mut signed_slices = Vec::with_capacity(macho.slices().len());
+    use rayon::prelude::*;
 
-    for (index, slice) in macho.slices().iter().enumerate() {
-        let slice_data = macho.slice_data(slice);
+    let signed_slices: Vec<SignedSlice> = macho.slices()
+        .par_iter()
+        .enumerate()
+        .map(|(index, slice)| -> Result<SignedSlice> {
+            let slice_data = macho.slice_data(slice);
 
-        let mut signed = sign_slice_complete(
-            slice_data, slice, identifier, &ctx, credentials,
-        )?;
+            let mut signed = sign_slice_complete(
+                slice_data, slice, identifier, &ctx, credentials,
+            )?;
 
-        signed.slice_index = index;
-        signed_slices.push(signed);
-    }
+            signed.slice_index = index;
+            Ok(signed)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(signed_slices)
 }
@@ -266,12 +270,12 @@ fn sign_slice_complete(
             cpu_type: slice.cpu_type,
             is_64: slice.is_64,
             is_executable: slice.is_executable,
-            code_sig_offset: Some(slice.code_length as u32),
-            code_sig_size: Some((reallocated.len() - slice.code_length) as u32),
-            text_segment_size: slice.text_segment_size,
-            code_length: slice.code_length,
-            metadata: updated_metadata.clone(),
-        };
+            code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
+                code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
+                text_segment_size: slice.text_segment_size,
+                code_length: slice.code_length,
+                metadata: updated_metadata.clone(),
+            };
 
         (reallocated, updated_metadata, new_slice, false)
     } else {
@@ -331,10 +335,70 @@ fn sign_slice_complete(
     let final_sig = builder.build();
 
     if final_sig.len() > sig_space_size {
-        return Err(crate::Error::MachO(format!(
-            "signature exceeded reserved size: reserved={}, actual={}",
-            sig_space_size, final_sig.len()
-        )));
+        // Retry with larger reserve based on actual signature size
+        let padded_sig_size = align_to(final_sig.len(), PAGE_SIZE);
+
+        // Re-prepare from the original slice data
+        let (mut buf2, working_metadata2, working_slice2) = if !has_enough_signature_space(slice_data, slice.code_length, padded_sig_size) {
+            let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(slice_data, &slice.metadata, slice.code_length)?;
+            let new_slice = ArchSlice {
+                offset: slice.offset,
+                size: reallocated.len(),
+                cpu_type: slice.cpu_type,
+                is_64: slice.is_64,
+                is_executable: slice.is_executable,
+                code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
+                code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
+                text_segment_size: slice.text_segment_size,
+                code_length: slice.code_length,
+                metadata: updated_metadata.clone(),
+            };
+            (reallocated, updated_metadata, new_slice)
+        } else {
+            (slice_data.to_vec(), slice.metadata.clone(), slice.clone())
+        };
+
+        let target2 = Some(buf2.len());
+        let (sig_offset2, _) = prepare_code_in_place(&mut buf2, &working_metadata2, working_slice2.code_length, padded_sig_size)?;
+
+        // Re-hash and re-sign with new offsets
+        let dual2 = hash_code_pages_dual(&buf2);
+        let cd_sha1_2 = build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha1, true);
+        let cd_sha256_2 = build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha256, false);
+
+        let cdhash_sha1_2: [u8; 20] = compute_cdhash_sha1(&cd_sha1_2);
+        let cdhash_sha256_2: [u8; 32] = compute_cdhash_sha256(&cd_sha256_2);
+
+        let cms_data2 = cms::sign_code_directory(&cd_sha1_2, credentials, &cdhash_sha1_2, &cdhash_sha256_2)?;
+        let sig_blob2 = build_signature_blob(&cms_data2);
+
+        let mut builder2 = SuperBlobBuilder::new()
+            .code_directory_sha1(cd_sha1_2)
+            .code_directory_sha256(cd_sha256_2)
+            .requirements(ctx.requirements.clone())
+            .cms_signature(sig_blob2);
+        if let Some(ref ent_blob) = ctx.entitlements_blob {
+            builder2 = builder2.entitlements(ent_blob.clone());
+        }
+        if let Some(ref der_ent_blob) = ctx.der_entitlements_blob {
+            builder2 = builder2.der_entitlements(der_ent_blob.clone());
+        }
+
+        let final_sig2 = builder2.build();
+        if final_sig2.len() > padded_sig_size {
+            return Err(crate::Error::MachO(format!(
+                "signature exceeded reserved size after retry: reserved={}, actual={}",
+                padded_sig_size, final_sig2.len()
+            )));
+        }
+
+        embed_signature_in_place(&mut buf2, &final_sig2, sig_offset2, target2);
+        return Ok(SignedSlice {
+            slice_index: 0,
+            offset: slice.offset,
+            original_size: slice.size,
+            signed_data: buf2,
+        });
     }
 
     // Step 8: Embed signature in-place
