@@ -111,8 +111,6 @@ pub struct IpaSigner<'a> {
     compression_level: CompressionLevel,
     /// Path to provisioning profile to embed as embedded.mobileprovision
     provisioning_profile_path: Option<PathBuf>,
-    /// Cached entitlements from provisioning profile
-    entitlements: Option<Vec<u8>>,
     /// Override bundle identifier for the main app bundle
     bundle_id: Option<String>,
 }
@@ -128,7 +126,6 @@ impl<'a> IpaSigner<'a> {
             credentials,
             compression_level: CompressionLevel::DEFAULT,
             provisioning_profile_path: None,
-            entitlements: None,
             bundle_id: None,
         }
     }
@@ -144,25 +141,10 @@ impl<'a> IpaSigner<'a> {
     /// Sets the provisioning profile to embed as `embedded.mobileprovision`.
     ///
     /// iOS apps require a provisioning profile to launch on device.
-    /// This copies the profile to the bundle and extracts entitlements
-    /// from the profile for code signing.
-    ///
-    /// # Errors
-    ///
-    /// Silently ignores errors reading the profile file; entitlements will
-    /// be `None` if the profile cannot be read or parsed.
+    /// The profile is read and entitlements are extracted during [`Self::sign`],
+    /// where errors can be properly propagated.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref();
-        self.provisioning_profile_path = Some(path.to_path_buf());
-
-        if let Ok(profile_data) = fs::read(path) {
-            match zsign_core::extract_entitlements_from_profile(&profile_data) {
-                Ok(Some(entitlements)) => self.entitlements = Some(entitlements),
-                Ok(None) => {}
-                Err(e) => eprintln!("Warning: Failed to extract entitlements: {}", e),
-            }
-        }
-
+        self.provisioning_profile_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -209,7 +191,16 @@ impl<'a> IpaSigner<'a> {
 
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
 
-        self.sign_bundle(&app_bundle)?;
+        let (profile_data, entitlements) = match &self.provisioning_profile_path {
+            Some(path) => {
+                let data = fs::read(path)?;
+                let ent = zsign_core::extract_entitlements_from_profile(&data)?;
+                (Some(data), ent)
+            }
+            None => (None, None),
+        };
+
+        self.sign_bundle(&app_bundle, entitlements.as_deref(), profile_data.as_deref())?;
 
         create_ipa(&app_bundle, output_ipa, self.compression_level)?;
 
@@ -231,7 +222,7 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all Mach-O binaries in-place (modifies binary content)
     /// 2. Copy provisioning profile to bundle (main app only)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
-    fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
+    fn sign_bundle(&self, bundle_path: &Path, entitlements: Option<&[u8]>, profile_data: Option<&[u8]>) -> Result<()> {
         if let Some(ref new_id) = self.bundle_id {
             self.rewrite_bundle_id(bundle_path, new_id)?;
         }
@@ -247,7 +238,12 @@ impl<'a> IpaSigner<'a> {
 
         for (nested_bundle_path, _depth) in &bundles {
             let is_main_bundle = nested_bundle_path == bundle_path;
-            self.sign_single_bundle(nested_bundle_path, is_main_bundle)?;
+            self.sign_single_bundle(
+                nested_bundle_path,
+                is_main_bundle,
+                entitlements,
+                if is_main_bundle { profile_data } else { None },
+            )?;
         }
 
         Ok(())
@@ -375,7 +371,7 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all binaries EXCEPT the main executable (no CodeResources yet)
     /// 2. Generate CodeResources (which hashes the signed binaries)
     /// 3. Sign the main executable WITH the CodeResources hash
-    fn sign_single_bundle(&self, bundle_path: &Path, copy_provisioning_profile: bool) -> Result<()> {
+    fn sign_single_bundle(&self, bundle_path: &Path, copy_provisioning_profile: bool, entitlements: Option<&[u8]>, profile_data: Option<&[u8]>) -> Result<()> {
         let identifier = self.get_bundle_identifier(bundle_path)?;
         let main_executable = self.get_main_executable(bundle_path)?;
 
@@ -387,16 +383,16 @@ impl<'a> IpaSigner<'a> {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or(&identifier);
-                self.sign_binary(binary_path, binary_identifier, None)?;
+                self.sign_binary(binary_path, binary_identifier, None, entitlements)?;
             }
         }
 
         if copy_provisioning_profile {
-            if let Some(ref profile_path) = self.provisioning_profile_path {
+            if let Some(data) = profile_data {
                 let embedded_path = bundle_path.join("embedded.mobileprovision");
-                fs::copy(profile_path, &embedded_path).map_err(|e| {
+                fs::write(&embedded_path, data).map_err(|e| {
                     Error::Core(zsign_core::Error::Signing(format!(
-                        "Failed to copy provisioning profile to {}: {}",
+                        "Failed to write provisioning profile to {}: {}",
                         embedded_path.display(),
                         e
                     )))
@@ -414,7 +410,7 @@ impl<'a> IpaSigner<'a> {
         };
 
         if main_executable.exists() {
-            self.sign_binary(&main_executable, &identifier, code_resources_data.as_deref())?;
+            self.sign_binary(&main_executable, &identifier, code_resources_data.as_deref(), entitlements)?;
         }
 
         Ok(())
@@ -456,7 +452,7 @@ impl<'a> IpaSigner<'a> {
                 continue;
             }
 
-            if path != self.get_main_executable(bundle_path)? && self.is_macho_binary(path)? {
+            if path != main_executable && self.is_macho_binary(path)? {
                 binaries.push(path.to_path_buf());
             }
         }
@@ -598,6 +594,7 @@ impl<'a> IpaSigner<'a> {
         binary_path: &Path,
         identifier: &str,
         code_resources: Option<&[u8]>,
+        entitlements: Option<&[u8]>,
     ) -> Result<()> {
         let macho = MachOFile::open(binary_path)?;
 
@@ -627,7 +624,7 @@ impl<'a> IpaSigner<'a> {
         let signed_binary = sign_any_macho(
             &macho,
             identifier,
-            self.entitlements.as_deref(),
+            entitlements,
             self.credentials,
             info_data.as_deref(),
             code_resources,
