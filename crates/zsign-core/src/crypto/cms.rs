@@ -38,6 +38,11 @@ use spki::AlgorithmIdentifierOwned;
 use x509_cert::attr::Attribute;
 use x509_cert::Certificate;
 
+/// Creates an `Error::Signing` with a formatted context message.
+fn signing_err(ctx: &str, err: impl std::fmt::Display) -> Error {
+    Error::Signing(format!("{}: {}", ctx, err))
+}
+
 /// Apple CDHash v1 attribute OID: `1.2.840.113635.100.9.1`
 ///
 /// This OID identifies the first generation of Apple's CDHash signed attribute.
@@ -88,10 +93,10 @@ pub fn sign_code_directory(
     let cdhash_v1_attr = build_apple_octet_string_attribute(APPLE_CDHASH_OID, &cdhash_plist)?;
     let cdhash_v2_attr = build_apple_der_attribute(APPLE_CDHASH_V2_OID, &cdhash_v2_value)?;
 
-    let message_digest = {
+    let message_digest: [u8; 32] = {
         let mut hasher = Sha256::new();
         hasher.update(data);
-        hasher.finalize().to_vec()
+        hasher.finalize().into()
     };
 
     let encap_content_info = EncapsulatedContentInfo {
@@ -109,47 +114,48 @@ pub fn sign_code_directory(
         serial_number: credentials.certificate.tbs_certificate.serial_number.clone(),
     });
 
+    let ctx = CmsBuildContext {
+        sid,
+        digest_algorithm,
+        encap_content_info: &encap_content_info,
+        message_digest: &message_digest,
+        attrs: CmsSignedAttrs {
+            cdhash_v1: cdhash_v1_attr,
+            cdhash_v2: cdhash_v2_attr,
+        },
+        signing_cert: &credentials.certificate,
+        cert_chain: &credentials.cert_chain,
+    };
+
     match &credentials.signing_key {
         SigningKeyType::Rsa(rsa_private_key) => {
             let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_private_key.clone());
-            build_cms_signed_data(
-                &signing_key,
-                sid,
-                digest_algorithm,
-                &encap_content_info,
-                &message_digest,
-                cdhash_v1_attr,
-                cdhash_v2_attr,
-                &credentials.certificate,
-                &credentials.cert_chain,
-            )
+            build_cms_signed_data(&signing_key, ctx)
         }
         SigningKeyType::Ecdsa(ecdsa_key) => {
-            build_cms_signed_data::<_, p256::ecdsa::DerSignature>(
-                ecdsa_key,
-                sid,
-                digest_algorithm,
-                &encap_content_info,
-                &message_digest,
-                cdhash_v1_attr,
-                cdhash_v2_attr,
-                &credentials.certificate,
-                &credentials.cert_chain,
-            )
+            build_cms_signed_data::<_, p256::ecdsa::DerSignature>(ecdsa_key, ctx)
         }
     }
 }
 
-fn build_cms_signed_data<S, Sig>(
-    signer: &S,
+struct CmsSignedAttrs {
+    cdhash_v1: Attribute,
+    cdhash_v2: Attribute,
+}
+
+struct CmsBuildContext<'a> {
     sid: SignerIdentifier,
     digest_algorithm: AlgorithmIdentifierOwned,
-    encap_content_info: &EncapsulatedContentInfo,
-    message_digest: &[u8],
-    cdhash_v1_attr: Attribute,
-    cdhash_v2_attr: Attribute,
-    signing_cert: &Certificate,
-    cert_chain: &[Certificate],
+    encap_content_info: &'a EncapsulatedContentInfo,
+    message_digest: &'a [u8],
+    attrs: CmsSignedAttrs,
+    signing_cert: &'a Certificate,
+    cert_chain: &'a [Certificate],
+}
+
+fn build_cms_signed_data<S, Sig>(
+    signer: &S,
+    ctx: CmsBuildContext<'_>,
 ) -> Result<Vec<u8>>
 where
     S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
@@ -157,45 +163,45 @@ where
 {
     let mut sib = SignerInfoBuilder::new(
         signer,
-        sid,
-        digest_algorithm.clone(),
-        encap_content_info,
-        Some(message_digest),
+        ctx.sid,
+        ctx.digest_algorithm.clone(),
+        ctx.encap_content_info,
+        Some(ctx.message_digest),
     )
-    .map_err(|e| Error::Signing(format!("Failed to create SignerInfoBuilder: {}", e)))?;
+    .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
 
-    sib.add_signed_attribute(cdhash_v1_attr)
-        .map_err(|e| Error::Signing(format!("Failed to add CDHash v1 attribute: {}", e)))?;
-    sib.add_signed_attribute(cdhash_v2_attr)
-        .map_err(|e| Error::Signing(format!("Failed to add CDHash v2 attribute: {}", e)))?;
+    sib.add_signed_attribute(ctx.attrs.cdhash_v1)
+        .map_err(|e| signing_err("Failed to add CDHash v1 attribute", e))?;
+    sib.add_signed_attribute(ctx.attrs.cdhash_v2)
+        .map_err(|e| signing_err("Failed to add CDHash v2 attribute", e))?;
 
-    let mut builder = SignedDataBuilder::new(encap_content_info);
-
-    builder
-        .add_digest_algorithm(digest_algorithm)
-        .map_err(|e| Error::Signing(format!("Failed to add digest algorithm: {}", e)))?;
+    let mut builder = SignedDataBuilder::new(ctx.encap_content_info);
 
     builder
-        .add_certificate(CertificateChoices::Certificate(signing_cert.clone()))
-        .map_err(|e| Error::Signing(format!("Failed to add signing certificate: {}", e)))?;
+        .add_digest_algorithm(ctx.digest_algorithm)
+        .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
 
-    for cert in cert_chain {
+    builder
+        .add_certificate(CertificateChoices::Certificate(ctx.signing_cert.clone()))
+        .map_err(|e| signing_err("Failed to add signing certificate", e))?;
+
+    for cert in ctx.cert_chain {
         builder
             .add_certificate(CertificateChoices::Certificate(cert.clone()))
-            .map_err(|e| Error::Signing(format!("Failed to add chain certificate: {}", e)))?;
+            .map_err(|e| signing_err("Failed to add chain certificate", e))?;
     }
 
     builder
         .add_signer_info::<S, Sig>(sib)
-        .map_err(|e| Error::Signing(format!("Failed to add signer info: {}", e)))?;
+        .map_err(|e| signing_err("Failed to add signer info", e))?;
 
     let content_info = builder
         .build()
-        .map_err(|e| Error::Signing(format!("Failed to build CMS SignedData: {}", e)))?;
+        .map_err(|e| signing_err("Failed to build CMS SignedData", e))?;
 
     content_info
         .to_der()
-        .map_err(|e| Error::Signing(format!("Failed to encode CMS to DER: {}", e)))
+        .map_err(|e| signing_err("Failed to encode CMS to DER", e))
 }
 
 /// Builds an Apple attribute wrapping the value in an `OCTET STRING` (for CDHash v1 plist).
@@ -204,12 +210,12 @@ fn build_apple_octet_string_attribute(
     value_bytes: &[u8],
 ) -> Result<Attribute> {
     let attr_value = Any::new(Tag::OctetString, value_bytes)
-        .map_err(|e| Error::Signing(format!("Failed to create attribute value: {}", e)))?;
+        .map_err(|e| signing_err("Failed to create attribute value", e))?;
 
     let mut values = SetOfVec::new();
     values
         .insert(attr_value)
-        .map_err(|e| Error::Signing(format!("Failed to insert attribute value: {}", e)))?;
+        .map_err(|e| signing_err("Failed to insert attribute value", e))?;
 
     Ok(Attribute { oid, values })
 }
@@ -221,12 +227,12 @@ fn build_apple_der_attribute(
 ) -> Result<Attribute> {
     use der::Decode;
     let attr_value = Any::from_der(value_der)
-        .map_err(|e| Error::Signing(format!("Failed to parse attribute DER: {}", e)))?;
+        .map_err(|e| signing_err("Failed to parse attribute DER", e))?;
 
     let mut values = SetOfVec::new();
     values
         .insert(attr_value)
-        .map_err(|e| Error::Signing(format!("Failed to insert attribute value: {}", e)))?;
+        .map_err(|e| signing_err("Failed to insert attribute value", e))?;
 
     Ok(Attribute { oid, values })
 }
@@ -537,5 +543,66 @@ mod tests {
             attr_oids.contains(&APPLE_CDHASH_V2_OID.to_string()),
             "Signed attributes should contain Apple CDHash v2 OID"
         );
+    }
+
+    #[test]
+    fn test_sign_code_directory_ecdsa() {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use cms::content_info::ContentInfo;
+        use cms::signed_data::SignedData;
+        use der::{Decode, Encode};
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let ecdsa_key = SigningKey::random(&mut OsRng);
+        let verifying_key = p256::ecdsa::VerifyingKey::from(&ecdsa_key);
+
+        let subject = Name::from_str("CN=ECDSA Test Signer,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(43u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = verifying_key.to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+
+        let cert = CertificateBuilder::new(
+            Profile::Root, serial, validity, subject, pub_key, &ecdsa_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
+
+        let credentials = SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Ecdsa(ecdsa_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        };
+
+        let code_dir_data = b"fake code directory data for ECDSA test";
+        let cdhash_sha1: [u8; 20] = [0xCC; 20];
+        let cdhash_sha256: [u8; 32] = [0xDD; 32];
+
+        let cms_der =
+            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256)
+                .unwrap();
+
+        let content_info = ContentInfo::from_der(&cms_der).unwrap();
+        let signed_data =
+            SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
+
+        assert!(signed_data.encap_content_info.econtent.is_none());
+        assert_eq!(signed_data.signer_infos.0.len(), 1);
+
+        let signer_info = signed_data.signer_infos.0.iter().next().unwrap();
+        let signed_attrs = signer_info.signed_attrs.as_ref().unwrap();
+        let attr_oids: Vec<String> = signed_attrs.iter().map(|a| a.oid.to_string()).collect();
+        assert!(attr_oids.contains(&APPLE_CDHASH_OID.to_string()));
+        assert!(attr_oids.contains(&APPLE_CDHASH_V2_OID.to_string()));
     }
 }
