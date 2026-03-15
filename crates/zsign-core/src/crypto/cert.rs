@@ -301,12 +301,13 @@ fn build_apple_ca_chain(signing_cert: &Certificate) -> Vec<Certificate> {
     chain
 }
 
-/// Extracts the Organizational Unit (OU) from a certificate's issuer.
-fn extract_issuer_ou(cert: &Certificate) -> Option<String> {
-    let issuer = &cert.tbs_certificate.issuer;
-    for rdn in issuer.0.iter() {
+/// Extracts a string attribute from an X.509 Name by OID.
+///
+/// Tries both UTF-8 and PrintableString encodings, matching Apple certificate conventions.
+fn extract_name_attr(name: &x509_cert::name::Name, oid: const_oid::ObjectIdentifier) -> Option<String> {
+    for rdn in name.0.iter() {
         for atav in rdn.0.iter() {
-            if atav.oid == const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME {
+            if atav.oid == oid {
                 if let Ok(s) = der::asn1::Utf8StringRef::try_from(&atav.value) {
                     return Some(s.as_str().to_string());
                 }
@@ -319,22 +320,14 @@ fn extract_issuer_ou(cert: &Certificate) -> Option<String> {
     None
 }
 
+/// Extracts the Organizational Unit (OU) from a certificate's issuer.
+fn extract_issuer_ou(cert: &Certificate) -> Option<String> {
+    extract_name_attr(&cert.tbs_certificate.issuer, const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME)
+}
+
 /// Extracts the Common Name (CN) from a certificate's issuer.
 fn extract_issuer_cn(cert: &Certificate) -> Option<String> {
-    let issuer = &cert.tbs_certificate.issuer;
-    for rdn in issuer.0.iter() {
-        for atav in rdn.0.iter() {
-            if atav.oid == const_oid::db::rfc4519::COMMON_NAME {
-                if let Ok(s) = der::asn1::Utf8StringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-                if let Ok(s) = der::asn1::PrintableStringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-            }
-        }
-    }
-    None
+    extract_name_attr(&cert.tbs_certificate.issuer, const_oid::db::rfc4519::COMMON_NAME)
 }
 
 /// Verifies that the private key matches the certificate's public key.
@@ -378,40 +371,12 @@ fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<(
 
 /// Extracts the Apple Team ID from a certificate's Organizational Unit field.
 fn extract_team_id(cert: &Certificate) -> Option<String> {
-    let subject = &cert.tbs_certificate.subject;
-
-    for rdn in subject.0.iter() {
-        for atav in rdn.0.iter() {
-            if atav.oid == const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME {
-                if let Ok(s) = der::asn1::Utf8StringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-                if let Ok(s) = der::asn1::PrintableStringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-            }
-        }
-    }
-    None
+    extract_name_attr(&cert.tbs_certificate.subject, const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME)
 }
 
 /// Extracts the Common Name (CN) from a certificate's subject.
 pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
-    let subject = &cert.tbs_certificate.subject;
-
-    for rdn in subject.0.iter() {
-        for atav in rdn.0.iter() {
-            if atav.oid == const_oid::db::rfc4519::COMMON_NAME {
-                if let Ok(s) = der::asn1::Utf8StringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-                if let Ok(s) = der::asn1::PrintableStringRef::try_from(&atav.value) {
-                    return Some(s.as_str().to_string());
-                }
-            }
-        }
-    }
-    None
+    extract_name_attr(&cert.tbs_certificate.subject, const_oid::db::rfc4519::COMMON_NAME)
 }
 
 #[cfg(test)]
@@ -454,5 +419,25 @@ mod tests {
         let cert = Certificate::from_pem(APPLE_WWDR_CA_G3_CERT.as_bytes()).unwrap();
         let team_id = extract_team_id(&cert);
         assert_eq!(team_id, Some("G3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_subject_cn_from_apple_wwdr_cert() {
+        use crate::crypto::assets::APPLE_WWDR_CA_G3_CERT;
+
+        let cert = Certificate::from_pem(APPLE_WWDR_CA_G3_CERT.as_bytes()).unwrap();
+        let cn = extract_subject_cn(&cert);
+        assert!(cn.is_some());
+        assert!(cn.unwrap().contains("Apple Worldwide Developer Relations"));
+    }
+
+    #[test]
+    fn test_extract_issuer_cn_from_apple_wwdr_cert() {
+        use crate::crypto::assets::APPLE_WWDR_CA_G3_CERT;
+
+        let cert = Certificate::from_pem(APPLE_WWDR_CA_G3_CERT.as_bytes()).unwrap();
+        let cn = extract_issuer_cn(&cert);
+        assert!(cn.is_some());
+        assert!(cn.unwrap().contains("Apple Root CA"));
     }
 }
