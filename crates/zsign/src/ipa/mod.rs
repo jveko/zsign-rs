@@ -241,7 +241,7 @@ impl<'a> IpaSigner<'a> {
             self.sign_single_bundle(
                 nested_bundle_path,
                 is_main_bundle,
-                entitlements,
+                if is_main_bundle { entitlements } else { None },
                 if is_main_bundle { profile_data } else { None },
             )?;
         }
