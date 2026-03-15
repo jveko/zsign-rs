@@ -34,6 +34,7 @@
 //! ```
 
 use super::constants::*;
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -48,10 +49,23 @@ pub struct DualPageHashes {
     pub sha256: Vec<u8>,
 }
 
-/// Hash all code pages with both SHA-1 and SHA-256 in a single pass.
+/// Minimum code size to enable parallel hashing (1MB).
+/// Below this threshold, rayon scheduling overhead exceeds the gain.
+const PARALLEL_HASH_THRESHOLD: usize = 1024 * 1024;
+
+/// Number of pages per parallel hashing stripe.
+const HASH_STRIPE_PAGES: usize = 128;
+
+/// Stripe size for parallel hashing (128 pages × 4KB = 512KB).
+/// Each rayon task hashes this many bytes sequentially.
+/// MUST be a multiple of PAGE_SIZE to preserve hash equivalence with sequential.
+const HASH_STRIPE_SIZE: usize = HASH_STRIPE_PAGES * PAGE_SIZE;
+
+/// Hash all code pages with both SHA-1 and SHA-256.
 ///
-/// Each 4KB page is fed to both hashers simultaneously, avoiding
-/// duplicate iteration over the code bytes.
+/// For binaries ≥1MB, pages are hashed in parallel using rayon with
+/// coarse-grained stripes (512KB each). On WASM, rayon degrades
+/// gracefully to sequential execution.
 pub fn hash_code_pages_dual(code: &[u8]) -> DualPageHashes {
     if code.is_empty() {
         return DualPageHashes {
@@ -60,7 +74,35 @@ pub fn hash_code_pages_dual(code: &[u8]) -> DualPageHashes {
         };
     }
 
-    let chunks: usize = code.len().div_ceil(PAGE_SIZE);
+    if code.len() < PARALLEL_HASH_THRESHOLD {
+        return hash_code_pages_dual_seq(code);
+    }
+
+    // Split into coarse stripes for parallel hashing
+    let stripe_hashes: Vec<DualPageHashes> = code
+        .par_chunks(HASH_STRIPE_SIZE)
+        .map(hash_code_pages_dual_seq)
+        .collect();
+
+    // Concatenate results in order
+    let total_pages = code.len().div_ceil(PAGE_SIZE);
+    let mut sha1_hashes = Vec::with_capacity(total_pages * CS_SHA1_LEN);
+    let mut sha256_hashes = Vec::with_capacity(total_pages * CS_SHA256_LEN);
+
+    for part in stripe_hashes {
+        sha1_hashes.extend_from_slice(&part.sha1);
+        sha256_hashes.extend_from_slice(&part.sha256);
+    }
+
+    DualPageHashes {
+        sha1: sha1_hashes,
+        sha256: sha256_hashes,
+    }
+}
+
+/// Sequential dual-hash implementation for a contiguous code region.
+fn hash_code_pages_dual_seq(code: &[u8]) -> DualPageHashes {
+    let chunks = code.len().div_ceil(PAGE_SIZE);
     let mut sha1_hashes = Vec::with_capacity(chunks * CS_SHA1_LEN);
     let mut sha256_hashes = Vec::with_capacity(chunks * CS_SHA256_LEN);
 
@@ -900,5 +942,21 @@ mod tests {
         let from_hashes = builder.build_sha256_from_hashes(&dual.sha256);
 
         assert_eq!(from_internal, from_hashes);
+    }
+
+    #[test]
+    fn test_parallel_hash_matches_sequential() {
+        // Use a size > PARALLEL_HASH_THRESHOLD (1MB) and NOT divisible
+        // by HASH_STRIPE_SIZE to test boundary-crossing stripes
+        let size = 1024 * 1024 + 4096 * 7; // 1MB + 7 pages
+        let code = vec![0xABu8; size];
+
+        let parallel_result = hash_code_pages_dual(&code);
+        let sequential_result = hash_code_pages_dual_seq(&code);
+
+        assert_eq!(parallel_result.sha1, sequential_result.sha1,
+            "SHA-1 hashes must be identical for parallel and sequential");
+        assert_eq!(parallel_result.sha256, sequential_result.sha256,
+            "SHA-256 hashes must be identical for parallel and sequential");
     }
 }

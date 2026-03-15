@@ -27,6 +27,7 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
 p12 = "0.6"
 signature = { version = "2.2", features = ["std"] }
 spki = { version = "0.7", features = ["pem"] }
+rayon = "1.11"
 
 # WASM entropy support — getrandom is pulled transitively by rsa.
 # On wasm32, it needs the "js" feature to use crypto.getRandomValues().

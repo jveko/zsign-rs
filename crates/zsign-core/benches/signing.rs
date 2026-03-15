@@ -180,7 +180,11 @@ fn bench_parse_macho(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &macho_data, |b, data| {
-            b.iter(|| MachOFile::parse(data.clone()).unwrap());
+            b.iter_batched(
+                || data.clone(),
+                |cloned| MachOFile::parse(cloned).unwrap(),
+                criterion::BatchSize::LargeInput,
+            );
         });
     }
 
