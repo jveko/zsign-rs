@@ -46,7 +46,7 @@ const CODE_SIGN_PADDING: usize = 16384;
 /// Computes space for code hashes (SHA-1 and SHA-256) plus padding.
 /// Used by [`realloc_code_sign_space`] to determine expansion size.
 pub fn calculate_signature_space(code_length: usize) -> usize {
-    let pages = code_length / PAGE_SIZE;
+    let pages = code_length.div_ceil(PAGE_SIZE);
     let hash_slot_size = 20 + 32;
     let sig_space = align_to((pages + 1) * hash_slot_size, PAGE_SIZE);
     code_length + sig_space + CODE_SIGN_PADDING
@@ -154,10 +154,10 @@ fn realloc_code_sign_space_single(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = (new_length - code_length) as u32;
+    let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
 
     if let Some((offset, _)) = code_sig_cmd {
-        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
     } else {
         let first_segment_offset = find_first_segment_offset(macho);
@@ -178,7 +178,7 @@ fn realloc_code_sign_space_single(
 
         write_u32(&mut output, max_load_cmd_end, LC_CODE_SIGNATURE, is_big_endian)?;
         write_u32(&mut output, max_load_cmd_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
-        write_u32(&mut output, max_load_cmd_end + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, max_load_cmd_end + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
         write_u32(&mut output, max_load_cmd_end + 12, sig_datasize, is_big_endian)?;
 
         let current_ncmds = read_u32(&output, 16, is_big_endian)?;
@@ -366,7 +366,7 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
     };
 
     let sig_offset = align_to(code_length, 16);
-    let sig_size = signature.len() as u32;
+    let sig_size = checked_u32(signature.len(), "sig_size")?;
 
     let mut output = Vec::with_capacity(sig_offset + signature.len());
     output.extend_from_slice(&data[..code_length]);
@@ -378,13 +378,13 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
     output.extend_from_slice(signature);
 
     if let Some((offset, _)) = code_sig_cmd {
-        update_linkedit_data_command(&mut output, offset, sig_offset as u32, sig_size)?;
+        update_linkedit_data_command(&mut output, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
     } else {
         add_code_signature_command(
             &mut output,
             macho,
             max_load_cmd_end,
-            sig_offset as u32,
+            checked_u32(sig_offset, "sig_offset")?,
             sig_size,
         )?;
     }
@@ -557,6 +557,15 @@ pub fn align_to(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
+/// Converts a `usize` to `u32`, returning an error if the value exceeds `u32::MAX`.
+///
+/// Used for Mach-O fields that are defined as u32 (e.g., `LC_CODE_SIGNATURE` offsets).
+pub(crate) fn checked_u32(value: usize, field_name: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        Error::MachO(format!("{} exceeds u32::MAX: {}", field_name, value))
+    })
+}
+
 /// Prepares code bytes for signing by updating load commands.
 ///
 /// Must be called before hashing, as the hash includes the Mach-O header
@@ -643,18 +652,18 @@ fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usi
     };
 
     let sig_offset = align_to(code_length, 16);
-    let sig_size = estimated_signature_size as u32;
+    let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
 
     let mut prepared = data[..code_length].to_vec();
 
     if let Some((offset, _)) = code_sig_cmd {
-        update_linkedit_data_command(&mut prepared, offset, sig_offset as u32, sig_size)?;
+        update_linkedit_data_command(&mut prepared, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
     } else {
         add_code_signature_command(
             &mut prepared,
             macho,
             max_load_cmd_end,
-            sig_offset as u32,
+            checked_u32(sig_offset, "sig_offset")?,
             sig_size,
         )?;
     }
@@ -715,13 +724,13 @@ pub fn realloc_code_sign_space_with_metadata(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = (new_length - code_length) as u32;
+    let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
 
-        updated_metadata.code_sig_cmd = Some((offset, code_length as u32, sig_datasize));
+        updated_metadata.code_sig_cmd = Some((offset, checked_u32(code_length, "code_length")?, sig_datasize));
     } else {
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
         let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
@@ -741,7 +750,7 @@ pub fn realloc_code_sign_space_with_metadata(
         let cmd_offset = metadata.max_load_cmd_end;
         write_u32(&mut output, cmd_offset, LC_CODE_SIGNATURE, is_big_endian)?;
         write_u32(&mut output, cmd_offset + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
-        write_u32(&mut output, cmd_offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, cmd_offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
         write_u32(&mut output, cmd_offset + 12, sig_datasize, is_big_endian)?;
 
         let current_ncmds = read_u32(&output, 16, is_big_endian)?;
@@ -749,7 +758,7 @@ pub fn realloc_code_sign_space_with_metadata(
         write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
         write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
 
-        updated_metadata.code_sig_cmd = Some((cmd_offset, code_length as u32, sig_datasize));
+        updated_metadata.code_sig_cmd = Some((cmd_offset, checked_u32(code_length, "code_length")?, sig_datasize));
         updated_metadata.max_load_cmd_end = new_load_commands_end;
     }
 
@@ -785,17 +794,17 @@ pub fn prepare_code_with_metadata(
     };
 
     let sig_offset = align_to(code_length, 16);
-    let sig_size = estimated_signature_size as u32;
+    let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
 
     let mut prepared = data[..code_length].to_vec();
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        update_linkedit_data_command(&mut prepared, offset, sig_offset as u32, sig_size)?;
+        update_linkedit_data_command(&mut prepared, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
     } else {
         add_code_signature_command_with_metadata(
             &mut prepared,
             metadata,
-            sig_offset as u32,
+            checked_u32(sig_offset, "sig_offset")?,
             sig_size,
         )?;
     }
@@ -863,15 +872,15 @@ pub fn prepare_code_in_place(
     buf.truncate(code_length);
 
     let sig_offset = align_to(code_length, 16);
-    let sig_size = estimated_signature_size as u32;
+    let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        update_linkedit_data_command(buf, offset, sig_offset as u32, sig_size)?;
+        update_linkedit_data_command(buf, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
     } else {
         add_code_signature_command_with_metadata(
             buf,
             metadata,
-            sig_offset as u32,
+            checked_u32(sig_offset, "sig_offset")?,
             sig_size,
         )?;
     }
@@ -1009,6 +1018,16 @@ mod tests {
         // pages = 2560, (2560+1)*52 = 133172 -> align to 4096 = 135168
         // total = 10MB + 135168 + 16384 = 10637312
         assert_eq!(result, 10637312);
+    }
+
+    #[test]
+    fn test_calculate_signature_space_non_aligned() {
+        // 4097 bytes = 2 pages (partial page counts as full page)
+        let code_length = 4097;
+        let result = calculate_signature_space(code_length);
+        // pages = 2 (div_ceil), (2+1)*52 = 156 -> align to 4096 = 4096
+        // total = 4097 + 4096 + 16384 = 24577
+        assert_eq!(result, 24577);
     }
 
     #[test]

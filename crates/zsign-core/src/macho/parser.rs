@@ -122,7 +122,7 @@ impl MachOFile {
 
         let (is_fat, slices) = match mach {
             Mach::Binary(macho) => {
-                let slice = Self::parse_single(bytes, &macho, 0)?;
+                let slice = Self::parse_single(bytes, &macho, 0, bytes.len())?;
                 (false, vec![slice])
             }
             Mach::Fat(fat) => {
@@ -141,7 +141,7 @@ impl MachOFile {
                     let macho = MachO::parse(slice_data, 0)
                         .map_err(|e| Error::MachO(format!("Slice {}: {}", i, e)))?;
 
-                    let mut slice = Self::parse_single(bytes, &macho, offset)?;
+                    let mut slice = Self::parse_single(bytes, &macho, offset, size)?;
                     slice.offset = offset;
                     slice.size = size;
                     slices.push(slice);
@@ -153,7 +153,7 @@ impl MachOFile {
         Ok(Self { data, is_fat, slices })
     }
 
-    fn parse_single(data: &[u8], macho: &MachO, base_offset: usize) -> Result<ArchSlice> {
+    fn parse_single(data: &[u8], macho: &MachO, base_offset: usize, declared_size: usize) -> Result<ArchSlice> {
         let is_executable = macho.header.filetype == MH_EXECUTE;
         let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
         let cpu_type = macho.header.cputype;
@@ -202,6 +202,30 @@ impl MachOFile {
             }
         }
 
+        // Validate code signature bounds
+        if let (Some(dataoff), Some(datasize)) = (code_sig_offset, code_sig_size) {
+            let sig_end = (dataoff as usize).checked_add(datasize as usize)
+                .ok_or_else(|| Error::MachO("LC_CODE_SIGNATURE: offset + size overflow".into()))?;
+            if sig_end > declared_size {
+                return Err(Error::MachO(format!(
+                    "LC_CODE_SIGNATURE extends beyond slice: offset={}, size={}, slice_len={}",
+                    dataoff, datasize, declared_size
+                )));
+            }
+        }
+
+        // Validate __LINKEDIT bounds
+        if let Some((_, fileoff, _, filesize)) = meta_linkedit_cmd {
+            let linkedit_end = (fileoff as usize).checked_add(filesize as usize)
+                .ok_or_else(|| Error::MachO("__LINKEDIT: fileoff + filesize overflow".into()))?;
+            if linkedit_end > declared_size {
+                return Err(Error::MachO(format!(
+                    "__LINKEDIT extends beyond slice: fileoff={}, filesize={}, slice_len={}",
+                    fileoff, filesize, declared_size
+                )));
+            }
+        }
+
         let computed_first_segment_offset = if first_segment_offset == u64::MAX {
             4096
         } else {
@@ -220,16 +244,17 @@ impl MachOFile {
                 .filter_map(|lc| {
                     match &lc.command {
                         CommandVariant::Segment64(seg) => {
-                            Some((seg.fileoff + seg.filesize) as usize)
+                            seg.fileoff.checked_add(seg.filesize).map(|v| v as usize)
                         }
                         CommandVariant::Segment32(seg) => {
-                            Some((seg.fileoff + seg.filesize) as usize)
+                            (seg.fileoff as u64).checked_add(seg.filesize as u64).map(|v| v as usize)
                         }
                         _ => None
                     }
                 })
                 .max()
-                .unwrap_or(data.len());
+                .unwrap_or(declared_size)
+                .min(declared_size);
             let slice_end = base_offset.checked_add(end)
                 .ok_or_else(|| Error::MachO(format!("parse_single: offset {} + size {} overflow", base_offset, end)))?;
             if slice_end > data.len() {
@@ -241,6 +266,13 @@ impl MachOFile {
         let code_length = code_sig_offset
             .map(|o| o as usize)
             .unwrap_or(slice_data.len());
+
+        if code_length > declared_size {
+            return Err(Error::MachO(format!(
+                "code_length exceeds declared slice size: code_length={}, declared_size={}",
+                code_length, declared_size
+            )));
+        }
 
         Ok(ArchSlice {
             offset: 0,
@@ -320,5 +352,11 @@ mod tests {
         // This will fail without a real Mach-O, but validates the API compiles
         let result = MachOFile::parse(vec![0; 100]);
         assert!(result.is_err()); // Expected: not a valid Mach-O
+    }
+
+    #[test]
+    fn test_parse_rejects_garbage() {
+        let result = MachOFile::parse(vec![0xFF; 1000]);
+        assert!(result.is_err());
     }
 }
