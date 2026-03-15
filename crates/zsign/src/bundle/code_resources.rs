@@ -31,6 +31,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// A single file or symlink entry discovered during bundle scanning.
+struct ScannedEntry {
+    path: String,
+    sha1: [u8; 20],
+    sha256: [u8; 32],
+    symlink_target: Option<String>,
+}
+
 /// Builder for generating CodeResources plist files.
 ///
 /// This builder scans an iOS/macOS app bundle, computes cryptographic hashes
@@ -147,7 +155,7 @@ impl CodeResourcesBuilder {
         // Process entries in parallel
         let results: Vec<_> = entries
             .par_iter()
-            .map(|entry| -> Result<Option<(String, [u8; 20], [u8; 32], Option<String>)>> {
+            .map(|entry| -> Result<Option<ScannedEntry>> {
                 let path = entry.path();
                 let metadata = fs::symlink_metadata(path)?;
                 let is_symlink = metadata.file_type().is_symlink();
@@ -164,24 +172,22 @@ impl CodeResourcesBuilder {
 
                 if is_symlink {
                     match Self::hash_symlink_entry(path) {
-                        Some((sha1, sha256, target)) => Ok(Some((relative_path, sha1, sha256, Some(target)))),
+                        Some((sha1, sha256, target)) => Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: Some(target) })),
                         None => Ok(None),
                     }
                 } else {
                     let data = fs::read(path)?;
                     let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&data);
-                    Ok(Some((relative_path, sha1, sha256, None)))
+                    Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: None }))
                 }
             })
             .collect::<Result<Vec<_>>>()?;
 
-        for result in results {
-            if let Some((path, sha1, sha256, symlink_target)) = result {
-                if let Some(target) = symlink_target {
-                    self.inner.add_symlink(path, target, sha1, sha256);
-                } else {
-                    self.inner.add_file(path, sha1, sha256);
-                }
+        for entry in results.into_iter().flatten() {
+            if let Some(target) = entry.symlink_target {
+                self.inner.add_symlink(entry.path, target, entry.sha1, entry.sha256);
+            } else {
+                self.inner.add_file(entry.path, entry.sha1, entry.sha256);
             }
         }
 
