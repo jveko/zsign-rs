@@ -662,9 +662,228 @@ fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usi
     if let Some((offset, seg)) = linkedit_cmd {
         let new_filesize = (sig_offset + estimated_signature_size) as u64 - seg.fileoff;
         update_linkedit_segment(&mut prepared, offset, new_filesize)?;
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
     Ok((prepared, sig_offset, code_length))
+}
+
+use super::parser::MachOMetadata;
+
+/// Expands a Mach-O binary to accommodate a code signature using cached metadata.
+///
+/// Returns the expanded binary and updated metadata reflecting any changes made
+/// (e.g., new LC_CODE_SIGNATURE command or updated __LINKEDIT).
+///
+/// # Errors
+///
+/// Returns [`Error::MachO`] if:
+/// - The binary is 32-bit (not supported)
+/// - No `__LINKEDIT` segment exists
+/// - No space for `LC_CODE_SIGNATURE` in load commands area
+pub fn realloc_code_sign_space_with_metadata(
+    data: &[u8],
+    metadata: &MachOMetadata,
+    code_length: usize,
+) -> Result<(Vec<u8>, MachOMetadata)> {
+    if !metadata.is_64 {
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
+    }
+
+    let new_length = calculate_signature_space(code_length);
+
+    if new_length <= data.len() {
+        return Ok((data.to_vec(), metadata.clone()));
+    }
+
+    let mut output = data[..code_length].to_vec();
+    let is_big_endian = metadata.is_big_endian;
+    let mut updated_metadata = metadata.clone();
+
+    if let Some((offset, fileoff, vmsize, _filesize)) = metadata.linkedit_cmd {
+        let linkedit_fileoff = fileoff as usize;
+        let size_increase = new_length - data.len();
+        let new_vmsize = align_to(vmsize as usize + size_increase, PAGE_SIZE) as u64;
+        let new_filesize = (new_length - linkedit_fileoff) as u64;
+
+        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
+        write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
+
+        updated_metadata.linkedit_cmd = Some((offset, fileoff, new_vmsize, new_filesize));
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
+    }
+
+    let sig_datasize = (new_length - code_length) as u32;
+
+    if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
+        write_u32(&mut output, offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
+
+        updated_metadata.code_sig_cmd = Some((offset, code_length as u32, sig_datasize));
+    } else {
+        let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
+        let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
+
+        if new_load_commands_end > metadata.first_segment_offset {
+            let header_size = if metadata.is_64 { 32 } else { 28 };
+            let current_sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
+            let available_space = metadata.first_segment_offset - (header_size + current_sizeofcmds);
+
+            if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
+                return Err(Error::MachO(
+                    "No space for LC_CODE_SIGNATURE in load commands area".into(),
+                ));
+            }
+        }
+
+        let cmd_offset = metadata.max_load_cmd_end;
+        write_u32(&mut output, cmd_offset, LC_CODE_SIGNATURE, is_big_endian)?;
+        write_u32(&mut output, cmd_offset + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+        write_u32(&mut output, cmd_offset + 8, code_length as u32, is_big_endian)?;
+        write_u32(&mut output, cmd_offset + 12, sig_datasize, is_big_endian)?;
+
+        let current_ncmds = read_u32(&output, 16, is_big_endian)?;
+        let current_sizeofcmds = read_u32(&output, 20, is_big_endian)?;
+        write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
+        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+
+        updated_metadata.code_sig_cmd = Some((cmd_offset, code_length as u32, sig_datasize));
+        updated_metadata.max_load_cmd_end = new_load_commands_end;
+    }
+
+    output.resize(new_length, 0);
+
+    Ok((output, updated_metadata))
+}
+
+/// Prepares code bytes for signing using cached metadata.
+///
+/// Updates `LC_CODE_SIGNATURE` and `__LINKEDIT` in-place.
+///
+/// # Returns
+///
+/// Returns `(prepared_code, signature_offset, code_length)`.
+///
+/// # Errors
+///
+/// Returns [`Error::MachO`] if the binary is 32-bit or missing `__LINKEDIT`.
+pub fn prepare_code_with_metadata(
+    data: &[u8],
+    metadata: &MachOMetadata,
+    estimated_signature_size: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    if !metadata.is_64 {
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
+    }
+
+    let code_length = if let Some((_offset, dataoff, _datasize)) = metadata.code_sig_cmd {
+        dataoff as usize
+    } else {
+        data.len()
+    };
+
+    let sig_offset = align_to(code_length, 16);
+    let sig_size = estimated_signature_size as u32;
+
+    let mut prepared = data[..code_length].to_vec();
+
+    if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
+        update_linkedit_data_command(&mut prepared, offset, sig_offset as u32, sig_size)?;
+    } else {
+        add_code_signature_command_with_metadata(
+            &mut prepared,
+            metadata,
+            sig_offset as u32,
+            sig_size,
+        )?;
+    }
+
+    if let Some((offset, fileoff, _vmsize, _filesize)) = metadata.linkedit_cmd {
+        let new_filesize = (sig_offset + estimated_signature_size) as u64 - fileoff;
+        update_linkedit_segment(&mut prepared, offset, new_filesize)?;
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
+    }
+
+    Ok((prepared, sig_offset, code_length))
+}
+
+fn add_code_signature_command_with_metadata(
+    data: &mut [u8],
+    metadata: &MachOMetadata,
+    dataoff: u32,
+    datasize: u32,
+) -> Result<()> {
+    let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
+    let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
+
+    if new_load_commands_end > metadata.first_segment_offset {
+        return Err(Error::MachO(
+            "No space for LC_CODE_SIGNATURE in load commands area".into(),
+        ));
+    }
+
+    let is_big_endian = metadata.is_big_endian;
+    let load_commands_end = metadata.max_load_cmd_end;
+
+    write_u32(data, load_commands_end, LC_CODE_SIGNATURE, is_big_endian)?;
+    write_u32(data, load_commands_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+    write_u32(data, load_commands_end + 8, dataoff, is_big_endian)?;
+    write_u32(data, load_commands_end + 12, datasize, is_big_endian)?;
+
+    let current_ncmds = read_u32(data, 16, is_big_endian)?;
+    let current_sizeofcmds = read_u32(data, 20, is_big_endian)?;
+
+    write_u32(data, 16, current_ncmds + 1, is_big_endian)?;
+    write_u32(data, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+
+    Ok(())
+}
+
+/// Prepares code for signing in-place, avoiding extra allocations.
+///
+/// Truncates `buf` to `code_length`, updates load commands, and returns
+/// `(sig_offset, code_length)`.
+///
+/// # Errors
+///
+/// Returns [`Error::MachO`] if `__LINKEDIT` is missing or the binary is 32-bit.
+pub fn prepare_code_in_place(
+    buf: &mut Vec<u8>,
+    metadata: &MachOMetadata,
+    code_length: usize,
+    estimated_signature_size: usize,
+) -> Result<(usize, usize)> {
+    if !metadata.is_64 {
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
+    }
+
+    buf.truncate(code_length);
+
+    let sig_offset = align_to(code_length, 16);
+    let sig_size = estimated_signature_size as u32;
+
+    if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
+        update_linkedit_data_command(buf, offset, sig_offset as u32, sig_size)?;
+    } else {
+        add_code_signature_command_with_metadata(
+            buf,
+            metadata,
+            sig_offset as u32,
+            sig_size,
+        )?;
+    }
+
+    if let Some((offset, fileoff, _vmsize, _filesize)) = metadata.linkedit_cmd {
+        let new_filesize = (sig_offset + estimated_signature_size) as u64 - fileoff;
+        update_linkedit_segment(buf, offset, new_filesize)?;
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
+    }
+
+    Ok((sig_offset, code_length))
 }
 
 fn read_u32(data: &[u8], offset: usize, big_endian: bool) -> Result<u32> {

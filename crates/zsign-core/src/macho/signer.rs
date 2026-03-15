@@ -37,7 +37,7 @@ use sha2::Sha256;
 
 use super::parser::{ArchSlice, MachOFile};
 use super::writer::SignedSlice;
-use super::writer::{calculate_signature_space, has_enough_signature_space, prepare_code_for_signing_slice, realloc_code_sign_space_slice};
+use super::writer::{calculate_signature_space, has_enough_signature_space, prepare_code_in_place, realloc_code_sign_space_with_metadata};
 
 /// Pre-computed signing inputs that are invariant across all slices of a binary.
 ///
@@ -257,8 +257,8 @@ fn sign_slice_complete(
     let estimated_sig_size = compute_superblob_reserved_size(slice.code_length, identifier, ctx);
 
     // Step 2: Check if we need to reallocate space
-    let (working_slice_data, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, estimated_sig_size) {
-        let reallocated = realloc_code_sign_space_slice(slice_data, slice.code_length)?;
+    let (mut buf, working_metadata, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, estimated_sig_size) {
+        let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(slice_data, &slice.metadata, slice.code_length)?;
 
         let new_slice = ArchSlice {
             offset: slice.offset,
@@ -270,34 +270,35 @@ fn sign_slice_complete(
             code_sig_size: Some((reallocated.len() - slice.code_length) as u32),
             text_segment_size: slice.text_segment_size,
             code_length: slice.code_length,
+            metadata: updated_metadata.clone(),
         };
 
-        (reallocated, new_slice, false)
+        (reallocated, updated_metadata, new_slice, false)
     } else {
-        (slice_data.to_vec(), slice.clone(), true)
+        (slice_data.to_vec(), slice.metadata.clone(), slice.clone(), true)
     };
 
-    let target_binary_size = Some(working_slice_data.len());
+    let target_binary_size = Some(buf.len());
 
-    // Step 3: Prepare code for signing (update load commands)
+    // Step 3: Prepare code for signing in-place (update load commands, truncate to code_length)
     let sig_space_size = if preserve_original_size {
         let original_sig_space = slice_data.len().saturating_sub(slice.code_length);
         original_sig_space.max(estimated_sig_size)
     } else {
         estimated_sig_size
     };
-    let (prepared_code, sig_offset, _) = prepare_code_for_signing_slice(&working_slice_data, sig_space_size)?;
+    let (sig_offset, _) = prepare_code_in_place(&mut buf, &working_metadata, working_slice.code_length, sig_space_size)?;
 
     // Step 4: Hash code pages ONCE with both SHA-1 and SHA-256
-    // prepared_code contains exactly the code bytes (code_length) with updated load commands
-    let dual_hashes = hash_code_pages_dual(&prepared_code);
+    // buf now contains exactly the code bytes (code_length) with updated load commands
+    let dual_hashes = hash_code_pages_dual(&buf);
 
     // Step 5: Build both code directories from pre-computed hashes
     let cd_sha1 = build_code_directory_from_hashes(
-        identifier, &prepared_code, &working_slice, ctx, &dual_hashes.sha1, true,
+        identifier, &buf, &working_slice, ctx, &dual_hashes.sha1, true,
     );
     let cd_sha256 = build_code_directory_from_hashes(
-        identifier, &prepared_code, &working_slice, ctx, &dual_hashes.sha256, false,
+        identifier, &buf, &working_slice, ctx, &dual_hashes.sha256, false,
     );
 
     // Step 6: CMS sign ONCE
@@ -336,14 +337,14 @@ fn sign_slice_complete(
         )));
     }
 
-    // Step 8: Embed signature
-    let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, target_binary_size);
+    // Step 8: Embed signature in-place
+    embed_signature_in_place(&mut buf, &final_sig, sig_offset, target_binary_size);
 
     Ok(SignedSlice {
         slice_index: 0,
         offset: slice.offset,
         original_size: slice.size,
-        signed_data,
+        signed_data: buf,
     })
 }
 
@@ -355,6 +356,7 @@ pub(crate) struct SpecialSlotHashes {
     pub(crate) resources: Option<DualHash>,
 }
 
+#[allow(dead_code)]
 fn embed_signature_into_prepared(
     prepared_code: &[u8],
     signature: &[u8],
@@ -378,6 +380,29 @@ fn embed_signature_into_prepared(
     }
 
     output
+}
+
+fn embed_signature_in_place(
+    buf: &mut Vec<u8>,
+    signature: &[u8],
+    sig_offset: usize,
+    target_size: Option<usize>,
+) {
+    if buf.len() < sig_offset {
+        buf.resize(sig_offset, 0);
+    }
+
+    let needed = sig_offset + signature.len();
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
+    buf[sig_offset..sig_offset + signature.len()].copy_from_slice(signature);
+
+    if let Some(target) = target_size {
+        if buf.len() < target {
+            buf.resize(target, 0);
+        }
+    }
 }
 
 fn compute_superblob_reserved_size(

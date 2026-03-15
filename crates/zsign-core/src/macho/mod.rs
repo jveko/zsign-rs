@@ -10,7 +10,7 @@ pub mod parser;
 pub mod signer;
 pub mod writer;
 
-pub use parser::{ArchSlice, MachOFile};
+pub use parser::{ArchSlice, MachOFile, MachOMetadata};
 pub use writer::SignedSlice;
 pub use signer::{sign_macho, sign_macho_all_slices, sign_any_macho, EMPTY_ENTITLEMENTS};
 pub use writer::{

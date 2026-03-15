@@ -28,6 +28,28 @@ use goblin::mach::header::{MH_CIGAM_64, MH_EXECUTE, MH_MAGIC_64};
 use goblin::mach::load_command::CommandVariant;
 use goblin::mach::{Mach, MachO};
 
+/// Pre-parsed Mach-O load command metadata.
+///
+/// Caches the offsets and values that writer functions need,
+/// avoiding redundant `goblin::Mach::parse()` calls.
+#[derive(Clone)]
+pub struct MachOMetadata {
+    /// Offset and data of the LC_CODE_SIGNATURE command, if present.
+    /// `(offset, dataoff, datasize)`
+    pub code_sig_cmd: Option<(usize, u32, u32)>,
+    /// Offset and data of the __LINKEDIT segment command.
+    /// `(offset, fileoff, vmsize, filesize)`
+    pub linkedit_cmd: Option<(usize, u64, u64, u64)>,
+    /// Byte offset after the last load command.
+    pub max_load_cmd_end: usize,
+    /// Byte offset of the first segment's file data.
+    pub first_segment_offset: usize,
+    /// Whether the binary is big-endian.
+    pub is_big_endian: bool,
+    /// Whether this is a 64-bit binary.
+    pub is_64: bool,
+}
+
 /// A parsed Mach-O binary.
 ///
 /// Handles both single-architecture and FAT/Universal binaries. For FAT binaries,
@@ -73,6 +95,8 @@ pub struct ArchSlice {
     pub text_segment_size: u64,
     /// Length of code to be signed (excludes existing signature).
     pub code_length: usize,
+    /// Cached load command metadata for writer functions.
+    pub metadata: MachOMetadata,
 }
 
 impl MachOFile {
@@ -138,25 +162,56 @@ impl MachOFile {
         let mut code_sig_size = None;
         let mut text_segment_size = 0u64;
 
+        let mut meta_code_sig_cmd = None;
+        let mut meta_linkedit_cmd = None;
+        let mut max_load_cmd_end: usize = 0;
+        let mut first_segment_offset: u64 = u64::MAX;
+
         for lc in &macho.load_commands {
+            let lc_end = lc.offset + lc.command.cmdsize();
+            if lc_end > max_load_cmd_end {
+                max_load_cmd_end = lc_end;
+            }
+
             match lc.command {
                 CommandVariant::CodeSignature(cs) => {
                     code_sig_offset = Some(cs.dataoff);
                     code_sig_size = Some(cs.datasize);
+                    meta_code_sig_cmd = Some((lc.offset, cs.dataoff, cs.datasize));
                 }
                 CommandVariant::Segment64(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.vmsize;
+                    }
+                    if seg.segname.starts_with(b"__LINKEDIT") {
+                        meta_linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
+                    }
+                    if seg.fileoff > 0 && seg.fileoff < first_segment_offset {
+                        first_segment_offset = seg.fileoff;
                     }
                 }
                 CommandVariant::Segment32(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.vmsize as u64;
                     }
+                    if seg.fileoff > 0 && (seg.fileoff as u64) < first_segment_offset {
+                        first_segment_offset = seg.fileoff as u64;
+                    }
                 }
                 _ => {}
             }
         }
+
+        let computed_first_segment_offset = if first_segment_offset == u64::MAX {
+            4096
+        } else {
+            first_segment_offset as usize
+        };
+
+        let is_big_endian = data.len() >= 4
+            && (data[base_offset..base_offset + 4] == [0xfe, 0xed, 0xfa, 0xce]
+                || data[base_offset..base_offset + 4] == [0xfe, 0xed, 0xfa, 0xcf]
+                || data[base_offset..base_offset + 4] == [0xca, 0xfe, 0xba, 0xbe]);
 
         let slice_data = if base_offset == 0 {
             data
@@ -197,6 +252,14 @@ impl MachOFile {
             code_sig_size,
             text_segment_size,
             code_length,
+            metadata: MachOMetadata {
+                code_sig_cmd: meta_code_sig_cmd,
+                linkedit_cmd: meta_linkedit_cmd,
+                max_load_cmd_end,
+                first_segment_offset: computed_first_segment_offset,
+                is_big_endian,
+                is_64,
+            },
         })
     }
 
