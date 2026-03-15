@@ -98,6 +98,31 @@ impl From<u32> for CompressionLevel {
     }
 }
 
+/// File extensions that are already compressed or incompressible.
+/// Using `Stored` mode for these avoids wasting CPU on deflate
+/// with negligible size reduction.
+const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
+    // Images
+    "png", "jpg", "jpeg", "gif", "webp", "heic", "heif",
+    // Audio/Video (compressed containers only)
+    "mp3", "m4a", "aac", "mp4", "mov", "m4v",
+    // iOS assets
+    "car",  // Assets.car (compiled asset catalog)
+    // Archives
+    "zip", "gz", "bz2", "xz", "zst",
+];
+
+/// Returns true if the file extension indicates pre-compressed content.
+fn is_precompressed(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            let lower = ext.to_ascii_lowercase();
+            PRECOMPRESSED_EXTENSIONS.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
 /// Creates an IPA file from a signed `.app` bundle.
 ///
 /// The app bundle is placed inside a `Payload/` directory in the archive,
@@ -175,7 +200,7 @@ pub fn create_ipa(
 
     // Create ZIP file
     let file = File::create(output_path)?;
-    let mut zip = ZipWriter::new(file);
+    let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
 
     // Configure compression options
     let options = if compression_level.level() == 0 {
@@ -238,15 +263,23 @@ pub fn create_ipa(
             zip.add_symlink(&archive_path, target_str, options)
                 .map_err(Error::Zip)?;
         } else {
-            // Regular file
-            #[cfg(unix)]
-            let options = {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = metadata.permissions().mode();
-                options.unix_permissions(mode)
+            // Regular file — use Stored for pre-compressed formats
+            let file_options = if is_precompressed(path) {
+                options
+                    .compression_method(CompressionMethod::Stored)
+                    .compression_level(None)
+            } else {
+                options
             };
 
-            zip.start_file(&archive_path, options)
+            #[cfg(unix)]
+            let file_options = {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode();
+                file_options.unix_permissions(mode)
+            };
+
+            zip.start_file(&archive_path, file_options)
                 .map_err(Error::Zip)?;
 
             // Stream file directly without loading into memory
@@ -437,5 +470,46 @@ mod tests {
         }
 
         assert!(found_symlink, "Symlink should be preserved in ZIP");
+    }
+
+    #[test]
+    fn test_is_precompressed() {
+        use std::path::Path;
+        assert!(is_precompressed(Path::new("image.png")));
+        assert!(is_precompressed(Path::new("image.PNG")));
+        assert!(is_precompressed(Path::new("photo.jpg")));
+        assert!(is_precompressed(Path::new("video.mp4")));
+        assert!(is_precompressed(Path::new("Assets.car")));
+        assert!(!is_precompressed(Path::new("Info.plist")));
+        assert!(!is_precompressed(Path::new("binary")));
+        assert!(!is_precompressed(Path::new("data.json")));
+    }
+
+    #[test]
+    fn test_create_ipa_stored_for_precompressed() {
+        let temp_dir = TempDir::new().unwrap();
+        let app_dir = temp_dir.path().join("Test.app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        fs::write(app_dir.join("Info.plist"), b"<?xml version=\"1.0\"?><plist><dict></dict></plist>").unwrap();
+        fs::write(app_dir.join("icon.png"), b"fake png data").unwrap();
+
+        let output_ipa = temp_dir.path().join("output.ipa");
+        create_ipa(&app_dir, &output_ipa, CompressionLevel::DEFAULT).unwrap();
+
+        // Verify compression methods in the archive
+        let file = File::open(&output_ipa).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).unwrap();
+            if entry.name().ends_with("icon.png") {
+                assert_eq!(entry.compression(), CompressionMethod::Stored,
+                    "PNG should use Stored compression");
+            } else if entry.name().ends_with("Info.plist") {
+                assert_eq!(entry.compression(), CompressionMethod::Deflated,
+                    "plist should use Deflated compression");
+            }
+        }
     }
 }
