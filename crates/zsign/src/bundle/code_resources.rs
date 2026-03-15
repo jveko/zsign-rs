@@ -11,7 +11,7 @@
 //! ```no_run
 //! use zsign_rs::bundle::CodeResourcesBuilder;
 //!
-//! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
+//! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app")?;
 //! builder.scan()?;
 //! let plist_bytes = builder.build()?;
 //! std::fs::write("/path/to/MyApp.app/_CodeSignature/CodeResources", plist_bytes)?;
@@ -50,7 +50,7 @@ struct ScannedEntry {
 /// ```no_run
 /// use zsign_rs::bundle::CodeResourcesBuilder;
 ///
-/// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+/// let mut builder = CodeResourcesBuilder::new("/path/to/App.app")?;
 /// builder.exclude("DebugResources/");
 /// let plist = builder
 ///     .scan()?
@@ -81,22 +81,21 @@ impl CodeResourcesBuilder {
     /// ```no_run
     /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
-    /// let builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
+    /// let builder = CodeResourcesBuilder::new("/path/to/MyApp.app")?;
+    /// # Ok::<(), zsign_rs::Error>(())
     /// ```
-    pub fn new(bundle_path: impl AsRef<Path>) -> Self {
+    pub fn new(bundle_path: impl AsRef<Path>) -> Result<Self> {
         let bundle_path = bundle_path.as_ref().to_path_buf();
         let mut inner = zsign_core::bundle::CodeResourcesBuilder::new();
 
-        // Read main executable from Info.plist (log warning on failure)
+        // Read main executable from Info.plist — propagate errors if file exists
         match Self::read_main_executable(&bundle_path) {
             Ok(Some(exec_name)) => inner.set_main_executable(exec_name),
             Ok(None) => {}
-            Err(e) => {
-                eprintln!("Warning: Failed to read main executable from Info.plist: {}", e);
-            }
+            Err(e) => return Err(e),
         }
 
-        Self { bundle_path, inner }
+        Ok(Self { bundle_path, inner })
     }
 
     /// Adds a custom exclusion pattern.
@@ -108,9 +107,10 @@ impl CodeResourcesBuilder {
     /// ```no_run
     /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
-    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app")?;
     /// builder.exclude("DebugResources/");
     /// builder.exclude("TestData/");
+    /// # Ok::<(), zsign_rs::Error>(())
     /// ```
     pub fn exclude(&mut self, pattern: impl Into<String>) -> &mut Self {
         self.inner.exclude(pattern);
@@ -137,13 +137,14 @@ impl CodeResourcesBuilder {
     /// ```no_run
     /// use zsign_rs::bundle::CodeResourcesBuilder;
     ///
-    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app");
+    /// let mut builder = CodeResourcesBuilder::new("/path/to/App.app")?;
     /// builder.scan()?;
     /// println!("Scanned {} files", builder.file_count());
     /// # Ok::<(), zsign_rs::Error>(())
     /// ```
     pub fn scan(&mut self) -> Result<&mut Self> {
         let bundle_path = self.bundle_path.clone();
+        let inner = &self.inner;
 
         // Collect all entries first (WalkDir is not Send, so we collect to Vec)
         let entries: Vec<_> = WalkDir::new(&bundle_path)
@@ -157,10 +158,10 @@ impl CodeResourcesBuilder {
             .par_iter()
             .map(|entry| -> Result<Option<ScannedEntry>> {
                 let path = entry.path();
-                let metadata = fs::symlink_metadata(path)?;
-                let is_symlink = metadata.file_type().is_symlink();
+                let file_type = entry.file_type();
+                let is_symlink = file_type.is_symlink();
 
-                if !is_symlink && metadata.is_dir() {
+                if !is_symlink && file_type.is_dir() {
                     return Ok(None);
                 }
 
@@ -170,11 +171,13 @@ impl CodeResourcesBuilder {
                     .to_string_lossy()
                     .to_string();
 
+                if inner.should_exclude(&relative_path) {
+                    return Ok(None);
+                }
+
                 if is_symlink {
-                    match Self::hash_symlink_entry(path) {
-                        Some((sha1, sha256, target)) => Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: Some(target) })),
-                        None => Ok(None),
-                    }
+                    let (sha1, sha256, target) = Self::hash_symlink_entry(path)?;
+                    Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: Some(target) }))
                 } else {
                     let (sha1, sha256) = hash_file_streaming(path)?;
                     Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: None }))
@@ -241,19 +244,22 @@ impl CodeResourcesBuilder {
 
     /// Hash a symlink by hashing its target path
     #[cfg(unix)]
-    fn hash_symlink_entry(path: &Path) -> Option<([u8; 20], [u8; 32], String)> {
+    fn hash_symlink_entry(path: &Path) -> Result<([u8; 20], [u8; 32], String)> {
         use std::os::unix::ffi::OsStrExt;
 
-        let target = fs::read_link(path).ok()?;
+        let target = fs::read_link(path)?;
         let target_bytes = target.as_os_str().as_bytes();
         let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(target_bytes);
         let target_str = target.to_string_lossy().to_string();
-        Some((sha1, sha256, target_str))
+        Ok((sha1, sha256, target_str))
     }
 
     #[cfg(not(unix))]
-    fn hash_symlink_entry(_path: &Path) -> Option<([u8; 20], [u8; 32], String)> {
-        None
+    fn hash_symlink_entry(path: &Path) -> Result<([u8; 20], [u8; 32], String)> {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("Symlinks not supported on this platform: {}", path.display()),
+        )))
     }
 }
 
@@ -301,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_build_plist_structure() {
-        let builder = CodeResourcesBuilder::new("/fake/path");
+        let builder = CodeResourcesBuilder::new("/fake/path").unwrap();
         let plist_data = builder.build().unwrap();
 
         // Verify it's valid XML
@@ -316,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_plist_with_files() {
-        let mut builder = CodeResourcesBuilder::new("/fake/path");
+        let mut builder = CodeResourcesBuilder::new("/fake/path").unwrap();
 
         // Add a test file
         let sha1 = [1u8; 20];
@@ -338,7 +344,7 @@ mod tests {
         fs::create_dir(&bundle_path).unwrap();
 
         // Create some test files
-        fs::write(bundle_path.join("Info.plist"), b"<plist></plist>").unwrap();
+        fs::write(bundle_path.join("Info.plist"), b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleExecutable</key>\n<string>Test</string>\n</dict>\n</plist>").unwrap();
         fs::write(bundle_path.join("PkgInfo"), b"APPL????").unwrap();
 
         // Create a resources directory
@@ -352,7 +358,7 @@ mod tests {
         fs::write(code_sig.join("CodeResources"), b"should be excluded").unwrap();
 
         // Scan the bundle
-        let mut builder = CodeResourcesBuilder::new(&bundle_path);
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
         builder.scan().unwrap();
 
         // Verify files were found
@@ -375,7 +381,7 @@ mod tests {
         fs::create_dir(&bundle_path).unwrap();
 
         // Create main bundle files
-        fs::write(bundle_path.join("Info.plist"), b"main plist").unwrap();
+        fs::write(bundle_path.join("Info.plist"), b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleExecutable</key>\n<string>Test</string>\n</dict>\n</plist>").unwrap();
 
         // Create Frameworks directory with nested framework
         let frameworks = bundle_path.join("Frameworks");
@@ -383,10 +389,10 @@ mod tests {
         let framework = frameworks.join("Test.framework");
         fs::create_dir(&framework).unwrap();
         fs::write(framework.join("Test"), b"framework binary").unwrap();
-        fs::write(framework.join("Info.plist"), b"framework plist").unwrap();
+        fs::write(framework.join("Info.plist"), b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleExecutable</key>\n<string>Test</string>\n</dict>\n</plist>").unwrap();
 
         // Scan the bundle
-        let mut builder = CodeResourcesBuilder::new(&bundle_path);
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
         builder.scan().unwrap();
 
         // Nested framework files are included in parent's CodeResources
@@ -432,7 +438,7 @@ mod tests {
         symlink("Versions/Current/Test", &root_binary).unwrap();
 
         // Scan the bundle
-        let mut builder = CodeResourcesBuilder::new(&bundle_path);
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
         builder.scan().unwrap();
 
         // Build the plist and check for symlink entries

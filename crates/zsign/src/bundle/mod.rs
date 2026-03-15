@@ -27,7 +27,7 @@
 //! ```no_run
 //! use zsign_rs::bundle::CodeResourcesBuilder;
 //!
-//! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app");
+//! let mut builder = CodeResourcesBuilder::new("/path/to/MyApp.app")?;
 //! builder.scan()?;
 //! let plist_bytes = builder.build()?;
 //! # Ok::<(), zsign_rs::Error>(())

@@ -637,7 +637,7 @@ impl<'a> IpaSigner<'a> {
 
     /// Generate CodeResources plist for the bundle.
     fn generate_code_resources(&self, bundle_path: &Path) -> Result<()> {
-        let code_resources = CodeResourcesBuilder::new(bundle_path).scan()?.build()?;
+        let code_resources = CodeResourcesBuilder::new(bundle_path)?.scan()?.build()?;
 
         let codesig_dir = bundle_path.join("_CodeSignature");
         fs::create_dir_all(&codesig_dir)?;
