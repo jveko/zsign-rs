@@ -36,3 +36,8 @@ getrandom = { version = "0.2", features = ["js"] }
 [dev-dependencies]
 x509-cert = { version = "0.2.5", features = ["pem", "builder"] }
 rand = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "signing"
+harness = false
