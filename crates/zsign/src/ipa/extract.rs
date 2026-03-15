@@ -45,6 +45,49 @@ struct ExtractEntry {
     unix_mode: Option<u32>,
 }
 
+/// Validates that a symlink target is safe (not absolute, no `..` traversal).
+fn is_safe_symlink_target(target: &str) -> bool {
+    if target.starts_with('/') {
+        return false;
+    }
+    target.split('/').all(|component| component != "..")
+}
+
+/// Validates that no pre-existing symlink exists in the path from root to the target.
+///
+/// Walks from `root` downward toward `path`, checking each existing component.
+/// If a pre-existing symlink is found, returns an error (prevents symlink attacks).
+/// Stops checking at the first non-existent component (will be created fresh).
+fn validate_output_path(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Path {} is not under root {}", path.display(), root.display()),
+        ))
+    })?;
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        // Only check components that already exist
+        if let Ok(meta) = fs::symlink_metadata(&current) {
+            if meta.file_type().is_symlink() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Pre-existing symlink in extraction path: {}",
+                        current.display()
+                    ),
+                )));
+            }
+        } else {
+            // Path doesn't exist yet — safe, stop checking deeper components
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Extracts an IPA file to a destination directory.
 ///
 /// IPA files are ZIP archives containing a `Payload/` directory with the `.app` bundle.
@@ -104,6 +147,15 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
     // Create destination directory if it doesn't exist
     fs::create_dir_all(dest_dir)?;
 
+    // Verify destination is a real directory (not a symlink)
+    let dest_metadata = fs::symlink_metadata(dest_dir)?;
+    if dest_metadata.file_type().is_symlink() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Extraction destination is a symlink: {}", dest_dir.display()),
+        )));
+    }
+
     // First pass: collect entry metadata and create directories
     let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
     let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
@@ -157,16 +209,21 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 
     // Create all directories first (sequential, fast)
     for dir in &dirs_to_create {
+        validate_output_path(dest_dir, dir)?;
         fs::create_dir_all(dir)?;
     }
 
     // Filter to only files (not directories)
     let file_entries: Vec<_> = entries.into_iter().filter(|e| !e.is_dir).collect();
 
-    // Parallel extraction of files using chunks
-    // Each chunk reuses a single ZipArchive, avoiding per-entry archive creation
-    let chunk_size = (file_entries.len() / rayon::current_num_threads()).max(1);
-    file_entries
+    // Split into regular files and symlinks
+    let (symlink_entries, regular_entries): (Vec<_>, Vec<_>) =
+        file_entries.into_iter().partition(|e| e.is_symlink);
+
+    // Phase 1: Parallel extraction of regular files
+    let dest_dir_ref = dest_dir;
+    let chunk_size = (regular_entries.len() / rayon::current_num_threads()).max(1);
+    regular_entries
         .par_chunks(chunk_size)
         .try_for_each(|chunk| -> Result<()> {
             let cursor = Cursor::new(&mmap[..]);
@@ -174,27 +231,11 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 
             for entry in chunk {
                 let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
-
-                #[cfg(unix)]
-                if entry.is_symlink {
-                    let mut target = String::new();
-                    file.read_to_string(&mut target)?;
-
-                    if entry.outpath.exists() || entry.outpath.symlink_metadata().is_ok() {
-                        let _ = fs::remove_file(&entry.outpath);
-                    }
-
-                    use std::os::unix::fs::symlink;
-                    symlink(&target, &entry.outpath)?;
-                    continue;
-                }
-
-                // Regular file extraction with buffered writer
+                validate_output_path(dest_dir_ref, &entry.outpath)?;
                 let outfile = File::create(&entry.outpath)?;
                 let mut outfile = BufWriter::new(outfile);
                 io::copy(&mut file, &mut outfile)?;
 
-                // Set file permissions on Unix
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -204,9 +245,39 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
                     }
                 }
             }
-
             Ok(())
         })?;
+
+    // Phase 2: Sequential symlink creation (after all files exist)
+    #[cfg(unix)]
+    {
+        let cursor = Cursor::new(&mmap[..]);
+        let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
+
+        for entry in &symlink_entries {
+            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
+            let mut target = String::new();
+            file.read_to_string(&mut target)?;
+
+            if !is_safe_symlink_target(&target) {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unsafe symlink target in IPA: {} -> {}",
+                        entry.outpath.display(),
+                        target
+                    ),
+                )));
+            }
+
+            if entry.outpath.exists() || entry.outpath.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(&entry.outpath);
+            }
+
+            use std::os::unix::fs::symlink;
+            symlink(&target, &entry.outpath)?;
+        }
+    }
 
     // Find .app bundle in Payload/
     find_app_bundle(dest_dir)
@@ -436,5 +507,80 @@ mod tests {
             let target = std::fs::read_link(&symlink_path).unwrap();
             assert_eq!(target.to_str().unwrap(), "A");
         }
+    }
+
+    #[test]
+    fn test_is_safe_symlink_target() {
+        assert!(is_safe_symlink_target("A"));
+        assert!(is_safe_symlink_target("Versions/Current/Test"));
+        assert!(!is_safe_symlink_target("/etc/passwd"));
+        assert!(!is_safe_symlink_target("../../../etc/passwd"));
+        assert!(!is_safe_symlink_target("foo/../../bar"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_malicious_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("malicious.ipa");
+
+        // Create IPA with a malicious symlink pointing outside
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Evil.app/", options).unwrap();
+
+        zip.start_file("Payload/Evil.app/Info.plist", options).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+
+        // Malicious symlink pointing outside extraction dir
+        zip.add_symlink(
+            "Payload/Evil.app/escape",
+            "../../../etc/passwd",
+            options,
+        )
+        .unwrap();
+
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let result = extract_ipa(&ipa_path, &extract_dir);
+        assert!(result.is_err(), "Should reject IPA with malicious symlink");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_symlink_dest() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_test_ipa(temp_dir.path());
+
+        // Create a symlink as the destination
+        let real_dir = temp_dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let symlink_dest = temp_dir.path().join("symlink_dest");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dest).unwrap();
+
+        let result = extract_ipa(&ipa_path, &symlink_dest);
+        assert!(result.is_err(), "Should reject symlink destination");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_descendant_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_test_ipa(temp_dir.path());
+
+        // Create dest with a pre-existing symlink at Payload/
+        let extract_dir = temp_dir.path().join("extracted");
+        fs::create_dir(&extract_dir).unwrap();
+        let evil_dir = temp_dir.path().join("evil");
+        fs::create_dir(&evil_dir).unwrap();
+        std::os::unix::fs::symlink(&evil_dir, extract_dir.join("Payload")).unwrap();
+
+        let result = extract_ipa(&ipa_path, &extract_dir);
+        assert!(result.is_err(), "Should reject pre-existing symlink in extraction path");
     }
 }
