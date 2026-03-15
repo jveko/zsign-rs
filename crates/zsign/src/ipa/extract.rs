@@ -27,6 +27,7 @@
 use crate::{Error, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::borrow::Cow;
 use std::io::{self, BufWriter, Cursor, Read};
@@ -105,7 +106,7 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 
     // First pass: collect entry metadata and create directories
     let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
-    let mut dirs_to_create: Vec<PathBuf> = Vec::new();
+    let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
 
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(Error::Zip)?;
@@ -127,7 +128,7 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
         let is_symlink = false;
 
         if file.is_dir() {
-            dirs_to_create.push(outpath.clone());
+            dirs_to_create.insert(outpath.clone());
             entries.push(ExtractEntry {
                 index: i,
                 outpath,
@@ -140,7 +141,7 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
             // Collect parent directories
             if let Some(parent) = outpath.parent() {
                 if !dirs_to_create.contains(&parent.to_path_buf()) {
-                    dirs_to_create.push(parent.to_path_buf());
+                    dirs_to_create.insert(parent.to_path_buf());
                 }
             }
             entries.push(ExtractEntry {
@@ -162,42 +163,45 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
     // Filter to only files (not directories)
     let file_entries: Vec<_> = entries.into_iter().filter(|e| !e.is_dir).collect();
 
-    // Parallel extraction of files
+    // Parallel extraction of files using chunks
+    // Each chunk reuses a single ZipArchive, avoiding per-entry archive creation
+    let chunk_size = (file_entries.len() / rayon::current_num_threads()).max(1);
     file_entries
-        .par_iter()
-        .try_for_each(|entry| -> Result<()> {
-            // Each thread gets its own cursor into the mmap
+        .par_chunks(chunk_size)
+        .try_for_each(|chunk| -> Result<()> {
             let cursor = Cursor::new(&mmap[..]);
             let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
-            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
 
-            #[cfg(unix)]
-            if entry.is_symlink {
-                // Handle symlink
-                let mut target = String::new();
-                file.read_to_string(&mut target)?;
+            for entry in chunk {
+                let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
 
-                if entry.outpath.exists() || entry.outpath.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(&entry.outpath);
+                #[cfg(unix)]
+                if entry.is_symlink {
+                    let mut target = String::new();
+                    file.read_to_string(&mut target)?;
+
+                    if entry.outpath.exists() || entry.outpath.symlink_metadata().is_ok() {
+                        let _ = fs::remove_file(&entry.outpath);
+                    }
+
+                    use std::os::unix::fs::symlink;
+                    symlink(&target, &entry.outpath)?;
+                    continue;
                 }
 
-                use std::os::unix::fs::symlink;
-                symlink(&target, &entry.outpath)?;
-                return Ok(());
-            }
+                // Regular file extraction with buffered writer
+                let outfile = File::create(&entry.outpath)?;
+                let mut outfile = BufWriter::new(outfile);
+                io::copy(&mut file, &mut outfile)?;
 
-            // Regular file extraction with buffered writer
-            let outfile = File::create(&entry.outpath)?;
-            let mut outfile = BufWriter::new(outfile);
-            io::copy(&mut file, &mut outfile)?;
-
-            // Set file permissions on Unix
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Some(mode) = entry.unix_mode {
-                    let perms = mode & 0o7777;
-                    fs::set_permissions(&entry.outpath, fs::Permissions::from_mode(perms))?;
+                // Set file permissions on Unix
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = entry.unix_mode {
+                        let perms = mode & 0o7777;
+                        fs::set_permissions(&entry.outpath, fs::Permissions::from_mode(perms))?;
+                    }
                 }
             }
 

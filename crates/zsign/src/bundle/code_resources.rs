@@ -176,8 +176,7 @@ impl CodeResourcesBuilder {
                         None => Ok(None),
                     }
                 } else {
-                    let data = fs::read(path)?;
-                    let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&data);
+                    let (sha1, sha256) = hash_file_streaming(path)?;
                     Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: None }))
                 }
             })
@@ -256,6 +255,28 @@ impl CodeResourcesBuilder {
     fn hash_symlink_entry(_path: &Path) -> Option<([u8; 20], [u8; 32], String)> {
         None
     }
+}
+
+fn hash_file_streaming(path: &Path) -> Result<([u8; 20], [u8; 32])> {
+    use sha1::{Digest, Sha1};
+    use sha2::Sha256;
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut sha1_hasher = Sha1::new();
+    let mut sha256_hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha1_hasher.update(&buf[..n]);
+        sha256_hasher.update(&buf[..n]);
+    }
+
+    Ok((sha1_hasher.finalize().into(), sha256_hasher.finalize().into()))
 }
 
 #[cfg(test)]
