@@ -192,67 +192,40 @@ fn sign_slice_complete(
 
     let subject_cn = extract_subject_cn(&credentials.certificate).unwrap_or_default();
     let requirements = build_requirements_blob_full(identifier, &subject_cn);
-    let requirements_hash_sha1 = sha1_hash(&requirements);
-    let requirements_hash_sha256 = sha256_hash(&requirements);
 
-    let (entitlements_blob, ent_hash_sha1, ent_hash_sha256) = if let Some(ent) = entitlements {
-        let blob = build_entitlements_blob(ent);
-        (Some(blob.clone()), Some(sha1_hash(&blob)), Some(sha256_hash(&blob)))
+    let entitlements_blob = entitlements.map(build_entitlements_blob);
+
+    let der_entitlements_blob: Option<Vec<u8>> = if slice.is_executable {
+        entitlements.map(|ent| {
+            let der_data = plist_to_der(ent)?;
+            Ok::<_, crate::Error>(build_der_entitlements_blob(&der_data))
+        }).transpose()?
     } else {
-        (None, None, None)
-    };
-
-    let (der_entitlements_blob, der_ent_hash_sha1, der_ent_hash_sha256) =
-        if slice.is_executable {
-            if let Some(ent) = entitlements {
-                let der_data = plist_to_der(ent)?;
-                let blob = build_der_entitlements_blob(&der_data);
-                (Some(blob.clone()), Some(sha1_hash(&blob)), Some(sha256_hash(&blob)))
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-    let (info_hash_sha1, info_hash_sha256) = if let Some(info) = info_plist {
-        (Some(sha1_hash(info)), Some(sha256_hash(info)))
-    } else {
-        (None, None)
-    };
-
-    let (res_hash_sha1, res_hash_sha256) = if let Some(res) = code_resources {
-        (Some(sha1_hash(res)), Some(sha256_hash(res)))
-    } else {
-        (None, None)
+        None
     };
 
     let hashes = SpecialSlotHashes {
-        requirements_sha1: requirements_hash_sha1,
-        requirements_sha256: requirements_hash_sha256,
-        entitlements_sha1: ent_hash_sha1,
-        entitlements_sha256: ent_hash_sha256,
-        der_entitlements_sha1: der_ent_hash_sha1,
-        der_entitlements_sha256: der_ent_hash_sha256,
-        info_sha1: info_hash_sha1,
-        info_sha256: info_hash_sha256,
-        resources_sha1: res_hash_sha1,
-        resources_sha256: res_hash_sha256,
+        requirements: dual_hash(&requirements),
+        entitlements: entitlements_blob.as_ref().map(|b| dual_hash(b)),
+        der_entitlements: der_entitlements_blob.as_ref().map(|b| dual_hash(b)),
+        info: info_plist.map(dual_hash),
+        resources: code_resources.map(dual_hash),
     };
 
     let preliminary_code = &slice_data[..slice.code_length];
-    let preliminary_sig = build_superblob(
-        preliminary_code,
+    let input = SuperBlobInputs {
+        code: preliminary_code,
         slice,
         identifier,
         team_id,
         entitlements,
-        &requirements,
-        &hashes,
-        &entitlements_blob,
-        &der_entitlements_blob,
+        requirements: &requirements,
+        hashes: &hashes,
+        entitlements_blob: entitlements_blob.as_deref(),
+        der_entitlements_blob: der_entitlements_blob.as_deref(),
         credentials,
-    )?;
+    };
+    let preliminary_sig = build_superblob(&input)?;
 
     let (working_slice_data, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, preliminary_sig.len()) {
         let reallocated = realloc_code_sign_space_slice(slice_data, slice.code_length)?;
@@ -284,21 +257,19 @@ fn sign_slice_complete(
     };
     let (prepared_code, sig_offset, _) = prepare_code_for_signing_slice(&working_slice_data, sig_space_size)?;
 
-    let mut code_for_hashing = prepared_code.clone();
-    code_for_hashing.resize(sig_offset, 0);
-
-    let final_sig = build_superblob(
-        &code_for_hashing,
-        &working_slice,
+    let input = SuperBlobInputs {
+        code: &prepared_code[..sig_offset],
+        slice: &working_slice,
         identifier,
         team_id,
         entitlements,
-        &requirements,
-        &hashes,
-        &entitlements_blob,
-        &der_entitlements_blob,
+        requirements: &requirements,
+        hashes: &hashes,
+        entitlements_blob: entitlements_blob.as_deref(),
+        der_entitlements_blob: der_entitlements_blob.as_deref(),
         credentials,
-    )?;
+    };
+    let final_sig = build_superblob(&input)?;
 
     let signed_data = embed_signature_into_prepared(&prepared_code, &final_sig, sig_offset, target_binary_size);
 
@@ -311,16 +282,11 @@ fn sign_slice_complete(
 }
 
 struct SpecialSlotHashes {
-    requirements_sha1: [u8; 20],
-    requirements_sha256: [u8; 32],
-    entitlements_sha1: Option<[u8; 20]>,
-    entitlements_sha256: Option<[u8; 32]>,
-    der_entitlements_sha1: Option<[u8; 20]>,
-    der_entitlements_sha256: Option<[u8; 32]>,
-    info_sha1: Option<[u8; 20]>,
-    info_sha256: Option<[u8; 32]>,
-    resources_sha1: Option<[u8; 20]>,
-    resources_sha256: Option<[u8; 32]>,
+    requirements: DualHash,
+    entitlements: Option<DualHash>,
+    der_entitlements: Option<DualHash>,
+    info: Option<DualHash>,
+    resources: Option<DualHash>,
 }
 
 fn embed_signature_into_prepared(
@@ -348,23 +314,25 @@ fn embed_signature_into_prepared(
     output
 }
 
-fn build_superblob(
-    code: &[u8],
-    slice: &ArchSlice,
-    identifier: &str,
-    team_id: Option<&str>,
-    entitlements: Option<&[u8]>,
-    requirements: &[u8],
-    hashes: &SpecialSlotHashes,
-    entitlements_blob: &Option<Vec<u8>>,
-    der_entitlements_blob: &Option<Vec<u8>>,
-    credentials: &SigningCredentials,
-) -> Result<Vec<u8>> {
+struct SuperBlobInputs<'a> {
+    code: &'a [u8],
+    slice: &'a ArchSlice,
+    identifier: &'a str,
+    team_id: Option<&'a str>,
+    entitlements: Option<&'a [u8]>,
+    requirements: &'a [u8],
+    hashes: &'a SpecialSlotHashes,
+    entitlements_blob: Option<&'a [u8]>,
+    der_entitlements_blob: Option<&'a [u8]>,
+    credentials: &'a SigningCredentials,
+}
+
+fn build_superblob(input: &SuperBlobInputs<'_>) -> Result<Vec<u8>> {
     let cd_sha1 = build_code_directory(
-        identifier, team_id, code, slice, entitlements, hashes, true,
+        input.identifier, input.team_id, input.code, input.slice, input.entitlements, input.hashes, true,
     );
     let cd_sha256 = build_code_directory(
-        identifier, team_id, code, slice, entitlements, hashes, false,
+        input.identifier, input.team_id, input.code, input.slice, input.entitlements, input.hashes, false,
     );
 
     let cdhash_sha1: [u8; 20] = compute_cdhash_sha1(&cd_sha1);
@@ -372,7 +340,7 @@ fn build_superblob(
 
     let cms_data = cms::sign_code_directory(
         &cd_sha1,
-        credentials,
+        input.credentials,
         &cdhash_sha1,
         &cdhash_sha256,
     )?;
@@ -381,15 +349,15 @@ fn build_superblob(
     let mut builder = SuperBlobBuilder::new()
         .code_directory_sha1(cd_sha1)
         .code_directory_sha256(cd_sha256)
-        .requirements(requirements.to_vec())
+        .requirements(input.requirements.to_vec())
         .cms_signature(signature_blob);
 
-    if let Some(ent_blob) = entitlements_blob {
-        builder = builder.entitlements(ent_blob.clone());
+    if let Some(ent_blob) = input.entitlements_blob {
+        builder = builder.entitlements(ent_blob.to_vec());
     }
 
-    if let Some(der_ent_blob) = der_entitlements_blob {
-        builder = builder.der_entitlements(der_ent_blob.clone());
+    if let Some(der_ent_blob) = input.der_entitlements_blob {
+        builder = builder.der_entitlements(der_ent_blob.to_vec());
     }
 
     Ok(builder.build())
@@ -420,11 +388,11 @@ fn build_code_directory(
         }
     }
 
-    let requirements_hash: &[u8] = if is_sha1 { &hashes.requirements_sha1 } else { &hashes.requirements_sha256 };
-    let info_hash: Option<&[u8]> = if is_sha1 { hashes.info_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.info_sha256.as_ref().map(|h| h.as_slice()) };
-    let resources_hash: Option<&[u8]> = if is_sha1 { hashes.resources_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.resources_sha256.as_ref().map(|h| h.as_slice()) };
-    let entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.entitlements_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.entitlements_sha256.as_ref().map(|h| h.as_slice()) };
-    let der_entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.der_entitlements_sha1.as_ref().map(|h| h.as_slice()) } else { hashes.der_entitlements_sha256.as_ref().map(|h| h.as_slice()) };
+    let requirements_hash: &[u8] = if is_sha1 { &hashes.requirements.sha1 } else { &hashes.requirements.sha256 };
+    let info_hash: Option<&[u8]> = if is_sha1 { hashes.info.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.info.as_ref().map(|h| h.sha256.as_slice()) };
+    let resources_hash: Option<&[u8]> = if is_sha1 { hashes.resources.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.resources.as_ref().map(|h| h.sha256.as_slice()) };
+    let entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.entitlements.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.entitlements.as_ref().map(|h| h.sha256.as_slice()) };
+    let der_entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.der_entitlements.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.der_entitlements.as_ref().map(|h| h.sha256.as_slice()) };
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
@@ -451,6 +419,18 @@ fn build_code_directory(
         builder.build_sha1()
     } else {
         builder.build_sha256()
+    }
+}
+
+struct DualHash {
+    sha1: [u8; 20],
+    sha256: [u8; 32],
+}
+
+fn dual_hash(data: &[u8]) -> DualHash {
+    DualHash {
+        sha1: sha1_hash(data),
+        sha256: sha256_hash(data),
     }
 }
 
