@@ -50,6 +50,7 @@ pub(crate) struct SigningContext {
     pub(crate) der_entitlements_blob: Option<Vec<u8>>,
     pub(crate) hashes: SpecialSlotHashes,
     pub(crate) has_get_task_allow: bool,
+    pub(crate) cms_reserve: usize,
 }
 
 impl SigningContext {
@@ -98,6 +99,8 @@ impl SigningContext {
             resources: code_resources.map(dual_hash),
         };
 
+        let cms_reserve = cms::estimate_cms_size(credentials);
+
         Ok(Self {
             team_id: credentials.team_id.clone(),
             requirements,
@@ -105,6 +108,7 @@ impl SigningContext {
             der_entitlements_blob,
             hashes,
             has_get_task_allow,
+            cms_reserve,
         })
     }
 }
@@ -336,7 +340,7 @@ fn sign_slice_complete(
 
     if final_sig.len() > sig_space_size {
         // Retry with larger reserve based on actual signature size
-        let padded_sig_size = align_to(final_sig.len(), PAGE_SIZE);
+        let padded_sig_size = align_to(final_sig.len() + 256, PAGE_SIZE);
 
         // Re-prepare from the original slice data
         let (mut buf2, working_metadata2, working_slice2) = if !has_enough_signature_space(slice_data, slice.code_length, padded_sig_size) {
@@ -486,7 +490,7 @@ fn compute_superblob_reserved_size(
     let req_size = ctx.requirements.len();
     let ent_size = ctx.entitlements_blob.as_ref().map(|b| b.len()).unwrap_or(0);
     let der_ent_size = ctx.der_entitlements_blob.as_ref().map(|b| b.len()).unwrap_or(0);
-    let cms_reserve = 16384;
+    let cms_reserve = ctx.cms_reserve;
     let header = 12 + 7 * 8;
 
     let tight = header + cd_sha1 + cd_sha256 + req_size + ent_size + der_ent_size + cms_reserve;

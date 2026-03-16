@@ -305,6 +305,45 @@ fn build_cdhash_v2_attribute(cdhash_sha256: &[u8; 32]) -> Vec<u8> {
     result
 }
 
+/// Estimates the upper bound of a CMS SignedData DER encoding.
+///
+/// Computes a conservative estimate based on:
+/// - Fixed CMS structure overhead (~200 bytes)
+/// - Signing certificate DER size
+/// - Certificate chain DER sizes
+/// - Signature size (key-type dependent)
+/// - Signed attributes overhead (~300 bytes for CDHash v1/v2 + standard attrs)
+///
+/// Returns an upper bound in bytes. The actual CMS output will be smaller.
+pub fn estimate_cms_size(credentials: &SigningCredentials) -> usize {
+    let cms_overhead = 200;
+    let signed_attrs_size = 400;
+
+    let cert_size = credentials
+        .certificate
+        .to_der()
+        .map(|d| d.len())
+        .unwrap_or(2048);
+
+    let chain_size: usize = credentials
+        .cert_chain
+        .iter()
+        .map(|c| c.to_der().map(|d| d.len()).unwrap_or(2048))
+        .sum();
+
+    let signature_size = match &credentials.signing_key {
+        SigningKeyType::Rsa(_) => 512,
+        SigningKeyType::Ecdsa(_) => 72,
+    };
+
+    let signer_info_overhead = 100;
+
+    let total =
+        cms_overhead + signed_attrs_size + cert_size + chain_size + signature_size + signer_info_overhead;
+
+    crate::macho::writer::align_to(total + 2048, 4096)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +642,194 @@ mod tests {
         let attr_oids: Vec<String> = signed_attrs.iter().map(|a| a.oid.to_string()).collect();
         assert!(attr_oids.contains(&APPLE_CDHASH_OID.to_string()));
         assert!(attr_oids.contains(&APPLE_CDHASH_V2_OID.to_string()));
+    }
+
+    #[test]
+    fn test_estimate_cms_size_rsa_2048() {
+        let credentials = build_test_rsa_credentials(2048);
+        let estimated = estimate_cms_size(&credentials);
+
+        let code_dir = b"test code directory";
+        let cdhash_sha1 = [0xAA; 20];
+        let cdhash_sha256 = [0xBB; 32];
+        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
+            .unwrap();
+
+        assert!(estimated >= actual.len(),
+            "Estimate {} must be >= actual CMS size {} for RSA 2048",
+            estimated, actual.len());
+
+    }
+
+    #[test]
+    fn test_estimate_cms_size_ecdsa() {
+        let credentials = build_test_ecdsa_credentials();
+        let estimated = estimate_cms_size(&credentials);
+
+        let code_dir = b"test code directory";
+        let cdhash_sha1 = [0xCC; 20];
+        let cdhash_sha256 = [0xDD; 32];
+        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
+            .unwrap();
+
+        assert!(estimated >= actual.len(),
+            "Estimate {} must be >= actual CMS size {} for ECDSA P-256",
+            estimated, actual.len());
+
+    }
+
+    fn build_test_rsa_credentials(bits: usize) -> SigningCredentials {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::Decode;
+        use rsa::RsaPrivateKey;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let rsa_key = RsaPrivateKey::new(&mut rng, bits).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key.clone());
+        let subject = Name::from_str("CN=CMS Size Test,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(99u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &signing_key)
+            .unwrap()
+            .build::<rsa::pkcs1v15::Signature>()
+            .unwrap();
+
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Rsa(signing_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_estimate_cms_size_rsa_with_chain() {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::{Decode, Encode};
+        use rsa::RsaPrivateKey;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+
+        // Build root CA
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(root_key.clone());
+        let root_subject = Name::from_str("CN=Test Root CA,O=Test Corp").unwrap();
+        let root_pub_der = root_key.to_public_key().to_public_key_der().unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_ref()).unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(1u32),
+            Validity::from_now(Duration::from_secs(7200)).unwrap(),
+            root_subject,
+            root_pub,
+            &root_signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        // Build intermediate CA
+        let inter_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let inter_signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(inter_key.clone());
+        let inter_subject = Name::from_str("CN=Test Intermediate CA,O=Test Corp").unwrap();
+        let inter_pub_der = inter_key.to_public_key().to_public_key_der().unwrap();
+        let inter_pub = SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_ref()).unwrap();
+        let inter_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(2u32),
+            Validity::from_now(Duration::from_secs(7200)).unwrap(),
+            inter_subject,
+            inter_pub,
+            &inter_signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        // Build leaf signing cert
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(leaf_key.clone());
+        let leaf_subject = Name::from_str("CN=Test Leaf,OU=TESTTEAM").unwrap();
+        let leaf_pub_der = leaf_key.to_public_key().to_public_key_der().unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_ref()).unwrap();
+        let leaf_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(3u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            leaf_subject,
+            leaf_pub,
+            &leaf_signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        let credentials = SigningCredentials {
+            certificate: leaf_cert,
+            signing_key: SigningKeyType::Rsa(leaf_signing_key),
+            cert_chain: vec![inter_cert, root_cert],
+            team_id: Some("TESTTEAM".to_string()),
+        };
+
+        let estimated = estimate_cms_size(&credentials);
+
+        let code_dir = b"test code directory with chain";
+        let cdhash_sha1 = [0xEE; 20];
+        let cdhash_sha256 = [0xFF; 32];
+        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
+            .unwrap();
+
+        assert!(estimated >= actual.len(),
+            "Estimate {} must be >= actual CMS size {} for RSA 2048 with 2-cert chain",
+            estimated, actual.len());
+    }
+
+    fn build_test_ecdsa_credentials() -> SigningCredentials {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::Decode;
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let ecdsa_key = SigningKey::random(&mut OsRng);
+        let verifying_key = p256::ecdsa::VerifyingKey::from(&ecdsa_key);
+        let subject = Name::from_str("CN=CMS Size Test ECDSA,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(100u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = verifying_key.to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &ecdsa_key)
+            .unwrap()
+            .build::<p256::ecdsa::DerSignature>()
+            .unwrap();
+
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Ecdsa(ecdsa_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
     }
 }
