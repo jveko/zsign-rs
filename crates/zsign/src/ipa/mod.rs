@@ -64,6 +64,7 @@ use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 /// High-level IPA signing workflow.
@@ -228,9 +229,8 @@ impl<'a> IpaSigner<'a> {
         }
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
-        for dylib_path in &dylibs {
-            self.sign_standalone_dylib(dylib_path)?;
-        }
+        dylibs.par_iter()
+            .try_for_each(|dylib_path| self.sign_standalone_dylib(dylib_path))?;
 
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
 
@@ -377,15 +377,18 @@ impl<'a> IpaSigner<'a> {
 
         let binaries = self.find_immediate_macho_binaries(bundle_path)?;
 
-        for binary_path in &binaries {
-            if binary_path != &main_executable {
+        let non_main_binaries: Vec<_> = binaries.iter()
+            .filter(|p| *p != &main_executable)
+            .collect();
+
+        non_main_binaries.par_iter()
+            .try_for_each(|binary_path| {
                 let binary_identifier = binary_path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or(&identifier);
-                self.sign_binary(binary_path, binary_identifier, None, entitlements)?;
-            }
-        }
+                self.sign_binary(binary_path, binary_identifier, None, entitlements)
+            })?;
 
         if copy_provisioning_profile {
             if let Some(data) = profile_data {
