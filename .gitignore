@@ -37,3 +37,5 @@ bench.sh
 bench_results.json
 profile.json
 crates/zsign/tests/
+.brv
+.agents
