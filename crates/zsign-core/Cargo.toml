@@ -9,8 +9,6 @@ license = "MIT"
 [dependencies]
 goblin = "0.10"
 plist = "1.7"
-sha1 = "0.10"
-sha2 = "0.10"
 thiserror = "2.0"
 base64 = "0.22"
 der = { version = "0.7", features = ["alloc", "oid", "pem"] }
@@ -33,6 +31,12 @@ rayon = "1.11"
 # On wasm32, it needs the "js" feature to use crypto.getRandomValues().
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+sha1 = "0.10"
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sha1 = { version = "0.10", features = ["asm"] }
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 x509-cert = { version = "0.2.5", features = ["pem", "builder"] }
