@@ -47,6 +47,22 @@ struct Cli {
     /// New bundle identifier to set in Info.plist
     #[arg(short = 'b', long)]
     bundle_id: Option<String>,
+
+    /// New display name to set in Info.plist (CFBundleDisplayName)
+    #[arg(short = 'n', long)]
+    bundle_name: Option<String>,
+
+    /// New bundle version to set in Info.plist (CFBundleShortVersionString)
+    #[arg(short = 'r', long)]
+    bundle_version: Option<String>,
+
+    /// Emit only the SHA-256 code directory (no SHA-1 code directory)
+    #[arg(short = '2', long)]
+    sha256_only: bool,
+
+    /// Force re-signing (accepted for compatibility; no cache is kept)
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,12 +81,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(bundle_id) = cli.bundle_id {
         signer = signer.bundle_id(bundle_id);
     }
-
-    let output = cli.output.unwrap_or_else(|| {
-        let mut out = cli.input.clone();
-        out.set_extension("signed");
-        out
-    });
+    if let Some(name) = cli.bundle_name {
+        signer = signer.bundle_name(name);
+    }
+    if let Some(version) = cli.bundle_version {
+        signer = signer.bundle_version(version);
+    }
+    if cli.sha256_only {
+        signer = signer.sha256_only(true);
+    }
+    let _ = cli.force; // accepted for compatibility; no signing cache is kept
 
     let ext = cli
         .input
@@ -80,18 +100,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match ext.to_lowercase().as_str() {
         "ipa" => {
+            let output = cli.output.unwrap_or_else(|| {
+                let mut out = cli.input.clone();
+                out.set_extension("signed");
+                out
+            });
             signer.sign_ipa(&cli.input, &output)?;
+            println!("Signed: {}", output.display());
         }
         "app" => {
-            eprintln!("Error: .app bundle signing is not yet implemented. Use IPA signing instead.");
-            std::process::exit(1);
+            // Folder signing: with -o ending in .ipa, repack; otherwise in place.
+            signer.sign_bundle(&cli.input, cli.output.as_deref())?;
+            match &cli.output {
+                Some(ipa) => println!("Signed: {}", ipa.display()),
+                None => println!("Signed in place: {}", cli.input.display()),
+            }
         }
         _ => {
+            let output = cli.output.unwrap_or_else(|| {
+                let mut out = cli.input.clone();
+                out.set_extension("signed");
+                out
+            });
             signer.sign_macho(&cli.input, &output)?;
+            println!("Signed: {}", output.display());
         }
     }
 
-    println!("Signed: {}", output.display());
     Ok(())
 }
 

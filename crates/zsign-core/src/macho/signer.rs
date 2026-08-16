@@ -22,11 +22,14 @@
 use crate::codesign::code_directory::{
     compute_cdhash_sha1, compute_cdhash_sha256, hash_code_pages_dual, CodeDirectoryBuilder,
 };
-use crate::codesign::constants::{CS_EXECSEG_ALLOW_UNSIGNED, CS_EXECSEG_MAIN_BINARY, CS_SHA1_LEN, CS_SHA256_LEN, PAGE_SIZE};
+use crate::codesign::constants::{
+    CS_ADHOC, CS_EXECSEG_ALLOW_UNSIGNED, CS_EXECSEG_MAIN_BINARY, CS_SHA1_LEN, CS_SHA256_LEN,
+    PAGE_SIZE,
+};
 use crate::codesign::der::plist_to_der;
 use crate::codesign::superblob::{
     build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob_full,
-    build_signature_blob, SuperBlobBuilder,
+    build_adhoc_signature_blob, build_signature_blob, SuperBlobBuilder,
 };
 use crate::crypto::cert::extract_subject_cn;
 use crate::crypto::cms;
@@ -44,6 +47,7 @@ use super::writer::{align_to, calculate_signature_space, checked_u32, has_enough
 /// Avoids recomputing requirements, entitlements, hashes, and subject CN
 /// for each architecture slice in a FAT binary.
 pub(crate) struct SigningContext {
+    pub(crate) adhoc: bool,
     pub(crate) team_id: Option<String>,
     pub(crate) requirements: Vec<u8>,
     pub(crate) entitlements_blob: Option<Vec<u8>>,
@@ -60,13 +64,16 @@ impl SigningContext {
     /// of all special slots.
     pub(crate) fn new(
         identifier: &str,
-        credentials: &SigningCredentials,
+        credentials: Option<&SigningCredentials>,
         entitlements: Option<&[u8]>,
         is_executable: bool,
         info_plist: Option<&[u8]>,
         code_resources: Option<&[u8]>,
     ) -> Result<Self> {
-        let subject_cn = extract_subject_cn(&credentials.certificate).unwrap_or_default();
+        let subject_cn = credentials
+            .map(|c| extract_subject_cn(&c.certificate).unwrap_or_default())
+            .unwrap_or_default();
+        let adhoc = credentials.is_none();
         let requirements = build_requirements_blob_full(identifier, &subject_cn);
 
         let entitlements_blob = entitlements.map(build_entitlements_blob);
@@ -99,10 +106,11 @@ impl SigningContext {
             resources: code_resources.map(dual_hash),
         };
 
-        let cms_reserve = cms::estimate_cms_size(credentials);
+        let cms_reserve = credentials.map(cms::estimate_cms_size).unwrap_or(0);
 
         Ok(Self {
-            team_id: credentials.team_id.clone(),
+            adhoc,
+            team_id: credentials.and_then(|c| c.team_id.clone()),
             requirements,
             entitlements_blob,
             der_entitlements_blob,
@@ -200,13 +208,66 @@ pub fn sign_macho(
     let slice_data = macho.slice_data(slice);
 
     let ctx = SigningContext::new(
-        identifier, credentials, entitlements, slice.is_executable, info_plist, code_resources,
+        identifier, Some(credentials), entitlements, slice.is_executable, info_plist, code_resources,
     )?;
 
     let signed = sign_slice_complete(
-        slice_data, slice, identifier, &ctx, credentials,
+        slice_data, slice, identifier, &ctx, Some(credentials), false,
     )?;
 
+    Ok(signed.signed_data)
+}
+
+/// Signs a single-architecture Mach-O with no identity (ad-hoc).
+///
+/// The superblob carries an empty CMS wrapper and the code directories are
+/// flagged `CS_ADHOC`. No certificate or private key is required.
+pub fn sign_macho_adhoc(
+    macho: &MachOFile,
+    identifier: &str,
+    entitlements: Option<&[u8]>,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if macho.slices().len() != 1 {
+        return Err(crate::Error::MachO(
+            "sign_macho_adhoc only supports single-arch Mach-O".into()
+        ));
+    }
+    let slice = &macho.slices()[0];
+    let slice_data = macho.slice_data(slice);
+    let ctx = SigningContext::new(
+        identifier, None, entitlements, slice.is_executable, info_plist, code_resources,
+    )?;
+    let signed = sign_slice_complete(
+        slice_data, slice, identifier, &ctx, None, false,
+    )?;
+    Ok(signed.signed_data)
+}
+
+/// Signs a single-architecture Mach-O emitting only the SHA-256 code
+/// directory (no SHA-1 code directory slot).
+pub fn sign_macho_sha256_only(
+    macho: &MachOFile,
+    identifier: &str,
+    entitlements: Option<&[u8]>,
+    credentials: &SigningCredentials,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if macho.slices().len() != 1 {
+        return Err(crate::Error::MachO(
+            "sign_macho_sha256_only only supports single-arch Mach-O".into()
+        ));
+    }
+    let slice = &macho.slices()[0];
+    let slice_data = macho.slice_data(slice);
+    let ctx = SigningContext::new(
+        identifier, Some(credentials), entitlements, slice.is_executable, info_plist, code_resources,
+    )?;
+    let signed = sign_slice_complete(
+        slice_data, slice, identifier, &ctx, Some(credentials), true,
+    )?;
     Ok(signed.signed_data)
 }
 
@@ -231,7 +292,7 @@ pub fn sign_macho_all_slices(
 ) -> Result<Vec<SignedSlice>> {
     let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
     let ctx = SigningContext::new(
-        identifier, credentials, entitlements, is_executable, info_plist, code_resources,
+        identifier, Some(credentials), entitlements, is_executable, info_plist, code_resources,
     )?;
 
     use rayon::prelude::*;
@@ -243,7 +304,7 @@ pub fn sign_macho_all_slices(
             let slice_data = macho.slice_data(slice);
 
             let mut signed = sign_slice_complete(
-                slice_data, slice, identifier, &ctx, credentials,
+                slice_data, slice, identifier, &ctx, Some(credentials), false,
             )?;
 
             signed.slice_index = index;
@@ -259,7 +320,8 @@ fn sign_slice_complete(
     slice: &ArchSlice,
     identifier: &str,
     ctx: &SigningContext,
-    credentials: &SigningCredentials,
+    credentials: Option<&SigningCredentials>,
+    sha256_only: bool,
 ) -> Result<SignedSlice> {
     // Step 1: Estimate superblob size instead of building a preliminary one
     let estimated_sig_size = compute_superblob_reserved_size(slice.code_length, identifier, ctx);
@@ -302,32 +364,44 @@ fn sign_slice_complete(
     // buf now contains exactly the code bytes (code_length) with updated load commands
     let dual_hashes = hash_code_pages_dual(&buf);
 
-    // Step 5: Build both code directories from pre-computed hashes
-    let cd_sha1 = build_code_directory_from_hashes(
-        identifier, &buf, &working_slice, ctx, &dual_hashes.sha1, true,
-    );
+    // Step 5: Build code directories from pre-computed hashes
+    let cd_sha1 = if sha256_only {
+        Vec::new()
+    } else {
+        build_code_directory_from_hashes(
+            identifier, &buf, &working_slice, ctx, &dual_hashes.sha1, true,
+        )
+    };
     let cd_sha256 = build_code_directory_from_hashes(
         identifier, &buf, &working_slice, ctx, &dual_hashes.sha256, false,
     );
 
-    // Step 6: CMS sign ONCE
-    let cdhash_sha1: [u8; 20] = compute_cdhash_sha1(&cd_sha1);
+    // Step 6: CMS sign ONCE (in sha256-only mode the SHA-1 cdhash is
+    // unused because no SHA-1 code directory slot is emitted)
+    let cdhash_sha1: [u8; 20] = if cd_sha1.is_empty() {
+        [0; 20]
+    } else {
+        compute_cdhash_sha1(&cd_sha1)
+    };
     let cdhash_sha256: [u8; 32] = compute_cdhash_sha256(&cd_sha256);
 
-    let cms_data = cms::sign_code_directory(
-        &cd_sha1,
-        credentials,
-        &cdhash_sha1,
-        &cdhash_sha256,
-    )?;
-    let signature_blob = build_signature_blob(&cms_data);
+    let signature_blob = match credentials {
+        Some(creds) => {
+            let cms_data = cms::sign_code_directory(&cd_sha1, creds, &cdhash_sha1, &cdhash_sha256)?;
+            build_signature_blob(&cms_data)
+        }
+        None => build_adhoc_signature_blob(),
+    };
 
     // Step 7: Assemble superblob ONCE
     let mut builder = SuperBlobBuilder::new()
-        .code_directory_sha1(cd_sha1)
         .code_directory_sha256(cd_sha256)
         .requirements(ctx.requirements.clone())
         .cms_signature(signature_blob);
+    if !sha256_only {
+        builder = builder.code_directory_sha1(cd_sha1);
+    }
+
 
     if let Some(ref ent_blob) = ctx.entitlements_blob {
         builder = builder.entitlements(ent_blob.clone());
@@ -369,20 +443,35 @@ fn sign_slice_complete(
 
         // Re-hash and re-sign with new offsets
         let dual2 = hash_code_pages_dual(&buf2);
-        let cd_sha1_2 = build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha1, true);
+        let cd_sha1_2 = if sha256_only {
+            Vec::new()
+        } else {
+            build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha1, true)
+        };
         let cd_sha256_2 = build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha256, false);
 
-        let cdhash_sha1_2: [u8; 20] = compute_cdhash_sha1(&cd_sha1_2);
+        let cdhash_sha1_2: [u8; 20] = if cd_sha1_2.is_empty() {
+            [0; 20]
+        } else {
+            compute_cdhash_sha1(&cd_sha1_2)
+        };
         let cdhash_sha256_2: [u8; 32] = compute_cdhash_sha256(&cd_sha256_2);
 
-        let cms_data2 = cms::sign_code_directory(&cd_sha1_2, credentials, &cdhash_sha1_2, &cdhash_sha256_2)?;
-        let sig_blob2 = build_signature_blob(&cms_data2);
+        let sig_blob2 = match credentials {
+            Some(creds) => {
+                let cms_data2 = cms::sign_code_directory(&cd_sha1_2, creds, &cdhash_sha1_2, &cdhash_sha256_2)?;
+                build_signature_blob(&cms_data2)
+            }
+            None => build_adhoc_signature_blob(),
+        };
 
         let mut builder2 = SuperBlobBuilder::new()
-            .code_directory_sha1(cd_sha1_2)
             .code_directory_sha256(cd_sha256_2)
             .requirements(ctx.requirements.clone())
             .cms_signature(sig_blob2);
+        if !sha256_only {
+            builder2 = builder2.code_directory_sha1(cd_sha1_2);
+        }
         if let Some(ref ent_blob) = ctx.entitlements_blob {
             builder2 = builder2.entitlements(ent_blob.clone());
         }
@@ -526,6 +615,7 @@ fn build_code_directory_from_hashes(
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
+        .flags(if ctx.adhoc { CS_ADHOC } else { 0 })
         .exec_seg_base(slice.text_segment_base)
         .exec_seg_limit(slice.text_segment_size)
         .exec_seg_flags(exec_seg_flags);
@@ -742,6 +832,96 @@ mod tests {
             cert_chain: vec![],
             team_id: Some("TESTTEAM".to_string()),
         }
+    }
+
+    #[test]
+    fn test_sha256_only_signature_omits_sha1_code_directory() {
+        use crate::codesign::constants::{
+            CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
+            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE,
+        };
+
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let credentials = test_credentials();
+        let signed = sign_macho_sha256_only(
+            &macho, "com.zsign.sha256only", None, &credentials, None, None,
+        )
+        .expect("sha256-only signing must succeed");
+
+        let signed_macho = crate::macho::MachOFile::parse(signed.clone()).unwrap();
+        let slice = &signed_macho.slices()[0];
+        let off = slice.code_sig_offset.unwrap() as usize;
+        let size = slice.code_sig_size.unwrap() as usize;
+        let blob = &signed[off..off + size];
+        assert_eq!(
+            read_u32(blob, 0),
+            CSMAGIC_EMBEDDED_SIGNATURE,
+            "must be a superblob"
+        );
+        let count = read_u32(blob, 8) as usize;
+        let mut saw_sha256 = false;
+        let mut saw_sha1 = false;
+        let mut saw_cms = false;
+        for i in 0..count {
+            let typ = read_u32(blob, 12 + i * 8);
+            let eoff = read_u32(blob, 16 + i * 8) as usize;
+            match typ {
+                CSSLOT_CODEDIRECTORY => saw_sha1 = true,
+                CSSLOT_ALTERNATE_CODEDIRECTORIES => saw_sha256 = true,
+                CSSLOT_SIGNATURESLOT => {
+                    saw_cms = read_u32(blob, eoff) == CSMAGIC_BLOBWRAPPER;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_sha256, "sha256 code directory must be present");
+        assert!(!saw_sha1, "sha1 code directory must be omitted");
+        assert!(saw_cms, "cms signature must be present");
+    }
+
+    #[test]
+    fn test_adhoc_signature_has_cs_adhoc_flag_and_empty_wrapper() {
+        use crate::codesign::constants::{
+            CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
+            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE,
+        };
+
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let signed = sign_macho_adhoc(&macho, "com.zsign.adhoc", None, None, None)
+            .expect("adhoc signing must succeed");
+
+        let sm = crate::macho::MachOFile::parse(signed.clone()).unwrap();
+        let slice = &sm.slices()[0];
+        let off = slice.code_sig_offset.unwrap() as usize;
+        let size = slice.code_sig_size.unwrap() as usize;
+        let blob = &signed[off..off + size];
+        assert_eq!(read_u32(blob, 0), CSMAGIC_EMBEDDED_SIGNATURE);
+
+        let count = read_u32(blob, 8) as usize;
+        let mut saw_adhoc_flag = false;
+        let mut saw_empty_wrapper = false;
+        for i in 0..count {
+            let typ = read_u32(blob, 12 + i * 8);
+            let eoff = read_u32(blob, 16 + i * 8) as usize;
+            match typ {
+                CSSLOT_CODEDIRECTORY | CSSLOT_ALTERNATE_CODEDIRECTORIES => {
+                    let flags = read_u32(blob, eoff + 12);
+                    if flags & CS_ADHOC != 0 {
+                        saw_adhoc_flag = true;
+                    }
+                }
+                CSSLOT_SIGNATURESLOT => {
+                    let magic = read_u32(blob, eoff);
+                    let len = read_u32(blob, eoff + 4) as usize;
+                    if magic == CSMAGIC_BLOBWRAPPER && len == 8 {
+                        saw_empty_wrapper = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_adhoc_flag, "code directories must carry the CS_ADHOC flag");
+        assert!(saw_empty_wrapper, "signature slot must be the empty ad-hoc wrapper");
     }
 
     #[test]

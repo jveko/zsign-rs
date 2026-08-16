@@ -106,14 +106,20 @@ use walkdir::WalkDir;
 /// For manual control over extraction/repacking, use [`extract_ipa`] and
 /// [`create_ipa`] directly.
 pub struct IpaSigner<'a> {
-    /// Reference to signing credentials
-    credentials: &'a SigningCredentials,
+    /// Reference to signing credentials; `None` signs ad-hoc
+    credentials: Option<&'a SigningCredentials>,
     /// Compression level for output IPA
     compression_level: CompressionLevel,
     /// Path to provisioning profile to embed as embedded.mobileprovision
     provisioning_profile_path: Option<PathBuf>,
     /// Override bundle identifier for the main app bundle
     bundle_id: Option<String>,
+    /// Override display name for the main app bundle
+    bundle_name: Option<String>,
+    /// Override bundle version for the main app bundle
+    bundle_version: Option<String>,
+    /// Emit only the SHA-256 code directory (no SHA-1 code directory)
+    sha256_only: bool,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -124,11 +130,32 @@ impl<'a> IpaSigner<'a> {
     /// before calling [`Self::sign`].
     pub fn new(credentials: &'a SigningCredentials) -> Self {
         Self {
-            credentials,
+            credentials: Some(credentials),
             compression_level: CompressionLevel::DEFAULT,
             provisioning_profile_path: None,
             bundle_id: None,
+            bundle_name: None,
+            bundle_version: None,
+            sha256_only: false,
         }
+    }
+
+    /// Creates an ad-hoc signer (no certificate or private key).
+    pub fn new_adhoc() -> Self {
+        Self {
+            credentials: None,
+            compression_level: CompressionLevel::DEFAULT,
+            provisioning_profile_path: None,
+            bundle_id: None,
+            bundle_name: None,
+            bundle_version: None,
+            sha256_only: false,
+        }
+    }
+
+    /// Returns the signing credentials if identity signing was configured.
+    fn credentials_or_err(&self) -> Option<&'a SigningCredentials> {
+        self.credentials
     }
 
     /// Sets the compression level for the output IPA.
@@ -155,6 +182,34 @@ impl<'a> IpaSigner<'a> {
     /// rewritten to this value before signing.
     pub fn bundle_id(mut self, id: impl Into<String>) -> Self {
         self.bundle_id = Some(id.into());
+        self
+    }
+
+    /// Sets a new display name for the main app bundle.
+    ///
+    /// When set, `CFBundleDisplayName` in the main app's `Info.plist` is
+    /// rewritten before signing.
+    pub fn bundle_name(mut self, name: impl Into<String>) -> Self {
+        self.bundle_name = Some(name.into());
+        self
+    }
+
+    /// Sets a new bundle version for the main app bundle.
+    ///
+    /// When set, `CFBundleShortVersionString` in the main app's `Info.plist`
+    /// is rewritten before signing.
+    pub fn bundle_version(mut self, version: impl Into<String>) -> Self {
+        self.bundle_version = Some(version.into());
+        self
+    }
+
+    /// Emits only the SHA-256 code directory (`-2` behaviour).
+    ///
+    /// The SHA-1 code directory slot and its page hashes are omitted from
+    /// the superblob, matching the reference tool's single-code-directory
+    /// mode.
+    pub fn sha256_only(mut self, only: bool) -> Self {
+        self.sha256_only = only;
         self
     }
 
@@ -191,21 +246,54 @@ impl<'a> IpaSigner<'a> {
         })?;
 
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
-
-        let (profile_data, entitlements) = match &self.provisioning_profile_path {
-            Some(path) => {
-                let data = fs::read(path)?;
-                let ent = zsign_core::extract_entitlements_from_profile(&data)?;
-                (Some(data), ent)
-            }
-            None => (None, None),
-        };
-
-        self.sign_bundle(&app_bundle, entitlements.as_deref(), profile_data.as_deref())?;
+        self.sign_bundle_from_options(&app_bundle)?;
 
         create_ipa(&app_bundle, output_ipa, self.compression_level)?;
 
         Ok(())
+    }
+
+    /// Loads the provisioning profile and its entitlements.
+    fn load_profile(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        match &self.provisioning_profile_path {
+            Some(path) => {
+                let data = fs::read(path)?;
+                let ent = zsign_core::extract_entitlements_from_profile(&data)?;
+                Ok((Some(data), ent))
+            }
+            None => Ok((None, None)),
+        }
+    }
+
+    /// Signs an app bundle in place (`.app` folder signing).
+    ///
+    /// All Mach-O binaries are signed in place, the provisioning profile is
+    /// embedded (if set), and `_CodeSignature/CodeResources` is generated.
+    pub fn sign_folder_in_place(&self, bundle_path: impl AsRef<Path>) -> Result<()> {
+        let bundle_path = bundle_path.as_ref();
+        if !bundle_path.is_dir() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "Not a directory: {}",
+                bundle_path.display()
+            ))));
+        }
+        self.sign_bundle_from_options(bundle_path)
+    }
+
+    /// Signs an app bundle and repacks it as an IPA.
+    pub fn sign_folder_to_ipa(
+        &self,
+        bundle_path: impl AsRef<Path>,
+        output_ipa: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.sign_folder_in_place(&bundle_path)?;
+        create_ipa(bundle_path.as_ref(), output_ipa.as_ref(), self.compression_level)
+    }
+
+    /// Loads profile options and applies bundle rewrites before signing.
+    fn sign_bundle_from_options(&self, bundle_path: &Path) -> Result<()> {
+        let (profile_data, entitlements) = self.load_profile()?;
+        self.sign_bundle(bundle_path, entitlements.as_deref(), profile_data.as_deref())
     }
 
     /// Sign an app bundle in place.
@@ -225,7 +313,13 @@ impl<'a> IpaSigner<'a> {
     /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path, entitlements: Option<&[u8]>, profile_data: Option<&[u8]>) -> Result<()> {
         if let Some(ref new_id) = self.bundle_id {
-            self.rewrite_bundle_id(bundle_path, new_id)?;
+            self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
+        }
+        if let Some(ref name) = self.bundle_name {
+            self.rewrite_plist_string(bundle_path, "CFBundleDisplayName", name)?;
+        }
+        if let Some(ref version) = self.bundle_version {
+            self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
         }
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
@@ -349,14 +443,10 @@ impl<'a> IpaSigner<'a> {
             .unwrap_or("dylib")
             .to_string();
 
-        let signed_binary = sign_macho(
-            &macho,
-            &identifier,
-            None,
-            self.credentials,
-            None,
-            None,
-        )?;
+        let signed_binary = match self.credentials {
+            Some(creds) => sign_macho(&macho, &identifier, None, creds, None, None)?,
+            None => crate::macho::sign_macho_adhoc(&macho, &identifier, None, None, None)?,
+        };
 
         fs::write(dylib_path, signed_binary)?;
 
@@ -463,8 +553,8 @@ impl<'a> IpaSigner<'a> {
         Ok(binaries)
     }
 
-    /// Rewrite the `CFBundleIdentifier` in the main app's `Info.plist`.
-    fn rewrite_bundle_id(&self, bundle_path: &Path, new_id: &str) -> Result<()> {
+    /// Rewrites a string key in the main app's `Info.plist`.
+    fn rewrite_plist_string(&self, bundle_path: &Path, key: &str, value: &str) -> Result<()> {
         let info_plist_path = bundle_path.join("Info.plist");
 
         if !info_plist_path.exists() {
@@ -479,10 +569,7 @@ impl<'a> IpaSigner<'a> {
             .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
 
         if let Some(dict) = plist.as_dictionary_mut() {
-            dict.insert(
-                "CFBundleIdentifier".to_string(),
-                plist::Value::String(new_id.to_string()),
-            );
+            dict.insert(key.to_string(), plist::Value::String(value.to_string()));
         }
 
         let mut buf = Vec::new();
@@ -624,14 +711,36 @@ impl<'a> IpaSigner<'a> {
             None
         };
 
-        let signed_binary = sign_any_macho(
-            &macho,
-            identifier,
-            entitlements,
-            self.credentials,
-            info_data.as_deref(),
-            code_resources,
-        )?;
+        let signed_binary = match self.credentials {
+            Some(creds) => {
+                if self.sha256_only {
+                    crate::macho::sign_macho_sha256_only(
+                        &macho,
+                        identifier,
+                        entitlements,
+                        creds,
+                        info_data.as_deref(),
+                        code_resources,
+                    )?
+                } else {
+                    sign_any_macho(
+                        &macho,
+                        identifier,
+                        entitlements,
+                        creds,
+                        info_data.as_deref(),
+                        code_resources,
+                    )?
+                }
+            }
+            None => crate::macho::sign_macho_adhoc(
+                &macho,
+                identifier,
+                entitlements,
+                info_data.as_deref(),
+                code_resources,
+            )?,
+        };
 
         fs::write(binary_path, signed_binary)?;
 
@@ -730,7 +839,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = create_test_ipa(temp_dir.path());
 
-        let credentials = test_credentials();
+        let credentials = crate::test_util::test_credentials();
         let output_ipa = temp_dir.path().join("signed.ipa");
 
         IpaSigner::new(&credentials)
@@ -791,44 +900,5 @@ mod tests {
             }
         }
         assert!(saw_cms, "SuperBlob must contain a CMS signature");
-    }
-
-    /// Self-signed RSA-2048 credentials for signing tests.
-    fn test_credentials() -> crate::SigningCredentials {
-        use spki::der::Decode;
-        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
-        use rsa::RsaPrivateKey;
-        use sha2::Sha256;
-        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
-        use std::str::FromStr;
-        use std::time::Duration;
-        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-        use x509_cert::name::Name;
-        use x509_cert::serial_number::SerialNumber;
-        use x509_cert::time::Validity;
-
-        let mut rng = rand::thread_rng();
-        let rsa_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let signing_key = RsaSigningKey::<Sha256>::new(rsa_key.clone());
-
-        let subject = Name::from_str("CN=zsign e2e,OU=TESTTEAM").unwrap();
-        let serial = SerialNumber::from(7u32);
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
-        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
-        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-
-        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &signing_key)
-            .unwrap()
-            .build::<rsa::pkcs1v15::Signature>()
-            .unwrap();
-
-        crate::SigningCredentials {
-            certificate: cert,
-            signing_key: zsign_core::crypto::SigningKeyType::Rsa(
-                RsaSigningKey::<Sha256>::new(rsa_key),
-            ),
-            cert_chain: vec![],
-            team_id: Some("TESTTEAM".to_string()),
-        }
     }
 }

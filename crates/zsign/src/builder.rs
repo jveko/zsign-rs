@@ -79,6 +79,10 @@ pub struct ZSign {
     provisioning_profile: Option<PathBuf>,
     compression_level: CompressionLevel,
     bundle_id: Option<String>,
+    bundle_name: Option<String>,
+    bundle_version: Option<String>,
+    sha256_only: bool,
+    adhoc: bool,
 }
 
 impl ZSign {
@@ -97,6 +101,10 @@ impl ZSign {
             provisioning_profile: None,
             compression_level: CompressionLevel::DEFAULT,
             bundle_id: None,
+            bundle_name: None,
+            bundle_version: None,
+            sha256_only: false,
+            adhoc: false,
         }
     }
 
@@ -169,6 +177,32 @@ impl ZSign {
         self
     }
 
+    /// Rewrites `CFBundleDisplayName` in the main app's `Info.plist`.
+    pub fn bundle_name(mut self, name: impl Into<String>) -> Self {
+        self.bundle_name = Some(name.into());
+        self
+    }
+
+    /// Rewrites `CFBundleShortVersionString` in the main app's `Info.plist`.
+    pub fn bundle_version(mut self, version: impl Into<String>) -> Self {
+        self.bundle_version = Some(version.into());
+        self
+    }
+
+    /// Emits only the SHA-256 code directory (no SHA-1 code directory).
+    pub fn sha256_only(mut self, only: bool) -> Self {
+        self.sha256_only = only;
+        self
+    }
+
+    /// Signs without an identity (ad-hoc), like the reference tool's `-a`.
+    ///
+    /// No credentials are required; code directories are flagged `CS_ADHOC`.
+    pub fn adhoc(mut self, adhoc: bool) -> Self {
+        self.adhoc = adhoc;
+        self
+    }
+
     /// Validates the builder configuration.
     ///
     /// # Errors
@@ -184,7 +218,7 @@ impl ZSign {
     /// assert!(result.is_err()); // No credentials set
     /// ```
     pub fn validate(&self) -> Result<()> {
-        if self.credentials.is_none() {
+        if self.credentials.is_none() && !self.adhoc {
             return Err(Error::MissingCredentials(
                 "Credentials must be set using .credentials()".into(),
             ));
@@ -286,13 +320,15 @@ impl ZSign {
     pub fn sign_ipa(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
         self.validate()?;
 
-        let credentials = self
-            .credentials
-            .as_ref()
-            .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))?;
-
-        let mut signer =
-            IpaSigner::new(credentials).compression_level(self.compression_level);
+        let mut signer = if self.adhoc {
+            IpaSigner::new_adhoc().compression_level(self.compression_level)
+        } else {
+            let credentials = self
+                .credentials
+                .as_ref()
+                .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))?;
+            IpaSigner::new(credentials).compression_level(self.compression_level)
+        };
 
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
@@ -309,9 +345,55 @@ impl ZSign {
     ///
     /// # Errors
     ///
-    /// Currently returns an error as this feature is not yet implemented.
-    pub fn sign_bundle(&self, _bundle_path: impl AsRef<Path>) -> Result<()> {
-        Err(Error::Core(zsign_core::Error::Signing("Bundle signing not implemented".into())))
+    /// Signs an app bundle (`.app` folder) in place.
+    ///
+    /// When `output_ipa` is `Some`, the signed bundle is first produced in
+    /// place and then repacked into an IPA archive; when `None`, the bundle
+    /// is signed in place only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingCredentials`] when no credentials are set,
+    /// or a signing error if the bundle cannot be processed.
+    pub fn sign_bundle(
+        &self,
+        bundle_path: impl AsRef<Path>,
+        output_ipa: Option<&Path>,
+    ) -> Result<()> {
+        self.validate()?;
+
+        let mut signer = if self.adhoc {
+            crate::ipa::IpaSigner::new_adhoc().sha256_only(self.sha256_only)
+        } else {
+            let credentials = self.get_credentials()?;
+            crate::ipa::IpaSigner::new(credentials).sha256_only(self.sha256_only)
+        };
+        if let Some(ref profile) = self.provisioning_profile {
+            signer = signer.provisioning_profile(profile);
+        }
+        if let Some(ref bundle_id) = self.bundle_id {
+            signer = signer.bundle_id(bundle_id.as_str());
+        }
+        if let Some(ref name) = self.bundle_name {
+            signer = signer.bundle_name(name.as_str());
+        }
+        if let Some(ref version) = self.bundle_version {
+            signer = signer.bundle_version(version.as_str());
+        }
+
+        match output_ipa {
+            Some(ipa) if ipa.extension().map(|e| e.eq_ignore_ascii_case("ipa")).unwrap_or(false) => {
+                signer.sign_folder_to_ipa(&bundle_path, ipa)?
+            }
+            Some(other) => {
+                return Err(Error::Core(zsign_core::Error::Signing(format!(
+                    "app bundle output must end in .ipa, got: {}",
+                    other.display()
+                ))))
+            }
+            None => signer.sign_folder_in_place(&bundle_path)?,
+        }
+        Ok(())
     }
 
     /// Loads entitlements from the provisioning profile if set.
@@ -378,12 +460,82 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_bundle_not_implemented() {
+    fn test_sign_bundle_requires_credentials() {
         let zsign = ZSign::new();
-        let result = zsign.sign_bundle("MyApp.app");
+        let result = zsign.sign_bundle("MyApp.app", None);
+        assert!(matches!(result, Err(Error::MissingCredentials(_))));
+    }
+
+    #[test]
+    fn test_sign_bundle_missing_path() {
+        let zsign = ZSign::new().credentials(crate::test_util::test_credentials());
+        let result = zsign.sign_bundle("/nonexistent/MyApp.app", None);
         assert!(result.is_err());
-        if let Err(Error::Core(zsign_core::Error::Signing(msg))) = result {
-            assert!(msg.contains("not implemented"));
-        }
+    }
+
+    #[test]
+    fn test_sign_bundle_rejects_non_ipa_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        let zsign = ZSign::new().credentials(crate::test_util::test_credentials());
+        let result = zsign.sign_bundle(&app, Some(&dir.path().join("out.zip")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_bundle_folder_in_place() {
+        use crate::test_util::{minimal_macho, test_credentials};
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Test</string>
+  <key>CFBundleIdentifier</key><string>com.zsign.test</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        let mut f = std::fs::File::create(app.join("data.bin")).unwrap();
+        f.write_all(&[0xCD; 2048]).unwrap();
+
+        ZSign::new()
+            .credentials(test_credentials())
+            .bundle_id("com.zsign.changed")
+            .bundle_name("Renamed")
+            .bundle_version("2.0")
+            .sign_bundle(&app, None)
+            .expect("folder signing must succeed");
+
+        assert!(app.join("_CodeSignature/CodeResources").exists());
+        let plist: plist::Value =
+            plist::from_bytes(&std::fs::read(app.join("Info.plist")).unwrap()).unwrap();
+        let dict = plist.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("CFBundleIdentifier").unwrap().as_string().unwrap(),
+            "com.zsign.changed"
+        );
+        assert_eq!(
+            dict.get("CFBundleDisplayName").unwrap().as_string().unwrap(),
+            "Renamed"
+        );
+        assert_eq!(
+            dict.get("CFBundleShortVersionString").unwrap().as_string().unwrap(),
+            "2.0"
+        );
+
+        // Repack into an IPA too.
+        let ipa = dir.path().join("out.ipa");
+        ZSign::new()
+            .credentials(test_credentials())
+            .sign_bundle(&app, Some(&ipa))
+            .expect("folder to ipa must succeed");
+        assert!(ipa.exists());
     }
 }

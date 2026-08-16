@@ -533,37 +533,42 @@ impl<'a> CodeDirectoryBuilder<'a> {
     ///
     /// Special slots are stored in reverse order from -n to -1.
     /// Each slot is either the provided hash or zeros if not present.
+    ///
+    /// The emitted slot count must always equal [`Self::count_special_slots`],
+    /// otherwise the CodeDirectory header's `nSpecialSlots`/`hashOffset` would
+    /// not match the actual blob length.
     fn build_special_slots(&self, hash_size: usize) -> Vec<u8> {
         let empty = vec![0u8; hash_size];
-        let mut slots = Vec::new();
+        // Logical slots in reverse order (-7 to -1), mirroring count_special_slots.
+        let mut slots: Vec<&[u8]> = Vec::new();
 
-        let n_slots = self.count_special_slots();
-
-        // Build in reverse order (-7 to -1)
-        if n_slots >= 7 {
+        if self.is_main_executable() {
             // Slot -7: DER entitlements
-            slots.extend(self.der_entitlements_hash.as_ref().unwrap_or(&empty));
-        }
-        if n_slots >= 6 {
+            slots.push(self.der_entitlements_hash.as_deref().unwrap_or(&empty));
             // Slot -6: rep-specific (unused)
-            slots.extend(&empty);
+            slots.push(&empty);
         }
-        if n_slots >= 5 {
-            // Slot -5: XML entitlements
-            slots.extend(self.entitlements_hash.as_ref().unwrap_or(&empty));
-        }
-        if n_slots >= 4 {
-            // Slot -4: application (unused)
-            slots.extend(&empty);
-        }
+        // Slot -5: XML entitlements
+        slots.push(self.entitlements_hash.as_deref().unwrap_or(&empty));
+        // Slot -4: application (unused)
+        slots.push(&empty);
         // Slot -3: resources
-        slots.extend(self.resources_hash.as_ref().unwrap_or(&empty));
+        slots.push(self.resources_hash.as_deref().unwrap_or(&empty));
         // Slot -2: requirements
-        slots.extend(self.requirements_hash.as_ref().unwrap_or(&empty));
+        slots.push(self.requirements_hash.as_deref().unwrap_or(&empty));
         // Slot -1: info.plist
-        slots.extend(self.info_hash.as_ref().unwrap_or(&empty));
+        slots.push(self.info_hash.as_deref().unwrap_or(&empty));
 
-        slots
+        // Keep the trailing `count` slots; leading empty slots (with the
+        // highest negative indices) are trimmed, matching count_special_slots.
+        let n_slots = self.count_special_slots();
+        let start = slots.len().saturating_sub(n_slots);
+
+        let mut out = Vec::with_capacity(n_slots * hash_size);
+        for slot in &slots[start..] {
+            out.extend_from_slice(slot);
+        }
+        out
     }
 
     /// Hash all code pages sequentially.

@@ -47,6 +47,9 @@ pub mod macho;
 pub use zsign_core::{codesign, crypto, SigningCredentials};
 pub use zsign_core::provisioning::extract_entitlements_from_profile;
 
+#[cfg(test)]
+mod test_util;
+
 // Re-export native wrapper types
 pub use bundle::CodeResourcesBuilder;
 pub use builder::ZSign;

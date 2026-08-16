@@ -16,7 +16,10 @@
 use crate::{Error, Result};
 use goblin::mach::fat::FatArch;
 use goblin::mach::header::{MH_CIGAM_64, MH_MAGIC_64};
-use goblin::mach::load_command::{CommandVariant, LinkeditDataCommand, SegmentCommand64};
+use goblin::mach::load_command::{
+    CommandVariant, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_SEGMENT, LC_SEGMENT_64,
+    LinkeditDataCommand, SegmentCommand64,
+};
 use goblin::mach::{Mach, MachO, MultiArch};
 
 /// A signed architecture slice with its metadata.
@@ -497,6 +500,117 @@ fn add_code_signature_command(
     )?;
 
     Ok(())
+}
+
+/// Injects an `LC_LOAD_DYLIB` (or `LC_LOAD_WEAK_DYLIB` when `weak`) command into
+/// a 64-bit Mach-O, returning a new binary with the command appended to the
+/// load-command region.
+///
+/// # Errors
+///
+/// Returns [`Error::MachO`] if the input is not a 64-bit Mach-O or there is no
+/// room for the command between the last load command and the first segment.
+pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
+    const HEADER_SIZE: usize = 32;
+    const DYLIB_FIXED_SIZE: usize = 24;
+    const DEFAULT_FIRST_SEGMENT_OFFSET: usize = 4096;
+
+    if input.len() < HEADER_SIZE {
+        return Err(Error::MachO("binary too short for a 64-bit Mach-O header".into()));
+    }
+
+    let magic = read_u32(input, 0, false)?;
+    let is_big_endian = magic == MH_CIGAM_64;
+    if magic != MH_MAGIC_64 && magic != MH_CIGAM_64 {
+        return Err(Error::MachO("not a 64-bit Mach-O binary".into()));
+    }
+
+    let ncmds = read_u32(input, 16, is_big_endian)? as usize;
+
+    // Walk the load commands to find the end of the region and the smallest
+    // segment fileoff, which bounds where a new command may be inserted.
+    let mut offset = HEADER_SIZE;
+    let mut max_load_cmd_end = HEADER_SIZE;
+    let mut first_segment_offset = usize::MAX;
+
+    for _ in 0..ncmds {
+        let cmd = read_u32(input, offset, is_big_endian)?;
+        let cmdsize = read_u32(input, offset + 4, is_big_endian)? as usize;
+        if cmdsize < 8 {
+            return Err(Error::MachO(
+                format!("invalid load command cmdsize {} at offset {}", cmdsize, offset),
+            ));
+        }
+        let end = offset
+            .checked_add(cmdsize)
+            .ok_or_else(|| Error::MachO(format!("load command cmdsize overflow at offset {}", offset)))?;
+        if end > input.len() {
+            return Err(Error::MachO(
+                format!("load command at offset {} extends past end of binary", offset),
+            ));
+        }
+
+        match cmd {
+            LC_SEGMENT_64 => {
+                let fileoff = read_u64(input, offset + 40, is_big_endian)? as usize;
+                if fileoff > 0 && fileoff < first_segment_offset {
+                    first_segment_offset = fileoff;
+                }
+            }
+            LC_SEGMENT => {
+                let fileoff = read_u32(input, offset + 32, is_big_endian)? as usize;
+                if fileoff > 0 && fileoff < first_segment_offset {
+                    first_segment_offset = fileoff;
+                }
+            }
+            _ => {}
+        }
+
+        offset = end;
+        if end > max_load_cmd_end {
+            max_load_cmd_end = end;
+        }
+    }
+
+    if first_segment_offset == usize::MAX {
+        first_segment_offset = DEFAULT_FIRST_SEGMENT_OFFSET;
+    }
+
+    let name_len_with_nul = dylib_name.len() + 1;
+    let new_cmdsize = checked_u32(align_to(DYLIB_FIXED_SIZE + name_len_with_nul, 8), "cmdsize")?;
+    let new_cmd_end = max_load_cmd_end
+        .checked_add(new_cmdsize as usize)
+        .ok_or_else(|| Error::MachO("dylib command size overflow".into()))?;
+
+    if new_cmd_end > first_segment_offset {
+        return Err(Error::MachO("no space for dylib command in load commands area".into()));
+    }
+
+    let mut output = input.to_vec();
+    if new_cmd_end > output.len() {
+        return Err(Error::MachO("binary too short for dylib command".into()));
+    }
+
+    output[max_load_cmd_end..new_cmd_end].fill(0);
+
+    let cmd_value = if weak { LC_LOAD_WEAK_DYLIB } else { LC_LOAD_DYLIB };
+    write_u32(&mut output, max_load_cmd_end, cmd_value, is_big_endian)?;
+    write_u32(&mut output, max_load_cmd_end + 4, new_cmdsize, is_big_endian)?;
+    write_u32(&mut output, max_load_cmd_end + 8, DYLIB_FIXED_SIZE as u32, is_big_endian)?;
+    write_u32(&mut output, max_load_cmd_end + 12, 0, is_big_endian)?;
+    write_u32(&mut output, max_load_cmd_end + 16, 0, is_big_endian)?;
+    write_u32(&mut output, max_load_cmd_end + 20, 0, is_big_endian)?;
+
+    let name_start = max_load_cmd_end + DYLIB_FIXED_SIZE;
+    output[name_start..name_start + dylib_name.len()].copy_from_slice(dylib_name.as_bytes());
+    output[name_start + dylib_name.len()] = 0;
+
+    let current_ncmds = read_u32(input, 16, is_big_endian)?;
+    let current_sizeofcmds = read_u32(input, 20, is_big_endian)?;
+    write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
+    write_u32(&mut output, 20, current_sizeofcmds + new_cmdsize, is_big_endian)?;
+
+    Ok(output)
 }
 
 fn find_first_segment_offset(macho: &MachO) -> usize {
@@ -1041,5 +1155,112 @@ mod tests {
         // Edge case: code_length equals data length
         assert!(!has_enough_signature_space(&[0u8; 1000], 1000, 1));
         assert!(has_enough_signature_space(&[0u8; 1000], 1000, 0));
+    }
+
+    /// Builds a tiny 64-bit LE Mach-O: header plus one `LC_SEGMENT_64` __TEXT
+    /// command (72 bytes), padded to 0x1004 bytes. The segment's `fileoff` is
+    /// given by `segment_fileoff`.
+    fn build_test_binary(segment_fileoff: u64) -> Vec<u8> {
+        // 32-byte header + one 72-byte LC_SEGMENT_64 command
+        let mut data = vec![0u8; 104];
+        write_u32(&mut data, 0, 0xfeed_facf, false).unwrap(); // MH_MAGIC_64
+        write_u32(&mut data, 4, 0x0100_000c, false).unwrap(); // CPU_TYPE_ARM64
+        write_u32(&mut data, 8, 0, false).unwrap(); // cpusubtype
+        write_u32(&mut data, 12, 2, false).unwrap(); // MH_EXECUTE
+        write_u32(&mut data, 16, 1, false).unwrap(); // ncmds
+        write_u32(&mut data, 20, 72, false).unwrap(); // sizeofcmds
+        write_u32(&mut data, 24, 0, false).unwrap(); // flags
+        write_u32(&mut data, 28, 0, false).unwrap(); // reserved
+
+        let seg_off = 32usize;
+        write_u32(&mut data, seg_off, 0x19, false).unwrap(); // LC_SEGMENT_64
+        write_u32(&mut data, seg_off + 4, 72, false).unwrap();
+        data[seg_off + 8..seg_off + 15].copy_from_slice(b"__TEXT\0"); // segname
+        write_u64(&mut data, seg_off + 24, 0, false).unwrap(); // vmaddr
+        write_u64(&mut data, seg_off + 32, 0x1000, false).unwrap(); // vmsize
+        write_u64(&mut data, seg_off + 40, segment_fileoff, false).unwrap(); // fileoff
+        write_u64(&mut data, seg_off + 48, 0x1000, false).unwrap(); // filesize
+        write_u32(&mut data, seg_off + 56, 7, false).unwrap(); // maxprot
+        write_u32(&mut data, seg_off + 60, 7, false).unwrap(); // initprot
+        write_u32(&mut data, seg_off + 64, 0, false).unwrap(); // nsects
+        write_u32(&mut data, seg_off + 68, 0, false).unwrap(); // flags
+
+        data.resize(0x1004, 0xCC);
+        data
+    }
+
+    #[test]
+    fn test_inject_dylib_command() {
+        let input = build_test_binary(0x1000);
+        let insertion_point = 32 + 72; // end of the single load command
+
+        let name = "libtest.dylib"; // 13 bytes + NUL = 14
+        let expected_cmdsize = align_to(24 + name.len() + 1, 8); // 40
+
+        let output = inject_dylib_command(&input, name, false).unwrap();
+        assert_eq!(read_u32(&output, 16, false).unwrap(), 2); // ncmds
+        assert_eq!(
+            read_u32(&output, 20, false).unwrap(),
+            72 + expected_cmdsize as u32
+        ); // sizeofcmds
+
+        assert_eq!(read_u32(&output, insertion_point, false).unwrap(), 0xc); // LC_LOAD_DYLIB
+        assert_eq!(
+            read_u32(&output, insertion_point + 4, false).unwrap(),
+            expected_cmdsize as u32
+        );
+        assert_eq!(read_u32(&output, insertion_point + 8, false).unwrap(), 24); // name_offset
+        assert_eq!(read_u32(&output, insertion_point + 12, false).unwrap(), 0); // timestamp
+        assert_eq!(read_u32(&output, insertion_point + 16, false).unwrap(), 0); // current_version
+        assert_eq!(read_u32(&output, insertion_point + 20, false).unwrap(), 0); // compatibility_version
+
+        let name_start = insertion_point + 24;
+        assert_eq!(&output[name_start..name_start + name.len()], name.as_bytes());
+        assert_eq!(output[name_start + name.len()], 0);
+
+        // Nothing before the insertion point changed apart from the header
+        // ncmds/sizeofcmds bumps.
+        let mut expected_prefix = input[..insertion_point].to_vec();
+        write_u32(&mut expected_prefix, 16, 2, false).unwrap();
+        write_u32(&mut expected_prefix, 20, 72 + expected_cmdsize as u32, false).unwrap();
+        assert_eq!(&output[..insertion_point], &expected_prefix[..]);
+
+        // The weak variant uses LC_LOAD_WEAK_DYLIB and the same layout.
+        let weak = inject_dylib_command(&input, name, true).unwrap();
+        assert_eq!(read_u32(&weak, 16, false).unwrap(), 2);
+        assert_eq!(read_u32(&weak, insertion_point, false).unwrap(), 0x8000_0018);
+        assert_eq!(
+            read_u32(&weak, insertion_point + 4, false).unwrap(),
+            expected_cmdsize as u32
+        );
+        let mut expected_weak_prefix = input[..insertion_point].to_vec();
+        write_u32(&mut expected_weak_prefix, 16, 2, false).unwrap();
+        write_u32(&mut expected_weak_prefix, 20, 72 + expected_cmdsize as u32, false).unwrap();
+        assert_eq!(&weak[..insertion_point], &expected_weak_prefix[..]);
+    }
+
+    #[test]
+    fn test_inject_dylib_command_no_slack() {
+        // The segment starts exactly where the load-command region ends: no
+        // room for another command.
+        let input = build_test_binary(104);
+        match inject_dylib_command(&input, "libtest.dylib", false) {
+            Err(Error::MachO(msg)) => {
+                assert!(msg.contains("no space"), "unexpected error: {}", msg);
+            }
+            other => panic!("expected no-space error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_inject_dylib_command_cmdsize_alignment() {
+        let input = build_test_binary(0x1000);
+        let name = "abc1234"; // 7 bytes + NUL = 8
+        let output = inject_dylib_command(&input, name, false).unwrap();
+
+        let cmdsize = read_u32(&output, 32 + 72 + 4, false).unwrap() as usize;
+        assert_eq!(cmdsize % 8, 0);
+        assert_eq!(cmdsize, 24 + 8); // 32
+        assert_eq!(read_u32(&output, 20, false).unwrap(), 72 + 32);
     }
 }
