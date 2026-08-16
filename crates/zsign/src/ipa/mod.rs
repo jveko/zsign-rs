@@ -691,7 +691,11 @@ mod tests {
         .unwrap();
 
         zip.start_file("Payload/Test.app/Test", options).unwrap();
-        zip.write_all(b"MACHO_PLACEHOLDER").unwrap();
+        zip.write_all(include_bytes!("fixtures/minimal_macho.bin"))
+            .unwrap();
+
+        zip.start_file("Payload/Test.app/data.bin", options).unwrap();
+        zip.write_all(&[0xAB; 4096]).unwrap();
 
         zip.finish().unwrap();
 
@@ -723,5 +727,108 @@ mod tests {
 
     #[test]
     fn test_ipa_signer_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_test_ipa(temp_dir.path());
+
+        let credentials = test_credentials();
+        let output_ipa = temp_dir.path().join("signed.ipa");
+
+        IpaSigner::new(&credentials)
+            .bundle_id("com.zsign.changed")
+            .sign(&ipa_path, &output_ipa)
+            .expect("ipa signing must succeed");
+
+        assert!(output_ipa.exists());
+
+        // Unpack and assert the signed bundle structure.
+        let verify_dir = temp_dir.path().join("signed");
+        let bundle = extract_ipa(&output_ipa, &verify_dir).unwrap();
+
+        // The bundle identifier must be rewritten before signing.
+        let plist_data = fs::read(bundle.join("Info.plist")).unwrap();
+        let plist: plist::Value = plist::from_bytes(&plist_data).unwrap();
+        let identifier = plist
+            .as_dictionary()
+            .and_then(|d| d.get("CFBundleIdentifier"))
+            .and_then(|v| v.as_string())
+            .unwrap();
+        assert_eq!(identifier, "com.zsign.changed");
+
+        // CodeResources must exist and hash every non-excluded file.
+        let cr = fs::read(bundle.join("_CodeSignature/CodeResources")).unwrap();
+        let cr_plist: plist::Value = plist::from_bytes(&cr).unwrap();
+        let files = cr_plist
+            .as_dictionary()
+            .and_then(|d| d.get("files"))
+            .and_then(|v| v.as_dictionary())
+            .expect("CodeResources must have a files dict");
+        assert!(
+            files.get("data.bin").is_some(),
+            "CodeResources must hash the resource file"
+        );
+
+        // The main executable must carry an embedded code signature that
+        // parses as a SuperBlob containing code directories and a CMS blob.
+        let main_data = fs::read(bundle.join("Test")).unwrap();
+        let macho = zsign_core::macho::MachOFile::parse(main_data.clone())
+            .expect("signed binary must parse");
+        let slice = &macho.slices()[0];
+        let sig_off = slice.code_sig_offset.expect("binary must be signed");
+        let sig_size = slice.code_sig_size.expect("binary must be signed");
+        let blob = &main_data[sig_off as usize..(sig_off + sig_size) as usize];
+
+        let magic = u32::from_be_bytes(blob[0..4].try_into().unwrap());
+        assert_eq!(magic, 0xfade_0cc0, "embedded signature must be a SuperBlob");
+        let count = u32::from_be_bytes(blob[8..12].try_into().unwrap()) as usize;
+        let mut saw_cms = false;
+        for i in 0..count {
+            let typ = u32::from_be_bytes(blob[12 + i * 8..16 + i * 8].try_into().unwrap());
+            if typ == 0x10000 {
+                let off = u32::from_be_bytes(blob[16 + i * 8..20 + i * 8].try_into().unwrap()) as usize;
+                let cms_magic = u32::from_be_bytes(blob[off..off + 4].try_into().unwrap());
+                assert_eq!(cms_magic, 0xfade_0b01, "CMS slot must be a blob wrapper");
+                saw_cms = true;
+            }
+        }
+        assert!(saw_cms, "SuperBlob must contain a CMS signature");
+    }
+
+    /// Self-signed RSA-2048 credentials for signing tests.
+    fn test_credentials() -> crate::SigningCredentials {
+        use spki::der::Decode;
+        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let rsa_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let signing_key = RsaSigningKey::<Sha256>::new(rsa_key.clone());
+
+        let subject = Name::from_str("CN=zsign e2e,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(7u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+
+        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &signing_key)
+            .unwrap()
+            .build::<rsa::pkcs1v15::Signature>()
+            .unwrap();
+
+        crate::SigningCredentials {
+            certificate: cert,
+            signing_key: zsign_core::crypto::SigningKeyType::Rsa(
+                RsaSigningKey::<Sha256>::new(rsa_key),
+            ),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
     }
 }

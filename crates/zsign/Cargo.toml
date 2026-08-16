@@ -26,3 +26,10 @@ walkdir = "2.5"
 tempfile = "3.10"
 base64 = "0.22"
 rayon = "1.11"
+
+[dev-dependencies]
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+spki = { version = "0.7", features = ["alloc"] }
+x509-cert = { version = "0.2.5", features = ["builder"] }
