@@ -202,16 +202,19 @@ pub fn create_ipa(
     let file = File::create(output_path)?;
     let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
 
-    // Configure compression options
+    // Configure compression options. A fixed timestamp keeps the archive
+    // reproducible: outputs are byte-identical across runs.
     let options = if compression_level.level() == 0 {
         // For stored (no compression), don't set compression level
         SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default())
     } else {
         // For deflate, set the compression level
         SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
             .compression_level(Some(compression_level.level() as i64))
+            .last_modified_time(zip::DateTime::default())
     };
 
     // Add Payload/ directory
