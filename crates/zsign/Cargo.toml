@@ -17,7 +17,8 @@ zsign-core = { path = "../zsign-core" }
 goblin = "0.10"
 zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd", "time"] }
 plist = "1.7"
-sha1 = { version = "0.10", features = ["asm"] }
+# sha1 intentionally portable: the `asm` feature is broken on aarch64.
+sha1 = { version = "0.10" }
 sha2 = { version = "0.10", features = ["asm"] }
 thiserror = "2.0"
 memmap2 = "0.9"
