@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_cdhash_v2_contains_hash_and_oid() {
-        use der::{Decode, SliceReader, Reader};
+        use der::{SliceReader, Reader};
 
         let hash = [0xCC; 32];
         let v2_der = build_cdhash_v2_attribute(&hash);
@@ -714,7 +714,7 @@ mod tests {
     #[test]
     fn test_estimate_cms_size_rsa_with_chain() {
         use crate::crypto::cert::{SigningCredentials, SigningKeyType};
-        use der::{Decode, Encode};
+        use der::Decode;
         use rsa::RsaPrivateKey;
         use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
         use std::str::FromStr;
