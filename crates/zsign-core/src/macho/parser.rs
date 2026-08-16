@@ -93,6 +93,9 @@ pub struct ArchSlice {
     pub code_sig_size: Option<u32>,
     /// Size of the `__TEXT` segment (used for `execSegLimit` in code signing).
     pub text_segment_size: u64,
+    /// Base virtual address of the `__TEXT` segment (used for
+    /// `execSegBase` in code signing).
+    pub text_segment_base: u64,
     /// Length of code to be signed (excludes existing signature).
     pub code_length: usize,
     /// Cached load command metadata for writer functions.
@@ -161,6 +164,7 @@ impl MachOFile {
         let mut code_sig_offset = None;
         let mut code_sig_size = None;
         let mut text_segment_size = 0u64;
+        let mut text_segment_base = 0u64;
 
         let mut meta_code_sig_cmd = None;
         let mut meta_linkedit_cmd = None;
@@ -182,6 +186,7 @@ impl MachOFile {
                 CommandVariant::Segment64(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.vmsize;
+                        text_segment_base = seg.vmaddr;
                     }
                     if seg.segname.starts_with(b"__LINKEDIT") {
                         meta_linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
@@ -193,6 +198,7 @@ impl MachOFile {
                 CommandVariant::Segment32(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.vmsize as u64;
+                        text_segment_base = seg.vmaddr as u64;
                     }
                     if seg.fileoff > 0 && (seg.fileoff as u64) < first_segment_offset {
                         first_segment_offset = seg.fileoff as u64;
@@ -283,6 +289,7 @@ impl MachOFile {
             code_sig_offset,
             code_sig_size,
             text_segment_size,
+            text_segment_base,
             code_length,
             metadata: MachOMetadata {
                 code_sig_cmd: meta_code_sig_cmd,

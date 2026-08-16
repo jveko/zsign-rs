@@ -277,6 +277,7 @@ fn sign_slice_complete(
             code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
                 code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
                 text_segment_size: slice.text_segment_size,
+                text_segment_base: slice.text_segment_base,
                 code_length: slice.code_length,
                 metadata: updated_metadata.clone(),
             };
@@ -354,6 +355,7 @@ fn sign_slice_complete(
                 code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
                 code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
                 text_segment_size: slice.text_segment_size,
+                text_segment_base: slice.text_segment_base,
                 code_length: slice.code_length,
                 metadata: updated_metadata.clone(),
             };
@@ -524,6 +526,7 @@ fn build_code_directory_from_hashes(
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
+        .exec_seg_base(slice.text_segment_base)
         .exec_seg_limit(slice.text_segment_size)
         .exec_seg_flags(exec_seg_flags);
 
@@ -606,5 +609,323 @@ mod tests {
         let hash1 = sha256_hash(data);
         let hash2 = sha256_hash(data);
         assert_eq!(hash1, hash2);
+    }
+
+    /// A minimal, valid thin arm64 `MH_EXECUTE` Mach-O: header, a `__TEXT`
+    /// segment with a 4-byte `__text` section, a `__LINKEDIT` segment for the
+    /// signature, and a build version command. No `LC_CODE_SIGNATURE` — an
+    /// unsigned input for signing tests.
+    fn make_minimal_macho() -> Vec<u8> {
+        let mut b = Vec::new();
+        macro_rules! u32 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u32).to_le_bytes())
+            };
+        }
+        macro_rules! u64 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u64).to_le_bytes())
+            };
+        }
+        macro_rules! name {
+            ($s:expr, $len:expr) => {
+                let mut n = [0u8; 16];
+                n[..$s.len()].copy_from_slice($s.as_bytes());
+                b.extend_from_slice(&n[..$len]);
+            };
+        }
+
+        // mach_header_64
+        u32!(0xfeedfacf); // MH_MAGIC_64
+        u32!(0x0100_000c); // CPU_TYPE_ARM64
+        u32!(0x0000_0000); // CPU_SUBTYPE_ARM64_ALL
+        u32!(2); // MH_EXECUTE
+        u32!(3); // ncmds
+        u32!(152 + 72 + 24); // sizeofcmds
+        u32!(0x1); // MH_NOUNDEFS
+        u32!(0); // reserved
+
+        // LC_SEGMENT_64 "__TEXT" (152 bytes, one section)
+        u32!(0x19);
+        u32!(152);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x1000); // fileoff: leaves room for load commands
+        u64!(0x1000); // filesize
+        u32!(7); // maxprot
+        u32!(7); // initprot
+        u32!(1); // nsects
+        u32!(0); // flags
+        name!("__text", 16);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // addr
+        u64!(4); // size
+        u32!(0x1000); // absolute file offset of the code
+        u32!(0); // align
+        u32!(0); // reloff
+        u32!(0); // nreloc
+        u32!(0); // flags
+        u32!(0); // reserved1
+        u32!(0); // reserved2
+        u32!(0); // reserved3
+
+        // LC_SEGMENT_64 "__LINKEDIT" (72 bytes, no sections) — the signature
+        // is appended after this segment.
+        u32!(0x19);
+        u32!(72);
+        name!("__LINKEDIT", 16);
+        u64!(0x1_0000_1000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x2000); // fileoff
+        u64!(0); // filesize
+        u32!(1); // maxprot (read-only)
+        u32!(1); // initprot
+        u32!(0); // nsects
+        u32!(0); // flags
+
+        // LC_BUILD_VERSION (24 bytes)
+        u32!(0x32);
+        u32!(24);
+        u32!(1); // macOS
+        u32!(0x000f_0000); // minos 15.0
+        u32!(0x000f_0000); // sdk 15.0
+        u32!(0); // ntools
+
+        // Zero-fill the first page (load-command area, alignment), place the
+        // 4-byte __text code at 0x1000, then pad through the __LINKEDIT page.
+        b.resize(0x1000, 0);
+        b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        b.resize(0x2000, 0);
+        b
+    }
+
+    /// Self-signed RSA-2048 credentials with `team_id=Some("TESTTEAM")`.
+    fn test_credentials() -> crate::crypto::SigningCredentials {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::Decode;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let rsa_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(rsa_key.clone());
+
+        let subject = Name::from_str("CN=zsign roundtrip,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(7u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<Sha256>::new(rsa_key)),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_minimal_macho_is_parseable() {
+        let data = make_minimal_macho();
+        assert_eq!(data.len(), 0x2000);
+        let macho = MachOFile::parse(data).expect("minimal mach-o must parse");
+        assert!(!macho.is_fat());
+        assert_eq!(macho.slices().len(), 1);
+        assert!(macho.slices()[0].is_executable);
+        assert_eq!(macho.slices()[0].text_segment_size, 0x1000);
+        assert_eq!(macho.slices()[0].text_segment_base, 0x1_0000_0000);
+        assert_eq!(macho.code_bytes(&macho.slices()[0]).len(), 0x2000);
+    }
+
+    #[test]
+    fn test_sign_then_verify_roundtrip() {
+        use goblin::mach::load_command::CommandVariant;
+        use goblin::mach::Mach;
+
+        let identifier = "com.zsign.roundtrip";
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let credentials = test_credentials();
+
+        let signed = sign_macho(
+            &macho,
+            identifier,
+            Some(b"<plist><dict><key>get-task-allow</key><true/></dict></plist>"),
+            &credentials,
+            Some(b"<plist><dict><key>CFBundleIdentifier</key><string>com.zsign.roundtrip</string></dict></plist>"),
+            Some(b"<plist><dict><key>files</key><dict/></dict></plist>"),
+        )
+        .expect("signing must succeed");
+
+        // The signed binary must still parse with the same code region.
+        let signed_macho = MachOFile::parse(signed.clone()).unwrap();
+        let slice = &signed_macho.slices()[0];
+        let code = signed_macho.code_bytes(slice);
+        assert_eq!(code.len(), 0x2000, "signing must not alter the code region");
+
+        // Locate the embedded code signature through goblin.
+        let Mach::Binary(binary) = Mach::parse(&signed).unwrap() else {
+            panic!("signed binary must be a single-arch Mach-O");
+        };
+        let lc = binary
+            .load_commands
+            .iter()
+            .find_map(|cmd| match cmd.command {
+                CommandVariant::CodeSignature(cs) => Some(cs),
+                _ => None,
+            })
+            .expect("signed binary must carry LC_CODE_SIGNATURE");
+        let blob = &signed[lc.dataoff as usize..(lc.dataoff + lc.datasize) as usize];
+
+        assert_eq!(
+            read_u32(blob, 0),
+            crate::codesign::constants::CSMAGIC_EMBEDDED_SIGNATURE,
+            "embedded signature must be a SuperBlob"
+        );
+        let count = read_u32(blob, 8) as usize;
+        assert!(count >= 3, "superblob needs code directories + CMS");
+
+        // Collect blob entries.
+        let mut cms_found = false;
+        let mut hash_size_seen = 0usize;
+        for i in 0..count {
+            let typ = read_u32(blob, 12 + i * 8);
+            let off = read_u32(blob, 12 + i * 8 + 4) as usize;
+            let entry = &blob[off..];
+            match typ {
+                crate::codesign::constants::CSSLOT_SIGNATURESLOT => {
+                    assert_eq!(
+                        read_u32(entry, 0),
+                        crate::codesign::constants::CSMAGIC_BLOBWRAPPER,
+                        "CMS slot must be a blob wrapper"
+                    );
+                    let len = read_u32(entry, 4) as usize;
+                    assert!(len > 100, "CMS signature must be non-trivial");
+                    cms_found = true;
+                }
+                crate::codesign::constants::CSSLOT_CODEDIRECTORY
+                | crate::codesign::constants::CSSLOT_ALTERNATE_CODEDIRECTORIES => {
+                    hash_size_seen =
+                        verify_code_directory(entry, code, identifier, &credentials, hash_size_seen);
+                }
+                _ => {}
+            }
+        }
+        assert!(cms_found, "superblob must contain a CMS signature");
+        assert!(
+            (hash_size_seen & (20 | 32)) == (20 | 32),
+            "both SHA-1 and SHA-256 code directories must be present"
+        );
+    }
+
+    /// Code-signing blobs are stored big-endian (`0xfade0cc0` is written as
+    /// `fa de 0c c0`), matching the in-file byte order of Apple's CS blobs.
+    fn read_u32(s: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes(s[off..off + 4].try_into().unwrap())
+    }
+
+    /// Independently recomputes the code-page hashes and checks every
+    /// important CodeDirectory field. Returns the hash size seen (20 or 32).
+    fn verify_code_directory(
+        cd: &[u8],
+        code: &[u8],
+        identifier: &str,
+        credentials: &crate::crypto::SigningCredentials,
+        mut seen: usize,
+    ) -> usize {
+        use crate::codesign::constants::CSMAGIC_CODEDIRECTORY;
+
+        assert_eq!(read_u32(cd, 0), CSMAGIC_CODEDIRECTORY, "code directory magic");
+        let version = read_u32(cd, 8);
+        assert!(version >= 0x20400, "code directory must be v0x20400+");
+        let hash_offset = read_u32(cd, 16) as usize;
+        let ident_offset = read_u32(cd, 20) as usize;
+        let n_special = read_u32(cd, 24) as usize;
+        let n_code = read_u32(cd, 28) as usize;
+        let code_limit = read_u32(cd, 32) as usize;
+        let hash_size = cd[36] as usize;
+        let hash_type = cd[37];
+        let page_size_log2 = cd[39];
+        seen |= hash_size;
+
+        assert_eq!(page_size_log2, 12, "page size must be 4096");
+        assert_eq!(
+            code_limit, code.len(),
+            "codeLimit must cover exactly the unsigned code region"
+        );
+        assert_eq!(
+            n_code,
+            code.len().div_ceil(4096),
+            "code slot count must match the page count"
+        );
+
+        let hash_type_expected: u8 = if hash_size == 20 { 1 } else { 2 };
+        assert_eq!(hash_type, hash_type_expected, "hash type must match hash size");
+
+        let ident_end = cd[ident_offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("identifier must be NUL-terminated");
+        assert_eq!(
+            std::str::from_utf8(&cd[ident_offset..ident_offset + ident_end]).unwrap(),
+            identifier,
+            "code directory identifier must match the signing identifier"
+        );
+
+        // Executable segment fields (v0x20400).
+        let exec_seg_base = u64::from_be_bytes(cd[64..72].try_into().unwrap());
+        let exec_seg_limit = u64::from_be_bytes(cd[72..80].try_into().unwrap());
+        assert_eq!(exec_seg_base, 0x1_0000_0000, "exec segment base");
+        assert_eq!(exec_seg_limit, 0x1000, "exec segment limit");
+
+        // Team identifier (v0x20200+).
+        let team_off = read_u32(cd, 48) as usize;
+        let team_end = cd[team_off..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("team id must be NUL-terminated");
+        assert_eq!(
+            std::str::from_utf8(&cd[team_off..team_off + team_end]).unwrap(),
+            credentials.team_id.as_deref().unwrap(),
+            "team id must round-trip through the code directory"
+        );
+
+        // The stored `hashOffset` points at the first code slot (the
+        // special-slot hashes precede it), matching zsign's layout.
+        let hashes = &cd[hash_offset..hash_offset + n_code * hash_size];
+        let _ = (n_special, seen);
+        let mut manual = Vec::with_capacity(hashes.len());
+        for page in code.chunks(4096) {
+            if hash_size == 20 {
+                let mut h = Sha1::new();
+                h.update(page);
+                manual.extend_from_slice(&h.finalize());
+            } else {
+                let mut h = Sha256::new();
+                h.update(page);
+                manual.extend_from_slice(&h.finalize());
+            }
+        }
+        assert_eq!(hashes, manual, "code-page hashes must verify");
+        seen
     }
 }

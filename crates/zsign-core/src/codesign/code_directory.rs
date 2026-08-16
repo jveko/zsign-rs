@@ -168,6 +168,7 @@ pub struct CodeDirectoryBuilder<'a> {
     requirements_hash: Option<Vec<u8>>,
     /// Executable segment limit (__TEXT segment size)
     exec_seg_limit: u64,
+    exec_seg_base: u64,
     /// Executable segment flags (raw value, e.g., CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED)
     exec_seg_flags: u64,
     /// Code signature flags (e.g., CS_ADHOC)
@@ -192,6 +193,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
             der_entitlements_hash: None,
             requirements_hash: None,
             exec_seg_limit: 0,
+            exec_seg_base: 0,
             exec_seg_flags: 0,
             flags: 0,
         }
@@ -251,6 +253,13 @@ impl<'a> CodeDirectoryBuilder<'a> {
     /// This is typically the __TEXT segment size from the Mach-O header.
     pub fn exec_seg_limit(mut self, limit: u64) -> Self {
         self.exec_seg_limit = limit;
+        self
+    }
+
+    /// Sets the base virtual address of the executable segment
+    /// (`execSegBase`).
+    pub fn exec_seg_base(mut self, base: u64) -> Self {
+        self.exec_seg_base = base;
         self
     }
 
@@ -364,8 +373,8 @@ impl<'a> CodeDirectoryBuilder<'a> {
         buf.extend(&0u32.to_be_bytes());
         buf.extend(&team_offset.to_be_bytes());
         buf.extend(&0u32.to_be_bytes());
-        buf.extend(&0u64.to_be_bytes());
-        buf.extend(&0u64.to_be_bytes());
+        buf.extend(&0u64.to_be_bytes()); // codeLimit64
+        buf.extend(&self.exec_seg_base.to_be_bytes()); // execSegBase
         buf.extend(&self.exec_seg_limit.to_be_bytes());
         buf.extend(&self.exec_seg_flags.to_be_bytes());
 
@@ -447,7 +456,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
         buf.extend(&team_offset.to_be_bytes()); // teamOffset
         buf.extend(&0u32.to_be_bytes()); // spare3
         buf.extend(&0u64.to_be_bytes()); // codeLimit64 (unused, codeLimit is sufficient)
-        buf.extend(&0u64.to_be_bytes()); // execSegBase (always 0)
+        buf.extend(&self.exec_seg_base.to_be_bytes()); // execSegBase
         buf.extend(&self.exec_seg_limit.to_be_bytes()); // execSegLimit
 
         // execSegFlags - use raw value directly
@@ -958,5 +967,43 @@ mod tests {
             "SHA-1 hashes must be identical for parallel and sequential");
         assert_eq!(parallel_result.sha256, sequential_result.sha256,
             "SHA-256 hashes must be identical for parallel and sequential");
+    }
+
+    #[test]
+    fn test_digest_known_answer_vectors() {
+        // Guards against hash-backend regressions (a broken `asm` feature
+        // once produced wrong, run-varying SHA-1 digests on aarch64).
+        let mut sha1 = Sha1::new();
+        sha1.update(b"abc");
+        assert_eq!(
+            sha1.finalize()[..],
+            [
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78,
+                0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+            ],
+            "SHA-1 of \"abc\" must match the canonical vector"
+        );
+
+        let mut sha256 = Sha256::new();
+        sha256.update(b"abc");
+        assert_eq!(
+            sha256.finalize()[..],
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
+                0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
+                0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+            ],
+            "SHA-256 of \"abc\" must match the canonical vector"
+        );
+
+        // A full page through the dual hasher must equal a manual digest.
+        let page = vec![0x5a; PAGE_SIZE];
+        let dual = hash_code_pages_dual(&page);
+        let mut manual_s1 = Sha1::new();
+        manual_s1.update(&page);
+        let mut manual_s256 = Sha256::new();
+        manual_s256.update(&page);
+        assert_eq!(&dual.sha1[..], &manual_s1.finalize()[..]);
+        assert_eq!(&dual.sha256[..], &manual_s256.finalize()[..]);
     }
 }
