@@ -105,6 +105,9 @@ use walkdir::WalkDir;
 ///
 /// For manual control over extraction/repacking, use [`extract_ipa`] and
 /// [`create_ipa`] directly.
+/// Provisioning profile bytes and their extracted entitlements.
+type ProfilePayload = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 pub struct IpaSigner<'a> {
     /// Reference to signing credentials; `None` signs ad-hoc
     credentials: Option<&'a SigningCredentials>,
@@ -120,6 +123,10 @@ pub struct IpaSigner<'a> {
     bundle_version: Option<String>,
     /// Emit only the SHA-256 code directory (no SHA-1 code directory)
     sha256_only: bool,
+    /// Dylib load paths to inject into signed binaries
+    dylibs: Vec<String>,
+    /// Inject with LC_LOAD_WEAK_DYLIB instead of LC_LOAD_DYLIB
+    weak_dylibs: bool,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -137,6 +144,8 @@ impl<'a> IpaSigner<'a> {
             bundle_name: None,
             bundle_version: None,
             sha256_only: false,
+            dylibs: Vec::new(),
+            weak_dylibs: false,
         }
     }
 
@@ -150,12 +159,9 @@ impl<'a> IpaSigner<'a> {
             bundle_name: None,
             bundle_version: None,
             sha256_only: false,
+            dylibs: Vec::new(),
+            weak_dylibs: false,
         }
-    }
-
-    /// Returns the signing credentials if identity signing was configured.
-    fn credentials_or_err(&self) -> Option<&'a SigningCredentials> {
-        self.credentials
     }
 
     /// Sets the compression level for the output IPA.
@@ -213,6 +219,15 @@ impl<'a> IpaSigner<'a> {
         self
     }
 
+    /// Injects the given dylib load paths into every signed bundle binary.
+    ///
+    /// `weak` selects `LC_LOAD_WEAK_DYLIB`; otherwise `LC_LOAD_DYLIB` is used.
+    pub fn dylib_injection(mut self, dylibs: Vec<String>, weak: bool) -> Self {
+        self.dylibs = dylibs;
+        self.weak_dylibs = weak;
+        self
+    }
+
     /// Signs an IPA file.
     ///
     /// This performs the complete signing workflow:
@@ -254,7 +269,7 @@ impl<'a> IpaSigner<'a> {
     }
 
     /// Loads the provisioning profile and its entitlements.
-    fn load_profile(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    fn load_profile(&self) -> Result<ProfilePayload> {
         match &self.provisioning_profile_path {
             Some(path) => {
                 let data = fs::read(path)?;
@@ -686,13 +701,25 @@ impl<'a> IpaSigner<'a> {
         code_resources: Option<&[u8]>,
         entitlements: Option<&[u8]>,
     ) -> Result<()> {
-        let macho = MachOFile::open(binary_path)?;
-
-        let is_executable = macho
+        let binary_data = fs::read(binary_path)?;
+        let executable_probe = MachOFile::parse(binary_data.clone())?;
+        let is_executable = executable_probe
             .slices()
             .first()
             .map(|s| s.is_executable)
             .unwrap_or(false);
+
+        // Dylib injection applies to executables, before they are signed.
+        let mut binary_data = binary_data;
+        if !self.dylibs.is_empty() && is_executable {
+            for name in &self.dylibs {
+                binary_data = zsign_core::macho::writer::inject_dylib_command(
+                    &binary_data, name, self.weak_dylibs,
+                )?;
+            }
+            fs::write(binary_path, &binary_data)?;
+        }
+        let macho = MachOFile::parse(binary_data)?;
 
         // Only the main executable gets Info.plist in its CodeDirectory.
         // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
@@ -771,6 +798,24 @@ mod tests {
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+
+    #[test]
+    fn test_ipa_signing_is_deterministic() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_test_ipa(temp_dir.path());
+        let credentials = crate::test_util::test_credentials();
+
+        let out_a = temp_dir.path().join("a.ipa");
+        let out_b = temp_dir.path().join("b.ipa");
+        IpaSigner::new(&credentials).sign(&ipa_path, &out_a).unwrap();
+        IpaSigner::new(&credentials).sign(&ipa_path, &out_b).unwrap();
+
+        assert_eq!(
+            fs::read(&out_a).unwrap(),
+            fs::read(&out_b).unwrap(),
+            "re-signing the same IPA must produce byte-identical output"
+        );
+    }
 
     /// Create a minimal test IPA file.
     fn create_test_ipa(dir: &Path) -> PathBuf {

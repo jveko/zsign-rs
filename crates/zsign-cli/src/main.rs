@@ -63,16 +63,48 @@ struct Cli {
     /// Force re-signing (accepted for compatibility; no cache is kept)
     #[arg(short = 'f', long)]
     force: bool,
+
+    /// Sign without an identity (ad-hoc)
+    #[arg(short = 'a', long)]
+    adhoc: bool,
+
+    /// Dylib load path to inject (repeatable)
+    #[arg(short = 'l', long)]
+    dylibs: Vec<String>,
+
+    /// Inject dylibs as LC_LOAD_WEAK_DYLIB
+    #[arg(short = 'w', long)]
+    weak: bool,
+
+    /// Check whether the input Mach-O is signed and its hashes verify
+    #[arg(short = 'C', long)]
+    check: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let credentials = load_credentials(&cli)?;
+    if cli.check {
+        let report = zsign_rs::macho::check_signature(&cli.input)?;
+        println!("signed: {}", report.signed);
+        println!("identifier: {:?}", report.identifier);
+        println!("sha1 pages: {:?}", report.sha1_pages);
+        println!("sha256 pages: {:?}", report.sha256_pages);
+        println!("cms present: {}", report.cms_present);
+        println!("hashes match: {}", report.hashes_match);
+        if !report.hashes_match {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
-    let mut signer = ZSign::new()
-        .credentials(credentials)
-        .compression_level(cli.zip_level);
+    let mut signer = if cli.adhoc {
+        ZSign::new().adhoc(true)
+    } else {
+        let credentials = load_credentials(&cli)?;
+        ZSign::new().credentials(credentials)
+    }
+    .compression_level(cli.zip_level);
 
     if let Some(profile) = cli.profile {
         signer = signer.provisioning_profile(profile);
@@ -89,6 +121,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.sha256_only {
         signer = signer.sha256_only(true);
+    }
+    if !cli.dylibs.is_empty() {
+        signer = signer.dylib_injection(cli.dylibs.clone(), cli.weak);
     }
     let _ = cli.force; // accepted for compatibility; no signing cache is kept
 

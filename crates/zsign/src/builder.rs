@@ -83,6 +83,8 @@ pub struct ZSign {
     bundle_version: Option<String>,
     sha256_only: bool,
     adhoc: bool,
+    dylibs: Vec<String>,
+    weak_dylibs: bool,
 }
 
 impl ZSign {
@@ -105,6 +107,8 @@ impl ZSign {
             bundle_version: None,
             sha256_only: false,
             adhoc: false,
+            dylibs: Vec::new(),
+            weak_dylibs: false,
         }
     }
 
@@ -203,6 +207,15 @@ impl ZSign {
         self
     }
 
+    /// Injects dylib load paths into every signed executable.
+    ///
+    /// `weak` selects `LC_LOAD_WEAK_DYLIB`.
+    pub fn dylib_injection(mut self, dylibs: Vec<String>, weak: bool) -> Self {
+        self.dylibs = dylibs;
+        self.weak_dylibs = weak;
+        self
+    }
+
     /// Validates the builder configuration.
     ///
     /// # Errors
@@ -261,7 +274,7 @@ impl ZSign {
     ///     .unwrap();
     /// ```
     pub fn sign_macho(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
-        let credentials = self.get_credentials()?;
+        self.validate()?;
         let macho = MachOFile::open(input.as_ref())?;
 
         let identifier = input
@@ -270,16 +283,20 @@ impl ZSign {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        let entitlements = self.load_entitlements_from_profile()?;
-
-        let signed_binary = sign_macho(
-            &macho,
-            identifier,
-            entitlements.as_deref(),
-            credentials,
-            None,
-            None,
-        )?;
+        let signed_binary = if self.adhoc {
+            crate::macho::sign_macho_adhoc(&macho, identifier, None, None, None)?
+        } else {
+            let credentials = self.get_credentials()?;
+            let entitlements = self.load_entitlements_from_profile()?;
+            sign_macho(
+                &macho,
+                identifier,
+                entitlements.as_deref(),
+                credentials,
+                None,
+                None,
+            )?
+        };
 
         std::fs::write(output.as_ref(), signed_binary)?;
 
@@ -329,6 +346,9 @@ impl ZSign {
                 .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))?;
             IpaSigner::new(credentials).compression_level(self.compression_level)
         };
+        if !self.dylibs.is_empty() {
+            signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
+        }
 
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
@@ -368,6 +388,9 @@ impl ZSign {
             let credentials = self.get_credentials()?;
             crate::ipa::IpaSigner::new(credentials).sha256_only(self.sha256_only)
         };
+        if !self.dylibs.is_empty() {
+            signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
+        }
         if let Some(ref profile) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile);
         }
