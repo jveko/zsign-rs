@@ -22,10 +22,17 @@ cms = { version = "0.2.3", features = ["builder"] }
 rsa = { version = "0.9", features = ["sha2"] }
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"] }
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
-p12 = "0.6"
 signature = { version = "2.2", features = ["std"] }
 spki = { version = "0.7", features = ["pem"] }
 rayon = "1.11"
+
+# PKCS#12 decryption (pure Rust, wasm-compatible)
+aes = "0.8"
+des = "0.8"
+rc2 = "0.8"
+pbkdf2 = "0.12"
+hmac = "0.12"
+digest = "0.10"
 
 # WASM entropy support — getrandom is pulled transitively by rsa.
 # On wasm32, it needs the "js" feature to use crypto.getRandomValues().

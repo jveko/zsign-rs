@@ -200,16 +200,10 @@ impl SigningCredentials {
     /// # Ok::<(), zsign_core::Error>(())
     /// ```
     pub fn from_p12(p12_data: &[u8], password: &str) -> Result<Self> {
-        let pfx = p12::PFX::parse(p12_data)
-            .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {:?}", e)))?;
-
-        let keys = pfx
-            .key_bags(password)
-            .map_err(|e| Error::Certificate(format!("Failed to extract keys from PKCS#12: {:?}", e)))?;
-
-        let certs = pfx
-            .cert_x509_bags(password)
-            .map_err(|e| Error::Certificate(format!("Failed to extract certs from PKCS#12: {:?}", e)))?;
+        let contents = super::pkcs12::extract_p12(p12_data, password)
+            .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
+        let keys = contents.keys;
+        let certs = contents.certs;
 
         if certs.is_empty() {
             return Err(Error::Certificate("No certificate in PKCS#12".into()));

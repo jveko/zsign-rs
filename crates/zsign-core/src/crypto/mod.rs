@@ -29,6 +29,7 @@
 pub mod assets;
 pub mod cert;
 pub mod cms;
+mod pkcs12;
 
 pub use cert::SigningCredentials;
 pub use cert::SigningKeyType;
