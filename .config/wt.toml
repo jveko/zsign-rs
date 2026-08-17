@@ -1,0 +1,8 @@
+[[post-start]]
+copy = "wt step copy-ignored"
+
+[[post-start]]
+install = "cargo fetch"
+
+[aliases]
+mrg = "wt merge --no-squash"

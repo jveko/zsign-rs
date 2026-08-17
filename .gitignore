@@ -39,3 +39,4 @@ profile.json
 crates/zsign/tests/
 .brv
 .agents
+.worktrees/
