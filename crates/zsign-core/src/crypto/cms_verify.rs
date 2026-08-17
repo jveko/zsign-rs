@@ -228,6 +228,8 @@ pub struct CmsVerifyReport {
     pub chain_ok: bool,
     /// Whether the chain terminates at a self-signed anchor.
     pub anchored: bool,
+    /// Why the chain check failed, when it did.
+    pub chain_reason: Option<String>,
     /// Certificate subjects from leaf to anchor.
     pub chain: Vec<String>,
     /// Non-fatal observations (e.g. unsupported attributes).
@@ -644,10 +646,11 @@ fn verify_signed_data(
         report.signature_ok = sig_ok;
 
         // 4. Chain structure.
-        let (chain_ok, anchored, chain) = verify_chain(&certs, cert);
+        let (chain_ok, anchored, chain, chain_reason) = verify_chain(&certs, cert);
         report.chain_ok = chain_ok;
         report.anchored = anchored;
         report.chain = chain;
+        report.chain_reason = chain_reason.clone();
 
         let mut errors = Vec::new();
         if !md_ok {
@@ -663,7 +666,11 @@ fn verify_signed_data(
             errors.push("signature does not verify over the signed attributes".into());
         }
         if !chain_ok {
-            errors.push("certificate chain is not structurally valid".into());
+            errors.push(
+                chain_reason
+                    .clone()
+                    .unwrap_or_else(|| "certificate chain is not structurally valid".into()),
+            );
         }
 
         if errors.is_empty() {
@@ -805,7 +812,7 @@ fn verify_signer_signature(
 fn verify_chain(
     certs: &[x509_cert::Certificate],
     leaf: &x509_cert::Certificate,
-) -> (bool, bool, Vec<String>) {
+) -> (bool, bool, Vec<String>, Option<String>) {
     let mut chain = vec![leaf];
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut current = leaf;
@@ -814,14 +821,29 @@ fn verify_chain(
     // Leaf code-signing EKU check (only when an EKU extension is present).
     if let Some(eku) = leaf_eku(leaf) {
         if !eku.contains(&OID_CODE_SIGNING) {
-            return (false, false, names);
+            return (
+                false,
+                false,
+                names,
+                Some(format!("leaf EKU lacks codeSigning: {eku:?}")),
+            );
         }
     }
     if !in_validity(leaf, now) {
-        return (false, false, names);
+        let v = &leaf.tbs_certificate.validity;
+        return (
+            false,
+            false,
+            names,
+            Some(format!(
+                "leaf outside validity (not_before={}, not_after={})",
+                fmt_time(&v.not_before),
+                fmt_time(&v.not_after)
+            )),
+        );
     }
 
-    for _ in 0..=certs.len() {
+    for depth in 0..=certs.len() {
         let self_signed = current.tbs_certificate.subject == current.tbs_certificate.issuer;
 
         // Find the issuer: a certificate whose subject equals our issuer.
@@ -832,28 +854,63 @@ fn verify_chain(
         match parent {
             Some(p) if !std::ptr::eq(p, current) => {
                 if !in_validity(p, now) {
-                    return (false, false, names);
+                    let v = &p.tbs_certificate.validity;
+                    return (
+                        false,
+                        false,
+                        names,
+                        Some(format!(
+                            "issuer outside validity (not_before={}, not_after={})",
+                            fmt_time(&v.not_before),
+                            fmt_time(&v.not_after)
+                        )),
+                    );
                 }
                 if !verify_cert_signature(current, p) {
-                    return (false, false, names);
+                    return (
+                        false,
+                        false,
+                        names,
+                        Some(format!(
+                            "certificate at depth {depth} fails issuer-signature verification"
+                        )),
+                    );
                 }
                 chain.push(p);
                 names.push(p.tbs_certificate.subject.to_string());
                 current = p;
+                continue;
             }
             _ => {
                 if self_signed {
                     // Anchor found (leaf or an ancestor is self-signed).
-                    return (true, true, names);
+                    return (true, true, names, None);
                 }
                 // Chain runs out without an anchor: structural checks pass,
                 // trust is not established (device policy decides).
-                return (true, false, names);
+                let missing = current.tbs_certificate.issuer.to_string();
+                return (
+                    true,
+                    false,
+                    names,
+                    Some(format!(
+                        "issuer \"{missing}\" not present in the embedded set"
+                    )),
+                );
             }
         }
     }
     let _ = chain;
-    (false, false, names)
+    (
+        false,
+        false,
+        names,
+        Some("chain longer than the embedded certificate set".into()),
+    )
+}
+
+fn fmt_time(t: &x509_cert::time::Time) -> String {
+    format!("{}", t.to_date_time().unix_duration().as_secs())
 }
 
 /// Verifies `child`'s signature with `issuer`'s public key.
