@@ -33,4 +33,7 @@ pub enum Error {
 
     #[error("DER encoding error: {0}")]
     DerEncoding(String),
+
+    #[error("Verification failed: {0}")]
+    Verification(String),
 }

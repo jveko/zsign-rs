@@ -47,6 +47,7 @@ pub mod code_directory;
 pub mod constants;
 pub mod der;
 pub mod superblob;
+pub mod verify;
 
 pub use code_directory::{hash_code_pages_dual, CodeDirectoryBuilder, DualPageHashes};
 pub use superblob::{
