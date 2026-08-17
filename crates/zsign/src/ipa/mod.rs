@@ -782,6 +782,21 @@ impl<'a> IpaSigner<'a> {
             .map(|s| s.is_executable)
             .unwrap_or(false);
 
+        // Refuse to sign encrypted binaries before any on-disk mutation
+        // (dylib injection below rewrites the file first). executable_probe
+        // holds the same original bytes parsed at the top of the function.
+        if !self.allow_encrypted {
+            for slice in executable_probe.slices() {
+                if slice.is_encrypted() {
+                    return Err(self.encrypted_error(
+                        &binary_path.display().to_string(),
+                        identifier,
+                        slice,
+                    ));
+                }
+            }
+        }
+
         // Dylib injection applies to executables, before they are signed.
         let mut binary_data = binary_data;
         if !self.dylibs.is_empty() && is_executable {
@@ -795,18 +810,6 @@ impl<'a> IpaSigner<'a> {
             fs::write(binary_path, &binary_data)?;
         }
         let macho = MachOFile::parse(binary_data)?;
-
-        if !self.allow_encrypted {
-            for slice in macho.slices() {
-                if slice.is_encrypted() {
-                    return Err(self.encrypted_error(
-                        &binary_path.display().to_string(),
-                        identifier,
-                        slice,
-                    ));
-                }
-            }
-        }
 
         // Only the main executable gets Info.plist in its CodeDirectory.
         // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
