@@ -29,9 +29,8 @@ use crate::codesign::constants::{
 use crate::codesign::der::plist_to_der;
 use crate::codesign::superblob::{
     build_adhoc_signature_blob, build_der_entitlements_blob, build_entitlements_blob,
-    build_requirements_blob_full, build_signature_blob, SuperBlobBuilder,
+    build_requirements_blob, build_signature_blob, SuperBlobBuilder,
 };
-use crate::crypto::cert::extract_subject_cn;
 use crate::crypto::cms;
 use crate::crypto::SigningCredentials;
 use crate::Result;
@@ -66,18 +65,20 @@ impl SigningContext {
     /// Parses entitlements once, builds all blobs, and computes dual hashes
     /// of all special slots.
     pub(crate) fn new(
-        identifier: &str,
+        _identifier: &str,
         credentials: Option<&SigningCredentials>,
         entitlements: Option<&[u8]>,
         is_executable: bool,
         info_plist: Option<&[u8]>,
         code_resources: Option<&[u8]>,
     ) -> Result<Self> {
-        let subject_cn = credentials
-            .map(|c| extract_subject_cn(&c.certificate).unwrap_or_default())
-            .unwrap_or_default();
         let adhoc = credentials.is_none();
-        let requirements = build_requirements_blob_full(identifier, &subject_cn);
+        // Apple's baseline is an empty requirements blob: codesign and the
+        // device synthesize the designated requirement from the embedded
+        // certificate chain at verification time. Writing an explicit DR
+        // (especially one pinned to `anchor apple generic`) fails
+        // verification for certificates that do not chain to Apple.
+        let requirements = build_requirements_blob();
 
         let entitlements_blob = entitlements.map(build_entitlements_blob);
 
@@ -471,7 +472,21 @@ fn sign_slice_complete(
 
     let signature_blob = match credentials {
         Some(creds) => {
-            let cms_data = cms::sign_code_directory(&cd_sha1, creds, &cdhash_sha1, &cdhash_sha256)?;
+            // The CMS must sign the CodeDirectory that is actually emitted as
+            // primary. In sha256-only mode cd_sha1 is empty — signing it would
+            // bind the signature to zero bytes and macOS verify would fail
+            // with "invalid signature (code or signature have been modified)".
+            let signed_cd = if sha256_only { &cd_sha256 } else { &cd_sha1 };
+            let cms_data = cms::sign_code_directory(
+                signed_cd,
+                creds,
+                if sha256_only {
+                    None
+                } else {
+                    Some(&cdhash_sha1)
+                },
+                &cdhash_sha256,
+            )?;
             build_signature_blob(&cms_data)
         }
         None => build_adhoc_signature_blob(),
@@ -569,8 +584,21 @@ fn sign_slice_complete(
 
         let sig_blob2 = match credentials {
             Some(creds) => {
-                let cms_data2 =
-                    cms::sign_code_directory(&cd_sha1_2, creds, &cdhash_sha1_2, &cdhash_sha256_2)?;
+                let signed_cd2 = if sha256_only {
+                    &cd_sha256_2
+                } else {
+                    &cd_sha1_2
+                };
+                let cms_data2 = cms::sign_code_directory(
+                    signed_cd2,
+                    creds,
+                    if sha256_only {
+                        None
+                    } else {
+                        Some(&cdhash_sha1_2)
+                    },
+                    &cdhash_sha256_2,
+                )?;
                 build_signature_blob(&cms_data2)
             }
             None => build_adhoc_signature_blob(),
@@ -1012,15 +1040,18 @@ mod tests {
             let typ = read_u32(blob, 12 + i * 8);
             let eoff = read_u32(blob, 16 + i * 8) as usize;
             match typ {
-                CSSLOT_CODEDIRECTORY => saw_sha1 = true,
-                CSSLOT_ALTERNATE_CODEDIRECTORIES => saw_sha256 = true,
+                CSSLOT_CODEDIRECTORY => saw_sha256 = true,
+                CSSLOT_ALTERNATE_CODEDIRECTORIES => saw_sha1 = true,
                 CSSLOT_SIGNATURESLOT => {
                     saw_cms = read_u32(blob, eoff) == CSMAGIC_BLOBWRAPPER;
                 }
                 _ => {}
             }
         }
-        assert!(saw_sha256, "sha256 code directory must be present");
+        assert!(
+            saw_sha256,
+            "sha256 code directory must be present in the primary slot"
+        );
         assert!(!saw_sha1, "sha1 code directory must be omitted");
         assert!(saw_cms, "cms signature must be present");
     }
