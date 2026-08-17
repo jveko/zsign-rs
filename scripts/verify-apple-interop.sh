@@ -146,4 +146,49 @@ openssl cms -verify -binary -inform DER \
     -in "$WORK/cms.der" -content "$WORK/cd.der" \
     -noverify -out /dev/null
 
-echo "PASS: Apple codesign interop verification"
+# ---------------------------------------------------------------------------
+# 7. zsign -V agreement: our verifier must agree with Apple's in both
+#    directions — accept what codesign accepts, reject what codesign rejects.
+# ---------------------------------------------------------------------------
+agree_valid() {
+    local label="$1" target="$2"
+    local out
+    if ! out="$("$ZIGN" -V "$target" 2>&1)"; then
+        fail "zsign -V disagrees with codesign on $label:\n$out"
+    fi
+    grep -q "^verified: yes" <<<"$out" || fail "zsign -V rejected valid $label:\n$out"
+    echo "OK  zsign -V accepts $label"
+}
+
+agree_invalid() {
+    local label="$1" target="$2"
+    local out
+    out="$("$ZIGN" -V "$target" 2>&1 || true)"
+    if grep -q "^verified: yes" <<<"$out"; then
+        fail "zsign -V accepted $label that codesign rejects"
+    fi
+    echo "OK  zsign -V rejects $label"
+}
+
+# 7a. The two bundles codesign accepted in steps 3/4.
+agree_valid "cert-signed bundle" "$WORK/cert/Test.app"
+agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
+
+# 7b. A real Apple-signed system binary (FAT, 16 KB pages, Apple chain).
+agree_valid "Apple-signed /bin/ls" /bin/ls
+
+# 7c. An ad-hoc signature produced by codesign itself.
+cp /bin/ls "$WORK/ls-adhoc"
+codesign --force -s - "$WORK/ls-adhoc" 2>/dev/null
+agree_valid "codesign ad-hoc output" "$WORK/ls-adhoc"
+
+# 7d. Negative control: tamper a signed binary — codesign and zsign must both
+#     reject it.
+cp "$WORK/cert/Test.app/Test" "$WORK/Test.tampered"
+printf '\x90' | dd of="$WORK/Test.tampered" bs=1 seek=64 conv=notrunc 2>/dev/null
+if codesign --verify "$WORK/Test.tampered" >/dev/null 2>&1; then
+    fail "codesign accepted tampered binary (negative control broken)"
+fi
+agree_invalid "tampered binary" "$WORK/Test.tampered"
+
+echo "PASS: Apple codesign interop verification (incl. zsign -V agreement)"

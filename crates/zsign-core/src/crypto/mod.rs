@@ -29,6 +29,7 @@
 pub mod assets;
 pub mod cert;
 pub mod cms;
+pub mod cms_verify;
 mod pkcs12;
 
 pub use cert::SigningCredentials;

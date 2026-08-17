@@ -133,6 +133,28 @@ zsign-cli \
     input.ipa
 ```
 
+#### Verify a signed binary, bundle, or IPA
+
+`-V/--verify` checks the input the way `codesign --verify --deep --strict`
+does: code-page hashes, special-slot digests (Info.plist, CodeResources,
+entitlements), the embedded CMS signature (message digest, Apple CDHash
+attributes, signer certificate + chain), and — for bundles/IPAs — the
+CodeResources file and every nested code (Frameworks, appex, nested apps).
+
+```bash
+# Verify a signed IPA (deep)
+zsign-cli -V signed.ipa
+
+# Verify an app bundle in place
+zsign-cli -V Test.app
+
+# Verify a single Mach-O
+zsign-cli -V Test
+```
+
+Exit status: `0` valid, `1` invalid (issues printed), `2` hard error
+(unreadable/unsupported input).
+
 ### WASM (Browser)
 
 ```javascript

@@ -120,6 +120,21 @@ pub struct ArchSlice {
     pub encryption: Option<EncryptionInfo>,
 }
 
+impl ArchSlice {
+    /// Returns the readable architecture name for this slice's CPU type
+    /// (e.g. `arm64`, `x86_64`), for reports and diagnostics.
+    pub fn arch_name(&self) -> String {
+        match self.cpu_type {
+            0x0100_000C => "arm64".to_string(),    // CPU_TYPE_ARM64
+            0x0200_000C => "arm64_32".to_string(), // CPU_TYPE_ARM64_32
+            0x0000_000C => "arm".to_string(),      // CPU_TYPE_ARM
+            0x0100_0007 => "x86_64".to_string(),   // CPU_TYPE_X86_64
+            0x0000_0007 => "i386".to_string(),     // CPU_TYPE_X86
+            other => format!("cpu:{other:#010x}"),
+        }
+    }
+}
+
 impl MachOFile {
     /// Parses a Mach-O binary from in-memory data.
     ///

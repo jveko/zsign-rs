@@ -12,6 +12,7 @@ plist = "1.7"
 thiserror = "2.0"
 base64 = "0.22"
 der = { version = "0.7", features = ["alloc", "oid", "pem"] }
+time = "0.3"
 const-oid = { version = "0.9", features = ["db"] }
 
 # RustCrypto x509/CMS — pure Rust, WASM-compatible

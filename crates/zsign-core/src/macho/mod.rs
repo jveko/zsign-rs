@@ -8,13 +8,18 @@
 
 pub mod parser;
 pub mod signer;
+pub mod verify;
 pub mod writer;
+
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 pub use parser::{ArchSlice, EncryptionInfo, MachOFile, MachOMetadata};
 pub use signer::{
     sign_any_macho, sign_macho, sign_macho_adhoc, sign_macho_all_slices, sign_macho_sha256_only,
     EMPTY_ENTITLEMENTS,
 };
+pub use verify::{verify_macho, MachOVerifyReport, SliceVerifyReport};
 pub use writer::SignedSlice;
 pub use writer::{
     align_to, calculate_signature_space, embed_signature, embed_signature_fat,
