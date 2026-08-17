@@ -1083,7 +1083,9 @@ mod tests {
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
 
         let credentials = crate::test_util::test_credentials();
-        let signer = IpaSigner::new(&credentials);
+        let before = std::fs::read(app.join("Enc")).unwrap();
+        let signer =
+            IpaSigner::new(&credentials).dylib_injection(vec!["lib.dylib".to_string()], false);
         let err = signer
             .sign_folder_in_place(&app)
             .expect_err("encrypted main executable must refuse");
@@ -1093,6 +1095,11 @@ mod tests {
         assert!(
             msg.contains("decrypt"),
             "error must tell the user to decrypt: {msg}"
+        );
+        let after = std::fs::read(app.join("Enc")).unwrap();
+        assert_eq!(
+            after, before,
+            "refused signing must not mutate the encrypted binary"
         );
     }
 
