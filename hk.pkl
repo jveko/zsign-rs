@@ -1,0 +1,49 @@
+amends "package://github.com/jdx/hk/releases/download/v1.55.0/hk@1.55.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.55.0/hk@1.55.0#/Builtins.pkl"
+
+min_hk_version = "1.55.0"
+
+// The builtin cargo steps run per-crate via workspace_indicator; the repo's
+// fmt and clippy gates run across the whole workspace, so override both.
+local clippy = new Mapping<String, Step> {
+  ["cargo-clippy"] = (Builtins.cargo_clippy) {
+    check = "cargo clippy --workspace --all-targets -- -D warnings"
+    fix = "cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings"
+  }
+}
+
+local lint = new Mapping<String, Step> {
+  ["trailing-whitespace"] = Builtins.trailing_whitespace
+  ["newlines"] = Builtins.newlines
+  ["check-merge-conflict"] = Builtins.check_merge_conflict
+  ["detect-private-key"] = Builtins.detect_private_key
+  ["cargo-fmt"] = (Builtins.cargo_fmt) {
+    check = "cargo fmt --all -- --check"
+    fix = "cargo fmt --all"
+  }
+  ["actionlint"] = Builtins.actionlint
+}
+
+local static = new Mapping<String, Step> {
+  ...lint
+  ...clippy
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = lint
+  }
+  ["pre-push"] {
+    steps = clippy
+  }
+  ["check"] {
+    steps = static
+  }
+  ["fix"] {
+    fix = true
+    stash = "git"
+    steps = lint
+  }
+}

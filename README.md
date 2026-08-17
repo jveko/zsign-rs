@@ -163,6 +163,20 @@ wasm-pack build crates/zsign-wasm --target web
 cargo doc --open
 ```
 
+## Development
+
+Tools are pinned with [mise](https://mise.jdx.dev) and git hooks run through [hk](https://hk.jdx.dev):
+
+```bash
+mise install        # install pinned tools and register git hooks
+hk check --all      # run all lint steps (fmt, clippy, hygiene, actionlint)
+hk fix              # auto-fix what hk can
+```
+
+Pre-commit runs file hygiene, `cargo fmt`, and `actionlint` on your workflows;
+pre-push runs `cargo clippy --workspace --all-targets -- -D warnings`.
+The full test suite runs in CI.
+
 ## Learning Resources
 
 This project serves as a learning exercise for:

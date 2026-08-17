@@ -1,6 +1,8 @@
 # AGENTS.md — zsign-rs
 
 ## Build & Test
+- Tooling: `mise install` installs pinned tools (hk, actionlint) from `mise.toml` and registers git hooks
+- Hooks: `hk` — pre-commit (file hygiene, `cargo fmt`, actionlint), pre-push (`cargo clippy --workspace --all-targets -- -D warnings`); manual runs: `hk check --all`, `hk fix`
 - Build: `cargo build --release`
 - Test all: `cargo test`
 - Test single: `cargo test -p zsign-rs test_name` or `cargo test -p zsign-cli test_name`
