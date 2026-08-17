@@ -40,3 +40,6 @@ crates/zsign/tests/
 .brv
 .agents
 .worktrees/
+
+# Local agent MCP config (never commit)
+/.mcp.json
