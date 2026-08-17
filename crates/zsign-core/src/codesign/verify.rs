@@ -383,8 +383,6 @@ pub enum PageCheck {
     Matched,
     /// `page_index` (0-based) hash mismatch.
     Mismatch { page_index: usize },
-    /// Page size not supported by this verifier (only 4096).
-    UnsupportedPageSize { page_size_log2: u8 },
     /// Stored hash count does not match the code region's page count.
     CountMismatch { stored: usize, computed: usize },
 }
@@ -396,12 +394,9 @@ pub enum PageCheck {
 /// hashed in `page_size`-sized chunks with a partial last page hashed as-is,
 /// matching both the signer and Apple's verifier.
 pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
+    // Page size comes from the CodeDirectory (log2): 4096 on iOS, 16384 on
+    // modern macOS system binaries.
     let page_size = 1usize << cd.page_size_log2;
-    if page_size != PAGE_SIZE {
-        return PageCheck::UnsupportedPageSize {
-            page_size_log2: cd.page_size_log2,
-        };
-    }
 
     let region_len = (cd.code_limit as usize).min(code.len());
     // Guard against a CodeDirectory claiming more code than exists.
@@ -413,7 +408,7 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
     }
 
     let stored = cd.code_hashes();
-    let expected_slots = region_len.div_ceil(PAGE_SIZE);
+    let expected_slots = region_len.div_ceil(page_size);
     if stored.len() != expected_slots * cd.hash_size {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
@@ -425,11 +420,16 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
     }
 
     let region = &code[..region_len];
-    for (i, chunk) in region.chunks(PAGE_SIZE).enumerate() {
+    for (i, chunk) in region.chunks(page_size).enumerate() {
         let digest = match cd.hash_type {
             CS_HASHTYPE_SHA1 => Sha1::digest(chunk).to_vec(),
             CS_HASHTYPE_SHA256 => Sha256::digest(chunk).to_vec(),
-            _ => return PageCheck::UnsupportedPageSize { page_size_log2: 0 }, // unreachable
+            _ => {
+                return PageCheck::CountMismatch {
+                    stored: 0,
+                    computed: 0,
+                }
+            } // unreachable
         };
         let expected = &stored[i * cd.hash_size..(i + 1) * cd.hash_size];
         if digest.as_slice() != expected {

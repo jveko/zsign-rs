@@ -108,8 +108,11 @@ fn verify_slice(
             return Ok(report);
         }
     };
+    // Load-command offsets are slice-relative; FAT slices sit at an arch
+    // offset within the file.
+    let sig_file_off = slice.offset.saturating_add(sig_off);
 
-    let Some(sig) = data.get(sig_off..sig_off.saturating_add(sig_size)) else {
+    let Some(sig) = data.get(sig_file_off..sig_file_off.saturating_add(sig_size)) else {
         report
             .errors
             .push("code signature region is out of file bounds".into());
@@ -148,11 +151,6 @@ fn verify_slice(
                 "code slot count mismatch: {stored} stored vs {computed} pages computed"
             ));
         }
-        PageCheck::UnsupportedPageSize { page_size_log2 } => {
-            report.warnings.push(format!(
-                "page size 2^{page_size_log2} is not 4096; code pages not checked"
-            ));
-        }
     }
 
     // Special slots: self-consistent blobs + caller-supplied file contents.
@@ -167,8 +165,14 @@ fn verify_slice(
         }
     }
 
-    // CMS signature.
+    // CMS signature. An empty signature slot (wrapper header only) is what
+    // codesign emits for ad-hoc output.
     if let Some(cms_blob) = superblob.cms {
+        if cms_blob.len() <= 8 {
+            report.cms = Some(crate::crypto::cms_verify::adhoc_report());
+            return Ok(report);
+        }
+
         let cd_sha256: [u8; 32] = primary.cdhash_sha256();
         let cd_sha1 = alternate_sha1(&superblob);
         match crate::crypto::cms_verify::verify_code_signature(
