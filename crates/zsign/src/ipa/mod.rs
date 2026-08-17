@@ -143,7 +143,7 @@ impl<'a> IpaSigner<'a> {
             bundle_id: None,
             bundle_name: None,
             bundle_version: None,
-            sha256_only: false,
+            sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
         }
@@ -158,7 +158,7 @@ impl<'a> IpaSigner<'a> {
             bundle_id: None,
             bundle_name: None,
             bundle_version: None,
-            sha256_only: false,
+            sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
         }

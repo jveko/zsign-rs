@@ -51,3 +51,15 @@ jobs:
         run: cargo check -p zsign-wasm --target wasm32-unknown-unknown
       - name: Release build wasm32
         run: cargo build -p zsign-wasm --target wasm32-unknown-unknown --release
+
+  interop:
+    name: Apple codesign interop (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release zsign-cli
+        run: cargo build -p zsign-cli --release
+      - name: Sign + verify with Apple codesign
+        run: scripts/verify-apple-interop.sh

@@ -550,8 +550,9 @@ impl SuperBlobBuilder {
 
     /// Set the SHA-256 CodeDirectory blob.
     ///
-    /// SHA-256 goes in the alternate slot `CSSLOT_ALTERNATE_CODEDIRECTORIES` (0x1000).
-    /// This is used by iOS 11+ for verification.
+    /// In legacy dual mode this goes in the alternate slot
+    /// `CSSLOT_ALTERNATE_CODEDIRECTORIES` (0x1000). In modern sha256-only mode
+    /// it is the primary CodeDirectory in slot `CSSLOT_CODEDIRECTORY` (0x0000).
     pub fn code_directory_sha256(mut self, cd: Vec<u8>) -> Self {
         self.code_directory_sha256 = Some(cd);
         self
@@ -620,11 +621,12 @@ impl SuperBlobBuilder {
     /// Build the SuperBlob with all configured components.
     ///
     /// Components are ordered by slot type (matching Apple codesign/zsign):
-    /// 1. CodeDirectory SHA-1 (0x0000) - primary slot, CMS signs this
+    /// 1. Primary CodeDirectory (0x0000) - SHA-1 in legacy dual mode, or the
+    ///    SHA-256 CodeDirectory when no SHA-1 directory is emitted
     /// 2. Requirements (0x0002)
     /// 3. Entitlements (0x0005) - if present
     /// 4. DER Entitlements (0x0007) - if present
-    /// 5. CodeDirectory SHA-256 (0x1000) - alternate slot for iOS 11+
+    /// 5. Alternate CodeDirectory (0x1000) - SHA-256, legacy dual mode only
     /// 6. CMS Signature (0x10000) - if present
     ///
     /// # Returns
@@ -633,9 +635,16 @@ impl SuperBlobBuilder {
     pub fn build(self) -> Vec<u8> {
         let mut entries = Vec::new();
 
-        // Slot 0x0000: CodeDirectory SHA-1 (primary - CMS signs this one)
-        if let Some(cd_sha1) = self.code_directory_sha1 {
-            entries.push(BlobEntry::new(CSSLOT_CODEDIRECTORY, cd_sha1));
+        // Slot 0x0000: primary CodeDirectory. Legacy dual mode emits SHA-1
+        // here with SHA-256 as alternate; modern mode emits the single
+        // SHA-256 CodeDirectory as primary (Apple's current layout — codesign
+        // reports "code object is not signed at all" when slot 0 is absent).
+        let (primary_cd, alternate_cd) = match self.code_directory_sha1 {
+            Some(cd_sha1) => (Some(cd_sha1), self.code_directory_sha256),
+            None => (self.code_directory_sha256, None),
+        };
+        if let Some(cd) = primary_cd {
+            entries.push(BlobEntry::new(CSSLOT_CODEDIRECTORY, cd));
         }
 
         // Slot 0x0002: Requirements
@@ -659,9 +668,9 @@ impl SuperBlobBuilder {
             entries.push(BlobEntry::new(CSSLOT_DER_ENTITLEMENTS, der_ent));
         }
 
-        // Slot 0x1000: CodeDirectory SHA-256 (alternate for iOS 11+)
-        if let Some(cd_sha256) = self.code_directory_sha256 {
-            entries.push(BlobEntry::new(CSSLOT_ALTERNATE_CODEDIRECTORIES, cd_sha256));
+        // Slot 0x1000: alternate CodeDirectory (SHA-256, legacy dual mode only)
+        if let Some(cd) = alternate_cd {
+            entries.push(BlobEntry::new(CSSLOT_ALTERNATE_CODEDIRECTORIES, cd));
         }
 
         // Slot 0x10000: CMS Signature (optional for adhoc)

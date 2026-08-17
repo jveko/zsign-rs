@@ -386,6 +386,7 @@ fn extract_team_id(cert: &Certificate) -> Option<String> {
 }
 
 /// Extracts the Common Name (CN) from a certificate's subject.
+#[cfg(test)]
 pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
     extract_name_attr(
         &cert.tbs_certificate.subject,

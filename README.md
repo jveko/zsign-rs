@@ -15,9 +15,13 @@ zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS
 - **Mach-O Support** — Handle single-architecture and FAT/Universal binaries
 - **Cross-Platform** — Works on macOS, Linux, Windows, and WebAssembly
 - **Multiple Certificate Formats** — PKCS#12 (`.p12`) and PEM support
-- **Dual Hash Generation** — SHA-1 (legacy) and SHA-256 code directories
+- **SHA-256 Primary Code Directory** — modern default accepted by current
+  macOS verification and iOS 15+; legacy SHA-1 + SHA-256 dual directories
+  opt-in via `-L` for iOS <= 10 targets only
 - **Bundle ID Rewriting** — Change `CFBundleIdentifier` during signing
 - **WASM Support** — Pure-Rust crypto stack enables browser-based signing
+- **Apple Interop Verified** — CI signs bundles and verifies them with Apple's
+  own `codesign --verify --deep --strict` on macOS (`scripts/verify-apple-interop.sh`)
 
 ## Architecture
 

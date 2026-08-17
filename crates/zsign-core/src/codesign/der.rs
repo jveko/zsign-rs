@@ -3,12 +3,20 @@
 //! This module converts XML plist entitlements to DER format as required by
 //! iOS/macOS code signing for slot -7 (DER entitlements).
 //!
-//! The encoding uses the following ASN.1 DER tags:
-//! - `0x01`: BOOLEAN
-//! - `0x02`: INTEGER
-//! - `0x0c`: UTF8String
-//! - `0x30`: SEQUENCE (for arrays)
-//! - `0x31`: SET (for dictionaries)
+//! The encoding uses Apple's canonical entitlements DER (slot -7):
+//!
+//! ```text
+//! [APPLICATION 16] (0x70) IMPLICIT SEQUENCE {
+//!     version INTEGER (1),
+//!     entries [16] (0xB0) IMPLICIT SET OF Entitlement
+//! }
+//! Entitlement ::= SEQUENCE { UTF8String key, value }
+//! ```
+//!
+//! Keys are sorted lexicographically and `BOOLEAN true` is encoded as `0xFF`
+//! (DER canonical). This is the format Apple's `codesign --generate-entitlement-der`
+//! emits; non-canonical variants (bare SETs, `BOOLEAN true = 0x01`) are rejected
+//! by modern macOS verification and iOS 15+ installs.
 //!
 //! # Examples
 //!
@@ -83,7 +91,9 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
         Value::Boolean(b) => {
             output.push(DER_TAG_BOOLEAN);
             output.push(1); // length
-            output.push(if *b { 1 } else { 0 });
+                            // DER canonical: TRUE must be 0xFF, FALSE 0x00. Apple's parser
+                            // rejects the lenient 0x01 for TRUE.
+            output.push(if *b { 0xff } else { 0x00 });
         }
         Value::Integer(i) => {
             let val = i.as_signed().unwrap_or(0) as u64;
@@ -222,8 +232,49 @@ pub fn plist_to_der(plist_xml: &[u8]) -> Result<Vec<u8>> {
     let value: Value = plist::from_bytes(plist_xml)
         .map_err(|e| Error::DerEncoding(format!("Failed to parse plist: {}", e)))?;
 
-    // Encode to DER
-    let der = encode_value(&value)?;
+    // Entitlements root must be a dictionary; encode its sorted key/value
+    // pairs as the entries SET content (each pair is a SEQUENCE).
+    let dict = value
+        .as_dictionary()
+        .ok_or_else(|| Error::DerEncoding("Entitlements plist root must be a dictionary".into()))?;
+    let mut pairs = Vec::new();
+    for (key, val) in dict {
+        let encoded_val = encode_value(val)?;
+
+        let mut key_encoded = Vec::new();
+        key_encoded.push(DER_TAG_UTF8STRING);
+        encode_length(&mut key_encoded, key.len());
+        key_encoded.extend(key.as_bytes());
+
+        let pair_len = key_encoded.len() + encoded_val.len();
+        let mut pair = Vec::with_capacity(pair_len + 4);
+        pair.push(DER_TAG_SEQUENCE);
+        encode_length(&mut pair, pair_len);
+        pair.extend_from_slice(&key_encoded);
+        pair.extend_from_slice(&encoded_val);
+        pairs.extend_from_slice(&pair);
+    }
+
+    // Apple canonical envelope (matches `codesign --generate-entitlement-der`):
+    //   [APPLICATION 16] (0x70) IMPLICIT SEQUENCE {
+    //       version  INTEGER (1),
+    //       entries  [16] (0xB0) IMPLICIT SET OF Entitlement
+    //   }
+    let mut entries = Vec::with_capacity(pairs.len() + 4);
+    entries.push(0xb0); // [16] IMPLICIT SET (constructed)
+    encode_length(&mut entries, pairs.len());
+    entries.extend_from_slice(&pairs);
+
+    let mut seq_content = Vec::with_capacity(entries.len() + 4);
+    seq_content.push(DER_TAG_INTEGER);
+    seq_content.push(1); // length
+    seq_content.push(1); // version 1
+    seq_content.extend_from_slice(&entries);
+
+    let mut der = Vec::with_capacity(seq_content.len() + 4);
+    der.push(0x70); // [APPLICATION 16] IMPLICIT SEQUENCE (constructed)
+    encode_length(&mut der, seq_content.len());
+    der.extend_from_slice(&seq_content);
 
     if der.is_empty() {
         Err(Error::DerEncoding("Empty DER output".into()))
@@ -255,7 +306,7 @@ mod tests {
     fn test_encode_boolean_true() {
         let value = Value::Boolean(true);
         let der = encode_value(&value).unwrap();
-        assert_eq!(der, vec![0x01, 0x01, 0x01]);
+        assert_eq!(der, vec![0x01, 0x01, 0xff]);
     }
 
     #[test]
@@ -295,8 +346,10 @@ mod tests {
         assert!(der.is_ok());
         let der = der.unwrap();
 
-        // Should start with SET tag (0x31)
-        assert_eq!(der[0], 0x31);
+        // Should start with the [APPLICATION 16] envelope tag (0x70).
+        assert_eq!(der[0], 0x70);
+        // ... IMPLICIT SEQUENCE { INTEGER version 1, [16] IMPLICIT SET ... }
+        assert_eq!(&der[1..6], &[0x1a, 0x02, 0x01, 0x01, 0xb0]);
     }
 
     #[test]
@@ -312,8 +365,8 @@ mod tests {
         assert!(der.is_ok());
         let der = der.unwrap();
 
-        // Empty dict: SET with 0 content
-        assert_eq!(der, vec![0x31, 0x00]);
+        // Empty dict: canonical envelope with empty entries SET.
+        assert_eq!(der, vec![0x70, 0x05, 0x02, 0x01, 0x01, 0xb0, 0x00]);
     }
 
     #[test]

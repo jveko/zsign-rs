@@ -71,7 +71,8 @@ const SHA256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.10
 ///
 /// * `data` - The CodeDirectory DER bytes to sign
 /// * `credentials` - Signing credentials (certificate + private key)
-/// * `cdhash_sha1` - 20-byte SHA-1 hash of the CodeDirectory
+/// * `cdhash_sha1` - 20-byte SHA-1 hash of the CodeDirectory; `None` when no
+///   SHA-1 CodeDirectory is emitted (sha256-only mode)
 /// * `cdhash_sha256` - 32-byte SHA-256 hash of the CodeDirectory
 ///
 /// # Returns
@@ -84,7 +85,7 @@ const SHA256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.10
 pub fn sign_code_directory(
     data: &[u8],
     credentials: &SigningCredentials,
-    cdhash_sha1: &[u8; 20],
+    cdhash_sha1: Option<&[u8; 20]>,
     cdhash_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
     let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
@@ -234,29 +235,32 @@ fn build_apple_der_attribute(oid: ObjectIdentifier, value_der: &[u8]) -> Result<
 
 /// Builds the CDHash v1 plist for the Apple signed attribute.
 ///
-/// Creates an XML plist with a `cdhashes` array containing SHA-1 and SHA-256
-/// hashes. The SHA-256 hash is truncated to 20 bytes to match SHA-1 length,
-/// as required by the Apple CDHash v1 format.
+/// Creates an XML plist with a `cdhashes` array enumerating the digests of
+/// every CodeDirectory present in the signature, matching Apple's own output:
+/// - sha256-only: a single 20-byte entry, the truncated SHA-256 CDHash
+/// - legacy dual: `[SHA-1 CDHash, truncated SHA-256 CDHash]`
+///
+/// A zeroed SHA-1 entry in sha256-only output is rejected by Apple's
+/// verifier ("invalid signature (code or signature have been modified)").
 ///
 /// # Arguments
 ///
-/// * `sha1` - 20-byte SHA-1 hash of the CodeDirectory
+/// * `sha1` - SHA-1 CDHash; `None` when no SHA-1 CodeDirectory is emitted
 /// * `sha256` - 32-byte SHA-256 hash of the CodeDirectory (will be truncated)
 ///
 /// # Returns
 ///
 /// UTF-8 encoded XML plist bytes with trailing newline.
-pub fn build_cdhash_plist(sha1: &[u8; 20], sha256: &[u8; 32]) -> Vec<u8> {
+pub fn build_cdhash_plist(sha1: Option<&[u8; 20]>, sha256: &[u8; 32]) -> Vec<u8> {
     use plist::{Dictionary, Value};
 
+    let mut cdhashes = vec![Value::Data(sha256[..20].to_vec())];
+    if let Some(sha1) = sha1 {
+        cdhashes.insert(0, Value::Data(sha1.to_vec()));
+    }
+
     let mut dict = Dictionary::new();
-    dict.insert(
-        "cdhashes".to_string(),
-        Value::Array(vec![
-            Value::Data(sha1.to_vec()),
-            Value::Data(sha256[..20].to_vec()),
-        ]),
-    );
+    dict.insert("cdhashes".to_string(), Value::Array(cdhashes));
 
     let mut buf = Vec::new();
     plist::to_writer_xml(&mut buf, &Value::Dictionary(dict)).expect("plist serialization failed");
@@ -352,7 +356,7 @@ mod tests {
     fn test_build_cdhash_plist() {
         let sha1 = [0u8; 20];
         let sha256 = [0u8; 32];
-        let plist = build_cdhash_plist(&sha1, &sha256);
+        let plist = build_cdhash_plist(Some(&sha1), &sha256);
 
         assert!(!plist.is_empty());
         let plist_str = String::from_utf8_lossy(&plist);
@@ -373,7 +377,7 @@ mod tests {
             0x37, 0xc9, 0xe5, 0x92,
         ];
 
-        let plist = build_cdhash_plist(&sha1, &sha256);
+        let plist = build_cdhash_plist(Some(&sha1), &sha256);
 
         let parsed: plist::Value = plist::from_bytes(&plist).unwrap();
         let dict = parsed.as_dictionary().unwrap();
@@ -415,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_cdhash_v1_attribute_is_octet_string() {
-        let plist_bytes = build_cdhash_plist(&[0xAA; 20], &[0xBB; 32]);
+        let plist_bytes = build_cdhash_plist(Some(&[0xAA; 20]), &[0xBB; 32]);
         let attr = build_apple_octet_string_attribute(APPLE_CDHASH_OID, &plist_bytes).unwrap();
 
         assert_eq!(attr.oid, APPLE_CDHASH_OID);
@@ -535,8 +539,13 @@ mod tests {
         let cdhash_sha1: [u8; 20] = [0xAA; 20];
         let cdhash_sha256: [u8; 32] = [0xBB; 32];
 
-        let cms_der =
-            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
+        let cms_der = sign_code_directory(
+            code_dir_data,
+            &credentials,
+            Some(&cdhash_sha1),
+            &cdhash_sha256,
+        )
+        .unwrap();
 
         let content_info = ContentInfo::from_der(&cms_der).unwrap();
         let signed_data = SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
@@ -646,8 +655,13 @@ mod tests {
         let cdhash_sha1: [u8; 20] = [0xCC; 20];
         let cdhash_sha256: [u8; 32] = [0xDD; 32];
 
-        let cms_der =
-            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
+        let cms_der = sign_code_directory(
+            code_dir_data,
+            &credentials,
+            Some(&cdhash_sha1),
+            &cdhash_sha256,
+        )
+        .unwrap();
 
         let content_info = ContentInfo::from_der(&cms_der).unwrap();
         let signed_data = SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
@@ -671,7 +685,8 @@ mod tests {
         let cdhash_sha1 = [0xAA; 20];
         let cdhash_sha256 = [0xBB; 32];
         let actual =
-            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
+            sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &cdhash_sha256)
+                .unwrap();
 
         assert!(
             estimated >= actual.len(),
@@ -690,7 +705,8 @@ mod tests {
         let cdhash_sha1 = [0xCC; 20];
         let cdhash_sha256 = [0xDD; 32];
         let actual =
-            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
+            sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &cdhash_sha256)
+                .unwrap();
 
         assert!(
             estimated >= actual.len(),
@@ -822,7 +838,8 @@ mod tests {
         let cdhash_sha1 = [0xEE; 20];
         let cdhash_sha256 = [0xFF; 32];
         let actual =
-            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
+            sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &cdhash_sha256)
+                .unwrap();
 
         assert!(
             estimated >= actual.len(),
