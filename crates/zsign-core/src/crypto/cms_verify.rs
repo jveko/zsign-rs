@@ -72,6 +72,137 @@ const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29
 /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`
 const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
 
+/// Normalizes BER indefinite-length encodings to definite-length DER.
+///
+/// Apple's own toolchains occasionally emit CMS structures with BER
+/// indefinite lengths (observed in `/bin/ls` on Intel macOS runners), which
+/// strict DER parsers reject. This rewrites every indefinite-length constructed
+/// TLV into its definite-length form, leaving already-definite bytes untouched.
+/// `EOC` (0x00 0x00) closes the innermost indefinite frame.
+pub fn normalize_ber_lengths(input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let (bytes, consumed) = write_norm(input, i)?;
+        out.extend_from_slice(&bytes);
+        i += consumed;
+    }
+    Ok(out)
+}
+
+/// Serializes one TLV (and its children) starting at `i`, returning the
+/// normalized bytes and the number of input bytes consumed.
+fn write_norm(input: &[u8], mut i: usize) -> Result<(std::vec::Vec<u8>, usize)> {
+    let start = i;
+    let tag = *input
+        .get(i)
+        .ok_or_else(|| Error::Verification("truncated TLV tag".into()))?;
+    i += 1;
+    let l0 = *input
+        .get(i)
+        .ok_or_else(|| Error::Verification("truncated TLV length".into()))?;
+    i += 1;
+
+    let constructed = tag & 0x20 != 0;
+
+    // Indefinite length (BER): content runs until the EOC at this frame level.
+    if l0 == 0x80 {
+        if !constructed {
+            return Err(Error::Verification(
+                "indefinite length on a primitive TLV".into(),
+            ));
+        }
+        let mut content = Vec::new();
+        loop {
+            let (b, n) = {
+                let rest = &input[i..];
+                if rest.len() >= 2 && rest[0] == 0 && rest[1] == 0 {
+                    break; // EOC
+                }
+                write_norm(input, i)?
+            };
+            content.extend_from_slice(&b);
+            i += n;
+        }
+        i += 2; // consume EOC
+        let mut out = Vec::with_capacity(2 + len_len(content.len()) + content.len());
+        out.push(tag);
+        write_len(&mut out, content.len());
+        out.extend_from_slice(&content);
+        return Ok((out, i - start));
+    }
+
+    // Definite length.
+    let len = if l0 < 0x80 {
+        l0 as usize
+    } else {
+        let count = (l0 & 0x7f) as usize;
+        if count == 0 || count > 8 {
+            return Err(Error::Verification("malformed long-form length".into()));
+        }
+        let bytes = input
+            .get(i..i + count)
+            .ok_or_else(|| Error::Verification("truncated long-form length".into()))?;
+        i += count;
+        let mut v = 0usize;
+        for b in bytes {
+            v = v
+                .checked_mul(256)
+                .and_then(|v| v.checked_add(*b as usize))
+                .ok_or_else(|| Error::Verification("length overflow".into()))?;
+        }
+        v
+    };
+    let content_end = i
+        .checked_add(len)
+        .ok_or_else(|| Error::Verification("content overrun".into()))?;
+    let content = input
+        .get(i..content_end)
+        .ok_or_else(|| Error::Verification("truncated TLV content".into()))?;
+
+    let mut out = Vec::with_capacity(2 + (content_end - start));
+    out.push(tag);
+    write_len(&mut out, len);
+    if constructed {
+        let mut j = 0usize;
+        while j < content.len() {
+            let (child, n) = write_norm(content, j)?;
+            out.extend_from_slice(&child);
+            j += n;
+        }
+        if j != content.len() {
+            return Err(Error::Verification(
+                "child TLVs do not span the constructed content".into(),
+            ));
+        }
+    } else {
+        out.extend_from_slice(content);
+    }
+    Ok((out, content_end - start))
+}
+
+/// Number of bytes a definite length of `v` needs in its minimal encoding.
+fn len_len(v: usize) -> usize {
+    if v < 0x80 {
+        1
+    } else {
+        1 + (usize::BITS as usize - v.leading_zeros() as usize).div_ceil(8)
+    }
+}
+
+/// Appends the definite-length header bytes for `v` (short or minimal long form).
+fn write_len(out: &mut Vec<u8>, v: usize) {
+    if v < 0x80 {
+        out.push(v as u8);
+    } else {
+        let n = len_len(v) - 1;
+        out.push(0x80 | n as u8);
+        for k in (0..n).rev() {
+            out.push((v >> (8 * k)) as u8);
+        }
+    }
+}
+
 /// Result of a CMS verification attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CmsVerifyReport {
@@ -123,7 +254,10 @@ pub fn verify_code_signature(
     cd_sha256: &[u8; 32],
 ) -> Result<CmsVerifyReport> {
     let cms = strip_blob_wrapper(cms_blob)?;
-    verify_signed_data(cms, content, cd_sha1, cd_sha256)
+    // Some Apple-produced binaries use BER indefinite lengths; normalize to
+    // strict DER before parsing (no-op on already-definite input).
+    let cms = normalize_ber_lengths(cms)?;
+    verify_signed_data(&cms, content, cd_sha1, cd_sha256)
 }
 
 /// Builds a verification report for an ad-hoc signature (no CMS present).
@@ -974,6 +1108,84 @@ mod tests {
         assert!(!report.valid);
         assert!(!report.cdhash_v1_ok);
         assert!(!report.cdhash_v2_ok);
+    }
+
+    /// Re-encodes a DER blob with every constructed TLV switched to BER
+    /// indefinite-length form (used to exercise the normalization path).
+    fn to_indefinite(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < input.len() {
+            let tag = input[i];
+            i += 1;
+            let l0 = input[i];
+            i += 1;
+            let constructed = tag & 0x20 != 0;
+            let len = if l0 < 0x80 {
+                l0 as usize
+            } else {
+                let count = (l0 & 0x7f) as usize;
+                let mut v = 0usize;
+                for b in &input[i..i + count] {
+                    v = v * 256 + *b as usize;
+                }
+                i += count;
+                v
+            };
+            let content = &input[i..i + len];
+            i += len;
+
+            if !constructed {
+                // Primitive: copy tag + original length bytes + content.
+                let len_bytes = if l0 < 0x80 {
+                    1
+                } else {
+                    1 + (l0 & 0x7f) as usize
+                };
+                out.push(tag);
+                out.extend_from_slice(&input[i - len - len_bytes..i - len]);
+                out.extend_from_slice(content);
+                continue;
+            }
+            // Constructed: rewrite as indefinite.
+            out.push(tag);
+            out.push(0x80);
+            out.extend_from_slice(&to_indefinite(content));
+            out.extend_from_slice(&[0x00, 0x00]);
+        }
+        out
+    }
+
+    #[test]
+    fn normalizes_ber_indefinite_lengths() {
+        // Short-form definite original: the BER form must fold back to it.
+        let der = b"\x30\x03\x02\x01\x01".to_vec();
+        let indefinite = to_indefinite(&der);
+        assert_eq!(indefinite, b"\x30\x80\x02\x01\x01\x00\x00");
+        assert_eq!(normalize_ber_lengths(&indefinite).unwrap(), der);
+    }
+
+    #[test]
+    fn normalize_is_noop_on_definite_input() {
+        let der = b"\x30\x03\x02\x01\x01\x04\x02\xaa\xbb".to_vec();
+        assert_eq!(normalize_ber_lengths(&der).unwrap(), der);
+    }
+
+    #[test]
+    fn ber_indefinite_cms_verifies() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        // Wrap the CMS (ContentInfo, SignedData, etc.) in indefinite form.
+        let indefinite = to_indefinite(&cms);
+        assert_ne!(indefinite, cms, "re-encode must differ");
+        let report = verify_code_signature(&wrap(&indefinite), content, None, &cd_sha256).unwrap();
+        assert!(
+            report.valid,
+            "BER-indefinite CMS must verify after normalization: {:?}",
+            report.errors
+        );
     }
 
     #[test]
