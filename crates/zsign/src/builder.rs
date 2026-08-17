@@ -105,7 +105,7 @@ impl ZSign {
             bundle_id: None,
             bundle_name: None,
             bundle_version: None,
-            sha256_only: false,
+            sha256_only: true,
             adhoc: false,
             dylibs: Vec::new(),
             weak_dylibs: false,
@@ -194,8 +194,21 @@ impl ZSign {
     }
 
     /// Emits only the SHA-256 code directory (no SHA-1 code directory).
+    ///
+    /// This is the modern default: current macOS verification rejects
+    /// SHA-1-primary dual directories, and SHA-1 is only needed for
+    /// iOS <= 10 targets (see [`Self::legacy_sha1`]).
     pub fn sha256_only(mut self, only: bool) -> Self {
         self.sha256_only = only;
+        self
+    }
+
+    /// Opts back into the legacy SHA-1 + SHA-256 dual code directories.
+    ///
+    /// Dual output is only needed for iOS <= 10 targets and is rejected by
+    /// `codesign --verify` on current macOS.
+    pub fn legacy_sha1(mut self, legacy: bool) -> Self {
+        self.sha256_only = !legacy;
         self
     }
 
@@ -288,14 +301,25 @@ impl ZSign {
         } else {
             let credentials = self.get_credentials()?;
             let entitlements = self.load_entitlements_from_profile()?;
-            sign_macho(
-                &macho,
-                identifier,
-                entitlements.as_deref(),
-                credentials,
-                None,
-                None,
-            )?
+            if self.sha256_only {
+                crate::macho::sign_macho_sha256_only(
+                    &macho,
+                    identifier,
+                    entitlements.as_deref(),
+                    credentials,
+                    None,
+                    None,
+                )?
+            } else {
+                sign_macho(
+                    &macho,
+                    identifier,
+                    entitlements.as_deref(),
+                    credentials,
+                    None,
+                    None,
+                )?
+            }
         };
 
         std::fs::write(output.as_ref(), signed_binary)?;

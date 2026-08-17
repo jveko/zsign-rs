@@ -56,9 +56,17 @@ struct Cli {
     #[arg(short = 'r', long)]
     bundle_version: Option<String>,
 
-    /// Emit only the SHA-256 code directory (no SHA-1 code directory)
+    /// Emit only the SHA-256 code directory (no SHA-1 code directory).
+    /// This is the modern default; SHA-1 dual directories are rejected by
+    /// current macOS verification and only needed for iOS <= 10 targets.
     #[arg(short = '2', long)]
     sha256_only: bool,
+
+    /// Legacy SHA-1 + SHA-256 dual code directories (iOS <= 10 only).
+    /// Emitting a SHA-1 primary directory makes output fail
+    /// `codesign --verify` on modern macOS.
+    #[arg(short = 'L', long)]
+    legacy_sha1: bool,
 
     /// Force re-signing (accepted for compatibility; no cache is kept)
     #[arg(short = 'f', long)]
@@ -121,6 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.sha256_only {
         signer = signer.sha256_only(true);
+    }
+    if cli.legacy_sha1 {
+        signer = signer.sha256_only(false);
     }
     if !cli.dylibs.is_empty() {
         signer = signer.dylib_injection(cli.dylibs.clone(), cli.weak);
