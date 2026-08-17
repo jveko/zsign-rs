@@ -2,7 +2,10 @@
 name = "zsign-cli"
 version = "0.1.1"
 edition = "2021"
+description = "Cross-platform iOS code signing CLI - Rust port of zsign"
+license = "MIT"
+repository = "https://github.com/jveko/zsign-rs"
 
 [dependencies]
-zsign-rs = { path = "../zsign", version = "0.1.1", default-features = true }
+zsign-rs = { path = "../zsign", version = "0.1.2", default-features = true }
 clap = { version = "4.5.53", features = ["derive"] }
