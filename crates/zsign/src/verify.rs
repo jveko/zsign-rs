@@ -23,11 +23,13 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::{Error, Result};
+use crate::Result;
 use sha2::{Digest, Sha256};
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use walkdir::WalkDir;
+pub use zsign_core::macho::verify::{MachOVerifyReport, SliceVerifyReport};
 
 /// Verification of one file path (Mach-O binary) inside a bundle.
 #[derive(Debug, Clone, Default)]
@@ -228,21 +230,8 @@ pub fn verify_bundle(path: impl AsRef<Path>) -> Result<VerifyReport> {
 pub fn verify_ipa(path: impl AsRef<Path>) -> Result<VerifyReport> {
     let path = path.as_ref();
     let tmp = tempfile::TempDir::new()?;
-    let extracted = crate::ipa::extract_ipa(path, tmp.path())?;
-
-    // The extracted payload contains exactly one top-level .app.
-    let payload = extracted.join("Payload");
-    let app = WalkDir::new(&payload)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .find(|e| is_bundle_dir(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .ok_or_else(|| {
-            Error::Core(zsign_core::Error::Verification(
-                "IPA contains no Payload/*.app bundle".into(),
-            ))
-        })?;
+    // extract_ipa returns the Payload/*.app bundle path directly.
+    let app = crate::ipa::extract_ipa(path, tmp.path())?;
 
     let bundle = verify_bundle_dir(&app, &app, "")?;
     Ok(VerifyReport {

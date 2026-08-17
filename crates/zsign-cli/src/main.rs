@@ -5,6 +5,8 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use zsign_rs::codesign::verify::{PageCheck, SpecialSlotCheck};
+use zsign_rs::verify::MachOVerifyReport;
 use zsign_rs::{SigningCredentials, ZSign};
 
 #[derive(Parser)]
@@ -84,26 +86,19 @@ struct Cli {
     #[arg(short = 'w', long)]
     weak: bool,
 
-    /// Check whether the input Mach-O is signed and its hashes verify
-    #[arg(short = 'C', long)]
-    check: bool,
+    /// Verify a signed Mach-O, app bundle, or IPA the way
+    /// `codesign --verify --deep --strict` does: code-page hashes, special
+    /// slots, CodeResources, and the CMS signature + certificate chain.
+    /// Exit 0 = valid, 1 = invalid, 2 = hard error.
+    #[arg(short = 'V', long)]
+    verify: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    if cli.check {
-        let report = zsign_rs::macho::check_signature(&cli.input)?;
-        println!("signed: {}", report.signed);
-        println!("identifier: {:?}", report.identifier);
-        println!("sha1 pages: {:?}", report.sha1_pages);
-        println!("sha256 pages: {:?}", report.sha256_pages);
-        println!("cms present: {}", report.cms_present);
-        println!("hashes match: {}", report.hashes_match);
-        if !report.hashes_match {
-            std::process::exit(1);
-        }
-        return Ok(());
+    if cli.verify {
+        return run_verify(&cli.input);
     }
 
     let mut signer = if cli.adhoc {
@@ -170,6 +165,205 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Runs the deep verifier and maps the report to the exit-code contract:
+/// 0 valid, 1 invalid, 2 hard error.
+fn run_verify(input: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let report = match input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("ipa") => zsign_rs::verify::verify_ipa(input)?,
+        Some("app") => zsign_rs::verify::verify_bundle(input)?,
+        _ => zsign_rs::verify::verify_macho_file(input)?,
+    };
+
+    print_report(&report);
+
+    if report.valid() {
+        Ok(())
+    } else if report.errors.is_empty() {
+        std::process::exit(1)
+    } else {
+        eprintln!("error: verification could not complete");
+        for e in &report.errors {
+            eprintln!("  {e}");
+        }
+        std::process::exit(2)
+    }
+}
+
+fn print_report(report: &zsign_rs::VerifyReport) {
+    println!("verified: {}", if report.valid() { "yes" } else { "no" });
+    println!("input: {}", report.input);
+
+    if let Some(macho) = &report.macho {
+        print_macho(macho);
+    }
+    if let Some(bundle) = &report.bundle {
+        print_bundle(bundle, 0);
+    }
+    for w in &report.warnings {
+        println!("warning: {w}");
+    }
+    if !report.errors.is_empty() {
+        for e in &report.errors {
+            println!("error: {e}");
+        }
+    }
+}
+
+fn print_macho(macho: &MachOVerifyReport) {
+    for slice in &macho.slices {
+        println!(
+            "slice: {} {} (identifier: {:?}, ad-hoc: {})",
+            slice.arch,
+            if slice.is_valid() { "ok" } else { "INVALID" },
+            slice.identifier,
+            slice.adhoc
+        );
+        match &slice.pages {
+            PageCheck::Matched => {}
+            PageCheck::Empty => println!("  pages: empty code region"),
+            PageCheck::Mismatch { page_index } => {
+                println!("  pages: MISMATCH at page {page_index}")
+            }
+            PageCheck::CountMismatch { stored, computed } => {
+                println!("  pages: slot count {stored} != computed {computed}")
+            }
+        }
+        if let Some(cms) = &slice.cms {
+            if cms.no_signature {
+                println!("  cms: ad-hoc (no signature)");
+            } else {
+                println!(
+                    "  cms: {} (chain: {}, anchor: {})",
+                    if cms.valid { "valid" } else { "INVALID" },
+                    if cms.chain.is_empty() {
+                        "n/a".to_string()
+                    } else {
+                        cms.chain.join(" <- ")
+                    },
+                    cms.anchored
+                );
+                if let Some(subject) = &cms.signer_subject {
+                    println!("  signer: {subject}");
+                }
+            }
+        }
+        // Index special slots -1..-n (index 0 = -1 Info.plist).
+        let labels = [
+            "Info.plist",
+            "requirements",
+            "CodeResources",
+            "application",
+            "entitlements",
+            "rep-specific",
+            "der entitlements",
+        ];
+        for (i, check) in slice.special_slots.iter().enumerate() {
+            let label = labels.get(i).copied().unwrap_or("?");
+            match check {
+                SpecialSlotCheck::Matched => {}
+                SpecialSlotCheck::NotChecked => {}
+                SpecialSlotCheck::Mismatch => println!("  slot -{} ({label}): MISMATCH", i + 1),
+                // Zeroed/unbound slots are normal (e.g. no Info.plist binding).
+                SpecialSlotCheck::Missing => {}
+            }
+        }
+        for e in &slice.errors {
+            println!("  error: {e}");
+        }
+        for w in &slice.warnings {
+            println!("  warning: {w}");
+        }
+    }
+}
+
+fn print_bundle(bundle: &zsign_rs::verify::BundleVerification, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let label = if depth == 0 {
+        "bundle".to_string()
+    } else {
+        "nested".to_string()
+    };
+    println!(
+        "{indent}{label}: {} ({})",
+        display_path(&bundle.path),
+        if bundle.valid() { "ok" } else { "INVALID" }
+    );
+
+    for b in &bundle.binaries {
+        let status = if b.valid() { "ok" } else { "INVALID" };
+        println!("{indent}  binary: {} ({status})", display_path(&b.path));
+        if let Some(m) = &b.report {
+            for slice in &m.slices {
+                let cms = slice
+                    .cms
+                    .as_ref()
+                    .map(|c| {
+                        if c.no_signature {
+                            "ad-hoc".to_string()
+                        } else if c.valid {
+                            "CMS valid".to_string()
+                        } else {
+                            "CMS INVALID".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "no CMS".to_string());
+                println!(
+                    "{indent}    {}: pages {}, {cms}",
+                    slice.arch,
+                    match &slice.pages {
+                        PageCheck::Matched => "ok".to_string(),
+                        PageCheck::Empty => "empty".to_string(),
+                        PageCheck::Mismatch { page_index } => {
+                            format!("MISMATCH page {page_index}")
+                        }
+                        PageCheck::CountMismatch { stored, computed } => {
+                            format!("count {stored} != {computed}")
+                        }
+                    }
+                );
+            }
+        }
+        for e in &b.errors {
+            println!("{indent}    error: {e}");
+        }
+    }
+    if let Some(cr) = &bundle.code_resources {
+        let cr_status = if cr.valid() { "ok" } else { "INVALID" };
+        println!(
+            "{indent}  code resources: {cr_status} ({} sealed)",
+            cr.matched
+        );
+        for f in &cr.mismatched {
+            println!("{indent}    mismatch: {f}");
+        }
+        for f in &cr.missing {
+            println!("{indent}    missing: {f}");
+        }
+        for f in &cr.unsealed {
+            println!("{indent}    unsealed: {f}");
+        }
+    }
+    for e in &bundle.errors {
+        println!("{indent}  error: {e}");
+    }
+    for nested in &bundle.nested {
+        print_bundle(nested, depth + 1);
+    }
+}
+
+fn display_path(path: &str) -> &str {
+    if path.is_empty() {
+        "."
+    } else {
+        path
+    }
 }
 
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
