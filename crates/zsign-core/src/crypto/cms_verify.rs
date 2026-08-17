@@ -61,8 +61,14 @@ const OID_APPLE_CDHASH_V2: ObjectIdentifier =
 const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 /// rsaEncryption: `1.2.840.113549.1.1.1`
 const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+/// sha1WithRSAEncryption: `1.2.840.113549.1.1.5`
+const OID_SHA1_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.5");
 /// sha256WithRSAEncryption: `1.2.840.113549.1.1.11`
 const OID_SHA256_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+/// sha384WithRSAEncryption: `1.2.840.113549.1.1.12`
+const OID_SHA384_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+/// sha512WithRSAEncryption: `1.2.840.113549.1.1.13`
+const OID_SHA512_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
 /// ecdsa-with-SHA256: `1.2.840.10045.4.3.2`
 const OID_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 /// id-ecPublicKey: `1.2.840.10045.2.1`
@@ -922,6 +928,7 @@ fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Cer
     let sig_bytes = child.signature.raw_bytes().to_vec();
     let spki = &issuer.tbs_certificate.subject_public_key_info;
     let alg = spki.algorithm.oid;
+    let sig_alg = child.signature_algorithm.oid;
 
     let Ok(pk_der) = spki.to_der() else {
         return false;
@@ -933,6 +940,24 @@ fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Cer
         let Ok(sig) = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice()) else {
             return false;
         };
+        // The digest comes from the certificate's own signature algorithm:
+        // Apple's older intermediates still sign with SHA-1.
+        if sig_alg == OID_SHA1_WITH_RSA {
+            return rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::new(pub_key)
+                .verify(&tbs, &sig)
+                .is_ok();
+        }
+        if sig_alg == OID_SHA384_WITH_RSA {
+            return rsa::pkcs1v15::VerifyingKey::<sha2::Sha384>::new(pub_key)
+                .verify(&tbs, &sig)
+                .is_ok();
+        }
+        if sig_alg == OID_SHA512_WITH_RSA {
+            return rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(pub_key)
+                .verify(&tbs, &sig)
+                .is_ok();
+        }
+        // Default (and by far the most common): SHA-256.
         rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pub_key)
             .verify(&tbs, &sig)
             .is_ok()
@@ -1243,6 +1268,65 @@ mod tests {
             "BER-indefinite CMS must verify after normalization: {:?}",
             report.errors
         );
+    }
+
+    /// A CA signed with SHA-1 (Apple's older intermediates) must still chain.
+    #[test]
+    fn chain_accepts_sha1_signed_intermediate() {
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let root_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signing = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(root_key.clone());
+        let root_subject = Name::from_str("CN=zsign sha1 root").unwrap();
+        let root_serial = SerialNumber::from(1u32);
+        let root_validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let root_pub_der = root_key.to_public_key().to_public_key_der().unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_ref()).unwrap();
+        let root = CertificateBuilder::new(
+            Profile::Root,
+            root_serial,
+            root_validity,
+            root_subject.clone(),
+            root_pub,
+            &root_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        // Leaf signed by the SHA-1 root (the leaf's own key only provides the
+        // public half used in the certificate).
+        let leaf_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_subject = Name::from_str("CN=zsign sha1 leaf").unwrap();
+        let leaf_serial = SerialNumber::from(2u32);
+        let leaf_validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let leaf_pub_der = leaf_key.to_public_key().to_public_key_der().unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_ref()).unwrap();
+        let leaf = CertificateBuilder::new(
+            // End-entity signed by the SHA-1 root.
+            Profile::Leaf {
+                issuer: root_subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            leaf_serial,
+            leaf_validity,
+            leaf_subject,
+            leaf_pub,
+            &root_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        let (ok, anchored, _names, reason) = verify_chain(&[root.clone(), leaf.clone()], &leaf);
+        assert!(ok, "SHA-1-signed intermediate must chain: {reason:?}");
+        assert!(anchored);
     }
 
     #[test]

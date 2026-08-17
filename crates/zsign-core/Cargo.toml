@@ -20,7 +20,7 @@ x509-cert = { version = "0.2.5", features = ["pem"] }
 cms = { version = "0.2.3", features = ["builder"] }
 
 # Signing key types
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["sha2", "sha1"] }
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std", "ecdsa", "pem"] }
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "alloc", "std"] }
 signature = { version = "2.2", features = ["std"] }
@@ -45,7 +45,7 @@ sha2 = "0.10"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # NOTE: sha1's `asm` feature is broken on aarch64 (produces wrong, run-varying
 # digests), so it stays on the portable implementation everywhere.
-sha1 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
