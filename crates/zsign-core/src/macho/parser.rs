@@ -28,6 +28,22 @@ use goblin::mach::header::{MH_CIGAM_64, MH_EXECUTE, MH_MAGIC_64};
 use goblin::mach::load_command::CommandVariant;
 use goblin::mach::{Mach, MachO};
 
+/// FairPlay encryption state from `LC_ENCRYPTION_INFO` / `LC_ENCRYPTION_INFO_64`.
+///
+/// `cryptid != 0 && cryptsize != 0` marks an encrypted slice: at exec the
+/// kernel decrypts the `[cryptoff, cryptoff+cryptsize)` range of `__TEXT`,
+/// so re-signing the on-disk ciphertext yields a signature that no longer
+/// matches the decrypted pages (AMFI kill / install abort).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionInfo {
+    /// File offset of the encrypted range.
+    pub cryptoff: u32,
+    /// File size of the encrypted range.
+    pub cryptsize: u32,
+    /// Encryption system: 0 = not encrypted, 1 = FairPlay, 0x10 = NULL.
+    pub cryptid: u32,
+}
+
 /// Pre-parsed Mach-O load command metadata.
 ///
 /// Caches the offsets and values that writer functions need,
@@ -100,6 +116,8 @@ pub struct ArchSlice {
     pub code_length: usize,
     /// Cached load command metadata for writer functions.
     pub metadata: MachOMetadata,
+    /// FairPlay encryption info from `LC_ENCRYPTION_INFO(_64)`, if present.
+    pub encryption: Option<EncryptionInfo>,
 }
 
 impl MachOFile {
@@ -181,6 +199,7 @@ impl MachOFile {
         let mut code_sig_size = None;
         let mut text_segment_size = 0u64;
         let mut text_segment_base = 0u64;
+        let mut encryption = None;
 
         let mut meta_code_sig_cmd = None;
         let mut meta_linkedit_cmd = None;
@@ -220,6 +239,20 @@ impl MachOFile {
                     if seg.fileoff > 0 && (seg.fileoff as u64) < first_segment_offset {
                         first_segment_offset = seg.fileoff as u64;
                     }
+                }
+                CommandVariant::EncryptionInfo32(ref enc) => {
+                    encryption = Some(EncryptionInfo {
+                        cryptoff: enc.cryptoff,
+                        cryptsize: enc.cryptsize,
+                        cryptid: enc.cryptid,
+                    });
+                }
+                CommandVariant::EncryptionInfo64(ref enc) => {
+                    encryption = Some(EncryptionInfo {
+                        cryptoff: enc.cryptoff,
+                        cryptsize: enc.cryptsize,
+                        cryptid: enc.cryptid,
+                    });
                 }
                 _ => {}
             }
@@ -327,6 +360,7 @@ impl MachOFile {
                 is_big_endian,
                 is_64,
             },
+            encryption,
         })
     }
 
@@ -378,6 +412,19 @@ impl MachOFile {
     }
 }
 
+impl ArchSlice {
+    /// Whether the kernel will attempt FairPlay decryption of this slice.
+    ///
+    /// Matches xnu: `cryptid != 0` selects a decrypter, but the kernel
+    /// ignores the entire command when `cryptsize == 0`.
+    pub fn is_encrypted(&self) -> bool {
+        match &self.encryption {
+            Some(e) => e.cryptid != 0 && e.cryptsize != 0,
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +440,140 @@ mod tests {
     fn test_parse_rejects_garbage() {
         let result = MachOFile::parse(vec![0xFF; 1000]);
         assert!(result.is_err());
+    }
+
+    /// Build a minimal arm64 MH_EXECUTE with an injected LC_ENCRYPTION_INFO_64.
+    /// `cryptsize == 0` is the kernel-ignored (decrypted) form.
+    fn minimal_macho_with_encryption(cryptid: u32, cryptsize: u32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(0x2000);
+
+        macro_rules! u32 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u32).to_le_bytes())
+            };
+        }
+        macro_rules! u64 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u64).to_le_bytes())
+            };
+        }
+        macro_rules! name {
+            ($s:expr, $len:expr) => {
+                let mut n = [0u8; 16];
+                n[..$s.len()].copy_from_slice($s.as_bytes());
+                b.extend_from_slice(&n[..$len]);
+            };
+        }
+
+        // mach_header_64
+        u32!(0xfeedfacf); // MH_MAGIC_64
+        u32!(0x0100_000c); // CPU_TYPE_ARM64
+        u32!(0x0000_0000); // CPU_SUBTYPE_ARM64_ALL
+        u32!(2); // MH_EXECUTE
+        u32!(4); // ncmds: __TEXT, __LINKEDIT, build version, encryption info
+        u32!(152 + 72 + 24 + 24); // sizeofcmds
+        u32!(0x1); // MH_NOUNDEFS
+        u32!(0); // reserved
+
+        // LC_SEGMENT_64 "__TEXT" (152 bytes, one section)
+        u32!(0x19);
+        u32!(152);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x1000); // fileoff
+        u64!(0x1000); // filesize
+        u32!(7); // maxprot
+        u32!(7); // initprot
+        u32!(1); // nsects
+        u32!(0); // flags
+        name!("__text", 16);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // addr
+        u64!(4); // size
+        u32!(0x1000); // file offset of code
+        u32!(0); // align
+        u32!(0); // reloff
+        u32!(0); // nreloc
+        u32!(0); // flags
+        u32!(0); // reserved1
+        u32!(0); // reserved2
+        u32!(0); // reserved3
+
+        // LC_SEGMENT_64 "__LINKEDIT" (72 bytes, no sections)
+        u32!(0x19);
+        u32!(72);
+        name!("__LINKEDIT", 16);
+        u64!(0x1_0000_1000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x2000); // fileoff
+        u64!(0); // filesize
+        u32!(1); // maxprot
+        u32!(1); // initprot
+        u32!(0); // nsects
+        u32!(0); // flags
+
+        // LC_BUILD_VERSION (24 bytes)
+        u32!(0x32);
+        u32!(24);
+        u32!(1); // macOS
+        u32!(0x000f_0000); // minos 15.0
+        u32!(0x000f_0000); // sdk 15.0
+        u32!(0); // ntools
+
+        // LC_ENCRYPTION_INFO_64 (24 bytes)
+        u32!(0x2c);
+        u32!(24);
+        u32!(0x1000); // cryptoff
+        u32!(cryptsize);
+        u32!(cryptid);
+        u32!(0); // pad
+
+        // Zero-fill first page, code at 0x1000, pad through __LINKEDIT page
+        b.resize(0x1000, 0);
+        b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        b.resize(0x2000, 0);
+        b
+    }
+
+    #[test]
+    fn test_parse_records_encryption_info() {
+        let data = minimal_macho_with_encryption(1, 0x1000);
+        let macho = MachOFile::parse(data).expect("encrypted mach-o must parse");
+        let slice = &macho.slices()[0];
+        assert!(slice.is_64, "arm64 slice must be 64-bit");
+        let enc = slice.encryption.as_ref().expect("encryption info recorded");
+        assert_eq!(enc.cryptoff, 0x1000);
+        assert_eq!(enc.cryptsize, 0x1000);
+        assert_eq!(enc.cryptid, 1);
+        assert!(
+            slice.is_encrypted(),
+            "cryptid=1 + cryptsize>0 must be encrypted"
+        );
+    }
+
+    #[test]
+    fn test_parse_plain_macho_is_not_encrypted() {
+        let data = minimal_macho_with_encryption(0, 0x1000);
+        let macho = MachOFile::parse(data).unwrap();
+        assert_eq!(
+            macho.slices()[0].encryption.as_ref().map(|e| e.cryptid),
+            Some(0)
+        );
+        assert!(
+            !macho.slices()[0].is_encrypted(),
+            "cryptid=0 must not be encrypted"
+        );
+    }
+
+    #[test]
+    fn test_parse_cryptsize_zero_is_not_encrypted() {
+        // Kernel ignores cryptid when cryptsize == 0 (cleaned binary runs fine).
+        let data = minimal_macho_with_encryption(1, 0);
+        let macho = MachOFile::parse(data).unwrap();
+        assert!(
+            !macho.slices()[0].is_encrypted(),
+            "cryptsize=0 must not be treated as encrypted"
+        );
     }
 }

@@ -407,6 +407,7 @@ fn sign_slice_complete(
                 text_segment_base: slice.text_segment_base,
                 code_length: slice.code_length,
                 metadata: updated_metadata.clone(),
+                encryption: slice.encryption,
             };
 
             (reallocated, updated_metadata, new_slice, false)
@@ -538,6 +539,7 @@ fn sign_slice_complete(
                     text_segment_base: slice.text_segment_base,
                     code_length: slice.code_length,
                     metadata: updated_metadata.clone(),
+                    encryption: slice.encryption,
                 };
                 (reallocated, updated_metadata, new_slice)
             } else {
