@@ -127,6 +127,8 @@ pub struct IpaSigner<'a> {
     dylibs: Vec<String>,
     /// Inject with LC_LOAD_WEAK_DYLIB instead of LC_LOAD_DYLIB
     weak_dylibs: bool,
+    /// Override the FairPlay-encryption refusal (sign an encrypted binary anyway).
+    allow_encrypted: bool,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -146,6 +148,7 @@ impl<'a> IpaSigner<'a> {
             sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            allow_encrypted: false,
         }
     }
 
@@ -161,6 +164,7 @@ impl<'a> IpaSigner<'a> {
             sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            allow_encrypted: false,
         }
     }
 
@@ -225,6 +229,15 @@ impl<'a> IpaSigner<'a> {
     pub fn dylib_injection(mut self, dylibs: Vec<String>, weak: bool) -> Self {
         self.dylibs = dylibs;
         self.weak_dylibs = weak;
+        self
+    }
+
+    /// Overrides the FairPlay-encryption refusal and signs encrypted binaries anyway.
+    ///
+    /// Use only on binaries you have already decrypted; otherwise the output
+    /// dies on-device with an AMFI kill at launch.
+    pub fn allow_encrypted(mut self, allow: bool) -> Self {
+        self.allow_encrypted = allow;
         self
     }
 
@@ -469,9 +482,36 @@ impl<'a> IpaSigner<'a> {
             .unwrap_or("dylib")
             .to_string();
 
+        if !self.allow_encrypted {
+            for slice in macho.slices() {
+                if slice.is_encrypted() {
+                    return Err(self.encrypted_error(
+                        &dylib_path.display().to_string(),
+                        &identifier,
+                        slice,
+                    ));
+                }
+            }
+        }
+
         let signed_binary = match self.credentials {
-            Some(creds) => sign_macho(&macho, &identifier, None, creds, None, None)?,
-            None => crate::macho::sign_macho_adhoc(&macho, &identifier, None, None, None)?,
+            Some(creds) => sign_macho(
+                &macho,
+                &identifier,
+                None,
+                creds,
+                None,
+                None,
+                self.allow_encrypted,
+            )?,
+            None => crate::macho::sign_macho_adhoc(
+                &macho,
+                &identifier,
+                None,
+                None,
+                None,
+                self.allow_encrypted,
+            )?,
         };
 
         fs::write(dylib_path, signed_binary)?;
@@ -756,6 +796,18 @@ impl<'a> IpaSigner<'a> {
         }
         let macho = MachOFile::parse(binary_data)?;
 
+        if !self.allow_encrypted {
+            for slice in macho.slices() {
+                if slice.is_encrypted() {
+                    return Err(self.encrypted_error(
+                        &binary_path.display().to_string(),
+                        identifier,
+                        slice,
+                    ));
+                }
+            }
+        }
+
         // Only the main executable gets Info.plist in its CodeDirectory.
         // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
         // with "has entitlements but is not a main binary".
@@ -785,6 +837,7 @@ impl<'a> IpaSigner<'a> {
                         creds,
                         info_data.as_deref(),
                         code_resources,
+                        self.allow_encrypted,
                     )?
                 } else {
                     sign_any_macho(
@@ -794,6 +847,7 @@ impl<'a> IpaSigner<'a> {
                         creds,
                         info_data.as_deref(),
                         code_resources,
+                        self.allow_encrypted,
                     )?
                 }
             }
@@ -803,12 +857,30 @@ impl<'a> IpaSigner<'a> {
                 entitlements,
                 info_data.as_deref(),
                 code_resources,
+                self.allow_encrypted,
             )?,
         };
 
         fs::write(binary_path, signed_binary)?;
 
         Ok(())
+    }
+
+    /// Builds a path-qualified EncryptedBinary error for one slice.
+    fn encrypted_error(
+        &self,
+        path: &str,
+        identifier: &str,
+        slice: &zsign_core::macho::ArchSlice,
+    ) -> Error {
+        let enc = slice
+            .encryption
+            .as_ref()
+            .expect("is_encrypted() implies encryption is Some");
+        Error::Core(zsign_core::Error::EncryptedBinary(format!(
+            "{path}: identifier \"{identifier}\", cpu 0x{:x}: cryptid={}, cryptoff=0x{:x}, cryptsize=0x{:x}: decrypt the binary first (frida-ios-dump / bagbak / Clutch / bfdecrypt), then re-sign. Pass allow_encrypted(true) / -f/--force to override.",
+            slice.cpu_type, enc.cryptid, enc.cryptoff, enc.cryptsize
+        )))
     }
 
     /// Generate CodeResources plist for the bundle.
@@ -987,5 +1059,62 @@ mod tests {
             }
         }
         assert!(saw_cms, "SuperBlob must contain a CMS signature");
+    }
+
+    #[test]
+    fn test_ipa_signer_refuses_encrypted_bundle() {
+        let temp_dir = TempDir::new().unwrap();
+        let app = temp_dir.path().join("Enc.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Enc</string>
+  <key>CFBundleIdentifier</key><string>com.zsign.enc</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Enc"), crate::test_util::minimal_macho_encrypted()).unwrap();
+        std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
+
+        let credentials = crate::test_util::test_credentials();
+        let signer = IpaSigner::new(&credentials);
+        let err = signer
+            .sign_folder_in_place(&app)
+            .expect_err("encrypted main executable must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("Enc"), "error must name the file: {msg}");
+        assert!(msg.contains("cryptid"), "error must show cryptid: {msg}");
+        assert!(
+            msg.contains("decrypt"),
+            "error must tell the user to decrypt: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ipa_signer_allow_encrypted_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let app = temp_dir.path().join("Enc.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Enc</string>
+  <key>CFBundleIdentifier</key><string>com.zsign.enc</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Enc"), crate::test_util::minimal_macho_encrypted()).unwrap();
+        std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .allow_encrypted(true)
+            .sign_folder_in_place(&app)
+            .expect("allow_encrypted=true must sign");
+        assert!(app.join("_CodeSignature/CodeResources").exists());
     }
 }

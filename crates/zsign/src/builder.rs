@@ -85,6 +85,7 @@ pub struct ZSign {
     adhoc: bool,
     dylibs: Vec<String>,
     weak_dylibs: bool,
+    allow_encrypted: bool,
 }
 
 impl ZSign {
@@ -109,6 +110,7 @@ impl ZSign {
             adhoc: false,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            allow_encrypted: false,
         }
     }
 
@@ -229,6 +231,12 @@ impl ZSign {
         self
     }
 
+    /// Overrides the FairPlay-encryption refusal (`-f/--force` on the CLI).
+    pub fn allow_encrypted(mut self, allow: bool) -> Self {
+        self.allow_encrypted = allow;
+        self
+    }
+
     /// Validates the builder configuration.
     ///
     /// # Errors
@@ -297,7 +305,14 @@ impl ZSign {
             .unwrap_or("unknown");
 
         let signed_binary = if self.adhoc {
-            crate::macho::sign_macho_adhoc(&macho, identifier, None, None, None)?
+            crate::macho::sign_macho_adhoc(
+                &macho,
+                identifier,
+                None,
+                None,
+                None,
+                self.allow_encrypted,
+            )?
         } else {
             let credentials = self.get_credentials()?;
             let entitlements = self.load_entitlements_from_profile()?;
@@ -309,6 +324,7 @@ impl ZSign {
                     credentials,
                     None,
                     None,
+                    self.allow_encrypted,
                 )?
             } else {
                 sign_macho(
@@ -318,6 +334,7 @@ impl ZSign {
                     credentials,
                     None,
                     None,
+                    self.allow_encrypted,
                 )?
             }
         };
@@ -373,6 +390,7 @@ impl ZSign {
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
         }
+        signer = signer.allow_encrypted(self.allow_encrypted);
 
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
@@ -415,6 +433,7 @@ impl ZSign {
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
         }
+        signer = signer.allow_encrypted(self.allow_encrypted);
         if let Some(ref profile) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile);
         }
@@ -489,6 +508,10 @@ mod tests {
             Some(PathBuf::from("/path/to/profile.mobileprovision"))
         );
         assert_eq!(zsign.compression_level.level(), 9);
+
+        assert!(!zsign.allow_encrypted);
+        let zsign = ZSign::new().allow_encrypted(true);
+        assert!(zsign.allow_encrypted);
     }
 
     #[test]

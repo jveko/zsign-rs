@@ -67,6 +67,7 @@ pub fn sign_macho(
     credentials: &zsign_core::crypto::SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho(
         macho.as_core(),
@@ -75,6 +76,7 @@ pub fn sign_macho(
         credentials,
         info_plist,
         code_resources,
+        allow_encrypted,
     )?)
 }
 
@@ -89,6 +91,7 @@ pub fn sign_macho_all_slices(
     credentials: &zsign_core::crypto::SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> crate::Result<Vec<SignedSlice>> {
     Ok(zsign_core::macho::sign_macho_all_slices(
         macho.as_core(),
@@ -97,6 +100,7 @@ pub fn sign_macho_all_slices(
         credentials,
         info_plist,
         code_resources,
+        allow_encrypted,
     )?)
 }
 
@@ -107,6 +111,7 @@ pub fn sign_macho_adhoc(
     entitlements: Option<&[u8]>,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho_adhoc(
         macho.as_core(),
@@ -114,6 +119,7 @@ pub fn sign_macho_adhoc(
         entitlements,
         info_plist,
         code_resources,
+        allow_encrypted,
     )?)
 }
 
@@ -126,6 +132,7 @@ pub fn sign_macho_sha256_only(
     credentials: &zsign_core::crypto::SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho_sha256_only(
         macho.as_core(),
@@ -134,6 +141,7 @@ pub fn sign_macho_sha256_only(
         credentials,
         info_plist,
         code_resources,
+        allow_encrypted,
     )?)
 }
 
@@ -149,6 +157,7 @@ pub fn sign_any_macho(
     credentials: &zsign_core::crypto::SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_any_macho(
         macho.as_core(),
@@ -157,6 +166,7 @@ pub fn sign_any_macho(
         credentials,
         info_plist,
         code_resources,
+        allow_encrypted,
     )?)
 }
 
@@ -331,7 +341,7 @@ mod tests {
     fn check_signature_reports_signed_binary() {
         let creds = test_credentials();
         let macho = MachOFile::parse(minimal_macho()).unwrap();
-        let signed = sign_macho(&macho, "com.check.test", None, &creds, None, None)
+        let signed = sign_macho(&macho, "com.check.test", None, &creds, None, None, false)
             .expect("signing must succeed");
 
         let code_length = macho.slices()[0].code_length;

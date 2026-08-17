@@ -10,6 +10,21 @@ pub(crate) fn minimal_macho() -> Vec<u8> {
     include_bytes!("ipa/fixtures/minimal_macho.bin").to_vec()
 }
 
+/// minimal_macho() with an injected LC_ENCRYPTION_INFO_64 (cryptid=1, cryptsize=0x1000).
+pub(crate) fn minimal_macho_encrypted() -> Vec<u8> {
+    let mut data = minimal_macho();
+    let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let sizeofcmds = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    data[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+    data[20..24].copy_from_slice(&(sizeofcmds + 24).to_le_bytes());
+    let off = 32 + sizeofcmds as usize;
+    let lc: [u32; 6] = [0x2c, 24, 0x1000, 0x1000, 1, 0];
+    for (i, v) in lc.iter().enumerate() {
+        data[off + i * 4..off + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    data
+}
+
 /// Self-signed RSA-2048 credentials with `team_id=Some("TESTTEAM")`.
 pub(crate) fn test_credentials() -> crate::SigningCredentials {
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
