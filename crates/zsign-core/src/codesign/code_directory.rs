@@ -331,7 +331,10 @@ impl<'a> CodeDirectoryBuilder<'a> {
             page_hashes.len(),
             n_code_slots * hash_size,
             "page_hashes length mismatch: expected {} ({}×{}), got {}",
-            n_code_slots * hash_size, n_code_slots, hash_size, page_hashes.len()
+            n_code_slots * hash_size,
+            n_code_slots,
+            hash_size,
+            page_hashes.len()
         );
 
         let n_special_slots = self.count_special_slots();
@@ -350,7 +353,8 @@ impl<'a> CodeDirectoryBuilder<'a> {
             .map(|t| t.len() as u32 + 1)
             .unwrap_or(0);
 
-        let hash_offset = ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
+        let hash_offset =
+            ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
         let total_len = hash_offset + (n_code_slots as u32 * hash_size as u32);
 
         let mut buf = Vec::with_capacity(total_len as usize);
@@ -429,7 +433,8 @@ impl<'a> CodeDirectoryBuilder<'a> {
             .unwrap_or(0);
 
         // Hash offset is after header, identifier, team ID, and special slots
-        let hash_offset = ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
+        let hash_offset =
+            ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
 
         // Total length includes header, strings, special slots, and code slots
         let total_len = hash_offset + (n_code_slots as u32 * hash_size as u32);
@@ -588,24 +593,22 @@ impl<'a> CodeDirectoryBuilder<'a> {
 
         // Collect chunks with their indices for ordered parallel processing
         let chunks: Vec<_> = self.code.chunks(PAGE_SIZE).collect();
-        
+
         // Sequential hash computation
         let hashes: Vec<Vec<u8>> = chunks
             .iter()
-            .map(|chunk| {
-                match hash_type {
-                    CS_HASHTYPE_SHA1 => {
-                        let mut hasher = Sha1::new();
-                        hasher.update(chunk);
-                        hasher.finalize().to_vec()
-                    }
-                    CS_HASHTYPE_SHA256 => {
-                        let mut hasher = Sha256::new();
-                        hasher.update(chunk);
-                        hasher.finalize().to_vec()
-                    }
-                    _ => unreachable!(),
+            .map(|chunk| match hash_type {
+                CS_HASHTYPE_SHA1 => {
+                    let mut hasher = Sha1::new();
+                    hasher.update(chunk);
+                    hasher.finalize().to_vec()
                 }
+                CS_HASHTYPE_SHA256 => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(chunk);
+                    hasher.finalize().to_vec()
+                }
+                _ => unreachable!(),
             })
             .collect();
 
@@ -898,7 +901,10 @@ mod tests {
         let from_internal = builder.build_sha256();
         let from_hashes = builder.build_sha256_from_hashes(&dual.sha256);
 
-        assert_eq!(from_internal, from_hashes, "build_sha256_from_hashes must produce byte-identical output to build_sha256");
+        assert_eq!(
+            from_internal, from_hashes,
+            "build_sha256_from_hashes must produce byte-identical output to build_sha256"
+        );
     }
 
     #[test]
@@ -914,7 +920,10 @@ mod tests {
         let from_internal = builder.build_sha1();
         let from_hashes = builder.build_sha1_from_hashes(&dual.sha1);
 
-        assert_eq!(from_internal, from_hashes, "build_sha1_from_hashes must produce byte-identical output to build_sha1");
+        assert_eq!(
+            from_internal, from_hashes,
+            "build_sha1_from_hashes must produce byte-identical output to build_sha1"
+        );
     }
 
     #[test]
@@ -968,10 +977,14 @@ mod tests {
         let parallel_result = hash_code_pages_dual(&code);
         let sequential_result = hash_code_pages_dual_seq(&code);
 
-        assert_eq!(parallel_result.sha1, sequential_result.sha1,
-            "SHA-1 hashes must be identical for parallel and sequential");
-        assert_eq!(parallel_result.sha256, sequential_result.sha256,
-            "SHA-256 hashes must be identical for parallel and sequential");
+        assert_eq!(
+            parallel_result.sha1, sequential_result.sha1,
+            "SHA-1 hashes must be identical for parallel and sequential"
+        );
+        assert_eq!(
+            parallel_result.sha256, sequential_result.sha256,
+            "SHA-256 hashes must be identical for parallel and sequential"
+        );
     }
 
     #[test]
@@ -983,8 +996,8 @@ mod tests {
         assert_eq!(
             sha1.finalize()[..],
             [
-                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78,
-                0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
             ],
             "SHA-1 of \"abc\" must match the canonical vector"
         );
@@ -994,9 +1007,9 @@ mod tests {
         assert_eq!(
             sha256.finalize()[..],
             [
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
-                0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
-                0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
             ],
             "SHA-256 of \"abc\" must match the canonical vector"
         );

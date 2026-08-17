@@ -44,11 +44,21 @@ impl MachOFile {
         &self.inner
     }
 
-    pub fn data(&self) -> &[u8] { self.inner.data() }
-    pub fn is_fat(&self) -> bool { self.inner.is_fat() }
-    pub fn slices(&self) -> &[ArchSlice] { self.inner.slices() }
-    pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] { self.inner.code_bytes(slice) }
-    pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] { self.inner.slice_data(slice) }
+    pub fn data(&self) -> &[u8] {
+        self.inner.data()
+    }
+    pub fn is_fat(&self) -> bool {
+        self.inner.is_fat()
+    }
+    pub fn slices(&self) -> &[ArchSlice] {
+        self.inner.slices()
+    }
+    pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] {
+        self.inner.code_bytes(slice)
+    }
+    pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] {
+        self.inner.slice_data(slice)
+    }
 }
 
 #[cfg(test)]

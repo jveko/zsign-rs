@@ -151,7 +151,12 @@ impl CodeResourcesBuilder {
             .follow_links(false)
             .into_iter()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to walk directory: {}", e))))?;
+            .map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "Failed to walk directory: {}",
+                    e
+                )))
+            })?;
 
         // Process entries in parallel
         let results: Vec<_> = entries
@@ -167,7 +172,12 @@ impl CodeResourcesBuilder {
 
                 let relative_path = path
                     .strip_prefix(&bundle_path)
-                    .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to strip prefix: {}", e))))?
+                    .map_err(|e| {
+                        Error::Io(std::io::Error::other(format!(
+                            "Failed to strip prefix: {}",
+                            e
+                        )))
+                    })?
                     .to_string_lossy()
                     .to_string();
 
@@ -177,17 +187,28 @@ impl CodeResourcesBuilder {
 
                 if is_symlink {
                     let (sha1, sha256, target) = Self::hash_symlink_entry(path)?;
-                    Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: Some(target) }))
+                    Ok(Some(ScannedEntry {
+                        path: relative_path,
+                        sha1,
+                        sha256,
+                        symlink_target: Some(target),
+                    }))
                 } else {
                     let (sha1, sha256) = hash_file_streaming(path)?;
-                    Ok(Some(ScannedEntry { path: relative_path, sha1, sha256, symlink_target: None }))
+                    Ok(Some(ScannedEntry {
+                        path: relative_path,
+                        sha1,
+                        sha256,
+                        symlink_target: None,
+                    }))
                 }
             })
             .collect::<Result<Vec<_>>>()?;
 
         for entry in results.into_iter().flatten() {
             if let Some(target) = entry.symlink_target {
-                self.inner.add_symlink(entry.path, target, entry.sha1, entry.sha256);
+                self.inner
+                    .add_symlink(entry.path, target, entry.sha1, entry.sha256);
             } else {
                 self.inner.add_file(entry.path, entry.sha1, entry.sha256);
             }
@@ -232,12 +253,15 @@ impl CodeResourcesBuilder {
         let data = fs::read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&data)?;
 
-        let dict = plist.as_dictionary()
-            .ok_or_else(|| Error::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Info.plist is not a dictionary")
-            ))?;
+        let dict = plist.as_dictionary().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Info.plist is not a dictionary",
+            ))
+        })?;
 
-        Ok(dict.get("CFBundleExecutable")
+        Ok(dict
+            .get("CFBundleExecutable")
             .and_then(|v| v.as_string())
             .map(|s| s.to_string()))
     }
@@ -258,7 +282,10 @@ impl CodeResourcesBuilder {
     fn hash_symlink_entry(path: &Path) -> Result<([u8; 20], [u8; 32], String)> {
         Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("Symlinks not supported on this platform: {}", path.display()),
+            format!(
+                "Symlinks not supported on this platform: {}",
+                path.display()
+            ),
         )))
     }
 }
@@ -282,7 +309,10 @@ fn hash_file_streaming(path: &Path) -> Result<([u8; 20], [u8; 32])> {
         sha256_hasher.update(&buf[..n]);
     }
 
-    Ok((sha1_hasher.finalize().into(), sha256_hasher.finalize().into()))
+    Ok((
+        sha1_hasher.finalize().into(),
+        sha256_hasher.finalize().into(),
+    ))
 }
 
 #[cfg(test)]
@@ -446,7 +476,9 @@ mod tests {
         let plist_str = String::from_utf8(plist_data).unwrap();
 
         // Symlinks should have a <key>symlink</key> entry in files2
-        assert!(plist_str.contains("<key>symlink</key>"),
-            "Symlink entries should have symlink key in plist");
+        assert!(
+            plist_str.contains("<key>symlink</key>"),
+            "Symlink entries should have symlink key in plist"
+        );
     }
 }

@@ -111,7 +111,11 @@ pub fn sign_code_directory(
 
     let sid = SignerIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
         issuer: credentials.certificate.tbs_certificate.issuer.clone(),
-        serial_number: credentials.certificate.tbs_certificate.serial_number.clone(),
+        serial_number: credentials
+            .certificate
+            .tbs_certificate
+            .serial_number
+            .clone(),
     });
 
     let ctx = CmsBuildContext {
@@ -128,9 +132,7 @@ pub fn sign_code_directory(
     };
 
     match &credentials.signing_key {
-        SigningKeyType::Rsa(signing_key) => {
-            build_cms_signed_data(signing_key, ctx)
-        }
+        SigningKeyType::Rsa(signing_key) => build_cms_signed_data(signing_key, ctx),
         SigningKeyType::Ecdsa(ecdsa_key) => {
             build_cms_signed_data::<_, p256::ecdsa::DerSignature>(ecdsa_key, ctx)
         }
@@ -152,10 +154,7 @@ struct CmsBuildContext<'a> {
     cert_chain: &'a [Certificate],
 }
 
-fn build_cms_signed_data<S, Sig>(
-    signer: &S,
-    ctx: CmsBuildContext<'_>,
-) -> Result<Vec<u8>>
+fn build_cms_signed_data<S, Sig>(signer: &S, ctx: CmsBuildContext<'_>) -> Result<Vec<u8>>
 where
     S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
     Sig: spki::SignatureBitStringEncoding,
@@ -220,13 +219,10 @@ fn build_apple_octet_string_attribute(
 }
 
 /// Builds an Apple attribute by parsing the value as raw DER (for CDHash v2 `SEQUENCE`).
-fn build_apple_der_attribute(
-    oid: ObjectIdentifier,
-    value_der: &[u8],
-) -> Result<Attribute> {
+fn build_apple_der_attribute(oid: ObjectIdentifier, value_der: &[u8]) -> Result<Attribute> {
     use der::Decode;
-    let attr_value = Any::from_der(value_der)
-        .map_err(|e| signing_err("Failed to parse attribute DER", e))?;
+    let attr_value =
+        Any::from_der(value_der).map_err(|e| signing_err("Failed to parse attribute DER", e))?;
 
     let mut values = SetOfVec::new();
     values
@@ -338,8 +334,12 @@ pub fn estimate_cms_size(credentials: &SigningCredentials) -> usize {
 
     let signer_info_overhead = 100;
 
-    let total =
-        cms_overhead + signed_attrs_size + cert_size + chain_size + signature_size + signer_info_overhead;
+    let total = cms_overhead
+        + signed_attrs_size
+        + cert_size
+        + chain_size
+        + signature_size
+        + signer_info_overhead;
 
     crate::macho::writer::align_to(total + 2048, 4096)
 }
@@ -397,7 +397,9 @@ mod tests {
         assert_eq!(attr[0], 0x30);
         assert!(!attr.is_empty());
         let sha256_oid_bytes: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-        assert!(attr.windows(sha256_oid_bytes.len()).any(|w| w == sha256_oid_bytes));
+        assert!(attr
+            .windows(sha256_oid_bytes.len())
+            .any(|w| w == sha256_oid_bytes));
         assert!(attr.windows(sha256.len()).any(|w| w == sha256));
     }
 
@@ -420,7 +422,10 @@ mod tests {
         assert_eq!(attr.values.len(), 1);
 
         let value_der = attr.values.iter().next().unwrap().to_der().unwrap();
-        assert_eq!(value_der[0], 0x04, "CDHash v1 value tag must be OCTET STRING (0x04)");
+        assert_eq!(
+            value_der[0], 0x04,
+            "CDHash v1 value tag must be OCTET STRING (0x04)"
+        );
     }
 
     #[test]
@@ -433,11 +438,16 @@ mod tests {
         assert_eq!(attr.values.len(), 1);
 
         let value_der = attr.values.iter().next().unwrap().to_der().unwrap();
-        assert_eq!(value_der[0], 0x30, "CDHash v2 value tag must be SEQUENCE (0x30)");
+        assert_eq!(
+            value_der[0], 0x30,
+            "CDHash v2 value tag must be SEQUENCE (0x30)"
+        );
 
         let sha256_oid_bytes: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
         assert!(
-            value_der.windows(sha256_oid_bytes.len()).any(|w| w == sha256_oid_bytes),
+            value_der
+                .windows(sha256_oid_bytes.len())
+                .any(|w| w == sha256_oid_bytes),
             "SEQUENCE must contain SHA-256 OID"
         );
         assert!(
@@ -448,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_cdhash_v2_contains_hash_and_oid() {
-        use der::{SliceReader, Reader};
+        use der::{Reader, SliceReader};
 
         let hash = [0xCC; 32];
         let v2_der = build_cdhash_v2_attribute(&hash);
@@ -460,10 +470,20 @@ mod tests {
 
         let mut reader = SliceReader::new(body).unwrap();
         let oid: ObjectIdentifier = reader.decode().expect("first element must be an OID");
-        assert_eq!(oid.to_string(), "2.16.840.1.101.3.4.2.1", "OID must be SHA-256");
+        assert_eq!(
+            oid.to_string(),
+            "2.16.840.1.101.3.4.2.1",
+            "OID must be SHA-256"
+        );
 
-        let octet: der::asn1::OctetStringRef<'_> = reader.decode().expect("second element must be an OCTET STRING");
-        assert_eq!(octet.as_bytes(), &hash, "OCTET STRING must contain the exact 32-byte hash");
+        let octet: der::asn1::OctetStringRef<'_> = reader
+            .decode()
+            .expect("second element must be an OCTET STRING");
+        assert_eq!(
+            octet.as_bytes(),
+            &hash,
+            "OCTET STRING must contain the exact 32-byte hash"
+        );
     }
 
     #[test]
@@ -516,12 +536,10 @@ mod tests {
         let cdhash_sha256: [u8; 32] = [0xBB; 32];
 
         let cms_der =
-            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256)
-                .unwrap();
+            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
 
         let content_info = ContentInfo::from_der(&cms_der).unwrap();
-        let signed_data =
-            SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
+        let signed_data = SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
 
         // Detached signature: econtent must be None
         assert!(
@@ -560,10 +578,7 @@ mod tests {
             .as_ref()
             .expect("SignerInfo should have signed attributes");
 
-        let attr_oids: Vec<String> = signed_attrs
-            .iter()
-            .map(|a| a.oid.to_string())
-            .collect();
+        let attr_oids: Vec<String> = signed_attrs.iter().map(|a| a.oid.to_string()).collect();
 
         assert!(
             attr_oids.contains(&"1.2.840.113549.1.9.3".to_string()),
@@ -609,7 +624,12 @@ mod tests {
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
         let cert = CertificateBuilder::new(
-            Profile::Root, serial, validity, subject, pub_key, &ecdsa_key,
+            Profile::Root,
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &ecdsa_key,
         )
         .unwrap()
         .build::<p256::ecdsa::DerSignature>()
@@ -627,12 +647,10 @@ mod tests {
         let cdhash_sha256: [u8; 32] = [0xDD; 32];
 
         let cms_der =
-            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256)
-                .unwrap();
+            sign_code_directory(code_dir_data, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
 
         let content_info = ContentInfo::from_der(&cms_der).unwrap();
-        let signed_data =
-            SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
+        let signed_data = SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
 
         assert!(signed_data.encap_content_info.econtent.is_none());
         assert_eq!(signed_data.signer_infos.0.len(), 1);
@@ -652,13 +670,15 @@ mod tests {
         let code_dir = b"test code directory";
         let cdhash_sha1 = [0xAA; 20];
         let cdhash_sha256 = [0xBB; 32];
-        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
-            .unwrap();
+        let actual =
+            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
 
-        assert!(estimated >= actual.len(),
+        assert!(
+            estimated >= actual.len(),
             "Estimate {} must be >= actual CMS size {} for RSA 2048",
-            estimated, actual.len());
-
+            estimated,
+            actual.len()
+        );
     }
 
     #[test]
@@ -669,13 +689,15 @@ mod tests {
         let code_dir = b"test code directory";
         let cdhash_sha1 = [0xCC; 20];
         let cdhash_sha256 = [0xDD; 32];
-        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
-            .unwrap();
+        let actual =
+            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
 
-        assert!(estimated >= actual.len(),
+        assert!(
+            estimated >= actual.len(),
             "Estimate {} must be >= actual CMS size {} for ECDSA P-256",
-            estimated, actual.len());
-
+            estimated,
+            actual.len()
+        );
     }
 
     fn build_test_rsa_credentials(bits: usize) -> SigningCredentials {
@@ -698,10 +720,17 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &signing_key)
-            .unwrap()
-            .build::<rsa::pkcs1v15::Signature>()
-            .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
 
         SigningCredentials {
             certificate: cert,
@@ -792,12 +821,15 @@ mod tests {
         let code_dir = b"test code directory with chain";
         let cdhash_sha1 = [0xEE; 20];
         let cdhash_sha256 = [0xFF; 32];
-        let actual = sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256)
-            .unwrap();
+        let actual =
+            sign_code_directory(code_dir, &credentials, &cdhash_sha1, &cdhash_sha256).unwrap();
 
-        assert!(estimated >= actual.len(),
+        assert!(
+            estimated >= actual.len(),
             "Estimate {} must be >= actual CMS size {} for RSA 2048 with 2-cert chain",
-            estimated, actual.len());
+            estimated,
+            actual.len()
+        );
     }
 
     fn build_test_ecdsa_credentials() -> SigningCredentials {
@@ -820,10 +852,17 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_key_der = verifying_key.to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &ecdsa_key)
-            .unwrap()
-            .build::<p256::ecdsa::DerSignature>()
-            .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &ecdsa_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
 
         SigningCredentials {
             certificate: cert,

@@ -96,7 +96,10 @@ fn standard_rules() -> Dictionary {
     let mut locversion = Dictionary::new();
     locversion.insert("omit".to_string(), Value::Boolean(true));
     locversion.insert("weight".to_string(), Value::Real(1100.0));
-    rules.insert("^.*\\.lproj/locversion.plist$".to_string(), Value::Dictionary(locversion));
+    rules.insert(
+        "^.*\\.lproj/locversion.plist$".to_string(),
+        Value::Dictionary(locversion),
+    );
 
     // Base.lproj has higher weight
     let mut base_lproj = Dictionary::new();
@@ -128,7 +131,10 @@ fn standard_rules2() -> Dictionary {
     let mut ds_store = Dictionary::new();
     ds_store.insert("omit".to_string(), Value::Boolean(true));
     ds_store.insert("weight".to_string(), Value::Real(2000.0));
-    rules2.insert("^(.*/)?\\.DS_Store$".to_string(), Value::Dictionary(ds_store));
+    rules2.insert(
+        "^(.*/)?\\.DS_Store$".to_string(),
+        Value::Dictionary(ds_store),
+    );
 
     // .lproj directories are optional
     let mut lproj = Dictionary::new();
@@ -140,7 +146,10 @@ fn standard_rules2() -> Dictionary {
     let mut locversion = Dictionary::new();
     locversion.insert("omit".to_string(), Value::Boolean(true));
     locversion.insert("weight".to_string(), Value::Real(1100.0));
-    rules2.insert("^.*\\.lproj/locversion.plist$".to_string(), Value::Dictionary(locversion));
+    rules2.insert(
+        "^.*\\.lproj/locversion.plist$".to_string(),
+        Value::Dictionary(locversion),
+    );
 
     // Base.lproj has higher weight
     let mut base_lproj = Dictionary::new();
@@ -162,12 +171,18 @@ fn standard_rules2() -> Dictionary {
     // embedded.provisionprofile (note: different from mobileprovision)
     let mut provision = Dictionary::new();
     provision.insert("weight".to_string(), Value::Real(20.0));
-    rules2.insert("^embedded\\.provisionprofile$".to_string(), Value::Dictionary(provision));
+    rules2.insert(
+        "^embedded\\.provisionprofile$".to_string(),
+        Value::Dictionary(provision),
+    );
 
     // version.plist
     let mut version_plist = Dictionary::new();
     version_plist.insert("weight".to_string(), Value::Real(20.0));
-    rules2.insert("^version\\.plist$".to_string(), Value::Dictionary(version_plist));
+    rules2.insert(
+        "^version\\.plist$".to_string(),
+        Value::Dictionary(version_plist),
+    );
 
     rules2
 }
@@ -319,7 +334,14 @@ impl CodeResourcesBuilder {
         if self.should_exclude(&path) {
             return false;
         }
-        self.files.insert(path, FileEntry { sha1, sha256, symlink_target: None });
+        self.files.insert(
+            path,
+            FileEntry {
+                sha1,
+                sha256,
+                symlink_target: None,
+            },
+        );
         true
     }
 
@@ -447,8 +469,7 @@ impl CodeResourcesBuilder {
 
         // Serialize to XML plist
         let mut buf = Vec::new();
-        plist::to_writer_xml(&mut buf, &Value::Dictionary(root))
-            .map_err(Error::Plist)?;
+        plist::to_writer_xml(&mut buf, &Value::Dictionary(root)).map_err(Error::Plist)?;
 
         Ok(buf)
     }

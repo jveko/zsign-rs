@@ -27,12 +27,11 @@
 
 pub mod parser;
 
-pub use zsign_core::macho::writer::{
-    SignedSlice, align_to, embed_signature, embed_signature_fat,
-    calculate_signature_space, prepare_code_for_signing,
-    prepare_code_for_signing_slice,
-};
 pub use parser::{ArchSlice, MachOFile};
+pub use zsign_core::macho::writer::{
+    align_to, calculate_signature_space, embed_signature, embed_signature_fat,
+    prepare_code_for_signing, prepare_code_for_signing_slice, SignedSlice,
+};
 
 /// Write signed Mach-O to file (native-only).
 pub fn write_signed_macho(
@@ -70,7 +69,12 @@ pub fn sign_macho(
     code_resources: Option<&[u8]>,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho(
-        macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
+        macho.as_core(),
+        identifier,
+        entitlements,
+        credentials,
+        info_plist,
+        code_resources,
     )?)
 }
 
@@ -87,7 +91,12 @@ pub fn sign_macho_all_slices(
     code_resources: Option<&[u8]>,
 ) -> crate::Result<Vec<SignedSlice>> {
     Ok(zsign_core::macho::sign_macho_all_slices(
-        macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
+        macho.as_core(),
+        identifier,
+        entitlements,
+        credentials,
+        info_plist,
+        code_resources,
     )?)
 }
 
@@ -100,7 +109,11 @@ pub fn sign_macho_adhoc(
     code_resources: Option<&[u8]>,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho_adhoc(
-        macho.as_core(), identifier, entitlements, info_plist, code_resources,
+        macho.as_core(),
+        identifier,
+        entitlements,
+        info_plist,
+        code_resources,
     )?)
 }
 
@@ -115,7 +128,12 @@ pub fn sign_macho_sha256_only(
     code_resources: Option<&[u8]>,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_macho_sha256_only(
-        macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
+        macho.as_core(),
+        identifier,
+        entitlements,
+        credentials,
+        info_plist,
+        code_resources,
     )?)
 }
 
@@ -133,7 +151,12 @@ pub fn sign_any_macho(
     code_resources: Option<&[u8]>,
 ) -> crate::Result<Vec<u8>> {
     Ok(zsign_core::macho::sign_any_macho(
-        macho.as_core(), identifier, entitlements, credentials, info_plist, code_resources,
+        macho.as_core(),
+        identifier,
+        entitlements,
+        credentials,
+        info_plist,
+        code_resources,
     )?)
 }
 

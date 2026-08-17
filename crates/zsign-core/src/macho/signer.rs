@@ -28,8 +28,8 @@ use crate::codesign::constants::{
 };
 use crate::codesign::der::plist_to_der;
 use crate::codesign::superblob::{
-    build_der_entitlements_blob, build_entitlements_blob, build_requirements_blob_full,
-    build_adhoc_signature_blob, build_signature_blob, SuperBlobBuilder,
+    build_adhoc_signature_blob, build_der_entitlements_blob, build_entitlements_blob,
+    build_requirements_blob_full, build_signature_blob, SuperBlobBuilder,
 };
 use crate::crypto::cert::extract_subject_cn;
 use crate::crypto::cms;
@@ -40,7 +40,10 @@ use sha2::Sha256;
 
 use super::parser::{ArchSlice, MachOFile};
 use super::writer::SignedSlice;
-use super::writer::{align_to, calculate_signature_space, checked_u32, has_enough_signature_space, prepare_code_in_place, realloc_code_sign_space_with_metadata};
+use super::writer::{
+    align_to, calculate_signature_space, checked_u32, has_enough_signature_space,
+    prepare_code_in_place, realloc_code_sign_space_with_metadata,
+};
 
 /// Pre-computed signing inputs that are invariant across all slices of a binary.
 ///
@@ -79,10 +82,12 @@ impl SigningContext {
         let entitlements_blob = entitlements.map(build_entitlements_blob);
 
         let der_entitlements_blob: Option<Vec<u8>> = if is_executable {
-            entitlements.map(|ent| {
-                let der_data = plist_to_der(ent)?;
-                Ok::<_, crate::Error>(build_der_entitlements_blob(&der_data))
-            }).transpose()?
+            entitlements
+                .map(|ent| {
+                    let der_data = plist_to_der(ent)?;
+                    Ok::<_, crate::Error>(build_der_entitlements_blob(&der_data))
+                })
+                .transpose()?
         } else {
             None
         };
@@ -137,14 +142,34 @@ pub fn sign_any_macho(
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
-    let ent = if is_executable { entitlements } else { Some(EMPTY_ENTITLEMENTS) };
+    let is_executable = macho
+        .slices()
+        .first()
+        .map(|s| s.is_executable)
+        .unwrap_or(false);
+    let ent = if is_executable {
+        entitlements
+    } else {
+        Some(EMPTY_ENTITLEMENTS)
+    };
 
     if macho.slices().len() == 1 {
-        sign_macho(macho, identifier, ent, credentials, info_plist, code_resources)
+        sign_macho(
+            macho,
+            identifier,
+            ent,
+            credentials,
+            info_plist,
+            code_resources,
+        )
     } else {
         let signed_slices = sign_macho_all_slices(
-            macho, identifier, ent, credentials, info_plist, code_resources,
+            macho,
+            identifier,
+            ent,
+            credentials,
+            info_plist,
+            code_resources,
         )?;
         super::writer::embed_signature_fat(macho.data(), &signed_slices)
     }
@@ -208,11 +233,21 @@ pub fn sign_macho(
     let slice_data = macho.slice_data(slice);
 
     let ctx = SigningContext::new(
-        identifier, Some(credentials), entitlements, slice.is_executable, info_plist, code_resources,
+        identifier,
+        Some(credentials),
+        entitlements,
+        slice.is_executable,
+        info_plist,
+        code_resources,
     )?;
 
     let signed = sign_slice_complete(
-        slice_data, slice, identifier, &ctx, Some(credentials), false,
+        slice_data,
+        slice,
+        identifier,
+        &ctx,
+        Some(credentials),
+        false,
     )?;
 
     Ok(signed.signed_data)
@@ -231,17 +266,20 @@ pub fn sign_macho_adhoc(
 ) -> Result<Vec<u8>> {
     if macho.slices().len() != 1 {
         return Err(crate::Error::MachO(
-            "sign_macho_adhoc only supports single-arch Mach-O".into()
+            "sign_macho_adhoc only supports single-arch Mach-O".into(),
         ));
     }
     let slice = &macho.slices()[0];
     let slice_data = macho.slice_data(slice);
     let ctx = SigningContext::new(
-        identifier, None, entitlements, slice.is_executable, info_plist, code_resources,
+        identifier,
+        None,
+        entitlements,
+        slice.is_executable,
+        info_plist,
+        code_resources,
     )?;
-    let signed = sign_slice_complete(
-        slice_data, slice, identifier, &ctx, None, false,
-    )?;
+    let signed = sign_slice_complete(slice_data, slice, identifier, &ctx, None, false)?;
     Ok(signed.signed_data)
 }
 
@@ -257,17 +295,20 @@ pub fn sign_macho_sha256_only(
 ) -> Result<Vec<u8>> {
     if macho.slices().len() != 1 {
         return Err(crate::Error::MachO(
-            "sign_macho_sha256_only only supports single-arch Mach-O".into()
+            "sign_macho_sha256_only only supports single-arch Mach-O".into(),
         ));
     }
     let slice = &macho.slices()[0];
     let slice_data = macho.slice_data(slice);
     let ctx = SigningContext::new(
-        identifier, Some(credentials), entitlements, slice.is_executable, info_plist, code_resources,
+        identifier,
+        Some(credentials),
+        entitlements,
+        slice.is_executable,
+        info_plist,
+        code_resources,
     )?;
-    let signed = sign_slice_complete(
-        slice_data, slice, identifier, &ctx, Some(credentials), true,
-    )?;
+    let signed = sign_slice_complete(slice_data, slice, identifier, &ctx, Some(credentials), true)?;
     Ok(signed.signed_data)
 }
 
@@ -290,21 +331,36 @@ pub fn sign_macho_all_slices(
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
 ) -> Result<Vec<SignedSlice>> {
-    let is_executable = macho.slices().first().map(|s| s.is_executable).unwrap_or(false);
+    let is_executable = macho
+        .slices()
+        .first()
+        .map(|s| s.is_executable)
+        .unwrap_or(false);
     let ctx = SigningContext::new(
-        identifier, Some(credentials), entitlements, is_executable, info_plist, code_resources,
+        identifier,
+        Some(credentials),
+        entitlements,
+        is_executable,
+        info_plist,
+        code_resources,
     )?;
 
     use rayon::prelude::*;
 
-    let signed_slices: Vec<SignedSlice> = macho.slices()
+    let signed_slices: Vec<SignedSlice> = macho
+        .slices()
         .par_iter()
         .enumerate()
         .map(|(index, slice)| -> Result<SignedSlice> {
             let slice_data = macho.slice_data(slice);
 
             let mut signed = sign_slice_complete(
-                slice_data, slice, identifier, &ctx, Some(credentials), false,
+                slice_data,
+                slice,
+                identifier,
+                &ctx,
+                Some(credentials),
+                false,
             )?;
 
             signed.slice_index = index;
@@ -327,27 +383,40 @@ fn sign_slice_complete(
     let estimated_sig_size = compute_superblob_reserved_size(slice.code_length, identifier, ctx);
 
     // Step 2: Check if we need to reallocate space
-    let (mut buf, working_metadata, working_slice, preserve_original_size) = if !has_enough_signature_space(slice_data, slice.code_length, estimated_sig_size) {
-        let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(slice_data, &slice.metadata, slice.code_length)?;
+    let (mut buf, working_metadata, working_slice, preserve_original_size) =
+        if !has_enough_signature_space(slice_data, slice.code_length, estimated_sig_size) {
+            let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(
+                slice_data,
+                &slice.metadata,
+                slice.code_length,
+            )?;
 
-        let new_slice = ArchSlice {
-            offset: slice.offset,
-            size: reallocated.len(),
-            cpu_type: slice.cpu_type,
-            is_64: slice.is_64,
-            is_executable: slice.is_executable,
-            code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
-                code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
+            let new_slice = ArchSlice {
+                offset: slice.offset,
+                size: reallocated.len(),
+                cpu_type: slice.cpu_type,
+                is_64: slice.is_64,
+                is_executable: slice.is_executable,
+                code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
+                code_sig_size: Some(checked_u32(
+                    reallocated.len() - slice.code_length,
+                    "sig_size",
+                )?),
                 text_segment_size: slice.text_segment_size,
                 text_segment_base: slice.text_segment_base,
                 code_length: slice.code_length,
                 metadata: updated_metadata.clone(),
             };
 
-        (reallocated, updated_metadata, new_slice, false)
-    } else {
-        (slice_data.to_vec(), slice.metadata.clone(), slice.clone(), true)
-    };
+            (reallocated, updated_metadata, new_slice, false)
+        } else {
+            (
+                slice_data.to_vec(),
+                slice.metadata.clone(),
+                slice.clone(),
+                true,
+            )
+        };
 
     let target_binary_size = Some(buf.len());
 
@@ -358,7 +427,12 @@ fn sign_slice_complete(
     } else {
         estimated_sig_size
     };
-    let (sig_offset, _) = prepare_code_in_place(&mut buf, &working_metadata, working_slice.code_length, sig_space_size)?;
+    let (sig_offset, _) = prepare_code_in_place(
+        &mut buf,
+        &working_metadata,
+        working_slice.code_length,
+        sig_space_size,
+    )?;
 
     // Step 4: Hash code pages ONCE with both SHA-1 and SHA-256
     // buf now contains exactly the code bytes (code_length) with updated load commands
@@ -369,11 +443,21 @@ fn sign_slice_complete(
         Vec::new()
     } else {
         build_code_directory_from_hashes(
-            identifier, &buf, &working_slice, ctx, &dual_hashes.sha1, true,
+            identifier,
+            &buf,
+            &working_slice,
+            ctx,
+            &dual_hashes.sha1,
+            true,
         )
     };
     let cd_sha256 = build_code_directory_from_hashes(
-        identifier, &buf, &working_slice, ctx, &dual_hashes.sha256, false,
+        identifier,
+        &buf,
+        &working_slice,
+        ctx,
+        &dual_hashes.sha256,
+        false,
     );
 
     // Step 6: CMS sign ONCE (in sha256-only mode the SHA-1 cdhash is
@@ -402,7 +486,6 @@ fn sign_slice_complete(
         builder = builder.code_directory_sha1(cd_sha1);
     }
 
-
     if let Some(ref ent_blob) = ctx.entitlements_blob {
         builder = builder.entitlements(ent_blob.clone());
     }
@@ -418,37 +501,64 @@ fn sign_slice_complete(
         let padded_sig_size = align_to(final_sig.len() + 256, PAGE_SIZE);
 
         // Re-prepare from the original slice data
-        let (mut buf2, working_metadata2, working_slice2) = if !has_enough_signature_space(slice_data, slice.code_length, padded_sig_size) {
-            let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(slice_data, &slice.metadata, slice.code_length)?;
-            let new_slice = ArchSlice {
-                offset: slice.offset,
-                size: reallocated.len(),
-                cpu_type: slice.cpu_type,
-                is_64: slice.is_64,
-                is_executable: slice.is_executable,
-                code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
-                code_sig_size: Some(checked_u32(reallocated.len() - slice.code_length, "sig_size")?),
-                text_segment_size: slice.text_segment_size,
-                text_segment_base: slice.text_segment_base,
-                code_length: slice.code_length,
-                metadata: updated_metadata.clone(),
+        let (mut buf2, working_metadata2, working_slice2) =
+            if !has_enough_signature_space(slice_data, slice.code_length, padded_sig_size) {
+                let (reallocated, updated_metadata) = realloc_code_sign_space_with_metadata(
+                    slice_data,
+                    &slice.metadata,
+                    slice.code_length,
+                )?;
+                let new_slice = ArchSlice {
+                    offset: slice.offset,
+                    size: reallocated.len(),
+                    cpu_type: slice.cpu_type,
+                    is_64: slice.is_64,
+                    is_executable: slice.is_executable,
+                    code_sig_offset: Some(checked_u32(slice.code_length, "code_length")?),
+                    code_sig_size: Some(checked_u32(
+                        reallocated.len() - slice.code_length,
+                        "sig_size",
+                    )?),
+                    text_segment_size: slice.text_segment_size,
+                    text_segment_base: slice.text_segment_base,
+                    code_length: slice.code_length,
+                    metadata: updated_metadata.clone(),
+                };
+                (reallocated, updated_metadata, new_slice)
+            } else {
+                (slice_data.to_vec(), slice.metadata.clone(), slice.clone())
             };
-            (reallocated, updated_metadata, new_slice)
-        } else {
-            (slice_data.to_vec(), slice.metadata.clone(), slice.clone())
-        };
 
         let target2 = Some(buf2.len());
-        let (sig_offset2, _) = prepare_code_in_place(&mut buf2, &working_metadata2, working_slice2.code_length, padded_sig_size)?;
+        let (sig_offset2, _) = prepare_code_in_place(
+            &mut buf2,
+            &working_metadata2,
+            working_slice2.code_length,
+            padded_sig_size,
+        )?;
 
         // Re-hash and re-sign with new offsets
         let dual2 = hash_code_pages_dual(&buf2);
         let cd_sha1_2 = if sha256_only {
             Vec::new()
         } else {
-            build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha1, true)
+            build_code_directory_from_hashes(
+                identifier,
+                &buf2,
+                &working_slice2,
+                ctx,
+                &dual2.sha1,
+                true,
+            )
         };
-        let cd_sha256_2 = build_code_directory_from_hashes(identifier, &buf2, &working_slice2, ctx, &dual2.sha256, false);
+        let cd_sha256_2 = build_code_directory_from_hashes(
+            identifier,
+            &buf2,
+            &working_slice2,
+            ctx,
+            &dual2.sha256,
+            false,
+        );
 
         let cdhash_sha1_2: [u8; 20] = if cd_sha1_2.is_empty() {
             [0; 20]
@@ -459,7 +569,8 @@ fn sign_slice_complete(
 
         let sig_blob2 = match credentials {
             Some(creds) => {
-                let cms_data2 = cms::sign_code_directory(&cd_sha1_2, creds, &cdhash_sha1_2, &cdhash_sha256_2)?;
+                let cms_data2 =
+                    cms::sign_code_directory(&cd_sha1_2, creds, &cdhash_sha1_2, &cdhash_sha256_2)?;
                 build_signature_blob(&cms_data2)
             }
             None => build_adhoc_signature_blob(),
@@ -483,7 +594,8 @@ fn sign_slice_complete(
         if final_sig2.len() > padded_sig_size {
             return Err(crate::Error::MachO(format!(
                 "signature exceeded reserved size after retry: reserved={}, actual={}",
-                padded_sig_size, final_sig2.len()
+                padded_sig_size,
+                final_sig2.len()
             )));
         }
 
@@ -523,7 +635,9 @@ fn embed_signature_into_prepared(
     original_binary_size: Option<usize>,
 ) -> Vec<u8> {
     let min_size = sig_offset + signature.len();
-    let final_size = original_binary_size.map(|orig| orig.max(min_size)).unwrap_or(min_size);
+    let final_size = original_binary_size
+        .map(|orig| orig.max(min_size))
+        .unwrap_or(min_size);
     let mut output = Vec::with_capacity(final_size);
 
     output.extend_from_slice(prepared_code);
@@ -580,7 +694,11 @@ fn compute_superblob_reserved_size(
     let cd_sha256 = 88 + id_len + team_len + special_slots * CS_SHA256_LEN + pages * CS_SHA256_LEN;
     let req_size = ctx.requirements.len();
     let ent_size = ctx.entitlements_blob.as_ref().map(|b| b.len()).unwrap_or(0);
-    let der_ent_size = ctx.der_entitlements_blob.as_ref().map(|b| b.len()).unwrap_or(0);
+    let der_ent_size = ctx
+        .der_entitlements_blob
+        .as_ref()
+        .map(|b| b.len())
+        .unwrap_or(0);
     let cms_reserve = ctx.cms_reserve;
     let header = 12 + 7 * 8;
 
@@ -607,11 +725,34 @@ fn build_code_directory_from_hashes(
     }
 
     let hashes = &ctx.hashes;
-    let requirements_hash: &[u8] = if is_sha1 { &hashes.requirements.sha1 } else { &hashes.requirements.sha256 };
-    let info_hash: Option<&[u8]> = if is_sha1 { hashes.info.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.info.as_ref().map(|h| h.sha256.as_slice()) };
-    let resources_hash: Option<&[u8]> = if is_sha1 { hashes.resources.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.resources.as_ref().map(|h| h.sha256.as_slice()) };
-    let entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.entitlements.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.entitlements.as_ref().map(|h| h.sha256.as_slice()) };
-    let der_entitlements_hash: Option<&[u8]> = if is_sha1 { hashes.der_entitlements.as_ref().map(|h| h.sha1.as_slice()) } else { hashes.der_entitlements.as_ref().map(|h| h.sha256.as_slice()) };
+    let requirements_hash: &[u8] = if is_sha1 {
+        &hashes.requirements.sha1
+    } else {
+        &hashes.requirements.sha256
+    };
+    let info_hash: Option<&[u8]> = if is_sha1 {
+        hashes.info.as_ref().map(|h| h.sha1.as_slice())
+    } else {
+        hashes.info.as_ref().map(|h| h.sha256.as_slice())
+    };
+    let resources_hash: Option<&[u8]> = if is_sha1 {
+        hashes.resources.as_ref().map(|h| h.sha1.as_slice())
+    } else {
+        hashes.resources.as_ref().map(|h| h.sha256.as_slice())
+    };
+    let entitlements_hash: Option<&[u8]> = if is_sha1 {
+        hashes.entitlements.as_ref().map(|h| h.sha1.as_slice())
+    } else {
+        hashes.entitlements.as_ref().map(|h| h.sha256.as_slice())
+    };
+    let der_entitlements_hash: Option<&[u8]> = if is_sha1 {
+        hashes.der_entitlements.as_ref().map(|h| h.sha1.as_slice())
+    } else {
+        hashes
+            .der_entitlements
+            .as_ref()
+            .map(|h| h.sha256.as_slice())
+    };
 
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
@@ -837,14 +978,19 @@ mod tests {
     #[test]
     fn test_sha256_only_signature_omits_sha1_code_directory() {
         use crate::codesign::constants::{
-            CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
-            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE,
+            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
         };
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
         let credentials = test_credentials();
         let signed = sign_macho_sha256_only(
-            &macho, "com.zsign.sha256only", None, &credentials, None, None,
+            &macho,
+            "com.zsign.sha256only",
+            None,
+            &credentials,
+            None,
+            None,
         )
         .expect("sha256-only signing must succeed");
 
@@ -882,8 +1028,8 @@ mod tests {
     #[test]
     fn test_adhoc_signature_has_cs_adhoc_flag_and_empty_wrapper() {
         use crate::codesign::constants::{
-            CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
-            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE,
+            CSMAGIC_BLOBWRAPPER, CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
         };
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
@@ -920,8 +1066,14 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(saw_adhoc_flag, "code directories must carry the CS_ADHOC flag");
-        assert!(saw_empty_wrapper, "signature slot must be the empty ad-hoc wrapper");
+        assert!(
+            saw_adhoc_flag,
+            "code directories must carry the CS_ADHOC flag"
+        );
+        assert!(
+            saw_empty_wrapper,
+            "signature slot must be the empty ad-hoc wrapper"
+        );
     }
 
     #[test]
@@ -1004,8 +1156,13 @@ mod tests {
                 }
                 crate::codesign::constants::CSSLOT_CODEDIRECTORY
                 | crate::codesign::constants::CSSLOT_ALTERNATE_CODEDIRECTORIES => {
-                    hash_size_seen =
-                        verify_code_directory(entry, code, identifier, &credentials, hash_size_seen);
+                    hash_size_seen = verify_code_directory(
+                        entry,
+                        code,
+                        identifier,
+                        &credentials,
+                        hash_size_seen,
+                    );
                 }
                 _ => {}
             }
@@ -1034,7 +1191,11 @@ mod tests {
     ) -> usize {
         use crate::codesign::constants::CSMAGIC_CODEDIRECTORY;
 
-        assert_eq!(read_u32(cd, 0), CSMAGIC_CODEDIRECTORY, "code directory magic");
+        assert_eq!(
+            read_u32(cd, 0),
+            CSMAGIC_CODEDIRECTORY,
+            "code directory magic"
+        );
         let version = read_u32(cd, 8);
         assert!(version >= 0x20400, "code directory must be v0x20400+");
         let hash_offset = read_u32(cd, 16) as usize;
@@ -1049,7 +1210,8 @@ mod tests {
 
         assert_eq!(page_size_log2, 12, "page size must be 4096");
         assert_eq!(
-            code_limit, code.len(),
+            code_limit,
+            code.len(),
             "codeLimit must cover exactly the unsigned code region"
         );
         assert_eq!(
@@ -1059,7 +1221,10 @@ mod tests {
         );
 
         let hash_type_expected: u8 = if hash_size == 20 { 1 } else { 2 };
-        assert_eq!(hash_type, hash_type_expected, "hash type must match hash size");
+        assert_eq!(
+            hash_type, hash_type_expected,
+            "hash type must match hash size"
+        );
 
         let ident_end = cd[ident_offset..]
             .iter()

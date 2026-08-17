@@ -10,13 +10,13 @@
 //! All cryptographic operations use pure-Rust RustCrypto implementations,
 //! making this crate fully compatible with `wasm32-unknown-unknown`.
 
+use sha1::{Digest as _, Sha1};
+use sha2::Sha256;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use zsign_core::bundle::CodeResourcesBuilder;
 use zsign_core::crypto::SigningCredentials;
 use zsign_core::provisioning::extract_entitlements_from_profile;
-use sha1::{Digest as _, Sha1};
-use sha2::Sha256;
 
 /// In-progress streaming hash state for a single file.
 struct StreamingHashState {
@@ -34,10 +34,14 @@ pub struct MachOInfo {
 #[wasm_bindgen]
 impl MachOInfo {
     #[wasm_bindgen(getter)]
-    pub fn is_fat(&self) -> bool { self.is_fat }
+    pub fn is_fat(&self) -> bool {
+        self.is_fat
+    }
 
     #[wasm_bindgen(getter)]
-    pub fn slices_count(&self) -> usize { self.slices_count }
+    pub fn slices_count(&self) -> usize {
+        self.slices_count
+    }
 }
 
 #[wasm_bindgen]
@@ -61,8 +65,9 @@ impl WasmSigner {
             .map_err(|e| JsError::new(&e.to_string()))?;
 
         let entitlements = match profile_bytes.as_deref() {
-            Some(data) => extract_entitlements_from_profile(data)
-                .map_err(|e| JsError::new(&e.to_string()))?,
+            Some(data) => {
+                extract_entitlements_from_profile(data).map_err(|e| JsError::new(&e.to_string()))?
+            }
             None => None,
         };
 
@@ -94,7 +99,8 @@ impl WasmSigner {
 
     /// Start or continue streaming hash for a large file.
     pub fn hash_file_chunk(&mut self, relative_path: &str, chunk: &[u8], is_final: bool) {
-        let state = self.streaming_hashes
+        let state = self
+            .streaming_hashes
             .entry(relative_path.to_string())
             .or_insert_with(|| StreamingHashState {
                 sha1: Sha1::new(),
@@ -125,7 +131,8 @@ impl WasmSigner {
     pub fn add_symlink(&mut self, relative_path: &str, target: &str) -> bool {
         let target_bytes = target.as_bytes();
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(target_bytes);
-        self.resource_builder.add_symlink(relative_path, target, sha1, sha256)
+        self.resource_builder
+            .add_symlink(relative_path, target, sha1, sha256)
     }
 
     /// Build and return the CodeResources plist bytes.
@@ -134,7 +141,8 @@ impl WasmSigner {
             let pending: Vec<_> = self.streaming_hashes.keys().collect();
             return Err(JsError::new(&format!(
                 "Cannot build CodeResources: {} unfinished streaming hashes: {:?}",
-                pending.len(), pending
+                pending.len(),
+                pending
             )));
         }
         self.resource_builder
@@ -150,14 +158,13 @@ impl WasmSigner {
 
     /// Extract entitlements from a provisioning profile.
     pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsError> {
-        extract_entitlements_from_profile(profile_data)
-            .map_err(|e| JsError::new(&e.to_string()))
+        extract_entitlements_from_profile(profile_data).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Parse a Mach-O binary and return metadata.
     pub fn parse_macho(data: Vec<u8>) -> Result<MachOInfo, JsError> {
-        let macho = zsign_core::macho::MachOFile::parse(data)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let macho =
+            zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
         Ok(MachOInfo {
             is_fat: macho.is_fat(),
             slices_count: macho.slices().len(),
@@ -177,8 +184,8 @@ impl WasmSigner {
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, JsError> {
-        let macho = zsign_core::macho::MachOFile::parse(data)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let macho =
+            zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
 
         zsign_core::macho::sign_any_macho(
             &macho,
@@ -211,14 +218,17 @@ impl WasmSigner {
         let plist_value: plist::Value = plist::from_bytes(data)
             .map_err(|e| JsError::new(&format!("Failed to parse Info.plist: {}", e)))?;
 
-        let dict = plist_value.as_dictionary()
+        let dict = plist_value
+            .as_dictionary()
             .ok_or_else(|| JsError::new("Info.plist is not a dictionary"))?;
 
-        let bundle_id = dict.get("CFBundleIdentifier")
+        let bundle_id = dict
+            .get("CFBundleIdentifier")
             .and_then(|v| v.as_string())
             .unwrap_or("");
 
-        let executable = dict.get("CFBundleExecutable")
+        let executable = dict
+            .get("CFBundleExecutable")
             .and_then(|v| v.as_string())
             .unwrap_or("");
 

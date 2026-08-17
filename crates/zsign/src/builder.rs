@@ -405,7 +405,12 @@ impl ZSign {
         }
 
         match output_ipa {
-            Some(ipa) if ipa.extension().map(|e| e.eq_ignore_ascii_case("ipa")).unwrap_or(false) => {
+            Some(ipa)
+                if ipa
+                    .extension()
+                    .map(|e| e.eq_ignore_ascii_case("ipa"))
+                    .unwrap_or(false) =>
+            {
                 signer.sign_folder_to_ipa(&bundle_path, ipa)?
             }
             Some(other) => {
@@ -545,11 +550,17 @@ mod tests {
             "com.zsign.changed"
         );
         assert_eq!(
-            dict.get("CFBundleDisplayName").unwrap().as_string().unwrap(),
+            dict.get("CFBundleDisplayName")
+                .unwrap()
+                .as_string()
+                .unwrap(),
             "Renamed"
         );
         assert_eq!(
-            dict.get("CFBundleShortVersionString").unwrap().as_string().unwrap(),
+            dict.get("CFBundleShortVersionString")
+                .unwrap()
+                .as_string()
+                .unwrap(),
             "2.0"
         );
 

@@ -11,9 +11,12 @@ pub mod signer;
 pub mod writer;
 
 pub use parser::{ArchSlice, MachOFile, MachOMetadata};
+pub use signer::{
+    sign_any_macho, sign_macho, sign_macho_adhoc, sign_macho_all_slices, sign_macho_sha256_only,
+    EMPTY_ENTITLEMENTS,
+};
 pub use writer::SignedSlice;
-pub use signer::{sign_macho, sign_macho_all_slices, sign_macho_sha256_only, sign_macho_adhoc, sign_any_macho, EMPTY_ENTITLEMENTS};
 pub use writer::{
-    align_to, embed_signature, embed_signature_fat, calculate_signature_space,
+    align_to, calculate_signature_space, embed_signature, embed_signature_fat,
     prepare_code_for_signing, prepare_code_for_signing_slice,
 };

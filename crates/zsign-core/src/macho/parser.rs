@@ -120,8 +120,8 @@ impl MachOFile {
     /// ```
     pub fn parse(data: Vec<u8>) -> Result<Self> {
         let bytes = &data[..];
-        let mach = Mach::parse(bytes)
-            .map_err(|e| Error::MachO(format!("Failed to parse: {}", e)))?;
+        let mach =
+            Mach::parse(bytes).map_err(|e| Error::MachO(format!("Failed to parse: {}", e)))?;
 
         let (is_fat, slices) = match mach {
             Mach::Binary(macho) => {
@@ -134,10 +134,17 @@ impl MachOFile {
                     let arch = arch.map_err(|e| Error::MachO(format!("Fat arch {}: {}", i, e)))?;
                     let offset = arch.offset as usize;
                     let size = arch.size as usize;
-                    let end = offset.checked_add(size)
+                    let end = offset
+                        .checked_add(size)
                         .ok_or_else(|| Error::MachO(format!("FAT slice {}: offset overflow", i)))?;
                     if end > bytes.len() {
-                        return Err(Error::MachO(format!("FAT slice {}: extends beyond file (offset={}, size={}, file_len={})", i, offset, size, bytes.len())));
+                        return Err(Error::MachO(format!(
+                            "FAT slice {}: extends beyond file (offset={}, size={}, file_len={})",
+                            i,
+                            offset,
+                            size,
+                            bytes.len()
+                        )));
                     }
                     let slice_data = &bytes[offset..end];
 
@@ -153,10 +160,19 @@ impl MachOFile {
             }
         };
 
-        Ok(Self { data, is_fat, slices })
+        Ok(Self {
+            data,
+            is_fat,
+            slices,
+        })
     }
 
-    fn parse_single(data: &[u8], macho: &MachO, base_offset: usize, declared_size: usize) -> Result<ArchSlice> {
+    fn parse_single(
+        data: &[u8],
+        macho: &MachO,
+        base_offset: usize,
+        declared_size: usize,
+    ) -> Result<ArchSlice> {
         let is_executable = macho.header.filetype == MH_EXECUTE;
         let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
         let cpu_type = macho.header.cputype;
@@ -189,7 +205,8 @@ impl MachOFile {
                         text_segment_base = seg.vmaddr;
                     }
                     if seg.segname.starts_with(b"__LINKEDIT") {
-                        meta_linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
+                        meta_linkedit_cmd =
+                            Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
                     }
                     if seg.fileoff > 0 && seg.fileoff < first_segment_offset {
                         first_segment_offset = seg.fileoff;
@@ -210,7 +227,8 @@ impl MachOFile {
 
         // Validate code signature bounds
         if let (Some(dataoff), Some(datasize)) = (code_sig_offset, code_sig_size) {
-            let sig_end = (dataoff as usize).checked_add(datasize as usize)
+            let sig_end = (dataoff as usize)
+                .checked_add(datasize as usize)
                 .ok_or_else(|| Error::MachO("LC_CODE_SIGNATURE: offset + size overflow".into()))?;
             if sig_end > declared_size {
                 return Err(Error::MachO(format!(
@@ -222,7 +240,8 @@ impl MachOFile {
 
         // Validate __LINKEDIT bounds
         if let Some((_, fileoff, _, filesize)) = meta_linkedit_cmd {
-            let linkedit_end = (fileoff as usize).checked_add(filesize as usize)
+            let linkedit_end = (fileoff as usize)
+                .checked_add(filesize as usize)
                 .ok_or_else(|| Error::MachO("__LINKEDIT: fileoff + filesize overflow".into()))?;
             if linkedit_end > declared_size {
                 return Err(Error::MachO(format!(
@@ -246,25 +265,34 @@ impl MachOFile {
         let slice_data = if base_offset == 0 {
             data
         } else {
-            let end = macho.load_commands.iter()
-                .filter_map(|lc| {
-                    match &lc.command {
-                        CommandVariant::Segment64(seg) => {
-                            seg.fileoff.checked_add(seg.filesize).map(|v| v as usize)
-                        }
-                        CommandVariant::Segment32(seg) => {
-                            (seg.fileoff as u64).checked_add(seg.filesize as u64).map(|v| v as usize)
-                        }
-                        _ => None
+            let end = macho
+                .load_commands
+                .iter()
+                .filter_map(|lc| match &lc.command {
+                    CommandVariant::Segment64(seg) => {
+                        seg.fileoff.checked_add(seg.filesize).map(|v| v as usize)
                     }
+                    CommandVariant::Segment32(seg) => (seg.fileoff as u64)
+                        .checked_add(seg.filesize as u64)
+                        .map(|v| v as usize),
+                    _ => None,
                 })
                 .max()
                 .unwrap_or(declared_size)
                 .min(declared_size);
-            let slice_end = base_offset.checked_add(end)
-                .ok_or_else(|| Error::MachO(format!("parse_single: offset {} + size {} overflow", base_offset, end)))?;
+            let slice_end = base_offset.checked_add(end).ok_or_else(|| {
+                Error::MachO(format!(
+                    "parse_single: offset {} + size {} overflow",
+                    base_offset, end
+                ))
+            })?;
             if slice_end > data.len() {
-                return Err(Error::MachO(format!("parse_single: slice extends beyond data (offset={}, size={}, data_len={})", base_offset, end, data.len())));
+                return Err(Error::MachO(format!(
+                    "parse_single: slice extends beyond data (offset={}, size={}, data_len={})",
+                    base_offset,
+                    end,
+                    data.len()
+                )));
             }
             &data[base_offset..slice_end]
         };

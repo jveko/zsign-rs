@@ -127,11 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = cli.force; // accepted for compatibility; no signing cache is kept
 
-    let ext = cli
-        .input
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = cli.input.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext.to_lowercase().as_str() {
         "ipa" => {

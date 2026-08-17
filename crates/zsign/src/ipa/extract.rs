@@ -27,9 +27,9 @@
 use crate::{Error, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::borrow::Cow;
 use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,7 +62,11 @@ fn validate_output_path(root: &Path, path: &Path) -> Result<()> {
     let relative = path.strip_prefix(root).map_err(|_| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Path {} is not under root {}", path.display(), root.display()),
+            format!(
+                "Path {} is not under root {}",
+                path.display(),
+                root.display()
+            ),
         ))
     })?;
 
@@ -152,7 +156,10 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
     if dest_metadata.file_type().is_symlink() {
         return Err(Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Extraction destination is a symlink: {}", dest_dir.display()),
+            format!(
+                "Extraction destination is a symlink: {}",
+                dest_dir.display()
+            ),
         )));
     }
 
@@ -381,7 +388,8 @@ mod tests {
         zip.add_directory("Payload/Test.app/", options).unwrap();
 
         // Create a minimal Info.plist inside the app
-        zip.start_file("Payload/Test.app/Info.plist", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
         zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
             .unwrap();
 
@@ -463,45 +471,63 @@ mod tests {
     fn test_extract_ipa_with_symlinks() {
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = temp_dir.path().join("symlink_test.ipa");
-        
+
         // Create IPA with symlinks
         let file = File::create(&ipa_path).unwrap();
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default();
-        
+
         // Add directories
         zip.add_directory("Payload/", options).unwrap();
         zip.add_directory("Payload/Test.app/", options).unwrap();
-        zip.add_directory("Payload/Test.app/Frameworks/", options).unwrap();
-        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/", options).unwrap();
-        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/Versions/", options).unwrap();
-        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/Versions/A/", options).unwrap();
-        
+        zip.add_directory("Payload/Test.app/Frameworks/", options)
+            .unwrap();
+        zip.add_directory("Payload/Test.app/Frameworks/Test.framework/", options)
+            .unwrap();
+        zip.add_directory(
+            "Payload/Test.app/Frameworks/Test.framework/Versions/",
+            options,
+        )
+        .unwrap();
+        zip.add_directory(
+            "Payload/Test.app/Frameworks/Test.framework/Versions/A/",
+            options,
+        )
+        .unwrap();
+
         // Real file
-        zip.start_file("Payload/Test.app/Frameworks/Test.framework/Versions/A/Test", options).unwrap();
+        zip.start_file(
+            "Payload/Test.app/Frameworks/Test.framework/Versions/A/Test",
+            options,
+        )
+        .unwrap();
         zip.write_all(b"binary content").unwrap();
-        
+
         // Symlink: Versions/Current -> A (use add_symlink to properly set file type)
         zip.add_symlink(
             "Payload/Test.app/Frameworks/Test.framework/Versions/Current",
             "A",
             options,
-        ).unwrap();
-        
-        zip.start_file("Payload/Test.app/Info.plist", options).unwrap();
-        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>").unwrap();
-        
+        )
+        .unwrap();
+
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+
         zip.finish().unwrap();
-        
+
         // Extract and verify
         let extract_dir = temp_dir.path().join("extracted");
         let result = extract_ipa(&ipa_path, &extract_dir);
         assert!(result.is_ok(), "Extraction failed: {:?}", result.err());
-        
+
         // Check if symlink was preserved
-        let symlink_path = extract_dir.join("Payload/Test.app/Frameworks/Test.framework/Versions/Current");
+        let symlink_path =
+            extract_dir.join("Payload/Test.app/Frameworks/Test.framework/Versions/Current");
         let metadata = std::fs::symlink_metadata(&symlink_path);
-        
+
         if let Ok(meta) = metadata {
             assert!(meta.file_type().is_symlink(), "Current should be a symlink");
             let target = std::fs::read_link(&symlink_path).unwrap();
@@ -532,17 +558,14 @@ mod tests {
         zip.add_directory("Payload/", options).unwrap();
         zip.add_directory("Payload/Evil.app/", options).unwrap();
 
-        zip.start_file("Payload/Evil.app/Info.plist", options).unwrap();
+        zip.start_file("Payload/Evil.app/Info.plist", options)
+            .unwrap();
         zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
             .unwrap();
 
         // Malicious symlink pointing outside extraction dir
-        zip.add_symlink(
-            "Payload/Evil.app/escape",
-            "../../../etc/passwd",
-            options,
-        )
-        .unwrap();
+        zip.add_symlink("Payload/Evil.app/escape", "../../../etc/passwd", options)
+            .unwrap();
 
         zip.finish().unwrap();
 
@@ -581,6 +604,9 @@ mod tests {
         std::os::unix::fs::symlink(&evil_dir, extract_dir.join("Payload")).unwrap();
 
         let result = extract_ipa(&ipa_path, &extract_dir);
-        assert!(result.is_err(), "Should reject pre-existing symlink in extraction path");
+        assert!(
+            result.is_err(),
+            "Should reject pre-existing symlink in extraction path"
+        );
     }
 }

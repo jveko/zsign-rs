@@ -17,8 +17,8 @@ use crate::{Error, Result};
 use goblin::mach::fat::FatArch;
 use goblin::mach::header::{MH_CIGAM_64, MH_MAGIC_64};
 use goblin::mach::load_command::{
-    CommandVariant, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_SEGMENT, LC_SEGMENT_64,
-    LinkeditDataCommand, SegmentCommand64,
+    CommandVariant, LinkeditDataCommand, SegmentCommand64, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB,
+    LC_SEGMENT, LC_SEGMENT_64,
 };
 use goblin::mach::{Mach, MachO, MultiArch};
 
@@ -75,9 +75,9 @@ pub fn realloc_code_sign_space(data: &[u8], code_length: usize) -> Result<Vec<u8
 
     match mach {
         Mach::Binary(macho) => realloc_code_sign_space_single(data, &macho, code_length),
-        Mach::Fat(_) => {
-            Err(Error::MachO("Use realloc_code_sign_space_slice for FAT binaries".into()))
-        }
+        Mach::Fat(_) => Err(Error::MachO(
+            "Use realloc_code_sign_space_slice for FAT binaries".into(),
+        )),
     }
 }
 
@@ -128,10 +128,8 @@ fn realloc_code_sign_space_single(
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) => {
-                if seg.segname.starts_with(b"__LINKEDIT") {
-                    linkedit_cmd = Some((lc.offset, *seg));
-                }
+            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, *seg));
             }
             _ => {}
         }
@@ -160,7 +158,12 @@ fn realloc_code_sign_space_single(
     let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
 
     if let Some((offset, _)) = code_sig_cmd {
-        write_u32(&mut output, offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
+        write_u32(
+            &mut output,
+            offset + 8,
+            checked_u32(code_length, "code_length")?,
+            is_big_endian,
+        )?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
     } else {
         let first_segment_offset = find_first_segment_offset(macho);
@@ -179,15 +182,40 @@ fn realloc_code_sign_space_single(
             }
         }
 
-        write_u32(&mut output, max_load_cmd_end, LC_CODE_SIGNATURE, is_big_endian)?;
-        write_u32(&mut output, max_load_cmd_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
-        write_u32(&mut output, max_load_cmd_end + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
-        write_u32(&mut output, max_load_cmd_end + 12, sig_datasize, is_big_endian)?;
+        write_u32(
+            &mut output,
+            max_load_cmd_end,
+            LC_CODE_SIGNATURE,
+            is_big_endian,
+        )?;
+        write_u32(
+            &mut output,
+            max_load_cmd_end + 4,
+            LINKEDIT_DATA_COMMAND_SIZE,
+            is_big_endian,
+        )?;
+        write_u32(
+            &mut output,
+            max_load_cmd_end + 8,
+            checked_u32(code_length, "code_length")?,
+            is_big_endian,
+        )?;
+        write_u32(
+            &mut output,
+            max_load_cmd_end + 12,
+            sig_datasize,
+            is_big_endian,
+        )?;
 
         let current_ncmds = read_u32(&output, 16, is_big_endian)?;
         let current_sizeofcmds = read_u32(&output, 20, is_big_endian)?;
         write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
-        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+        write_u32(
+            &mut output,
+            20,
+            current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE,
+            is_big_endian,
+        )?;
     }
 
     output.resize(new_length, 0);
@@ -226,7 +254,7 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
             let offset = first_arch.offset as usize;
             let size = first_arch.size as usize;
             let slice_data = &data[offset..offset + size];
-            
+
             let first_macho = MachO::parse(slice_data, 0)
                 .map_err(|e| Error::MachO(format!("Failed to parse first slice: {}", e)))?;
 
@@ -281,7 +309,7 @@ fn embed_fat_from_signed_slices(
     }
 
     let mut slice_data_vec: Vec<Vec<u8>> = Vec::with_capacity(arches.len());
-    
+
     for (i, arch) in arches.iter().enumerate() {
         if let Some(signed) = signed_slices.iter().find(|s| s.slice_index == i) {
             slice_data_vec.push(signed.signed_data.clone());
@@ -334,9 +362,7 @@ fn write_u32_be(data: &mut [u8], offset: usize, value: u32) {
 fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Result<Vec<u8>> {
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
     if !is_64 {
-        return Err(Error::MachO(
-            "32-bit Mach-O binaries not supported".into(),
-        ));
+        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
     }
 
     let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
@@ -353,10 +379,8 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) => {
-                if seg.segname.starts_with(b"__LINKEDIT") {
-                    linkedit_cmd = Some((lc.offset, *seg));
-                }
+            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, *seg));
             }
             _ => {}
         }
@@ -381,7 +405,12 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
     output.extend_from_slice(signature);
 
     if let Some((offset, _)) = code_sig_cmd {
-        update_linkedit_data_command(&mut output, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
+        update_linkedit_data_command(
+            &mut output,
+            offset,
+            checked_u32(sig_offset, "sig_offset")?,
+            sig_size,
+        )?;
     } else {
         add_code_signature_command(
             &mut output,
@@ -516,7 +545,9 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
     const DEFAULT_FIRST_SEGMENT_OFFSET: usize = 4096;
 
     if input.len() < HEADER_SIZE {
-        return Err(Error::MachO("binary too short for a 64-bit Mach-O header".into()));
+        return Err(Error::MachO(
+            "binary too short for a 64-bit Mach-O header".into(),
+        ));
     }
 
     let magic = read_u32(input, 0, false)?;
@@ -537,17 +568,22 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
         let cmd = read_u32(input, offset, is_big_endian)?;
         let cmdsize = read_u32(input, offset + 4, is_big_endian)? as usize;
         if cmdsize < 8 {
-            return Err(Error::MachO(
-                format!("invalid load command cmdsize {} at offset {}", cmdsize, offset),
-            ));
+            return Err(Error::MachO(format!(
+                "invalid load command cmdsize {} at offset {}",
+                cmdsize, offset
+            )));
         }
-        let end = offset
-            .checked_add(cmdsize)
-            .ok_or_else(|| Error::MachO(format!("load command cmdsize overflow at offset {}", offset)))?;
+        let end = offset.checked_add(cmdsize).ok_or_else(|| {
+            Error::MachO(format!(
+                "load command cmdsize overflow at offset {}",
+                offset
+            ))
+        })?;
         if end > input.len() {
-            return Err(Error::MachO(
-                format!("load command at offset {} extends past end of binary", offset),
-            ));
+            return Err(Error::MachO(format!(
+                "load command at offset {} extends past end of binary",
+                offset
+            )));
         }
 
         match cmd {
@@ -583,7 +619,9 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
         .ok_or_else(|| Error::MachO("dylib command size overflow".into()))?;
 
     if new_cmd_end > first_segment_offset {
-        return Err(Error::MachO("no space for dylib command in load commands area".into()));
+        return Err(Error::MachO(
+            "no space for dylib command in load commands area".into(),
+        ));
     }
 
     let mut output = input.to_vec();
@@ -593,10 +631,24 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
 
     output[max_load_cmd_end..new_cmd_end].fill(0);
 
-    let cmd_value = if weak { LC_LOAD_WEAK_DYLIB } else { LC_LOAD_DYLIB };
+    let cmd_value = if weak {
+        LC_LOAD_WEAK_DYLIB
+    } else {
+        LC_LOAD_DYLIB
+    };
     write_u32(&mut output, max_load_cmd_end, cmd_value, is_big_endian)?;
-    write_u32(&mut output, max_load_cmd_end + 4, new_cmdsize, is_big_endian)?;
-    write_u32(&mut output, max_load_cmd_end + 8, DYLIB_FIXED_SIZE as u32, is_big_endian)?;
+    write_u32(
+        &mut output,
+        max_load_cmd_end + 4,
+        new_cmdsize,
+        is_big_endian,
+    )?;
+    write_u32(
+        &mut output,
+        max_load_cmd_end + 8,
+        DYLIB_FIXED_SIZE as u32,
+        is_big_endian,
+    )?;
     write_u32(&mut output, max_load_cmd_end + 12, 0, is_big_endian)?;
     write_u32(&mut output, max_load_cmd_end + 16, 0, is_big_endian)?;
     write_u32(&mut output, max_load_cmd_end + 20, 0, is_big_endian)?;
@@ -608,7 +660,12 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
     let current_ncmds = read_u32(input, 16, is_big_endian)?;
     let current_sizeofcmds = read_u32(input, 20, is_big_endian)?;
     write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
-    write_u32(&mut output, 20, current_sizeofcmds + new_cmdsize, is_big_endian)?;
+    write_u32(
+        &mut output,
+        20,
+        current_sizeofcmds + new_cmdsize,
+        is_big_endian,
+    )?;
 
     Ok(output)
 }
@@ -618,15 +675,13 @@ fn find_first_segment_offset(macho: &MachO) -> usize {
 
     for lc in &macho.load_commands {
         match &lc.command {
-            CommandVariant::Segment64(seg) => {
-                if seg.fileoff > 0 && seg.fileoff < min_offset {
-                    min_offset = seg.fileoff;
-                }
+            CommandVariant::Segment64(seg) if seg.fileoff > 0 && seg.fileoff < min_offset => {
+                min_offset = seg.fileoff;
             }
-            CommandVariant::Segment32(seg) => {
-                if seg.fileoff > 0 && (seg.fileoff as u64) < min_offset {
-                    min_offset = seg.fileoff as u64;
-                }
+            CommandVariant::Segment32(seg)
+                if seg.fileoff > 0 && (seg.fileoff as u64) < min_offset =>
+            {
+                min_offset = seg.fileoff as u64;
             }
             _ => {}
         }
@@ -652,7 +707,12 @@ fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) ->
 
     let original_vmsize = read_u64(data, vmsize_offset, is_big_endian)?;
     let aligned_vmsize = align_to(new_filesize as usize, 0x4000) as u64;
-    write_u64(data, vmsize_offset, aligned_vmsize.max(original_vmsize), is_big_endian)?;
+    write_u64(
+        data,
+        vmsize_offset,
+        aligned_vmsize.max(original_vmsize),
+        is_big_endian,
+    )?;
 
     Ok(())
 }
@@ -675,9 +735,8 @@ pub fn align_to(value: usize, alignment: usize) -> usize {
 ///
 /// Used for Mach-O fields that are defined as u32 (e.g., `LC_CODE_SIGNATURE` offsets).
 pub(crate) fn checked_u32(value: usize, field_name: &str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| {
-        Error::MachO(format!("{} exceeds u32::MAX: {}", field_name, value))
-    })
+    u32::try_from(value)
+        .map_err(|_| Error::MachO(format!("{} exceeds u32::MAX: {}", field_name, value)))
 }
 
 /// Prepares code bytes for signing by updating load commands.
@@ -694,15 +753,18 @@ pub(crate) fn checked_u32(value: usize, field_name: &str) -> Result<u32> {
 /// # Errors
 ///
 /// Returns [`Error::MachO`] if the binary is invalid or 32-bit.
-pub fn prepare_code_for_signing(data: &[u8], estimated_signature_size: usize) -> Result<(Vec<u8>, usize, usize)> {
-    let mach = Mach::parse(data)
-        .map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
+pub fn prepare_code_for_signing(
+    data: &[u8],
+    estimated_signature_size: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let mach =
+        Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
 
     match mach {
         Mach::Binary(macho) => prepare_code_single(data, &macho, estimated_signature_size),
-        Mach::Fat(_) => {
-            Err(Error::MachO("Use prepare_code_for_signing_slice for FAT binaries".into()))
-        }
+        Mach::Fat(_) => Err(Error::MachO(
+            "Use prepare_code_for_signing_slice for FAT binaries".into(),
+        )),
     }
 }
 
@@ -730,7 +792,11 @@ pub fn prepare_code_for_signing_slice(
     }
 }
 
-fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usize) -> Result<(Vec<u8>, usize, usize)> {
+fn prepare_code_single(
+    data: &[u8],
+    macho: &MachO,
+    estimated_signature_size: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
     if !is_64 {
         return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
@@ -750,10 +816,8 @@ fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usi
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) => {
-                if seg.segname.starts_with(b"__LINKEDIT") {
-                    linkedit_cmd = Some((lc.offset, *seg));
-                }
+            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, *seg));
             }
             _ => {}
         }
@@ -771,7 +835,12 @@ fn prepare_code_single(data: &[u8], macho: &MachO, estimated_signature_size: usi
     let mut prepared = data[..code_length].to_vec();
 
     if let Some((offset, _)) = code_sig_cmd {
-        update_linkedit_data_command(&mut prepared, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
+        update_linkedit_data_command(
+            &mut prepared,
+            offset,
+            checked_u32(sig_offset, "sig_offset")?,
+            sig_size,
+        )?;
     } else {
         add_code_signature_command(
             &mut prepared,
@@ -841,10 +910,19 @@ pub fn realloc_code_sign_space_with_metadata(
     let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        write_u32(&mut output, offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
+        write_u32(
+            &mut output,
+            offset + 8,
+            checked_u32(code_length, "code_length")?,
+            is_big_endian,
+        )?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
 
-        updated_metadata.code_sig_cmd = Some((offset, checked_u32(code_length, "code_length")?, sig_datasize));
+        updated_metadata.code_sig_cmd = Some((
+            offset,
+            checked_u32(code_length, "code_length")?,
+            sig_datasize,
+        ));
     } else {
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
         let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
@@ -852,7 +930,8 @@ pub fn realloc_code_sign_space_with_metadata(
         if new_load_commands_end > metadata.first_segment_offset {
             let header_size = if metadata.is_64 { 32 } else { 28 };
             let current_sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
-            let available_space = metadata.first_segment_offset - (header_size + current_sizeofcmds);
+            let available_space =
+                metadata.first_segment_offset - (header_size + current_sizeofcmds);
 
             if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
                 return Err(Error::MachO(
@@ -863,16 +942,35 @@ pub fn realloc_code_sign_space_with_metadata(
 
         let cmd_offset = metadata.max_load_cmd_end;
         write_u32(&mut output, cmd_offset, LC_CODE_SIGNATURE, is_big_endian)?;
-        write_u32(&mut output, cmd_offset + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
-        write_u32(&mut output, cmd_offset + 8, checked_u32(code_length, "code_length")?, is_big_endian)?;
+        write_u32(
+            &mut output,
+            cmd_offset + 4,
+            LINKEDIT_DATA_COMMAND_SIZE,
+            is_big_endian,
+        )?;
+        write_u32(
+            &mut output,
+            cmd_offset + 8,
+            checked_u32(code_length, "code_length")?,
+            is_big_endian,
+        )?;
         write_u32(&mut output, cmd_offset + 12, sig_datasize, is_big_endian)?;
 
         let current_ncmds = read_u32(&output, 16, is_big_endian)?;
         let current_sizeofcmds = read_u32(&output, 20, is_big_endian)?;
         write_u32(&mut output, 16, current_ncmds + 1, is_big_endian)?;
-        write_u32(&mut output, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+        write_u32(
+            &mut output,
+            20,
+            current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE,
+            is_big_endian,
+        )?;
 
-        updated_metadata.code_sig_cmd = Some((cmd_offset, checked_u32(code_length, "code_length")?, sig_datasize));
+        updated_metadata.code_sig_cmd = Some((
+            cmd_offset,
+            checked_u32(code_length, "code_length")?,
+            sig_datasize,
+        ));
         updated_metadata.max_load_cmd_end = new_load_commands_end;
     }
 
@@ -913,7 +1011,12 @@ pub fn prepare_code_with_metadata(
     let mut prepared = data[..code_length].to_vec();
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        update_linkedit_data_command(&mut prepared, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
+        update_linkedit_data_command(
+            &mut prepared,
+            offset,
+            checked_u32(sig_offset, "sig_offset")?,
+            sig_size,
+        )?;
     } else {
         add_code_signature_command_with_metadata(
             &mut prepared,
@@ -952,7 +1055,12 @@ fn add_code_signature_command_with_metadata(
     let load_commands_end = metadata.max_load_cmd_end;
 
     write_u32(data, load_commands_end, LC_CODE_SIGNATURE, is_big_endian)?;
-    write_u32(data, load_commands_end + 4, LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+    write_u32(
+        data,
+        load_commands_end + 4,
+        LINKEDIT_DATA_COMMAND_SIZE,
+        is_big_endian,
+    )?;
     write_u32(data, load_commands_end + 8, dataoff, is_big_endian)?;
     write_u32(data, load_commands_end + 12, datasize, is_big_endian)?;
 
@@ -960,7 +1068,12 @@ fn add_code_signature_command_with_metadata(
     let current_sizeofcmds = read_u32(data, 20, is_big_endian)?;
 
     write_u32(data, 16, current_ncmds + 1, is_big_endian)?;
-    write_u32(data, 20, current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE, is_big_endian)?;
+    write_u32(
+        data,
+        20,
+        current_sizeofcmds + LINKEDIT_DATA_COMMAND_SIZE,
+        is_big_endian,
+    )?;
 
     Ok(())
 }
@@ -989,7 +1102,12 @@ pub fn prepare_code_in_place(
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
-        update_linkedit_data_command(buf, offset, checked_u32(sig_offset, "sig_offset")?, sig_size)?;
+        update_linkedit_data_command(
+            buf,
+            offset,
+            checked_u32(sig_offset, "sig_offset")?,
+            sig_size,
+        )?;
     } else {
         add_code_signature_command_with_metadata(
             buf,
@@ -1010,43 +1128,87 @@ pub fn prepare_code_in_place(
 }
 
 fn read_u32(data: &[u8], offset: usize, big_endian: bool) -> Result<u32> {
-    let end = offset.checked_add(4)
+    let end = offset
+        .checked_add(4)
         .ok_or_else(|| Error::MachO(format!("read_u32: offset {} overflow", offset)))?;
-    let bytes: [u8; 4] = data.get(offset..end)
-        .ok_or_else(|| Error::MachO(format!("read_u32: offset {} out of bounds (len={})", offset, data.len())))?
+    let bytes: [u8; 4] = data
+        .get(offset..end)
+        .ok_or_else(|| {
+            Error::MachO(format!(
+                "read_u32: offset {} out of bounds (len={})",
+                offset,
+                data.len()
+            ))
+        })?
         .try_into()
         .map_err(|_| Error::MachO("read_u32: slice conversion failed".into()))?;
-    Ok(if big_endian { u32::from_be_bytes(bytes) } else { u32::from_le_bytes(bytes) })
+    Ok(if big_endian {
+        u32::from_be_bytes(bytes)
+    } else {
+        u32::from_le_bytes(bytes)
+    })
 }
 
 fn read_u64(data: &[u8], offset: usize, big_endian: bool) -> Result<u64> {
-    let end = offset.checked_add(8)
+    let end = offset
+        .checked_add(8)
         .ok_or_else(|| Error::MachO(format!("read_u64: offset {} overflow", offset)))?;
-    let bytes: [u8; 8] = data.get(offset..end)
-        .ok_or_else(|| Error::MachO(format!("read_u64: offset {} out of bounds (len={})", offset, data.len())))?
+    let bytes: [u8; 8] = data
+        .get(offset..end)
+        .ok_or_else(|| {
+            Error::MachO(format!(
+                "read_u64: offset {} out of bounds (len={})",
+                offset,
+                data.len()
+            ))
+        })?
         .try_into()
         .map_err(|_| Error::MachO("read_u64: slice conversion failed".into()))?;
-    Ok(if big_endian { u64::from_be_bytes(bytes) } else { u64::from_le_bytes(bytes) })
+    Ok(if big_endian {
+        u64::from_be_bytes(bytes)
+    } else {
+        u64::from_le_bytes(bytes)
+    })
 }
 
 fn write_u32(data: &mut [u8], offset: usize, value: u32, big_endian: bool) -> Result<()> {
-    let bytes = if big_endian { value.to_be_bytes() } else { value.to_le_bytes() };
-    let end = offset.checked_add(4)
+    let bytes = if big_endian {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    };
+    let end = offset
+        .checked_add(4)
         .ok_or_else(|| Error::MachO(format!("write_u32: offset {} overflow", offset)))?;
     let data_len = data.len();
     data.get_mut(offset..end)
-        .ok_or_else(|| Error::MachO(format!("write_u32: offset {} out of bounds (len={})", offset, data_len)))?
+        .ok_or_else(|| {
+            Error::MachO(format!(
+                "write_u32: offset {} out of bounds (len={})",
+                offset, data_len
+            ))
+        })?
         .copy_from_slice(&bytes);
     Ok(())
 }
 
 fn write_u64(data: &mut [u8], offset: usize, value: u64, big_endian: bool) -> Result<()> {
-    let bytes = if big_endian { value.to_be_bytes() } else { value.to_le_bytes() };
-    let end = offset.checked_add(8)
+    let bytes = if big_endian {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    };
+    let end = offset
+        .checked_add(8)
         .ok_or_else(|| Error::MachO(format!("write_u64: offset {} overflow", offset)))?;
     let data_len = data.len();
     data.get_mut(offset..end)
-        .ok_or_else(|| Error::MachO(format!("write_u64: offset {} out of bounds (len={})", offset, data_len)))?
+        .ok_or_else(|| {
+            Error::MachO(format!(
+                "write_u64: offset {} out of bounds (len={})",
+                offset, data_len
+            ))
+        })?
         .copy_from_slice(&bytes);
     Ok(())
 }
@@ -1215,27 +1377,45 @@ mod tests {
         assert_eq!(read_u32(&output, insertion_point + 20, false).unwrap(), 0); // compatibility_version
 
         let name_start = insertion_point + 24;
-        assert_eq!(&output[name_start..name_start + name.len()], name.as_bytes());
+        assert_eq!(
+            &output[name_start..name_start + name.len()],
+            name.as_bytes()
+        );
         assert_eq!(output[name_start + name.len()], 0);
 
         // Nothing before the insertion point changed apart from the header
         // ncmds/sizeofcmds bumps.
         let mut expected_prefix = input[..insertion_point].to_vec();
         write_u32(&mut expected_prefix, 16, 2, false).unwrap();
-        write_u32(&mut expected_prefix, 20, 72 + expected_cmdsize as u32, false).unwrap();
+        write_u32(
+            &mut expected_prefix,
+            20,
+            72 + expected_cmdsize as u32,
+            false,
+        )
+        .unwrap();
         assert_eq!(&output[..insertion_point], &expected_prefix[..]);
 
         // The weak variant uses LC_LOAD_WEAK_DYLIB and the same layout.
         let weak = inject_dylib_command(&input, name, true).unwrap();
         assert_eq!(read_u32(&weak, 16, false).unwrap(), 2);
-        assert_eq!(read_u32(&weak, insertion_point, false).unwrap(), 0x8000_0018);
+        assert_eq!(
+            read_u32(&weak, insertion_point, false).unwrap(),
+            0x8000_0018
+        );
         assert_eq!(
             read_u32(&weak, insertion_point + 4, false).unwrap(),
             expected_cmdsize as u32
         );
         let mut expected_weak_prefix = input[..insertion_point].to_vec();
         write_u32(&mut expected_weak_prefix, 16, 2, false).unwrap();
-        write_u32(&mut expected_weak_prefix, 20, 72 + expected_cmdsize as u32, false).unwrap();
+        write_u32(
+            &mut expected_weak_prefix,
+            20,
+            72 + expected_cmdsize as u32,
+            false,
+        )
+        .unwrap();
         assert_eq!(&weak[..insertion_point], &expected_weak_prefix[..]);
     }
 

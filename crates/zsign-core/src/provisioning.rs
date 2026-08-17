@@ -27,9 +27,9 @@ pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<V
     let plist_slice = &profile_data[plist_start..plist_end];
     let plist: plist::Value = plist::from_bytes(plist_slice)
         .map_err(|e| Error::ProvisioningProfile(format!("Failed to parse plist: {}", e)))?;
-    let dict = plist.as_dictionary().ok_or_else(|| {
-        Error::ProvisioningProfile("Profile plist is not a dictionary".into())
-    })?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| Error::ProvisioningProfile("Profile plist is not a dictionary".into()))?;
     let entitlements = match dict.get("Entitlements") {
         Some(ent) => ent,
         None => return Ok(None),

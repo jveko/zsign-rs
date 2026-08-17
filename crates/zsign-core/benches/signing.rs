@@ -56,8 +56,7 @@ fn build_synthetic_macho(code_size: usize) -> Vec<u8> {
     // segname: "__TEXT\0..."
     buf[text_cmd_offset + 8..text_cmd_offset + 14].copy_from_slice(b"__TEXT");
     // vmaddr = 0x100000000
-    buf[text_cmd_offset + 24..text_cmd_offset + 32]
-        .copy_from_slice(&0x100000000u64.to_le_bytes());
+    buf[text_cmd_offset + 24..text_cmd_offset + 32].copy_from_slice(&0x100000000u64.to_le_bytes());
     // vmsize = 4096
     buf[text_cmd_offset + 32..text_cmd_offset + 40].copy_from_slice(&4096u64.to_le_bytes());
     // fileoff = 0
@@ -119,10 +118,17 @@ fn test_credentials() -> SigningCredentials {
     let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
     let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
-    let cert = CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, &signing_key)
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
-        .unwrap();
+    let cert = CertificateBuilder::new(
+        Profile::Root,
+        serial,
+        validity,
+        subject,
+        pub_key,
+        &signing_key,
+    )
+    .unwrap()
+    .build::<rsa::pkcs1v15::Signature>()
+    .unwrap();
 
     SigningCredentials {
         certificate: cert,
@@ -149,17 +155,7 @@ fn bench_sign_macho(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &macho, |b, macho| {
-            b.iter(|| {
-                sign_macho(
-                    macho,
-                    "com.bench.test",
-                    None,
-                    &credentials,
-                    None,
-                    None,
-                )
-                .unwrap()
-            });
+            b.iter(|| sign_macho(macho, "com.bench.test", None, &credentials, None, None).unwrap());
         });
     }
 
@@ -179,13 +175,17 @@ fn bench_parse_macho(c: &mut Criterion) {
         let macho_data = build_synthetic_macho(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &macho_data, |b, data| {
-            b.iter_batched(
-                || data.clone(),
-                |cloned| MachOFile::parse(cloned).unwrap(),
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &macho_data,
+            |b, data| {
+                b.iter_batched(
+                    || data.clone(),
+                    |cloned| MachOFile::parse(cloned).unwrap(),
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();

@@ -149,7 +149,7 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
     for entry in &entries {
         offsets.push(current_offset);
         current_offset += entry.data.len() as u32;
-        
+
         // Pad to 4-byte alignment for next blob
         let remainder = current_offset % 4;
         if remainder != 0 {
@@ -176,14 +176,14 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
     // Blob data with padding
     for (i, entry) in entries.iter().enumerate() {
         buf.extend(&entry.data);
-        
+
         // Add padding to reach the next offset (or total length for last entry)
         let next_offset = if i + 1 < entries.len() {
             offsets[i + 1]
         } else {
             total_length
         };
-        
+
         let current_pos = buf.len() as u32;
         if next_offset > current_pos {
             let padding = (next_offset - current_pos) as usize;
@@ -382,8 +382,7 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
         0x00, 0x00, 0x00, 0x01, // cert slot = 1 (intermediate)
         0x00, 0x00, 0x00, 0x0a, // OID length = 10
         0x2a, 0x86, 0x48, 0x86, // OID bytes: 1.2.840.113635.100.6.2.1
-        0xf7, 0x63, 0x64, 0x06,
-        0x02, 0x01, 0x00, 0x00, // + 2 bytes padding
+        0xf7, 0x63, 0x64, 0x06, 0x02, 0x01, 0x00, 0x00, // + 2 bytes padding
         0x00, 0x00, 0x00, 0x00, // match = MATCH_EXISTS
     ];
 
@@ -841,10 +840,7 @@ mod tests {
             .build();
 
         // Check magic
-        assert_eq!(
-            &superblob[0..4],
-            &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes()
-        );
+        assert_eq!(&superblob[0..4], &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
 
         // Should have 5 entries: CD SHA-1, requirements, entitlements, CD SHA-256, signature
         let count = u32::from_be_bytes([superblob[8], superblob[9], superblob[10], superblob[11]]);
@@ -887,10 +883,7 @@ mod tests {
         let superblob = build_superblob(vec![]);
 
         // Check magic
-        assert_eq!(
-            &superblob[0..4],
-            &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes()
-        );
+        assert_eq!(&superblob[0..4], &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
 
         // Check count = 0
         let count = u32::from_be_bytes([superblob[8], superblob[9], superblob[10], superblob[11]]);
@@ -927,22 +920,28 @@ mod tests {
 
         // Regardless of insertion order, slots should be ordered:
         // 0x0000 (SHA-1), 0x0002, 0x0005, 0x0007, 0x1000 (SHA-256), 0x10000
-        let slot0 = u32::from_be_bytes([superblob[12], superblob[13], superblob[14], superblob[15]]);
+        let slot0 =
+            u32::from_be_bytes([superblob[12], superblob[13], superblob[14], superblob[15]]);
         assert_eq!(slot0, CSSLOT_CODEDIRECTORY); // 0x0000
 
-        let slot1 = u32::from_be_bytes([superblob[20], superblob[21], superblob[22], superblob[23]]);
+        let slot1 =
+            u32::from_be_bytes([superblob[20], superblob[21], superblob[22], superblob[23]]);
         assert_eq!(slot1, CSSLOT_REQUIREMENTS); // 0x0002
 
-        let slot2 = u32::from_be_bytes([superblob[28], superblob[29], superblob[30], superblob[31]]);
+        let slot2 =
+            u32::from_be_bytes([superblob[28], superblob[29], superblob[30], superblob[31]]);
         assert_eq!(slot2, CSSLOT_ENTITLEMENTS); // 0x0005
 
-        let slot3 = u32::from_be_bytes([superblob[36], superblob[37], superblob[38], superblob[39]]);
+        let slot3 =
+            u32::from_be_bytes([superblob[36], superblob[37], superblob[38], superblob[39]]);
         assert_eq!(slot3, CSSLOT_DER_ENTITLEMENTS); // 0x0007
 
-        let slot4 = u32::from_be_bytes([superblob[44], superblob[45], superblob[46], superblob[47]]);
+        let slot4 =
+            u32::from_be_bytes([superblob[44], superblob[45], superblob[46], superblob[47]]);
         assert_eq!(slot4, CSSLOT_ALTERNATE_CODEDIRECTORIES); // 0x1000
 
-        let slot5 = u32::from_be_bytes([superblob[52], superblob[53], superblob[54], superblob[55]]);
+        let slot5 =
+            u32::from_be_bytes([superblob[52], superblob[53], superblob[54], superblob[55]]);
         assert_eq!(slot5, CSSLOT_SIGNATURESLOT); // 0x10000
     }
 
@@ -1064,10 +1063,7 @@ mod tests {
             .build();
 
         // Check magic
-        assert_eq!(
-            &superblob[0..4],
-            &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes()
-        );
+        assert_eq!(&superblob[0..4], &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
 
         // Should have 2 entries: CD SHA-1, requirements
         let count = u32::from_be_bytes([superblob[8], superblob[9], superblob[10], superblob[11]]);
@@ -1150,9 +1146,9 @@ mod tests {
     fn test_superblob_4byte_alignment() {
         // Create blobs with odd sizes to test alignment
         let entries = vec![
-            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xab; 101]),  // 101 bytes (odd)
-            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xcd; 13]),     // 13 bytes (odd)
-            BlobEntry::new(CSSLOT_ENTITLEMENTS, vec![0xef; 50]),     // 50 bytes (even but not aligned)
+            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xab; 101]), // 101 bytes (odd)
+            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xcd; 13]),   // 13 bytes (odd)
+            BlobEntry::new(CSSLOT_ENTITLEMENTS, vec![0xef; 50]), // 50 bytes (even but not aligned)
         ];
 
         let blob = build_superblob(entries);
@@ -1161,37 +1157,50 @@ mod tests {
         // Offset of first blob = 36 (aligned)
         // Offset of second blob = 36 + 101 + padding = 36 + 104 = 140 (must be 4-byte aligned)
         // Offset of third blob = 140 + 13 + padding = 140 + 16 = 156 (must be 4-byte aligned)
-        
+
         // Check second entry offset is 4-byte aligned
         let offset2 = u32::from_be_bytes([blob[24], blob[25], blob[26], blob[27]]);
-        assert_eq!(offset2 % 4, 0, "Second blob offset {} not 4-byte aligned", offset2);
+        assert_eq!(
+            offset2 % 4,
+            0,
+            "Second blob offset {} not 4-byte aligned",
+            offset2
+        );
 
-        // Check third entry offset is 4-byte aligned  
+        // Check third entry offset is 4-byte aligned
         let offset3 = u32::from_be_bytes([blob[32], blob[33], blob[34], blob[35]]);
-        assert_eq!(offset3 % 4, 0, "Third blob offset {} not 4-byte aligned", offset3);
+        assert_eq!(
+            offset3 % 4,
+            0,
+            "Third blob offset {} not 4-byte aligned",
+            offset3
+        );
     }
 
     #[test]
     fn test_superblob_alignment_padding_bytes() {
         // Verify padding bytes are zeros
         let entries = vec![
-            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xAB; 5]),  // 5 bytes, needs 3 padding
-            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xCD; 4]),   // 4 bytes, aligned
+            BlobEntry::new(CSSLOT_CODEDIRECTORY, vec![0xAB; 5]), // 5 bytes, needs 3 padding
+            BlobEntry::new(CSSLOT_REQUIREMENTS, vec![0xCD; 4]),  // 4 bytes, aligned
         ];
 
         let blob = build_superblob(entries);
-        
+
         // Header: 12 + 2*8 = 28 bytes
         // First blob at 28, length 5
         // Padding: 3 bytes at offsets 33, 34, 35
         // Second blob at 36
-        
+
         // Check padding bytes are zero
         assert_eq!(blob[33], 0x00, "Padding byte 1 should be zero");
         assert_eq!(blob[34], 0x00, "Padding byte 2 should be zero");
         assert_eq!(blob[35], 0x00, "Padding byte 3 should be zero");
-        
+
         // Check second blob starts correctly
-        assert_eq!(blob[36], 0xCD, "Second blob data should start at aligned offset");
+        assert_eq!(
+            blob[36], 0xCD,
+            "Second blob data should start at aligned offset"
+        );
     }
 }

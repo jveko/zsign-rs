@@ -61,10 +61,10 @@ use crate::bundle::CodeResourcesBuilder;
 use crate::crypto::SigningCredentials;
 use crate::macho::{sign_any_macho, sign_macho, MachOFile};
 use crate::{Error, Result};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
 /// High-level IPA signing workflow.
@@ -255,9 +255,10 @@ impl<'a> IpaSigner<'a> {
         validate_ipa(input_ipa)?;
 
         let temp_dir = TempDir::new().map_err(|e| {
-            Error::Io(std::io::Error::other(
-                format!("Failed to create temp directory: {}", e),
-            ))
+            Error::Io(std::io::Error::other(format!(
+                "Failed to create temp directory: {}",
+                e
+            )))
         })?;
 
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
@@ -302,13 +303,21 @@ impl<'a> IpaSigner<'a> {
         output_ipa: impl AsRef<Path>,
     ) -> Result<()> {
         self.sign_folder_in_place(&bundle_path)?;
-        create_ipa(bundle_path.as_ref(), output_ipa.as_ref(), self.compression_level)
+        create_ipa(
+            bundle_path.as_ref(),
+            output_ipa.as_ref(),
+            self.compression_level,
+        )
     }
 
     /// Loads profile options and applies bundle rewrites before signing.
     fn sign_bundle_from_options(&self, bundle_path: &Path) -> Result<()> {
         let (profile_data, entitlements) = self.load_profile()?;
-        self.sign_bundle(bundle_path, entitlements.as_deref(), profile_data.as_deref())
+        self.sign_bundle(
+            bundle_path,
+            entitlements.as_deref(),
+            profile_data.as_deref(),
+        )
     }
 
     /// Sign an app bundle in place.
@@ -326,7 +335,12 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all Mach-O binaries in-place (modifies binary content)
     /// 2. Copy provisioning profile to bundle (main app only)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
-    fn sign_bundle(&self, bundle_path: &Path, entitlements: Option<&[u8]>, profile_data: Option<&[u8]>) -> Result<()> {
+    fn sign_bundle(
+        &self,
+        bundle_path: &Path,
+        entitlements: Option<&[u8]>,
+        profile_data: Option<&[u8]>,
+    ) -> Result<()> {
         if let Some(ref new_id) = self.bundle_id {
             self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
         }
@@ -338,12 +352,13 @@ impl<'a> IpaSigner<'a> {
         }
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
-        dylibs.par_iter()
+        dylibs
+            .par_iter()
             .try_for_each(|dylib_path| self.sign_standalone_dylib(dylib_path))?;
 
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
 
-        bundles.sort_by(|a, b| b.1.cmp(&a.1));
+        bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         for (nested_bundle_path, _depth) in &bundles {
             let is_main_bundle = nested_bundle_path == bundle_path;
@@ -432,11 +447,7 @@ impl<'a> IpaSigner<'a> {
             }
 
             if let Some(ext) = path.extension() {
-                if ext == "dylib"
-                    && !path
-                        .components()
-                        .any(|c| c.as_os_str() == "_CodeSignature")
-                {
+                if ext == "dylib" && !path.components().any(|c| c.as_os_str() == "_CodeSignature") {
                     dylibs.push(path.to_path_buf());
                 }
             }
@@ -476,24 +487,28 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all binaries EXCEPT the main executable (no CodeResources yet)
     /// 2. Generate CodeResources (which hashes the signed binaries)
     /// 3. Sign the main executable WITH the CodeResources hash
-    fn sign_single_bundle(&self, bundle_path: &Path, copy_provisioning_profile: bool, entitlements: Option<&[u8]>, profile_data: Option<&[u8]>) -> Result<()> {
+    fn sign_single_bundle(
+        &self,
+        bundle_path: &Path,
+        copy_provisioning_profile: bool,
+        entitlements: Option<&[u8]>,
+        profile_data: Option<&[u8]>,
+    ) -> Result<()> {
         let identifier = self.get_bundle_identifier(bundle_path)?;
         let main_executable = self.get_main_executable(bundle_path)?;
 
         let binaries = self.find_immediate_macho_binaries(bundle_path)?;
 
-        let non_main_binaries: Vec<_> = binaries.iter()
-            .filter(|p| *p != &main_executable)
-            .collect();
+        let non_main_binaries: Vec<_> =
+            binaries.iter().filter(|p| *p != &main_executable).collect();
 
-        non_main_binaries.par_iter()
-            .try_for_each(|binary_path| {
-                let binary_identifier = binary_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&identifier);
-                self.sign_binary(binary_path, binary_identifier, None, entitlements)
-            })?;
+        non_main_binaries.par_iter().try_for_each(|binary_path| {
+            let binary_identifier = binary_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&identifier);
+            self.sign_binary(binary_path, binary_identifier, None, entitlements)
+        })?;
 
         if copy_provisioning_profile {
             if let Some(data) = profile_data {
@@ -518,7 +533,12 @@ impl<'a> IpaSigner<'a> {
         };
 
         if main_executable.exists() {
-            self.sign_binary(&main_executable, &identifier, code_resources_data.as_deref(), entitlements)?;
+            self.sign_binary(
+                &main_executable,
+                &identifier,
+                code_resources_data.as_deref(),
+                entitlements,
+            )?;
         }
 
         Ok(())
@@ -553,10 +573,7 @@ impl<'a> IpaSigner<'a> {
                 continue;
             }
 
-            if path
-                .components()
-                .any(|c| c.as_os_str() == "_CodeSignature")
-            {
+            if path.components().any(|c| c.as_os_str() == "_CodeSignature") {
                 continue;
             }
 
@@ -580,16 +597,24 @@ impl<'a> IpaSigner<'a> {
         }
 
         let plist_data = fs::read(&info_plist_path)?;
-        let mut plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
+        let mut plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
+            Error::Core(zsign_core::Error::Signing(format!(
+                "Failed to parse Info.plist: {}",
+                e
+            )))
+        })?;
 
         if let Some(dict) = plist.as_dictionary_mut() {
             dict.insert(key.to_string(), plist::Value::String(value.to_string()));
         }
 
         let mut buf = Vec::new();
-        plist::to_writer_xml(&mut buf, &plist)
-            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to serialize Info.plist: {}", e))))?;
+        plist::to_writer_xml(&mut buf, &plist).map_err(|e| {
+            Error::Core(zsign_core::Error::Signing(format!(
+                "Failed to serialize Info.plist: {}",
+                e
+            )))
+        })?;
 
         fs::write(&info_plist_path, &buf)?;
 
@@ -608,8 +633,12 @@ impl<'a> IpaSigner<'a> {
         }
 
         let plist_data = fs::read(&info_plist_path)?;
-        let plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
+        let plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
+            Error::Core(zsign_core::Error::Signing(format!(
+                "Failed to parse Info.plist: {}",
+                e
+            )))
+        })?;
 
         let identifier = plist
             .as_dictionary()
@@ -640,8 +669,12 @@ impl<'a> IpaSigner<'a> {
         }
 
         let plist_data = fs::read(&info_plist_path)?;
-        let plist: plist::Value = plist::from_bytes(&plist_data)
-            .map_err(|e| Error::Core(zsign_core::Error::Signing(format!("Failed to parse Info.plist: {}", e))))?;
+        let plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
+            Error::Core(zsign_core::Error::Signing(format!(
+                "Failed to parse Info.plist: {}",
+                e
+            )))
+        })?;
 
         let executable_name = plist
             .as_dictionary()
@@ -714,7 +747,9 @@ impl<'a> IpaSigner<'a> {
         if !self.dylibs.is_empty() && is_executable {
             for name in &self.dylibs {
                 binary_data = zsign_core::macho::writer::inject_dylib_command(
-                    &binary_data, name, self.weak_dylibs,
+                    &binary_data,
+                    name,
+                    self.weak_dylibs,
                 )?;
             }
             fs::write(binary_path, &binary_data)?;
@@ -725,9 +760,11 @@ impl<'a> IpaSigner<'a> {
         // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
         // with "has entitlements but is not a main binary".
         let info_data = if is_executable && code_resources.is_some() {
-            let bundle_path = binary_path
-                .parent()
-                .ok_or_else(|| Error::Core(zsign_core::Error::Signing("Binary has no parent directory".into())))?;
+            let bundle_path = binary_path.parent().ok_or_else(|| {
+                Error::Core(zsign_core::Error::Signing(
+                    "Binary has no parent directory".into(),
+                ))
+            })?;
             let info_plist = bundle_path.join("Info.plist");
             if info_plist.exists() {
                 Some(fs::read(&info_plist)?)
@@ -786,7 +823,6 @@ impl<'a> IpaSigner<'a> {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -807,8 +843,12 @@ mod tests {
 
         let out_a = temp_dir.path().join("a.ipa");
         let out_b = temp_dir.path().join("b.ipa");
-        IpaSigner::new(&credentials).sign(&ipa_path, &out_a).unwrap();
-        IpaSigner::new(&credentials).sign(&ipa_path, &out_b).unwrap();
+        IpaSigner::new(&credentials)
+            .sign(&ipa_path, &out_a)
+            .unwrap();
+        IpaSigner::new(&credentials)
+            .sign(&ipa_path, &out_b)
+            .unwrap();
 
         assert_eq!(
             fs::read(&out_a).unwrap(),
@@ -848,7 +888,8 @@ mod tests {
         zip.write_all(include_bytes!("fixtures/minimal_macho.bin"))
             .unwrap();
 
-        zip.start_file("Payload/Test.app/data.bin", options).unwrap();
+        zip.start_file("Payload/Test.app/data.bin", options)
+            .unwrap();
         zip.write_all(&[0xAB; 4096]).unwrap();
 
         zip.finish().unwrap();
@@ -938,7 +979,8 @@ mod tests {
         for i in 0..count {
             let typ = u32::from_be_bytes(blob[12 + i * 8..16 + i * 8].try_into().unwrap());
             if typ == 0x10000 {
-                let off = u32::from_be_bytes(blob[16 + i * 8..20 + i * 8].try_into().unwrap()) as usize;
+                let off =
+                    u32::from_be_bytes(blob[16 + i * 8..20 + i * 8].try_into().unwrap()) as usize;
                 let cms_magic = u32::from_be_bytes(blob[off..off + 4].try_into().unwrap());
                 assert_eq!(cms_magic, 0xfade_0b01, "CMS slot must be a blob wrapper");
                 saw_cms = true;

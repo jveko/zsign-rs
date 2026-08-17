@@ -44,15 +44,15 @@ pub mod ipa;
 pub mod macho;
 
 // Re-export core modules that don't need native wrapping
-pub use zsign_core::{codesign, crypto, SigningCredentials};
 pub use zsign_core::provisioning::extract_entitlements_from_profile;
+pub use zsign_core::{codesign, crypto, SigningCredentials};
 
 #[cfg(test)]
 mod test_util;
 
 // Re-export native wrapper types
-pub use bundle::CodeResourcesBuilder;
 pub use builder::ZSign;
+pub use bundle::CodeResourcesBuilder;
 pub use error::Error;
 pub use ipa::{create_ipa, extract_ipa, validate_ipa, CompressionLevel, IpaSigner};
 

@@ -44,9 +44,7 @@ pub(crate) fn test_credentials() -> crate::SigningCredentials {
 
     crate::SigningCredentials {
         certificate: cert,
-        signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::<Sha256>::new(
-            rsa_key,
-        )),
+        signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::<Sha256>::new(rsa_key)),
         cert_chain: vec![],
         team_id: Some("TESTTEAM".to_string()),
     }

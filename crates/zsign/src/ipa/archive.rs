@@ -107,7 +107,7 @@ const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
     // Audio/Video (compressed containers only)
     "mp3", "m4a", "aac", "mp4", "mov", "m4v",
     // iOS assets
-    "car",  // Assets.car (compiled asset catalog)
+    "car", // Assets.car (compiled asset catalog)
     // Archives
     "zip", "gz", "bz2", "xz", "zst",
 ];
@@ -218,26 +218,20 @@ pub fn create_ipa(
     };
 
     // Add Payload/ directory
-    zip.add_directory("Payload/", options)
-        .map_err(Error::Zip)?;
+    zip.add_directory("Payload/", options).map_err(Error::Zip)?;
 
     // Walk the app bundle and add all files - don't follow symlinks
     for entry in WalkDir::new(app_bundle_path).follow_links(false) {
-        let entry = entry.map_err(|e| {
-            Error::Io(io::Error::other(
-                format!("Failed to walk directory: {}", e),
-            ))
-        })?;
+        let entry = entry
+            .map_err(|e| Error::Io(io::Error::other(format!("Failed to walk directory: {}", e))))?;
 
         let path = entry.path();
-        let relative_path = path
-            .strip_prefix(app_bundle_path)
-            .map_err(|_| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Failed to compute relative path",
-                ))
-            })?;
+        let relative_path = path.strip_prefix(app_bundle_path).map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Failed to compute relative path",
+            ))
+        })?;
 
         // Build archive path: Payload/AppName.app/relative_path
         let archive_path = if relative_path.as_os_str().is_empty() {
@@ -256,8 +250,7 @@ pub fn create_ipa(
             } else {
                 format!("{}/", archive_path)
             };
-            zip.add_directory(&dir_path, options)
-                .map_err(Error::Zip)?;
+            zip.add_directory(&dir_path, options).map_err(Error::Zip)?;
         } else if metadata.file_type().is_symlink() {
             // Handle symlink using the zip crate's add_symlink method
             let target = fs::read_link(path)?;
@@ -401,7 +394,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let output_ipa = temp_dir.path().join("output.ipa");
 
-        let result = create_ipa("/nonexistent/Test.app", &output_ipa, CompressionLevel::DEFAULT);
+        let result = create_ipa(
+            "/nonexistent/Test.app",
+            &output_ipa,
+            CompressionLevel::DEFAULT,
+        );
         assert!(result.is_err());
     }
 
@@ -494,7 +491,11 @@ mod tests {
         let app_dir = temp_dir.path().join("Test.app");
         fs::create_dir_all(&app_dir).unwrap();
 
-        fs::write(app_dir.join("Info.plist"), b"<?xml version=\"1.0\"?><plist><dict></dict></plist>").unwrap();
+        fs::write(
+            app_dir.join("Info.plist"),
+            b"<?xml version=\"1.0\"?><plist><dict></dict></plist>",
+        )
+        .unwrap();
         fs::write(app_dir.join("icon.png"), b"fake png data").unwrap();
 
         let output_ipa = temp_dir.path().join("output.ipa");
@@ -507,11 +508,17 @@ mod tests {
         for i in 0..archive.len() {
             let entry = archive.by_index(i).unwrap();
             if entry.name().ends_with("icon.png") {
-                assert_eq!(entry.compression(), CompressionMethod::Stored,
-                    "PNG should use Stored compression");
+                assert_eq!(
+                    entry.compression(),
+                    CompressionMethod::Stored,
+                    "PNG should use Stored compression"
+                );
             } else if entry.name().ends_with("Info.plist") {
-                assert_eq!(entry.compression(), CompressionMethod::Deflated,
-                    "plist should use Deflated compression");
+                assert_eq!(
+                    entry.compression(),
+                    CompressionMethod::Deflated,
+                    "plist should use Deflated compression"
+                );
             }
         }
     }

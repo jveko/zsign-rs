@@ -866,9 +866,18 @@ mod tests {
             .subject_public_key_info
             .to_der()
             .expect("spki must encode");
-        let cert_pub = RsaPublicKey::from_public_key_der(&spki_der).expect("spki must be an rsa key");
-        assert_eq!(key_pub.n(), cert_pub.n(), "key and certificate modulus differ");
-        assert_eq!(key_pub.e(), cert_pub.e(), "key and certificate exponent differ");
+        let cert_pub =
+            RsaPublicKey::from_public_key_der(&spki_der).expect("spki must be an rsa key");
+        assert_eq!(
+            key_pub.n(),
+            cert_pub.n(),
+            "key and certificate modulus differ"
+        );
+        assert_eq!(
+            key_pub.e(),
+            cert_pub.e(),
+            "key and certificate exponent differ"
+        );
     }
 
     #[test]
@@ -885,7 +894,11 @@ mod tests {
     #[test]
     fn wrong_password_is_rejected_for_every_variant() {
         for (name, fixture, _) in VARIANTS {
-            let wrong = if name.contains("empty password") { "x" } else { "wrong" };
+            let wrong = if name.contains("empty password") {
+                "x"
+            } else {
+                "wrong"
+            };
             assert!(
                 matches!(extract_p12(fixture, wrong), Err(P12Error::Mac)),
                 "{name}: wrong password must fail the MAC check"

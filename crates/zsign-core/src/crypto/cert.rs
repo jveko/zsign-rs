@@ -246,7 +246,9 @@ impl SigningCredentials {
         use pkcs8::DecodePrivateKey;
 
         if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_der(der) {
-            return Ok(SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key)));
+            return Ok(SigningKeyType::Rsa(
+                rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key),
+            ));
         }
 
         if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_der(der) {
@@ -298,7 +300,10 @@ fn build_apple_ca_chain(signing_cert: &Certificate) -> Vec<Certificate> {
 /// Extracts a string attribute from an X.509 Name by OID.
 ///
 /// Tries both UTF-8 and PrintableString encodings, matching Apple certificate conventions.
-fn extract_name_attr(name: &x509_cert::name::Name, oid: const_oid::ObjectIdentifier) -> Option<String> {
+fn extract_name_attr(
+    name: &x509_cert::name::Name,
+    oid: const_oid::ObjectIdentifier,
+) -> Option<String> {
     for rdn in name.0.iter() {
         for atav in rdn.0.iter() {
             if atav.oid == oid {
@@ -316,12 +321,18 @@ fn extract_name_attr(name: &x509_cert::name::Name, oid: const_oid::ObjectIdentif
 
 /// Extracts the Organizational Unit (OU) from a certificate's issuer.
 fn extract_issuer_ou(cert: &Certificate) -> Option<String> {
-    extract_name_attr(&cert.tbs_certificate.issuer, const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME)
+    extract_name_attr(
+        &cert.tbs_certificate.issuer,
+        const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME,
+    )
 }
 
 /// Extracts the Common Name (CN) from a certificate's issuer.
 fn extract_issuer_cn(cert: &Certificate) -> Option<String> {
-    extract_name_attr(&cert.tbs_certificate.issuer, const_oid::db::rfc4519::COMMON_NAME)
+    extract_name_attr(
+        &cert.tbs_certificate.issuer,
+        const_oid::db::rfc4519::COMMON_NAME,
+    )
 }
 
 /// Verifies that the private key matches the certificate's public key.
@@ -368,12 +379,18 @@ fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<(
 
 /// Extracts the Apple Team ID from a certificate's Organizational Unit field.
 fn extract_team_id(cert: &Certificate) -> Option<String> {
-    extract_name_attr(&cert.tbs_certificate.subject, const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME)
+    extract_name_attr(
+        &cert.tbs_certificate.subject,
+        const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME,
+    )
 }
 
 /// Extracts the Common Name (CN) from a certificate's subject.
 pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
-    extract_name_attr(&cert.tbs_certificate.subject, const_oid::db::rfc4519::COMMON_NAME)
+    extract_name_attr(
+        &cert.tbs_certificate.subject,
+        const_oid::db::rfc4519::COMMON_NAME,
+    )
 }
 
 #[cfg(test)]
@@ -382,7 +399,8 @@ mod tests {
 
     #[test]
     fn test_signing_key_type_enum_exists() {
-        let _rsa: fn(rsa::pkcs1v15::SigningKey<sha2::Sha256>) -> SigningKeyType = SigningKeyType::Rsa;
+        let _rsa: fn(rsa::pkcs1v15::SigningKey<sha2::Sha256>) -> SigningKeyType =
+            SigningKeyType::Rsa;
         let _ecdsa: fn(EcdsaSigningKey) -> SigningKeyType = SigningKeyType::Ecdsa;
     }
 
