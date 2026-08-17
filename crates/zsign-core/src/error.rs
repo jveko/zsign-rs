@@ -7,6 +7,9 @@ pub enum Error {
     #[error("Invalid Mach-O: {0}")]
     MachO(String),
 
+    #[error("Cannot sign FairPlay-encrypted Mach-O: {0}")]
+    EncryptedBinary(String),
+
     #[error("Signing failed: {0}")]
     Signing(String),
 

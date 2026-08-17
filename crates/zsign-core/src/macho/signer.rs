@@ -130,6 +130,26 @@ impl SigningContext {
 /// Empty entitlements plist for non-executable binaries (dylibs, frameworks).
 pub const EMPTY_ENTITLEMENTS: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
 
+/// Refuse to sign if any slice is FairPlay-encrypted (unless overridden).
+fn reject_encrypted(macho: &MachOFile, identifier: &str, allow_encrypted: bool) -> Result<()> {
+    if allow_encrypted {
+        return Ok(());
+    }
+    for (index, slice) in macho.slices().iter().enumerate() {
+        if slice.is_encrypted() {
+            let enc = slice
+                .encryption
+                .as_ref()
+                .expect("is_encrypted() implies encryption is Some");
+            return Err(crate::Error::EncryptedBinary(format!(
+                "identifier \"{identifier}\", slice {index} (cpu 0x{:x}): cryptid={}, cryptoff=0x{:x}, cryptsize=0x{:x}: decrypt the binary first (frida-ios-dump / bagbak / Clutch / bfdecrypt), then re-sign. Pass allow_encrypted=true (-f/--force) to override.",
+                slice.cpu_type, enc.cryptid, enc.cryptoff, enc.cryptsize
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Signs any Mach-O binary (single-arch or FAT), returns signed bytes.
 ///
 /// Automatically selects entitlements based on executable type:
@@ -142,6 +162,7 @@ pub fn sign_any_macho(
     credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
     let is_executable = macho
         .slices()
@@ -153,6 +174,7 @@ pub fn sign_any_macho(
     } else {
         Some(EMPTY_ENTITLEMENTS)
     };
+    reject_encrypted(macho, identifier, allow_encrypted)?;
 
     if macho.slices().len() == 1 {
         sign_macho(
@@ -162,6 +184,7 @@ pub fn sign_any_macho(
             credentials,
             info_plist,
             code_resources,
+            allow_encrypted,
         )
     } else {
         let signed_slices = sign_macho_all_slices(
@@ -171,6 +194,7 @@ pub fn sign_any_macho(
             credentials,
             info_plist,
             code_resources,
+            allow_encrypted,
         )?;
         super::writer::embed_signature_fat(macho.data(), &signed_slices)
     }
@@ -214,6 +238,7 @@ pub fn sign_any_macho(
 ///     &credentials,
 ///     None,  // info_plist
 ///     None,  // code_resources
+///     false, // allow_encrypted
 /// )?;
 /// # Ok::<(), zsign_core::Error>(())
 /// ```
@@ -224,12 +249,14 @@ pub fn sign_macho(
     credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
     if macho.slices().len() != 1 {
         return Err(crate::Error::MachO(
             "sign_macho only supports single-arch Mach-O; use sign_macho_all_slices for FAT binaries".into()
         ));
     }
+    reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
     let slice_data = macho.slice_data(slice);
 
@@ -264,12 +291,14 @@ pub fn sign_macho_adhoc(
     entitlements: Option<&[u8]>,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
     if macho.slices().len() != 1 {
         return Err(crate::Error::MachO(
             "sign_macho_adhoc only supports single-arch Mach-O".into(),
         ));
     }
+    reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
     let slice_data = macho.slice_data(slice);
     let ctx = SigningContext::new(
@@ -293,12 +322,14 @@ pub fn sign_macho_sha256_only(
     credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
     if macho.slices().len() != 1 {
         return Err(crate::Error::MachO(
             "sign_macho_sha256_only only supports single-arch Mach-O".into(),
         ));
     }
+    reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
     let slice_data = macho.slice_data(slice);
     let ctx = SigningContext::new(
@@ -331,12 +362,14 @@ pub fn sign_macho_all_slices(
     credentials: &SigningCredentials,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
 ) -> Result<Vec<SignedSlice>> {
     let is_executable = macho
         .slices()
         .first()
         .map(|s| s.is_executable)
         .unwrap_or(false);
+    reject_encrypted(macho, identifier, allow_encrypted)?;
     let ctx = SigningContext::new(
         identifier,
         Some(credentials),
@@ -961,6 +994,23 @@ mod tests {
         b
     }
 
+    /// make_minimal_macho() plus an injected LC_ENCRYPTION_INFO_64.
+    fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<u8> {
+        let mut data = make_minimal_macho();
+        // ncmds (offset 16) and sizeofcmds (offset 20) live in mach_header_64.
+        let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let sizeofcmds = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        data[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+        data[20..24].copy_from_slice(&(sizeofcmds + 24).to_le_bytes());
+        // Append LC_ENCRYPTION_INFO_64 right after the last load command.
+        let off = 32 + sizeofcmds as usize;
+        let lc: [u32; 6] = [0x2c, 24, 0x1000, cryptsize, cryptid, 0];
+        for (i, v) in lc.iter().enumerate() {
+            data[off + i * 4..off + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        data
+    }
+
     /// Self-signed RSA-2048 credentials with `team_id=Some("TESTTEAM")`.
     fn test_credentials() -> crate::crypto::SigningCredentials {
         use crate::crypto::cert::{SigningCredentials, SigningKeyType};
@@ -1021,6 +1071,7 @@ mod tests {
             &credentials,
             None,
             None,
+            false,
         )
         .expect("sha256-only signing must succeed");
 
@@ -1066,7 +1117,7 @@ mod tests {
         };
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let signed = sign_macho_adhoc(&macho, "com.zsign.adhoc", None, None, None)
+        let signed = sign_macho_adhoc(&macho, "com.zsign.adhoc", None, None, None, false)
             .expect("adhoc signing must succeed");
 
         let sm = crate::macho::MachOFile::parse(signed.clone()).unwrap();
@@ -1138,6 +1189,7 @@ mod tests {
             &credentials,
             Some(b"<plist><dict><key>CFBundleIdentifier</key><string>com.zsign.roundtrip</string></dict></plist>"),
             Some(b"<plist><dict><key>files</key><dict/></dict></plist>"),
+            false,
         )
         .expect("signing must succeed");
 
@@ -1204,6 +1256,64 @@ mod tests {
         assert!(
             (hash_size_seen & (20 | 32)) == (20 | 32),
             "both SHA-1 and SHA-256 code directories must be present"
+        );
+    }
+
+    #[test]
+    fn test_sign_refuses_encrypted_binary() {
+        let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
+        let credentials = test_credentials();
+        let err = sign_macho(
+            &macho,
+            "com.zsign.encrypted",
+            None,
+            &credentials,
+            None,
+            None,
+            false, // allow_encrypted
+        )
+        .expect_err("signing an encrypted binary must refuse");
+        match err {
+            crate::Error::EncryptedBinary(msg) => {
+                assert!(
+                    msg.contains("com.zsign.encrypted"),
+                    "message must name the identifier: {msg}"
+                );
+                assert!(
+                    msg.contains("cryptid=1"),
+                    "message must show cryptid: {msg}"
+                );
+                assert!(
+                    msg.contains("0x1000"),
+                    "message must show cryptoff/cryptsize: {msg}"
+                );
+                assert!(
+                    msg.contains("decrypt"),
+                    "message must tell the user to decrypt: {msg}"
+                );
+            }
+            other => panic!("expected EncryptedBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sign_allow_encrypted_override() {
+        let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
+        let credentials = test_credentials();
+        let signed = sign_macho(
+            &macho,
+            "com.zsign.encrypted",
+            None,
+            &credentials,
+            None,
+            None,
+            true, // allow_encrypted
+        )
+        .expect("allow_encrypted=true must sign");
+        assert!(
+            signed.len() > 0x2000,
+            "signed output must append the embedded signature (got {} bytes)",
+            signed.len()
         );
     }
 

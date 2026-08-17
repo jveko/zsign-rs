@@ -194,6 +194,7 @@ impl WasmSigner {
             &self.credentials,
             info_plist.as_deref(),
             code_resources.as_deref(),
+            false,
         )
         .map_err(|e| JsError::new(&e.to_string()))
     }

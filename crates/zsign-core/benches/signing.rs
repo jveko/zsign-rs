@@ -155,7 +155,18 @@ fn bench_sign_macho(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &macho, |b, macho| {
-            b.iter(|| sign_macho(macho, "com.bench.test", None, &credentials, None, None).unwrap());
+            b.iter(|| {
+                sign_macho(
+                    macho,
+                    "com.bench.test",
+                    None,
+                    &credentials,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap()
+            });
         });
     }
 
