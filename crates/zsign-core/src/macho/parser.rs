@@ -256,18 +256,10 @@ impl MachOFile {
                     }
                 }
                 CommandVariant::EncryptionInfo32(ref enc) => {
-                    encryption = Some(EncryptionInfo {
-                        cryptoff: enc.cryptoff,
-                        cryptsize: enc.cryptsize,
-                        cryptid: enc.cryptid,
-                    });
+                    record_encryption(&mut encryption, enc.cryptoff, enc.cryptsize, enc.cryptid);
                 }
                 CommandVariant::EncryptionInfo64(ref enc) => {
-                    encryption = Some(EncryptionInfo {
-                        cryptoff: enc.cryptoff,
-                        cryptsize: enc.cryptsize,
-                        cryptid: enc.cryptid,
-                    });
+                    record_encryption(&mut encryption, enc.cryptoff, enc.cryptsize, enc.cryptid);
                 }
                 _ => {}
             }
@@ -440,6 +432,23 @@ impl ArchSlice {
     }
 }
 
+/// Records encryption info from an `LC_ENCRYPTION_INFO(_64)` load command.
+///
+/// Shared by the 32-bit and 64-bit match arms (goblin types differ, so the
+/// or-pattern cannot bind both); field remapping lives in one place.
+fn record_encryption(
+    encryption: &mut Option<EncryptionInfo>,
+    cryptoff: u32,
+    cryptsize: u32,
+    cryptid: u32,
+) {
+    *encryption = Some(EncryptionInfo {
+        cryptoff,
+        cryptsize,
+        cryptid,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +599,146 @@ mod tests {
             !macho.slices()[0].is_encrypted(),
             "cryptsize=0 must not be treated as encrypted"
         );
+    }
+
+    /// Build a minimal arm64 MH_EXECUTE with NO encryption load command.
+    /// Mirrors [`minimal_macho_with_encryption`] minus the
+    /// `LC_ENCRYPTION_INFO_64` (ncmds 4→3, sizeofcmds −24).
+    fn minimal_macho_plain() -> Vec<u8> {
+        let mut b = Vec::with_capacity(0x2000);
+
+        macro_rules! u32 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u32).to_le_bytes())
+            };
+        }
+        macro_rules! u64 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u64).to_le_bytes())
+            };
+        }
+        macro_rules! name {
+            ($s:expr, $len:expr) => {
+                let mut n = [0u8; 16];
+                n[..$s.len()].copy_from_slice($s.as_bytes());
+                b.extend_from_slice(&n[..$len]);
+            };
+        }
+
+        // mach_header_64
+        u32!(0xfeedfacf); // MH_MAGIC_64
+        u32!(0x0100_000c); // CPU_TYPE_ARM64
+        u32!(0x0000_0000); // CPU_SUBTYPE_ARM64_ALL
+        u32!(2); // MH_EXECUTE
+        u32!(3); // ncmds: __TEXT, __LINKEDIT, build version
+        u32!(152 + 72 + 24); // sizeofcmds
+        u32!(0x1); // MH_NOUNDEFS
+        u32!(0); // reserved
+
+        // LC_SEGMENT_64 "__TEXT" (152 bytes, one section)
+        u32!(0x19);
+        u32!(152);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x1000); // fileoff
+        u64!(0x1000); // filesize
+        u32!(7); // maxprot
+        u32!(7); // initprot
+        u32!(1); // nsects
+        u32!(0); // flags
+        name!("__text", 16);
+        name!("__TEXT", 16);
+        u64!(0x1_0000_0000); // addr
+        u64!(4); // size
+        u32!(0x1000); // file offset of code
+        u32!(0); // align
+        u32!(0); // reloff
+        u32!(0); // nreloc
+        u32!(0); // flags
+        u32!(0); // reserved1
+        u32!(0); // reserved2
+        u32!(0); // reserved3
+
+        // LC_SEGMENT_64 "__LINKEDIT" (72 bytes, no sections)
+        u32!(0x19);
+        u32!(72);
+        name!("__LINKEDIT", 16);
+        u64!(0x1_0000_1000); // vmaddr
+        u64!(0x1000); // vmsize
+        u64!(0x2000); // fileoff
+        u64!(0); // filesize
+        u32!(1); // maxprot
+        u32!(1); // initprot
+        u32!(0); // nsects
+        u32!(0); // flags
+
+        // LC_BUILD_VERSION (24 bytes)
+        u32!(0x32);
+        u32!(24);
+        u32!(1); // macOS
+        u32!(0x000f_0000); // minos 15.0
+        u32!(0x000f_0000); // sdk 15.0
+        u32!(0); // ntools
+
+        // Zero-fill first page, code at 0x1000, pad through __LINKEDIT page
+        b.resize(0x1000, 0);
+        b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        b.resize(0x2000, 0);
+        b
+    }
+
+    #[test]
+    fn test_parse_no_encryption_command_is_none() {
+        // A binary without any LC_ENCRYPTION_INFO(_64) — the common case.
+        let data = minimal_macho_plain();
+        assert_eq!(data.len(), 0x2000);
+        let macho = MachOFile::parse(data).unwrap();
+        let slice = &macho.slices()[0];
+        assert!(slice.encryption.is_none(), "no command means None");
+        assert!(!slice.is_encrypted(), "None means not encrypted");
+    }
+
+    /// Build a minimal 32-bit (armv7) MH_EXECUTE with LC_ENCRYPTION_INFO
+    /// (cmd 0x21, 20 bytes) — exercises the EncryptionInfo32 parse arm.
+    fn minimal_macho_32_with_encryption() -> Vec<u8> {
+        let mut b = Vec::with_capacity(0x80);
+        macro_rules! u32 {
+            ($v:expr) => {
+                b.extend_from_slice(&($v as u32).to_le_bytes())
+            };
+        }
+
+        // mach_header (28 bytes)
+        u32!(0xfeedface); // MH_MAGIC
+        u32!(0x0000_000c); // CPU_TYPE_ARM
+        u32!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+        u32!(2); // MH_EXECUTE
+        u32!(1); // ncmds
+        u32!(20); // sizeofcmds
+        u32!(0x1); // MH_NOUNDEFS
+
+        // LC_ENCRYPTION_INFO (20 bytes)
+        u32!(0x21);
+        u32!(20);
+        u32!(0x1000); // cryptoff
+        u32!(0x2000); // cryptsize
+        u32!(1); // cryptid
+
+        b.resize(0x80, 0);
+        b
+    }
+
+    #[test]
+    fn test_parse_32bit_encryption_info() {
+        let data = minimal_macho_32_with_encryption();
+        let macho = MachOFile::parse(data).expect("32-bit encrypted mach-o must parse");
+        let slice = &macho.slices()[0];
+        assert!(!slice.is_64, "armv7 slice must be 32-bit");
+        let enc = slice.encryption.as_ref().expect("encryption info recorded");
+        assert_eq!(enc.cryptid, 1);
+        assert_eq!(enc.cryptoff, 0x1000);
+        assert_eq!(enc.cryptsize, 0x2000);
+        assert!(slice.is_encrypted(), "32-bit cryptid=1 must be encrypted");
     }
 }

@@ -213,6 +213,8 @@ pub fn sign_any_macho(
 /// * `credentials` - Signing certificate and key from [`SigningCredentials`]
 /// * `info_plist` - Optional Info.plist data for hashing
 /// * `code_resources` - Optional CodeResources data for hashing
+/// * `allow_encrypted` - Override the FairPlay-encryption refusal and sign
+///   encrypted binaries anyway (for already-decrypted input only)
 ///
 /// # Returns
 ///
@@ -1156,7 +1158,9 @@ mod tests {
 
     #[test]
     fn test_sign_refuses_encrypted_binary() {
-        let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
+        // cryptsize=0x2000 (distinct from the fixture's hardcoded cryptoff=0x1000)
+        // so the message assertion proves both fields are serialized.
+        let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x2000)).unwrap();
         let credentials = test_credentials();
         let err = sign_macho(
             &macho,
@@ -1175,12 +1179,20 @@ mod tests {
                     "message must name the identifier: {msg}"
                 );
                 assert!(
+                    msg.contains("cpu 0x100000c"),
+                    "message must show the cpu type: {msg}"
+                );
+                assert!(
                     msg.contains("cryptid=1"),
                     "message must show cryptid: {msg}"
                 );
                 assert!(
-                    msg.contains("0x1000"),
-                    "message must show cryptoff/cryptsize: {msg}"
+                    msg.contains("cryptoff=0x1000"),
+                    "message must show cryptoff: {msg}"
+                );
+                assert!(
+                    msg.contains("cryptsize=0x2000"),
+                    "message must show cryptsize: {msg}"
                 );
                 assert!(
                     msg.contains("decrypt"),
@@ -1189,6 +1201,116 @@ mod tests {
             }
             other => panic!("expected EncryptedBinary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_sign_any_macho_refuses_encrypted() {
+        // sign_any_macho single-arch path must enforce the guard and forward
+        // allow_encrypted through to sign_macho.
+        let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
+        let credentials = test_credentials();
+        let err = sign_any_macho(
+            &macho,
+            "com.zsign.encrypted",
+            None,
+            &credentials,
+            None,
+            None,
+            false,
+        )
+        .expect_err("sign_any_macho must refuse encrypted input");
+        assert!(
+            matches!(err, crate::Error::EncryptedBinary(_)),
+            "expected EncryptedBinary, got {err:?}"
+        );
+    }
+
+    /// Builds a FAT binary: plain arm64 slice at offset 0x1000 and an
+    /// encrypted arm64 slice at offset 0x3000 (per-slice load commands).
+    fn make_fat_with_encrypted_second_slice() -> Vec<u8> {
+        let plain = make_minimal_macho();
+        let encrypted = make_minimal_macho_encrypted(1, 0x1000);
+        assert_eq!(plain.len(), encrypted.len());
+
+        let mut b = Vec::with_capacity(0x3000 + plain.len());
+        // FAT header (big-endian): magic, nfat_arch
+        b.extend_from_slice(&0xcafebabeu32.to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes());
+        // fat_arch[0]: cputype, cpusubtype, offset, size, align (BE)
+        b.extend_from_slice(&0x0100_000cu32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0x1000u32.to_be_bytes());
+        b.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+        b.extend_from_slice(&12u32.to_be_bytes());
+        // fat_arch[1]
+        b.extend_from_slice(&0x0100_000cu32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0x3000u32.to_be_bytes());
+        b.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
+        b.extend_from_slice(&12u32.to_be_bytes());
+        // slice data
+        b.resize(0x1000, 0);
+        b.extend_from_slice(&plain);
+        b.resize(0x3000, 0);
+        b.extend_from_slice(&encrypted);
+        b
+    }
+
+    #[test]
+    fn test_sign_refuses_fat_with_encrypted_slice() {
+        let macho = MachOFile::parse(make_fat_with_encrypted_second_slice())
+            .expect("FAT binary must parse");
+        assert!(macho.is_fat());
+        assert_eq!(macho.slices().len(), 2);
+        assert!(
+            !macho.slices()[0].is_encrypted(),
+            "first slice must be plain"
+        );
+        assert!(
+            macho.slices()[1].is_encrypted(),
+            "second slice must be encrypted"
+        );
+
+        let credentials = test_credentials();
+        let err = sign_any_macho(
+            &macho,
+            "com.zsign.fat",
+            None,
+            &credentials,
+            None,
+            None,
+            false,
+        )
+        .expect_err("FAT with an encrypted slice must refuse");
+        match err {
+            crate::Error::EncryptedBinary(msg) => {
+                assert!(
+                    msg.contains("slice 1"),
+                    "message must name the encrypted slice: {msg}"
+                );
+                assert!(
+                    msg.contains("cryptid=1"),
+                    "message must show cryptid: {msg}"
+                );
+            }
+            other => panic!("expected EncryptedBinary, got {other:?}"),
+        }
+
+        // allow_encrypted=true must sign a FAT binary with an encrypted slice.
+        let signed = sign_any_macho(
+            &macho,
+            "com.zsign.fat",
+            None,
+            &credentials,
+            None,
+            None,
+            true,
+        )
+        .expect("allow_encrypted=true must sign the FAT binary");
+        assert!(
+            signed.len() > macho.data().len(),
+            "signed FAT must include the embedded signature"
+        );
     }
 
     #[test]
