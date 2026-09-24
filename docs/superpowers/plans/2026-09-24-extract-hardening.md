@@ -92,6 +92,9 @@ must not contradict it).
     #[test]
     fn test_extract_ipa_rejects_nested_traversal_entry() {
         assert_rejects_hostile_entry("Payload/../../evil");
+        // Spelling that enclosed_name() silently normalizes instead of
+        // rejecting — the raw-name check must still fail closed.
+        assert_rejects_hostile_entry("Payload/../evil");
     }
 
     #[test]
@@ -103,6 +106,9 @@ must not contradict it).
     fn test_extract_ipa_rejects_windows_style_absolute_entry_name() {
         assert_rejects_hostile_entry("C:/abs/evil");
         assert_rejects_hostile_entry("\\abs\\evil");
+        // Backslash traversal that Windows-path componentization pops
+        // instead of rejecting.
+        assert_rejects_hostile_entry("Payload\\sub\\..\\evil");
     }
 ```
 
@@ -283,7 +289,7 @@ or relocated; gate green. **Controller commits:**
 Determinism notes: the two 600-byte file entries sum to 1200 > 1000, so at
 least one reservation observes an over-total value regardless of chunk
 scheduling; the symlink test runs in the sequential symlink pass (file
-bytes 59 + first target 4090 = 4149 ≤ 5000, second target crosses 5000), so
+bytes 49 + first target 4090 = 4139 ≤ 5000, second target crosses 5000), so
 it is fully ordered. Because the reservation happens *before* each write,
 disk bytes can never exceed the caps even when the error fires late.
 
@@ -821,14 +827,13 @@ archive entry. **Controller commits:**
 
     #[test]
     fn test_extract_ipa_rejects_descendant_of_file_entry() {
+        // Order 1: file ancestor first, then its descendant.
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = temp_dir.path().join("descendant.ipa");
         let file = File::create(&ipa_path).unwrap();
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default();
         zip.add_directory("Payload/", options).unwrap();
-        // File first; the later deep entry's immediate parent is NOT the
-        // file, only a higher ancestor is — the full chain must be walked.
         zip.start_file("Payload/a", options).unwrap();
         zip.write_all(b"i am a file").unwrap();
         zip.start_file("Payload/a/b/c", options).unwrap();
@@ -844,6 +849,30 @@ archive entry. **Controller commits:**
             "unexpected error: {msg}"
         );
         assert!(msg.contains("Payload/a"), "error must name the path: {msg}");
+
+        // Order 2: descendant registered first — the later ancestor file
+        // must hit the same collect-pass conflict, not an OS error after
+        // directories have been created.
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("descendant_first.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        zip.add_directory("Payload/", options).unwrap();
+        zip.start_file("Payload/a/b/c", options).unwrap();
+        zip.write_all(b"descendant of a file").unwrap();
+        zip.start_file("Payload/a", options).unwrap();
+        zip.write_all(b"i am a file").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("ancestor file after its descendant must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Payload/a"), "error must name the path: {msg}");
     }
 ```
 
@@ -851,10 +880,13 @@ archive entry. **Controller commits:**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
 Expected: all three new tests FAIL. Duplicate: pre-fix last write wins and
-extraction *succeeds*. Type conflict: pre-fix the error is
-`IO error: Is a directory (os error 21)`. Descendant: pre-fix
-`create_dir_all` fails with `IO error: File exists (os error 17)` (or
-`Not a directory`). None match the pinned messages.
+extraction *succeeds*. Type conflict: pre-fix the directory pass creates
+`Payload/D` as a directory, then `File::create(Payload/D)` fails with
+`IO error: Is a directory (os error 21)`. Descendant: pre-fix the
+directory pass (`extract.rs:215-218`) creates `Payload/a` as a directory
+before any archive file exists, then phase 1 fails at
+`File::create(Payload/a)` with `IO error: Is a directory (os error 21)` —
+in both archive orders. None match the pinned messages.
 
 - [ ] **Step 3: Implement collect-pass detection**
 
@@ -885,13 +917,37 @@ fn file_ancestor<'a>(
 }
 ```
 
+Add the ancestor-claim helper next to it:
+
+```rust
+/// Registers every ancestor of `path` strictly below `dest_dir` as a path
+/// that must exist as a directory.
+///
+/// Claims are recorded when each entry is seen so conflict detection is
+/// order-independent: an archive listing `Payload/a/b/c` before
+/// `Payload/a` is rejected the same way as the reverse order.
+fn register_ancestor_dirs(path: &Path, dest_dir: &Path, dirs: &mut HashSet<PathBuf>) {
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir == dest_dir {
+            break;
+        }
+        if !dirs.contains(dir) {
+            dirs.insert(dir.to_path_buf());
+        }
+        ancestor = dir.parent();
+    }
+}
+```
+
 Declare next to `dirs_to_create` (:168):
 
 ```rust
     let mut file_paths: HashSet<PathBuf> = HashSet::new();
 ```
 
-In the dir branch (:191-197), before `dirs_to_create.insert`:
+Replace the dir branch's `dirs_to_create.insert(outpath.clone());`
+(:191-197 region) with the checks plus registration:
 
 ```rust
             if file_paths.contains(&outpath) {
@@ -908,6 +964,13 @@ In the dir branch (:191-197), before `dirs_to_create.insert`:
                     format!("Conflicting entry path in IPA: {}", relative.display()),
                 )));
             }
+            dirs_to_create.insert(outpath.clone());
+            // Claim every implied ancestor as a must-be-directory so a
+            // later file at the same path is rejected in the collect pass,
+            // whichever order the archive lists them. A dir entry that
+            // contains registered files stays legal — claims add no new
+            // rejection here.
+            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
 ```
 
 Replace the file branch (:200-214) with:
@@ -935,10 +998,10 @@ Replace the file branch (:200-214) with:
                     format!("Conflicting entry path in IPA: {}", relative.display()),
                 )));
             }
-            // Collect parent directories (a file ancestor was rejected above).
-            if let Some(parent) = outpath.parent() {
-                dirs_to_create.insert(parent.to_path_buf());
-            }
+            // Claim this entry's ancestor chain as must-be-directories; the
+            // walk above already rejected file ancestors, and a later file
+            // at any claimed path conflicts below.
+            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
             file_paths.insert(outpath.clone());
             entries.push(ExtractEntry {
                 index: i,
@@ -951,9 +1014,13 @@ Replace the file branch (:200-214) with:
         }
 ```
 
-Directory duplicates stay legal: explicit dir entries and implicit parents
-legitimately collide in every normal IPA. `file_paths` grows only with
-non-dir entries, so `file_ancestor` never sees a directory hit.
+Directory duplicates stay legal: explicit dir entries and implicit
+ancestors legitimately collide in every normal IPA. `file_paths` grows only
+with non-dir entries, so `file_ancestor` never sees a directory hit, and
+ancestor-claim registration in *both* branches makes the two-set conflict
+rule order-independent: whichever of two contradictory entries comes second
+finds the claim. A dir entry that *contains* registered files stays legal —
+the dir branch claims ancestors but adds no file-descendant rejection.
 
 - [ ] **Step 4: Run the gate — expect PASS**
 

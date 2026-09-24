@@ -160,19 +160,30 @@ lines and were re-anchored.
 - Fixture: CDE byte-patch helper in the inline tests (premise correction 2).
 
 ### Item 5 — duplicate/conflicting paths
-- **A (chosen):** In the collect pass, add `file_paths: HashSet<PathBuf>`
-  alongside the existing `dirs_to_create` (reused as the dir set). Rules
-  before any write: file/symlink path already in `file_paths` → `Duplicate
-  entry path in IPA: <rel>`; file path already in `dirs_to_create` →
-  `Conflicting entry path in IPA: <rel>`; dir entry whose path is in
-  `file_paths` → conflict; and for **both** dir and file entries, any
-  **ancestor up to `dest_dir`** already in `file_paths` → conflict (walk the
-  whole parent chain: a file `Payload/a` must reject a later
-  `Payload/a/b/c`, whose immediate parent `Payload/a/b` is not itself
-  registered). Directory duplicates stay legal (explicit dir entries and
-  implicit parents legitimately collide; erroring would reject every normal
-  IPA). All errors `Error::Io(InvalidInput)`, message carries the path
-  relative to `dest_dir` (stable across TempDir prefixes).
+- **A (chosen):** In the collect pass, maintain two claims per path —
+  `file_paths: HashSet<PathBuf>` (every file/symlink entry) and
+  `dirs_to_create` (every path that must exist as a directory: explicit dir
+  entries **and the full ancestor chain of every entry**, claimed when the
+  entry is seen). Checks at each insert, all before any write:
+  - file/symlink path already in `file_paths` → `Duplicate entry path in
+    IPA: <rel>`;
+  - file/symlink path already in `dirs_to_create` → `Conflicting entry path
+    in IPA: <rel>` — this catches a same-path dir entry *and* an ancestor
+    implied by an already-registered descendant, so archive orders
+    `Payload/a` → `Payload/a/b/c` **and** `Payload/a/b/c` → `Payload/a`
+    fail identically, both naming `Payload/a`;
+  - dir entry whose path is in `file_paths` → conflict;
+  - any ancestor of the current entry (walk up to, excluding, `dest_dir`)
+    already in `file_paths` → conflict naming that ancestor.
+  Because every entry claims its full ancestor chain when seen, detection is
+  order-independent: whichever of the two contradictory entries comes second
+  finds the claim. The dir branch adds claims but no new rejection: a dir
+  entry that *contains* registered files (`Payload/a/b/` with
+  `Payload/a/b/c`) is agreement, not conflict, and must keep passing.
+  Directory duplicates stay legal (explicit dir entries and implicit
+  ancestors legitimately collide; erroring would reject every normal IPA).
+  All errors `Error::Io(InvalidInput)`, message carries the path relative to
+  `dest_dir` (stable across TempDir prefixes).
 - **B:** Single `HashMap<PathBuf, EntryKind>`. Rejected: equivalent
   semantics, but a bigger rewrite of the collect pass than the fix needs;
   two sets match the existing structure (dirs are already a `HashSet`).
@@ -295,16 +306,16 @@ Twelve new tests across tasks 1-5.
 | Test | Fixture | Pre-fix result (proof of regression value) |
 |---|---|---|
 | `test_extract_ipa_rejects_parent_traversal_entry` | `start_file("../evil")` inside an otherwise-valid IPA | pre-fix: skipped silently, extraction *succeeds* → test fails |
-| `test_extract_ipa_rejects_nested_traversal_entry` | `start_file("Payload/../../evil")` | pre-fix: `None` → skipped, extraction succeeds → fails |
+| `test_extract_ipa_rejects_nested_traversal_entry` | `start_file("Payload/../../evil")` plus the accepted `start_file("Payload/../evil")` spelling | pre-fix: first → `None` skipped, second → silently normalized to `evil`; extraction succeeds → fails |
 | `test_extract_ipa_rejects_absolute_entry_name` | `start_file("/abs/evil")` | pre-fix: relocated to `<dest>/abs/evil`, succeeds → fails |
-| `test_extract_ipa_rejects_windows_style_absolute_entry_name` | `start_file("C:/abs/evil")` and `start_file("\\abs\\evil")` | pre-fix: prefix/root ignored, relocated inside dest, succeeds → fails |
+| `test_extract_ipa_rejects_windows_style_absolute_entry_name` | `start_file("C:/abs/evil")`, `start_file("\\abs\\evil")`, and backslash traversal `start_file("Payload\\sub\\..\\evil")` | pre-fix: prefix/root ignored or `..` popped, relocated inside dest, succeeds → fails |
 | `test_extract_ipa_rejects_oversized_entry` | 2048-byte entry, `ExtractionLimits { max_entry_bytes: 100, ... }` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_oversized_total` | two 600-byte entries, `max_total_bytes: 1000` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_total_overflow_from_symlinks` | small file + two 4090-byte symlink targets, `max_total_bytes: 5000` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_strips_setuid_bit` (unix) | CDE-patched `0o104755` mode on `Info.plist`; assert on-disk `mode & 0o7777 == 0o755` | pre-fix: on-disk `0o4755` → fails |
 | `test_extract_ipa_rejects_duplicate_normalized_paths` | `Payload/Test.app/Info.plist` + `./Payload/Test.app/Info.plist` | pre-fix: last-write-wins, succeeds → fails |
 | `test_extract_ipa_rejects_type_conflicting_entries` | `add_directory("Payload/D")` + `start_file("Payload/D")` | pre-fix: raw OS error at write, message unpinned → fails message assert |
-| `test_extract_ipa_rejects_descendant_of_file_entry` | file `Payload/a` then file `Payload/a/b/c` | pre-fix: OS error in `create_dir_all`, unpinned message → fails message assert |
+| `test_extract_ipa_rejects_descendant_of_file_entry` | both archive orders in one test fn: file `Payload/a` → file `Payload/a/b/c`, and `Payload/a/b/c` → `Payload/a` | pre-fix: dir pass creates `Payload/a`, then `File::create(Payload/a)` → `Is a directory (os error 21)`, unpinned → fails message assert |
 | `test_extract_ipa_rejects_long_symlink_target` (unix) | `add_symlink` with a 5000-char safe target | pre-fix: fails later at `symlink()` with `File name too long`; message assert on `Symlink target too long in IPA` → fails |
 
 Determinism notes:
@@ -313,7 +324,7 @@ Determinism notes:
   always errors, and disk bytes can never exceed the cap because the
   reservation happens before each write.
 - The symlink budget test runs in the sequential symlink pass after the
-  files pass (60-byte file + 4090 = 4150 ≤ 5000; second target crosses
+  files pass (49-byte file + 4090 = 4139 ≤ 5000; second target crosses
   5000) — fully ordered, no scheduling dependence.
 
 Scoped gate after every task (never project-wide, per brief):
@@ -342,8 +353,10 @@ cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic
 6. Symlink target bytes counted toward both caps: partitioning symlinks out
    of the file loop must not exempt them from the budget. — item 2
 7. Two `HashSet`s over a kind-map rewrite in the collect pass; directory
-   duplicates remain legal; conflict detection walks the full ancestor
-   chain, not just the immediate parent. — item 5
+   duplicates remain legal; every entry claims its full ancestor chain at
+   collect time so conflict detection is order-independent — both
+   `Payload/a` → `Payload/a/b/c` and the reverse order fail identically,
+   and a dir entry containing registered files stays legal. — item 5
 8. Buffered per-pass `File` reopens over mmap-with-SAFETY (residual SIGBUS
    stays) and over whole-file `Arc<Vec<u8>>` (unbounded RAM). — item 6
 9. Best-effort post-create `symlink_metadata` check over `create_new`/O_EXCL
