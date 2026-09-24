@@ -141,7 +141,12 @@ fn verify_slice(
     // Code pages: hash the declared code region.
     report.pages = check_code_pages_in_file(primary, data, slice);
     match &report.pages {
-        PageCheck::Matched | PageCheck::Empty => {}
+        PageCheck::Matched => {}
+        PageCheck::Empty => {
+            report
+                .errors
+                .push("code directory covers zero code bytes".into());
+        }
         PageCheck::Mismatch { page_index } => {
             report.errors.push(format!(
                 "code page {page_index} hash mismatch (code region modified?)"
@@ -297,7 +302,7 @@ mod tests {
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
     use crate::macho::fixtures::make_minimal_macho;
-    use crate::macho::{sign_any_macho, sign_macho_sha256_only, MachOFile};
+    use crate::macho::{sign_any_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile};
     use der::Decode;
     use sha2::{Digest, Sha256};
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -443,6 +448,34 @@ mod tests {
             "oversized codeLimit must be reported, got {:?}",
             report.slices[1].errors
         );
+    }
+
+    #[test]
+    fn zero_code_coverage_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.zero", None, None, None, false).unwrap();
+
+        // Collapse the primary CD to zero coverage: nCodeSlots = 0,
+        // codeLimit = 0.
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let cd = entry_offset(&signed[sig_off..sig_off + sig_len], CSSLOT_CODEDIRECTORY)
+            .expect("primary CD entry");
+        let sb = &mut signed[sig_off..sig_off + sig_len];
+        sb[cd + 28..cd + 32].copy_from_slice(&0u32.to_be_bytes()); // nCodeSlots
+        sb[cd + 32..cd + 36].copy_from_slice(&0u32.to_be_bytes()); // codeLimit
+
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        let slice = &report.slices[0];
+        assert!(
+            slice.errors.iter().any(|e| e.contains("zero code bytes")),
+            "zero-coverage CD must be rejected, got {:?}",
+            slice.errors
+        );
+        assert!(!report.is_valid());
     }
 
     #[test]

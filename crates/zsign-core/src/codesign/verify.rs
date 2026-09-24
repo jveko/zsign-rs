@@ -448,7 +448,7 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
     if cd.code_limit as usize > code.len() {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
-            computed: region_len.div_ceil(PAGE_SIZE),
+            computed: region_len.div_ceil(page_size),
         };
     }
 
