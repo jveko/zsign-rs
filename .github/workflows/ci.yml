@@ -28,6 +28,10 @@ jobs:
           else
             hk check --all
           fi
+      - name: Check formatting (all files)
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test (workspace)
