@@ -55,8 +55,9 @@ callers `:538` / `:593` untouched):
    value — whether it points outside or *inside* the root — is rejected
    up front with an actionable error naming the value and the bundle.
    Then `resolve_within(bundle_path, Path::new(value))?` (item 3 helper)
-   rejects `RootDir`/`ParentDir`/`Prefix` components and any pre-existing
-   symlink component (`..` fails the component check).
+   rejects `RootDir`/`ParentDir`/`Prefix` components, non-plain spellings
+   (`./Test`, `foo//Test`, `Test/`), and any pre-existing symlink
+   component (`..` fails the component check).
    `fs::symlink_metadata` must report a **regular file**; otherwise a
    hard `Error::Core(Signing(...))` naming the offending value and the
    bundle. This fires for missing files, directories, and (final or
@@ -129,19 +130,53 @@ Mechanism (repo idiom, not canonicalize — the workspace uses no
    relative-and-not-`..` is taken as root-relative and joined; an absolute
    path that is not under `root` errors `"Path {} is not under root {}"`
    (verbatim `extract.rs:62-71` idiom).
-2. Reject `Component::ParentDir | RootDir | Prefix(_)` in `relative` with
-   `"Path {} escapes the bundle root {}"`.
-3. Downward walk: push each component onto a `current` buffer starting at
+2. Reject `Component::ParentDir | RootDir | Prefix(_)` in `relative`
+   with `"Path {} escapes the bundle root {}"`.
+3. Require plain spelling: reject `Component::CurDir`, and reject any
+   `relative` whose component rebuild differs from its raw `OsStr`
+   (`./Test`, `foo//Test`, `Test/`), with
+   `"Path {} is not a plain relative path under {}"`. CodeResources'
+   main-executable exclusion compares the *raw* `CFBundleExecutable`
+   string against WalkDir-relative paths
+   (`zsign-core/src/bundle/code_resources.rs:264-267`), so only a plain
+   raw value can keep that invariant. Root-prefixed inputs arrive via
+   `strip_prefix`, which already returns plain remainders (verified
+   against Rust std behavior), so the check only ever fires on
+   literal/relative inputs — i.e. the raw plist value.
+4. Downward walk: push each component onto a `current` buffer starting at
    root; if `fs::symlink_metadata(&current)` says symlink →
    `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:79-86`).
    The first `ErrorKind::NotFound` stops the walk (fresh tail is safe);
    any *other* metadata failure (permission, I/O) becomes a hard
    `Error::Core(Signing("Failed to inspect signing path {}: {}"))` — it
-   is never treated as proof of absence.
-4. Return `root.join(relative)` — lexical, never canonicalized.
+   is never treated as proof of absence. The walk starts *below* `root`;
+   the root itself is validated once at signing entry (next paragraph).
+5. Return `root.join(relative)` — lexical, never canonicalized.
 
 All errors are `Error::Core(zsign_core::Error::Signing(format!(...)))`,
 the established idiom of this file for signing-flow complaints.
+
+Root handling: the bundle root itself is validated once, at
+`sign_bundle_from_options` — `fs::symlink_metadata(bundle_path)` must
+not report a symlink, otherwise hard error
+(`"Bundle root must not be a symlink: {}"`). walkdir 2.5 follows a
+symlinked walk root even with `follow_links(false)`
+(`follow_root_links` defaults to true — walkdir 2.5.0 lib.rs:853, and
+the root-descent branch at :861-871), and `resolve_within` deliberately
+starts below the root, so this single entry check covers `sign()`,
+`sign_folder_in_place`, and `sign_folder_to_ipa` through their common
+funnel. This also covers a symlinked `Payload/*.app` returned by
+extraction (in-tree redirect targets pass `is_safe_symlink_target`, so
+the redirect is only blocked here). Because `lstat("link/")` follows a
+final symlink when a trailing separator is present (verified against
+`fs::symlink_metadata` on this toolchain), the check lstats the
+component-rebuilt path — trailing separators stripped. Ancestor path
+components of the
+root (the path *above* the final component) are trusted operator input
+— equivalent to the operator's choice of working directory — because
+the threat model is hostile bundle content, and rejecting symlinked
+ancestors would break standard layouts (macOS `/var` → `/private/var`,
+tempdir roots).
 
 Wiring — every `fs::write`/`create_dir_all` is preceded by exactly one
 validation: at function entry where the function also reads or dispatches
@@ -199,9 +234,14 @@ built inline exactly like `test_ipa_signer_refuses_encrypted_bundle`
 `fs::write` executable from `crate::test_util::minimal_macho()`. Symlink
 tests are `#[cfg(unix)]` + `std::os::unix::fs::symlink` (precedent:
 `ipa/extract.rs:470`, `ipa/archive.rs:426`,
-`bundle/code_resources.rs:441`). Each test fails before its fix; where an
-external or target file exists, its bytes must be byte-identical
-afterwards.
+`bundle/code_resources.rs:441`). Each containment test fails before its
+fix; where an external or target file exists, its bytes must be
+byte-identical afterwards. Platform note: tests 6-12 are
+`#[cfg(unix)]` (off-Unix only tests 1-5 exist), and test 7's probe
+returns early — passing without asserting — where DAC permission checks
+are bypassed (e.g. running as root). Test 12 is an explicit
+trust-boundary pin: it passes before and after the fix and fails only if
+ancestor-trusting is revoked.
 
 1. `test_sign_rejects_executable_path_outside_bundle` — `CFBundleExecutable`
    = `"../outside_macho"` (real Mach-O written beside the `.app` in the
@@ -217,34 +257,54 @@ afterwards.
 4. `test_sign_rejects_non_string_executable_value` — `CFBundleExecutable`
    is an `<integer>`; must fail with `"must be a string"` (the fallback
    is reserved for an absent key). Covers the fallback boundary.
-5. `test_sign_rejects_symlinked_main_executable` (`#[cfg(unix)]`) —
+5. `test_sign_rejects_nonplain_executable_value` — `CFBundleExecutable`
+   = `"./Test"` over a real in-bundle `Test`; must fail with
+   `"not a plain relative path"` — covers `CurDir`/redundant-separator
+   rejection that keeps CodeResources' raw-string main-executable
+   exclusion intact. Covers item 1 × item 3.
+6. `test_sign_rejects_symlinked_main_executable` (`#[cfg(unix)]`) —
    `CFBundleExecutable` names an in-root symlink whose target is a real
    in-bundle file; sign must fail (`"Pre-existing symlink"`) and the real
    target's bytes must stay unchanged — documents that layouts whose
    plist names the root link are rejected (Item 1 × Item 2 composition).
-6. `test_sign_errors_on_unreadable_path_component` (`#[cfg(unix)]`) — a
+7. `test_sign_errors_on_unreadable_path_component` (`#[cfg(unix)]`) — a
    bundle subdirectory is chmod'd unreadable and `CFBundleExecutable`
    points through it; sign must fail with
    `"Failed to inspect signing path"` — the metadata-error hard-error arm
    of `resolve_within`. Probe-guarded: environments that bypass DAC
    permission checks skip the assertions.
-7. `test_symlinked_dylib_is_skipped_and_target_untouched` — bundle with
-   real executable plus `lib.dylib` → `../outside.dylib` symlink.
-   `find_standalone_dylibs` and `find_immediate_macho_binaries` (private,
-   called directly from the inline tests) must not list it; a full
-   `sign_folder_in_place` succeeds and `outside.dylib` bytes are
-   unchanged. Covers item 2 (both walks that can see a file at bundle root).
-8. `test_symlinked_framework_is_not_collected_and_target_untouched` —
-   `Evil.framework` symlink → external dir containing `Info.plist` +
-   executable; `collect_nested_bundles` must not list it; full sign
-   succeeds; external executable bytes unchanged and no external
-   `_CodeSignature` appears. Covers item 2.
-9. `test_sign_rejects_symlinked_info_plist_rewrite` — `Info.plist` is a
-   symlink to a valid external plist; `.bundle_id("com.x")` triggers
-   `rewrite_plist_string` first; sign must `Err` and the external plist
-   bytes must be unchanged. This is the failing-first test for the
-   `resolve_within` write guard (items 3); without the guard the rewrite
-   writes through the symlink and the bytes change.
+8. `test_symlinked_dylib_is_skipped_and_target_untouched`
+   (`#[cfg(unix)]`) — bundle with real executable plus `lib.dylib` →
+   `../outside.dylib` symlink. `find_standalone_dylibs` and
+   `find_immediate_macho_binaries` (private, called directly from the
+   inline tests) must not list it; a full `sign_folder_in_place` succeeds
+   and `outside.dylib` bytes are unchanged. Covers item 2 (both walks
+   that can see a file at bundle root).
+9. `test_symlinked_framework_is_not_collected_and_target_untouched`
+   (`#[cfg(unix)]`) — `Evil.framework` symlink → external dir containing
+   `Info.plist` + executable; `collect_nested_bundles` must not list it;
+   full sign succeeds; external executable bytes unchanged and no
+   external `_CodeSignature` appears. Covers item 2.
+10. `test_sign_rejects_symlinked_info_plist_rewrite` (`#[cfg(unix)]`) —
+    `Info.plist` is a symlink to a valid external plist;
+    `.bundle_id("com.x")` triggers `rewrite_plist_string` first; sign
+    must `Err` and the external plist bytes must be unchanged. This is
+    the failing-first test for the `resolve_within` write guard (items
+    3); without the guard the rewrite writes through the symlink and the
+    bytes change.
+11. `test_sign_rejects_symlinked_bundle_root` (`#[cfg(unix)]`) — the
+    fixture's real `App.app` is renamed to `Outside.app` and `App.app`
+    recreated as a symlink to it; `sign_folder_in_place` must fail with
+    `"Bundle root must not be a symlink"` both for the plain path and
+    for the path with a trailing `/` (which would otherwise force the
+    kernel to follow the final component); outside bytes unchanged and
+    no external `_CodeSignature`. Covers item 3's root validation.
+12. `test_sign_trusts_operator_root_ancestors` (`#[cfg(unix)]`) — a real
+    bundle under `temp/real/App.app` is signed via `temp/link/App.app`
+    where `temp/link` → `temp/real`; the sign must **succeed** with
+    writes landing at the resolved location (`real/App.app/_CodeSignature`)
+    — pinning the documented trust boundary: root *ancestors* are
+    operator input, only the root's final component is checked.
 
 Existing `ipa::tests` (4 non-skipped) plus the cross-crate signer tests
 (`builder::tests :562`, `verify::tests :536/:572/:583/:596`, CLI
@@ -322,11 +382,27 @@ failure, ZSN-15).
   `CodeResourcesBuilder`'s scan (a different file — lane scope). A read
   through an in-tree symlink yields content the bundle owner could have
   placed in the bundle directly, and no bytes are written outside the
-  root; the `sign()` flow in addition cannot contain an escaping symlink
-  at all, because `extract.rs`'s `is_safe_symlink_target` refuses
-  absolute and `..` symlink targets at extraction
-  (`extract.rs:49-55,269`), and `sign_folder_in_place` trusts the
-  operator-supplied directory exactly as it trusts its file contents.
+  root; the `sign()` flow in addition cannot smuggle an *escaping*
+  symlink target through extraction (`extract.rs`'s
+  `is_safe_symlink_target` refuses absolute and `..` targets, so
+  extracted links resolve in-tree), and a symlinked bundle root —
+  extracted or operator-supplied — is rejected at signing entry
+  (see "Root handling" above), so neither flow can redirect the write
+  root.
+- *Decision — root final-component check, ancestors trusted:*
+  `sign_bundle_from_options` rejects a symlink *final* component of the
+  root (checked on the component-rebuilt path so a trailing separator
+  cannot force the kernel to follow it). Walking every lexical ancestor
+  was rejected: operator-supplied ancestors are invocation-time input —
+  outside the hostile-bundle threat model — and ancestry rejection would
+  break standard layouts (macOS `/var` → `/private/var`, tempdir roots).
+  Pinned by `test_sign_trusts_operator_root_ancestors`.
+- *Decision — plain spelling enforced in `resolve_within`, not
+  normalized:* the raw `CFBundleExecutable` string must equal its
+  WalkDir-relative form for CodeResources' exclusion invariant, and
+  `CodeResourcesBuilder` (out of lane scope) re-reads the raw string —
+  so normalization inside this file could not restore the invariant.
+  Reject instead: validate, don't guess.
 
 ## Non-goals
 
