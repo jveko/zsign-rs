@@ -52,7 +52,7 @@ impl BinaryVerification {
 /// Checksum verification of a `_CodeSignature/CodeResources` file.
 #[derive(Debug, Clone, Default)]
 pub struct CodeResourcesVerification {
-    /// Number of sealed files whose hashes matched.
+    /// Number of sealed entries verified (hash match or symlink target match).
     pub matched: usize,
     /// Sealed files whose on-disk content has a different hash.
     pub mismatched: Vec<String>,
@@ -441,16 +441,80 @@ fn check_code_resources(
         return Ok(out);
     };
 
-    // Sealed → disk: every entry must exist and hash to its recorded value.
+    // Sealed → disk: every entry must exist and match its recorded seal.
     for (rel, entry) in files2 {
         let file_path = bundle.join(rel.as_str());
-        let Some(data) = std::fs::read(&file_path).ok() else {
-            out.missing.push(rel.clone());
-            continue;
-        };
         let entry_dict = match entry.as_dictionary() {
             Some(d) => d,
             None => continue,
+        };
+
+        let symlink = entry_dict.get("symlink");
+        let has_hash = entry_dict.get("hash").is_some();
+        let has_hash2 = entry_dict.get("hash2").is_some();
+        let malformed = (symlink.is_some() && (has_hash || has_hash2))
+            || (has_hash
+                && entry_dict
+                    .get("hash")
+                    .is_some_and(|value| value.as_data().is_none()))
+            || (has_hash2
+                && entry_dict
+                    .get("hash2")
+                    .is_some_and(|value| value.as_data().is_none()))
+            || (symlink.is_some() && symlink.is_some_and(|value| value.as_string().is_none()));
+        if malformed {
+            errors.push(format!("malformed CodeResources entry: {rel}"));
+            continue;
+        }
+
+        if let Some(sealed_target) = symlink.and_then(|value| value.as_string()) {
+            let metadata = match std::fs::symlink_metadata(&file_path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    out.missing.push(rel.clone());
+                    continue;
+                }
+                Err(e) => return Err(crate::Error::Io(e)),
+            };
+            if !metadata.is_symlink() {
+                out.mismatched.push(rel.clone());
+                continue;
+            }
+            match std::fs::read_link(&file_path) {
+                Ok(actual) => {
+                    if actual.to_string_lossy().to_string() == sealed_target {
+                        out.matched += 1;
+                    } else {
+                        out.mismatched.push(rel.clone());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    out.missing.push(rel.clone());
+                }
+                Err(e) => return Err(crate::Error::Io(e)),
+            }
+            continue;
+        }
+
+        let metadata = match std::fs::symlink_metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.missing.push(rel.clone());
+                continue;
+            }
+            Err(e) => return Err(crate::Error::Io(e)),
+        };
+        if metadata.is_symlink() {
+            out.mismatched.push(rel.clone());
+            continue;
+        }
+        let data = match std::fs::read(&file_path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.missing.push(rel.clone());
+                continue;
+            }
+            Err(e) => return Err(crate::Error::Io(e)),
         };
         let computed = Sha256::digest(&data);
         let sealed = entry_dict
@@ -478,7 +542,7 @@ fn check_code_resources(
                 "Failed to walk directory: {e}"
             )))
         })?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
             continue;
         }
         let rel = entry
@@ -693,6 +757,26 @@ mod tests {
             cr.unsealed
         );
         assert!(cr.matched >= 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn signed_bundle_with_framework_symlink_verifies() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        // Target a plain resource, never a Mach-O: the signer's binary walk follows
+        // links (ipa/mod.rs:598-620) and would re-sign a linked executable through
+        // the symlink, which is out of this test's scope.
+        let app = build_signed_bundle_with(td.path(), |app| {
+            let framework = app.join("Frameworks").join("Sub.framework");
+            fs::write(framework.join("resource.bin"), b"framework resource").unwrap();
+            symlink("resource.bin", framework.join("reslink")).unwrap();
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            report.valid(),
+            "a bundle whose framework contains a sealed symlink must verify: {:?}",
+            report.bundle
+        );
     }
 
     #[test]
