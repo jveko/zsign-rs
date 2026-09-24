@@ -38,19 +38,24 @@ lines and were re-anchored.
 1. **`enclosed_name()` does not return `None` for every traversal or absolute
    name in zip 7.2.0.** It componentizes via `Utf8WindowsPath`
    (`zip-7.2.0/src/types.rs:589-607`): `ParentDir` pops and only yields `None`
-   on `checked_sub` underflow; leading `RootDir` is *ignored*; `CurDir` is
-   ignored. Consequences, verified against the implementation:
+   on `checked_sub` underflow; a leading `RootDir` or drive `Prefix` is
+   *ignored while depth is 0*; `CurDir` is ignored. Consequences, verified
+   against the implementation:
    - `"../evil"` → `None` (underflow) → currently skipped. ✔ matches brief.
    - `"Payload/../../evil"` → `None` (second `..` underflows) → currently
      skipped. ✔ matches brief.
    - `"/abs/evil"` → `Some("abs/evil")` — **silently relocated inside the
      dest, not skipped**. The brief's "absolute entry names are skipped"
      premise is wrong; rejecting them needs an explicit raw-name check.
+   - `"C:/abs/evil"` and `"\\abs\\evil"` behave like `/abs/evil` (prefix/root
+     ignored at depth 0, then relocated) — the raw-name check must be
+     Windows-form aware, not just `/`-based.
    - `"Payload/../x"` → `Some("x")` — silently normalized (contained but
      laundered).
    Therefore the fix is two-part: an explicit raw-name traversal/absolute
-   check **plus** `None => Err` (covers NUL names and underflow). Both brief
-   regression cases error via either path.
+   check (both separator spellings, drive and UNC prefixes) **plus**
+   `None => Err` (covers NUL names and underflow). All four brief regression
+   cases error via the raw check.
 2. **`SimpleFileOptions::unix_permissions(0o4755)` cannot forge a setuid
    fixture**: it masks `mode & 0o777` on write
    (`zip-7.2.0/src/write.rs:466-470`) and `FileOptions.permissions` is
@@ -58,16 +63,18 @@ lines and were re-anchored.
    central directory record at byte offset 38 (packed layout
    `types.rs:1028-1044`), stored as `mode << 16` (`types.rs:708-713`, reader
    `>> 16` at `types.rs:611-616`). The setuid fixture therefore patches the
-   CDE's `external_file_attributes` high half to `0o104755` after
-   `ZipWriter::finish()` (low 16 bits = DOS attributes, preserved).
+   CDE's `external_file_attributes` high half to `0o104755` (i.e.
+   `(mode << 16) | (old & 0xffff)`, preserving the low DOS-attribute bits)
+   after `ZipWriter::finish()`.
 3. **`ZipWriter::start_file` rejects byte-identical duplicate names**
    (`zip-7.2.0/src/write.rs:1128-1134`) but accepts *textually distinct,
    semantically equal* names — `./a` vs `a`, `a//b` vs `a/b` (both
    `enclosed_name()` to the same path) and directory `"Payload/D"` (stored as
    `"Payload/D/"`) vs file `"Payload/D"`. Duplicate-path tests use these.
-4. `extract_ipa` has exactly three production call sites — `ipa/mod.rs:268`
-   (`validate_ipa`), `ipa/mod.rs:277`, `verify.rs:234` — all positional
-   2-arg + `?`. The signature must not change (verify.rs is lane 26's).
+4. `extract_ipa` has exactly two production call sites — `ipa/mod.rs:277`
+   (inside `IpaSigner::sign`, directly after `validate_ipa(input_ipa)?` at
+   `:268`) and `verify.rs:234` — both positional 2-arg + `?`. The signature
+   must not change (verify.rs is lane 26's).
 5. `pub mod extract;` (`ipa/mod.rs:55`) makes new pub items reachable as
    `zsign_rs::ipa::extract::*` with **no** `mod.rs`/`lib.rs` edits.
 6. `memmap2` has exactly one consumer: `extract.rs:28,:144`; dependency at
@@ -87,10 +94,14 @@ lines and were re-anchored.
 ## 3. Per-item candidate designs
 
 ### Item 1 — fail closed on unsafe entry names
-- **A (chosen):** In the collect pass, reject any raw entry name where a
-  `/`-separated segment is `..` or the name starts with `/`; additionally
-  turn the `None` arm into `Err` naming the entry. Both checks use the raw
-  `file.name()` and run before any directory or file is written.
+- **A (chosen):** In the collect pass, reject any raw entry name that is
+  absolute in either spelling — starts with `/` or `\`, or carries an
+  alphabetic `X:` drive prefix — or whose `/`- **and** `\`-separated segments
+  contain `..`; additionally turn the `None` arm into `Err` naming the entry.
+  Both checks use the raw `file.name()` and run before any directory or file
+  is written. The dual spelling matters: the reader componentizes names with
+  Windows-path semantics (`Utf8WindowsPath`), so `C:/evil` and `\evil` would
+  otherwise be silently relocated inside the dest instead of rejected.
 - **B:** Rely on `enclosed_name() == None` alone. Rejected: does not catch
   absolute names or safely-normalized `..` (they are silently relocated, see
   premise correction 1), so the "absolute entry names" part of the brief
@@ -102,13 +113,19 @@ lines and were re-anchored.
 
 ### Item 2 — zip-bomb budgets
 - **A (chosen):** `ExtractionLimits { max_entry_bytes, max_total_bytes }`
-  (`Default` = 2 GiB / 8 GiB), enforced **while writing**: per entry via
-  `io::copy` over `(&mut file).take(max_entry_bytes.saturating_add(1))` and
-  comparing bytes written; total via a shared `AtomicU64` (`fetch_add`,
-  `Relaxed`) captured by reference across rayon workers. New sibling
-  `extract_ipa_with_limits(ipa, dest, limits: ExtractionLimits)`; `extract_ipa`
-  delegates with `ExtractionLimits::default()` so the three call sites keep
-  their 2-arg signature.
+  (`Default` = 2 GiB / 8 GiB), enforced **while writing**: a
+  `BudgetedWriter` adapter wraps the output file and, for every buffer, (a)
+  checks `entry_written + buf.len()` against the entry cap, then (b)
+  `fetch_add`s `buf.len()` into a shared `AtomicU64` total
+  (`Relaxed`, captured by reference across rayon workers) and checks it
+  against the total cap — all **before** the buffer reaches the underlying
+  writer. Neither cap can be overshot by parallel workers: bytes reaching
+  disk stay ≤ `max_entry_bytes` per entry and ≤ `max_total_bytes` overall.
+  Symlink target bytes count toward both caps in the sequential symlink pass
+  (entry cap: target length; total: reserved before `symlink(2)` is called).
+  New sibling `extract_ipa_with_limits(ipa, dest, limits: ExtractionLimits)`
+  ; `extract_ipa` delegates with `ExtractionLimits::default()` so the two
+  call sites keep their 2-arg signature.
 - **B:** Pre-check declared `file.size()` at collect time only. Rejected:
   header sizes are attacker-controlled; a lying-small header bypasses it.
   Write-time counting is the only guarantee the brief requires.
@@ -117,16 +134,17 @@ lines and were re-anchored.
   catch (at best it fails a few seconds earlier on a declared bomb).
 - Error: `Error::Io(InvalidData)`, message must contain
   `Archive exceeds extraction limit`.
-- Symlink targets are excluded from the byte budget: they are bounded at
-  4096 bytes per entry by item 3, so their aggregate is bounded by the
-  archive's own size.
+- Symlink targets participate fully: each target is checked against the
+  entry cap and its length reserved against the total before the link is
+  created; the item-3 read bound (4096 bytes) still caps each individual
+  read.
 
 ### Item 3 — bound the symlink-target read
 - **A (chosen):** `const MAX_SYMLINK_TARGET_BYTES: usize = 4096` (Linux
   `PATH_MAX`; longer targets can never be `symlink()`ed anyway). Read via
   `file.take(MAX + 1).read_to_string(&mut target)`, then reject
-  `target.len() > MAX` **before** `is_safe_symlink_target`. Peak memory
-  bounded at ~4097 bytes.
+  `target.len() > MAX` **before** the budget accounting and
+  `is_safe_symlink_target`. Peak memory bounded at ~4097 bytes.
 - **B:** Read into a fixed `[u8; 4096]` with `read_exact`. Rejected:
   more code (short-read handling, UTF-8 conversion) for the same bound.
 - Error: `Error::Io(InvalidData)` with
@@ -147,8 +165,11 @@ lines and were re-anchored.
   before any write: file/symlink path already in `file_paths` → `Duplicate
   entry path in IPA: <rel>`; file path already in `dirs_to_create` →
   `Conflicting entry path in IPA: <rel>`; dir entry whose path is in
-  `file_paths` → conflict; implicit parent that is already a file →
-  conflict. Directory duplicates stay legal (explicit dir entries and
+  `file_paths` → conflict; and for **both** dir and file entries, any
+  **ancestor up to `dest_dir`** already in `file_paths` → conflict (walk the
+  whole parent chain: a file `Payload/a` must reject a later
+  `Payload/a/b/c`, whose immediate parent `Payload/a/b` is not itself
+  registered). Directory duplicates stay legal (explicit dir entries and
   implicit parents legitimately collide; erroring would reject every normal
   IPA). All errors `Error::Io(InvalidInput)`, message carries the path
   relative to `dest_dir` (stable across TempDir prefixes).
@@ -211,12 +232,12 @@ them later).
 ### Error mapping (no new `Error` variants)
 | Condition | Variant / kind | Message (asserted substring **bold**) |
 |---|---|---|
-| `..` segment or absolute raw name; `enclosed_name()` → `None` | `Io(InvalidInput)` | `Unsafe entry name in IPA: <raw>` |
-| entry over `max_entry_bytes` | `Io(InvalidData)` | `Archive exceeds extraction limit: entry '<rel>' exceeds <N> bytes` |
-| total over `max_total_bytes` | `Io(InvalidData)` | `Archive exceeds extraction limit: total extracted size exceeds <N> bytes` |
+| `..` segment, `/`- or `\`-rooted, or drive-prefixed raw name; `enclosed_name()` → `None` | `Io(InvalidInput)` | `Unsafe entry name in IPA: <raw>` |
+| entry over `max_entry_bytes` (file write or symlink target) | `Io(InvalidData)` | `Archive exceeds extraction limit: entry '<rel>' exceeds <N> bytes` |
+| total over `max_total_bytes` (file bytes or symlink targets) | `Io(InvalidData)` | `Archive exceeds extraction limit: total extracted size exceeds <N> bytes` |
 | symlink target > 4096 bytes | `Io(InvalidData)` | `Symlink target too long in IPA: <path> (...)` |
 | duplicate file path | `Io(InvalidInput)` | `Duplicate entry path in IPA: <rel>` |
-| dir/file or parent/file conflict | `Io(InvalidInput)` | `Conflicting entry path in IPA: <rel>` |
+| dir/file, parent/file, or ancestor/file conflict | `Io(InvalidInput)` | `Conflicting entry path in IPA: <rel>` |
 | post-create path not a regular file | `Io(InvalidInput)` | `Extraction path is not a regular file: <path>` |
 
 `<rel>` = `outpath.strip_prefix(dest_dir)` (TempDir-stable in tests). The
@@ -224,28 +245,40 @@ published `Error` enum stays untouched; `thiserror` forwards the inner
 message so every substring above is visible via `err.to_string()`.
 
 ### Byte-accounting detail
-Per entry: `written = io::copy(&mut (&mut file).take(max.saturating_add(1)), &mut buf)` —
-at most limit+1 bytes are ever buffered, then `written > max` is detectable.
-Only entries within the per-entry cap are `fetch_add`ed to the atomic total
-(an over-cap entry aborts extraction anyway). `Ordering::Relaxed` suffices:
-the atomicity matters, not the ordering. On error the `BufWriter` flushes
-its partial file on drop — same as every other mid-extraction failure today;
-the destination is caller-invalidated on `Err`, which the existing contract
-already assumes.
+`BudgetedWriter<W>` wraps `BufWriter<File>` in the rayon loop. Its `write()`
+(a) rejects `entry_written + buf.len() > max_entry_bytes`, then (b)
+`fetch_add`s `buf.len()` into the shared total and rejects
+`total > max_total_bytes` — both **before** `inner.write(buf)`. Bytes
+actually reaching disk are therefore ≤ `max_entry_bytes` per entry and ≤
+`max_total_bytes` in aggregate, no matter how many workers run concurrently;
+the only overshoot possible is bytes held in `io::copy`'s small read buffer
+in memory, never on disk. `Ordering::Relaxed` suffices: atomicity of the
+tally is what matters, not ordering. A short inner write may over-reserve
+the total by the unwritten remainder — conservative, fails closed. Symlink
+pass: after the bounded read and its length check, the target length is
+checked against the entry cap and reserved against the total, both before
+`symlink(2)` is called. On error the `BufWriter` flushes its already-
+reserved partial file on drop — same as every other mid-extraction failure
+today; the destination is caller-invalidated on `Err`, which the existing
+contract already assumes.
 
 ## 5. Invariants
 
 1. **Fail closed:** any rejection aborts the whole extraction; no entry is
    ever silently skipped or relocated.
-2. **No writes before validation:** unsafe-name, duplicate/conflict, and
-   budget-*declaration* checks run in the collect pass or before the copy;
-   a rejected archive leaves no payload files beyond pre-existing content.
-3. **Bounded resource use:** per-entry ≤ `max_entry_bytes + 1` bytes
-   buffered; total ≤ `max_total_bytes + max_entry_bytes`; symlink target
-   read ≤ 4097 bytes; no `unsafe` code remains in the workspace.
+2. **No writes before name validation:** unsafe-name and duplicate/conflict
+   checks run in the collect pass, before any payload write — a rejected
+   name or path leaves no payload files. Budget and mid-write I/O failures
+   are *not* rolled back: they may leave partial destination content (the
+   destination is caller-invalidated on `Err`; no rollback is in scope).
+3. **Bounded resource use:** bytes reaching disk ≤ `max_entry_bytes` per
+   entry and ≤ `max_total_bytes` in aggregate (symlink targets included);
+   per-worker overshoot beyond disk is only `io::copy`'s in-memory read
+   buffer; symlink target read ≤ 4097 bytes; no `unsafe` code remains in
+   the workspace.
 4. **Privilege hygiene:** extracted files carry only `mode & 0o777`.
 5. **Signature stability:** `extract_ipa`/`validate_ipa` keep their current
-   signatures; the three production call sites compile unchanged.
+   signatures; the two `extract_ipa` call sites compile unchanged.
 6. **Existing security tests unchanged:** the four adversarial symlink tests
    and `test_is_safe_symlink_target` keep passing as written.
 7. **Scope:** only `extract.rs` (+ inline tests), plus the memmap2 removal
@@ -256,23 +289,32 @@ already assumes.
 All tests are inline (`extract.rs` `mod tests`), built with `ZipWriter`
 (string-name APIs only — `*_from_path` sanitizes). Every new test pins the
 error **message substring** (and where useful the `Error::Io` kind) so an
-unrelated `NotFound`/`ENAMETOOLONG` cannot false-green it.
+unrelated `NotFound`/`ENAMETOOLONG`/`EISDIR` error cannot false-green it.
+Twelve new tests across tasks 1-5.
 
 | Test | Fixture | Pre-fix result (proof of regression value) |
 |---|---|---|
-| `test_extract_ipa_rejects_parent_traversal_entry` | `start_file("../evil")` inside a otherwise-valid IPA | pre-fix: skipped silently, extraction *succeeds* → test fails |
+| `test_extract_ipa_rejects_parent_traversal_entry` | `start_file("../evil")` inside an otherwise-valid IPA | pre-fix: skipped silently, extraction *succeeds* → test fails |
 | `test_extract_ipa_rejects_nested_traversal_entry` | `start_file("Payload/../../evil")` | pre-fix: `None` → skipped, extraction succeeds → fails |
 | `test_extract_ipa_rejects_absolute_entry_name` | `start_file("/abs/evil")` | pre-fix: relocated to `<dest>/abs/evil`, succeeds → fails |
+| `test_extract_ipa_rejects_windows_style_absolute_entry_name` | `start_file("C:/abs/evil")` and `start_file("\\abs\\evil")` | pre-fix: prefix/root ignored, relocated inside dest, succeeds → fails |
 | `test_extract_ipa_rejects_oversized_entry` | 2048-byte entry, `ExtractionLimits { max_entry_bytes: 100, ... }` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_oversized_total` | two 600-byte entries, `max_total_bytes: 1000` | pre-fix: no limits API → red at compile |
+| `test_extract_ipa_rejects_total_overflow_from_symlinks` | small file + two 4090-byte symlink targets, `max_total_bytes: 5000` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_strips_setuid_bit` (unix) | CDE-patched `0o104755` mode on `Info.plist`; assert on-disk `mode & 0o7777 == 0o755` | pre-fix: on-disk `0o4755` → fails |
 | `test_extract_ipa_rejects_duplicate_normalized_paths` | `Payload/Test.app/Info.plist` + `./Payload/Test.app/Info.plist` | pre-fix: last-write-wins, succeeds → fails |
 | `test_extract_ipa_rejects_type_conflicting_entries` | `add_directory("Payload/D")` + `start_file("Payload/D")` | pre-fix: raw OS error at write, message unpinned → fails message assert |
+| `test_extract_ipa_rejects_descendant_of_file_entry` | file `Payload/a` then file `Payload/a/b/c` | pre-fix: OS error in `create_dir_all`, unpinned message → fails message assert |
 | `test_extract_ipa_rejects_long_symlink_target` (unix) | `add_symlink` with a 5000-char safe target | pre-fix: fails later at `symlink()` with `File name too long`; message assert on `Symlink target too long in IPA` → fails |
 
-Budget-test determinism: the two 600-byte entries sum to 1200 > 1000, so at
-least one `fetch_add` observes an over-total value regardless of chunk
-scheduling — the extraction always errors.
+Determinism notes:
+- The two 600-byte entries sum to 1200 > 1000, so at least one reservation
+  observes an over-total value regardless of chunk scheduling — that test
+  always errors, and disk bytes can never exceed the cap because the
+  reservation happens before each write.
+- The symlink budget test runs in the sequential symlink pass after the
+  files pass (60-byte file + 4090 = 4150 ≤ 5000; second target crosses
+  5000) — fully ordered, no scheduling dependence.
 
 Scoped gate after every task (never project-wide, per brief):
 
@@ -285,25 +327,33 @@ cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic
 1. Skipped-entry silent skip → hard error (fail-closed over partial
    extraction). — item 1
 2. Raw-name check **and** `None => Err`: `enclosed_name` alone cannot see
-   absolute names; `None` alone misses them. — item 1
+   absolute names; `None` alone misses them; the raw check is Windows-form
+   aware (both separators, drive/UNC prefixes) to match the reader's
+   componentization. — item 1
 3. Write-time byte counting over declared-size prechecks; no redundant
    preflight. — item 2
 4. Sibling `extract_ipa_with_limits` + `Copy` struct over changing
    `extract_ipa`'s signature (would break `verify.rs:234`, lane 26), over
    `Option<ExtractionLimits>` (callers would pass `None` habitually), and
    over a builder (one knob, YAGNI). — item 2
-5. Two `HashSet`s over a kind-map rewrite in the collect pass; directory
-   duplicates remain legal. — item 5
-6. Buffered per-pass `File` reopens over mmap-with-SAFETY (residual SIGBUS
+5. Pre-write reservation (`BudgetedWriter`) over a post-copy `fetch_add`
+   tally: a post-hoc tally lets every parallel worker commit a full entry
+   to disk before the error fires, overshooting `max_total_bytes`. — item 2
+6. Symlink target bytes counted toward both caps: partitioning symlinks out
+   of the file loop must not exempt them from the budget. — item 2
+7. Two `HashSet`s over a kind-map rewrite in the collect pass; directory
+   duplicates remain legal; conflict detection walks the full ancestor
+   chain, not just the immediate parent. — item 5
+8. Buffered per-pass `File` reopens over mmap-with-SAFETY (residual SIGBUS
    stays) and over whole-file `Arc<Vec<u8>>` (unbounded RAM). — item 6
-7. Best-effort post-create `symlink_metadata` check over `create_new`/O_EXCL
+9. Best-effort post-create `symlink_metadata` check over `create_new`/O_EXCL
    (breaks re-extraction) and over full `openat` plumbing (out of scope). — item 7
-8. No new `Error` variant: the enum is published and non-`#[non_exhaustive]`;
-   `Error::Io(kind, msg)` is this file's existing idiom.
-9. CDE byte-patch setuid fixture (with low 16 bits preserved) over
-   `unix_permissions` (masks to `0o777`) over symlink/dir mode tricks (never
-   reach `set_permissions`).
-10. Message-pinning assertions over bare `is_err()` for all new tests.
+10. No new `Error` variant: the enum is published and non-`#[non_exhaustive]`;
+    `Error::Io(kind, msg)` is this file's existing idiom.
+11. CDE byte-patch setuid fixture (with low 16 bits preserved) over
+    `unix_permissions` (masks to `0o777`) over symlink/dir mode tricks (never
+    reach `set_permissions`).
+12. Message-pinning assertions over bare `is_err()` for all new tests.
 
 ## 8. Deferred
 

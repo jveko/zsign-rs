@@ -14,6 +14,8 @@ setuid bits, duplicate/conflicting paths, undocumented mmap, TOCTOU.
 obsolete `memmap2` dependency from `crates/zsign/Cargo.toml`/`Cargo.lock`).
 Each task follows red-green: Tester subagent writes the failing test first,
 implementer subagents green it, controller runs the scoped gate and commits.
+Twelve new tests total; expected gate counts: task 1 → 16, task 2 → 19,
+task 3 → 20, task 4 → 21, task 5 → 24.
 
 **Tech Stack:** Rust 2021, zip 7.2.0 (writer fixtures), rayon (unchanged),
 `std::sync::atomic::AtomicU64` (new), tempfile (existing tests).
@@ -96,12 +98,18 @@ must not contradict it).
     fn test_extract_ipa_rejects_absolute_entry_name() {
         assert_rejects_hostile_entry("/abs/evil");
     }
+
+    #[test]
+    fn test_extract_ipa_rejects_windows_style_absolute_entry_name() {
+        assert_rejects_hostile_entry("C:/abs/evil");
+        assert_rejects_hostile_entry("\\abs\\evil");
+    }
 ```
 
 - [ ] **Step 2: Run the gate — expect FAIL**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: the three new tests FAIL (pre-fix the entries are silently skipped
+Expected: the four new tests FAIL (pre-fix the entries are silently skipped
 or relocated, so extraction *succeeds*); all pre-existing tests PASS.
 
 - [ ] **Step 3: Implement fail-closed name validation**
@@ -109,12 +117,21 @@ or relocated, so extraction *succeeds*); all pre-existing tests PASS.
 Add the helper after `is_safe_symlink_target` (:49-54):
 
 ```rust
-/// Returns true if an archive entry name uses `..` traversal or is absolute.
+/// Returns true if an archive entry name is absolute or uses `..` traversal.
 ///
-/// `zip`'s `enclosed_name()` sanitizes such names rather than rejecting them,
-/// so the raw name must be checked explicitly to fail closed.
+/// Both separator spellings are checked because the zip reader
+/// componentizes names with Windows-path semantics (`Utf8WindowsPath`):
+/// `C:/evil` and `\evil` would otherwise be silently relocated inside the
+/// destination instead of rejected.
 fn is_unsafe_entry_name(name: &str) -> bool {
-    name.starts_with('/') || name.split('/').any(|segment| segment == "..")
+    if name.starts_with('/') || name.starts_with('\\') {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    name.split(['/', '\\']).any(|segment| segment == "..")
 }
 ```
 
@@ -143,23 +160,24 @@ In the collect pass, replace the `enclosed_name` match (:173-176) with:
 - [ ] **Step 4: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (3 new + 12 existing).
+Expected: all tests pass (4 new + 12 existing = 16).
 
 - [ ] **Step 5: Update `extract_ipa`'s `# Errors` doc** (:122-129) — add a
   bullet: `- Returns [`Error::Io`] if an archive entry name is unsafe
   (traversal or absolute)`
 
-**Acceptance:** the three tests above pass; no entry can be silently skipped;
-gate green. **Controller commits:** `fix(zsign): fail closed on unsafe ipa entry names (ZSN-28)`
+**Acceptance:** the four tests above pass; no entry can be silently skipped
+or relocated; gate green. **Controller commits:**
+`fix(zsign): fail closed on unsafe ipa entry names (ZSN-28)`
 
 ---
 
 ### Task 2: Zip-bomb budgets with injectable limits
 
 **Files:**
-- Modify: `crates/zsign/src/ipa/extract.rs` (new `ExtractionLimits` +
-  `extract_ipa_with_limits` above `extract_ipa` :130; rayon copy loop
-  :239-254; imports; tests)
+- Modify: `crates/zsign/src/ipa/extract.rs` (new `BudgetedWriter` +
+  `ExtractionLimits` + `extract_ipa_with_limits` above `extract_ipa` :130;
+  rayon copy loop :239-254; symlink pass; imports; tests)
 
 - [ ] **Step 1: Write the failing tests** (append to `mod tests`)
 
@@ -226,10 +244,48 @@ gate green. **Controller commits:** `fix(zsign): fail closed on unsafe ipa entry
         );
         assert!(msg.contains("total"), "error must mention the total: {msg}");
     }
+
+    #[test]
+    fn test_extract_ipa_rejects_total_overflow_from_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("symlink_budget.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link1", "a".repeat(4090), options)
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link2", "a".repeat(4090), options)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 1_000_000,
+            max_total_bytes: 5_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("symlink bytes over the total budget must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("total"), "error must mention the total: {msg}");
+    }
 ```
 
-Determinism note: the two 600-byte entries sum to 1200 > 1000, so at least
-one `fetch_add` observes an over-total value regardless of chunk scheduling.
+Determinism notes: the two 600-byte file entries sum to 1200 > 1000, so at
+least one reservation observes an over-total value regardless of chunk
+scheduling; the symlink test runs in the sequential symlink pass (file
+bytes 59 + first target 4090 = 4149 ≤ 5000, second target crosses 5000), so
+it is fully ordered. Because the reservation happens *before* each write,
+disk bytes can never exceed the caps even when the error fires late.
 
 - [ ] **Step 2: Run the gate — expect FAIL**
 
@@ -239,10 +295,11 @@ not found) — that is the red state.
 
 - [ ] **Step 3: Implement the limits API**
 
-Add above `extract_ipa` (:130), imports updated to
-`use std::io::{self, BufReader, BufWriter, Cursor, Read};` is NOT yet touched
-(that is task 6) — only add
-`use std::sync::atomic::{AtomicU64, Ordering};`:
+Add the import `use std::sync::atomic::{AtomicU64, Ordering};` alongside the
+existing `use std::sync::...` group (there is none yet — add it as its own
+line after `use std::path::{Path, PathBuf};`).
+
+Add above `extract_ipa` (:130):
 
 ```rust
 /// Byte budgets enforced while writing extracted archive contents.
@@ -266,6 +323,58 @@ impl Default for ExtractionLimits {
 }
 ```
 
+Add the budgeted writer (file-level, next to `ExtractEntry`):
+
+```rust
+/// Wraps the extraction output and enforces byte budgets before any data
+/// reaches the underlying writer.
+///
+/// Every buffer is checked against the entry cap and reserved from the
+/// shared total first, so parallel workers cannot overshoot either cap: what
+/// reaches disk stays within budget.
+struct BudgetedWriter<'a, W> {
+    inner: W,
+    relative: &'a Path,
+    entry_written: u64,
+    max_entry_bytes: u64,
+    total: &'a AtomicU64,
+    max_total_bytes: u64,
+}
+
+impl<W: io::Write> io::Write for BudgetedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len() as u64;
+        if self.entry_written + n > self.max_entry_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                    self.relative.display(),
+                    self.max_entry_bytes
+                ),
+            ));
+        }
+        let total = self.total.fetch_add(n, Ordering::Relaxed) + n;
+        if total > self.max_total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                    self.max_total_bytes
+                ),
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.entry_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+```
+
 Convert the existing `extract_ipa` body into the delegating pair:
 
 ```rust
@@ -277,7 +386,8 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 ///
 /// Same as [`extract_ipa`], but the caller chooses the zip-bomb limits.
 /// Extraction fails with [`Error::Io`] (`InvalidData`) as soon as an entry
-/// or the archive total exceeds its budget.
+/// or the archive total exceeds its budget — the check runs before each
+/// buffer is written, so no unbudgeted bytes reach disk.
 ///
 /// # Examples
 ///
@@ -296,8 +406,7 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the IPA is missing, an entry name is unsafe, a
-/// path is a pre-existing symlink, or the extraction byte budget is
-/// exceeded.
+/// path is a pre-existing symlink, or an extraction byte budget is exceeded.
 /// Returns [`Error::Zip`] if the file is not a valid ZIP archive or no
 /// `.app` bundle is found in `Payload/`.
 pub fn extract_ipa_with_limits(
@@ -305,14 +414,16 @@ pub fn extract_ipa_with_limits(
     dest_dir: impl AsRef<Path>,
     limits: ExtractionLimits,
 ) -> Result<PathBuf> {
-    // ... existing extract_ipa body verbatim ...
+    // ... existing extract_ipa body moved here verbatim, except for Step 4 ...
 }
 ```
 
-(The original `extract_ipa` doc comment stays on `extract_ipa`; give it the
-same `# Errors` bullet for budgets as task 1 adds for unsafe names.)
+The original `extract_ipa` doc comment stays on `extract_ipa`; extend its
+`# Errors` section with: `- Returns [`Error::Io`] if an archive entry or the
+archive total exceeds the default extraction limits (2 GiB per entry, 8 GiB
+total)`.
 
-- [ ] **Step 4: Enforce budgets in the copy loop**
+- [ ] **Step 4: Enforce budgets while writing**
 
 Before the rayon phase (:230), add:
 
@@ -320,55 +431,75 @@ Before the rayon phase (:230), add:
     let total_written = AtomicU64::new(0);
 ```
 
-Inside the per-entry loop, replace the bare `io::copy` (:244) with:
+Inside the per-entry loop, replace `BufWriter::new(outfile)` + bare
+`io::copy` (:243-244) with:
 
 ```rust
-                let mut outfile = BufWriter::new(outfile);
-                // Read at most one byte past the cap so an over-budget entry
-                // is detected without ever buffering more than the limit.
-                let written = io::copy(
-                    &mut (&mut file).take(limits.max_entry_bytes.saturating_add(1)),
-                    &mut outfile,
-                )?;
-                if written > limits.max_entry_bytes {
-                    let relative = entry
-                        .outpath
-                        .strip_prefix(dest_dir_ref)
-                        .unwrap_or(&entry.outpath);
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
-                            relative.display(),
-                            limits.max_entry_bytes
-                        ),
-                    )));
-                }
-                let total = total_written.fetch_add(written, Ordering::Relaxed) + written;
-                if total > limits.max_total_bytes {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
-                            limits.max_total_bytes
-                        ),
-                    )));
-                }
+                let relative = entry
+                    .outpath
+                    .strip_prefix(dest_dir_ref)
+                    .unwrap_or(&entry.outpath);
+                let mut budgeted = BudgetedWriter {
+                    inner: BufWriter::new(outfile),
+                    relative,
+                    entry_written: 0,
+                    max_entry_bytes: limits.max_entry_bytes,
+                    total: &total_written,
+                    max_total_bytes: limits.max_total_bytes,
+                };
+                io::copy(&mut file, &mut budgeted)?;
+```
+
+(The `validate_output_path` → `File::create` sequence above is unchanged;
+task 7 later inserts its re-verify between them. The `#[cfg(unix)]`
+permission-restore block after the copy is unchanged for now.)
+
+In the symlink pass, insert between `file.read_to_string(&mut target)?;`
+(:267) and `if !is_safe_symlink_target(&target) {` (:269):
+
+```rust
+            // Symlink targets count toward both budgets, reserved before
+            // the link is created.
+            if target.len() as u64 > limits.max_entry_bytes {
+                let relative = entry
+                    .outpath
+                    .strip_prefix(dest_dir)
+                    .unwrap_or(&entry.outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                        relative.display(),
+                        limits.max_entry_bytes
+                    ),
+                )));
+            }
+            let target_bytes = target.len() as u64;
+            let total = total_written.fetch_add(target_bytes, Ordering::Relaxed) + target_bytes;
+            if total > limits.max_total_bytes {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                        limits.max_total_bytes
+                    ),
+                )));
+            }
 ```
 
 The closure captures `limits` (Copy) and `&total_written` by reference; both
-live in the function scope. `Ordering::Relaxed` suffices — only atomicity of
-the tally matters.
+live in the function scope, as does `total_written` for the symlink pass.
 
 - [ ] **Step 5: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (2 new + 14 from earlier tasks; the pre-existing
-happy-path tests prove the 2 GiB/8 GiB defaults do not trip on tiny IPAs).
+Expected: all tests pass (3 new, 19 total). The pre-existing happy-path
+tests prove the 2 GiB/8 GiB defaults do not trip on tiny IPAs.
 
-**Acceptance:** both budget tests pass with injected low limits; `extract_ipa`
-signature unchanged (callers `ipa/mod.rs:277`, `verify.rs:234` compile
-untouched). **Controller commits:**
+**Acceptance:** all three budget tests pass with injected low limits;
+bytes reaching disk provably stay within both caps; `extract_ipa` signature
+unchanged (callers `ipa/mod.rs:277`, `verify.rs:234` compile untouched).
+**Controller commits:**
 `feat(zsign): enforce extraction byte limits for ipa archives (ZSN-28)`
 
 ---
@@ -377,7 +508,7 @@ untouched). **Controller commits:**
 
 **Files:**
 - Modify: `crates/zsign/src/ipa/extract.rs` (new const near
-  `is_safe_symlink_target`; symlink pass :265-269; tests)
+  `is_safe_symlink_target`; symlink pass; tests)
 
 - [ ] **Step 1: Write the failing test** (append to `mod tests`)
 
@@ -431,15 +562,10 @@ Add near `is_safe_symlink_target`:
 const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 ```
 
-In the symlink pass, replace (:265-268):
-
-```rust
-            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
-            let mut target = String::new();
-            file.read_to_string(&mut target)?;
-```
-
-with:
+Replace the current symlink-pass region — from
+`let mut file = archive.by_index(entry.index)?;` through the budget blocks
+added in task 2, up to (but not including) `if !is_safe_symlink_target` —
+with this final state:
 
 ```rust
             let file = archive.by_index(entry.index).map_err(Error::Zip)?;
@@ -459,15 +585,44 @@ with:
                     ),
                 )));
             }
+            // Symlink targets count toward both budgets, reserved before
+            // the link is created.
+            if target.len() as u64 > limits.max_entry_bytes {
+                let relative = entry
+                    .outpath
+                    .strip_prefix(dest_dir)
+                    .unwrap_or(&entry.outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                        relative.display(),
+                        limits.max_entry_bytes
+                    ),
+                )));
+            }
+            let target_bytes = target.len() as u64;
+            let total = total_written.fetch_add(target_bytes, Ordering::Relaxed) + target_bytes;
+            if total > limits.max_total_bytes {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                        limits.max_total_bytes
+                    ),
+                )));
+            }
 ```
 
-The length check runs **before** `is_safe_symlink_target` (:269 onwards,
-unchanged). `file` is consumed by `take`, so its binding loses `mut`.
+The length check runs **before** the budget accounting and before
+`is_safe_symlink_target` (unchanged below). `file` is consumed by `take`,
+so its binding loses `mut`.
 
 - [ ] **Step 4: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass, including the four adversarial symlink tests.
+Expected: all tests pass (1 new, 20 total), including the four adversarial
+symlink tests.
 
 **Acceptance:** long-target test passes with the pinned message; peak
 symlink-read memory ≤ 4097 bytes. **Controller commits:**
@@ -508,7 +663,11 @@ symlink-read memory ≤ 4097 bytes. **Controller commits:**
         ]) as usize;
 
         for _ in 0..entry_count {
-            assert_eq!(&bytes[pos..pos + 4], b"PK\x01\x02", "bad central directory entry");
+            assert_eq!(
+                &bytes[pos..pos + 4],
+                b"PK\x01\x02",
+                "bad central directory entry"
+            );
             let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
             let extra_len = u16::from_le_bytes([bytes[pos + 30], bytes[pos + 31]]) as usize;
             let comment_len = u16::from_le_bytes([bytes[pos + 32], bytes[pos + 33]]) as usize;
@@ -580,7 +739,7 @@ with:
 - [ ] **Step 4: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass.
+Expected: all tests pass (1 new, 21 total).
 
 **Acceptance:** extracted `Info.plist` lands as `0o755` from a `0o104755`
 archive entry. **Controller commits:**
@@ -591,7 +750,8 @@ archive entry. **Controller commits:**
 ### Task 5: Reject duplicate/conflicting entry paths before any write
 
 **Files:**
-- Modify: `crates/zsign/src/ipa/extract.rs` (collect pass :166-215; tests)
+- Modify: `crates/zsign/src/ipa/extract.rs` (collect pass :166-215; new
+  `file_ancestor` helper; tests)
 
 - [ ] **Step 1: Write the failing tests** (append to `mod tests`)
 
@@ -658,17 +818,72 @@ archive entry. **Controller commits:**
         );
         assert!(msg.contains("Payload/D"), "error must name the path: {msg}");
     }
+
+    #[test]
+    fn test_extract_ipa_rejects_descendant_of_file_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("descendant.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        // File first; the later deep entry's immediate parent is NOT the
+        // file, only a higher ancestor is — the full chain must be walked.
+        zip.start_file("Payload/a", options).unwrap();
+        zip.write_all(b"i am a file").unwrap();
+        zip.start_file("Payload/a/b/c", options).unwrap();
+        zip.write_all(b"descendant of a file").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("entry under a file must be rejected in the collect pass");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Payload/a"), "error must name the path: {msg}");
+    }
 ```
 
 - [ ] **Step 2: Run the gate — expect FAIL**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: duplicate test FAILS (pre-fix: last write wins, extraction
-succeeds); conflict test FAILS (pre-fix the error is
-`IO error: Is a directory (os error 21)`, which does not match the pinned
-message).
+Expected: all three new tests FAIL. Duplicate: pre-fix last write wins and
+extraction *succeeds*. Type conflict: pre-fix the error is
+`IO error: Is a directory (os error 21)`. Descendant: pre-fix
+`create_dir_all` fails with `IO error: File exists (os error 17)` (or
+`Not a directory`). None match the pinned messages.
 
 - [ ] **Step 3: Implement collect-pass detection**
+
+Add the ancestor helper next to `is_unsafe_entry_name`:
+
+```rust
+/// Returns an ancestor of `path` strictly below `dest_dir` that is already
+/// registered as a file entry, if any.
+///
+/// Walks the whole parent chain: a file `Payload/a` must also reject
+/// `Payload/a/b/c`, whose immediate parent is not itself registered.
+fn file_ancestor<'a>(
+    path: &Path,
+    dest_dir: &Path,
+    file_paths: &'a HashSet<PathBuf>,
+) -> Option<&'a PathBuf> {
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir == dest_dir {
+            return None;
+        }
+        if let Some(hit) = file_paths.get(dir) {
+            return Some(hit);
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
+```
 
 Declare next to `dirs_to_create` (:168):
 
@@ -681,6 +896,13 @@ In the dir branch (:191-197), before `dirs_to_create.insert`:
 ```rust
             if file_paths.contains(&outpath) {
                 let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Conflicting entry path in IPA: {}", relative.display()),
@@ -706,16 +928,15 @@ Replace the file branch (:200-214) with:
                     format!("Conflicting entry path in IPA: {}", relative.display()),
                 )));
             }
-            // Collect parent directories; a parent that is itself a file is a
-            // conflict, not something to discover at create time.
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            // Collect parent directories (a file ancestor was rejected above).
             if let Some(parent) = outpath.parent() {
-                if file_paths.contains(parent) {
-                    let relative = parent.strip_prefix(dest_dir).unwrap_or(parent);
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Conflicting entry path in IPA: {}", relative.display()),
-                    )));
-                }
                 dirs_to_create.insert(parent.to_path_buf());
             }
             file_paths.insert(outpath.clone());
@@ -731,16 +952,18 @@ Replace the file branch (:200-214) with:
 ```
 
 Directory duplicates stay legal: explicit dir entries and implicit parents
-legitimately collide in every normal IPA.
+legitimately collide in every normal IPA. `file_paths` grows only with
+non-dir entries, so `file_ancestor` never sees a directory hit.
 
 - [ ] **Step 4: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (2 new + 17 accumulated).
+Expected: all tests pass (3 new, 24 total).
 
-**Acceptance:** both tests pass with pinned messages; detection happens in
-the collect pass, before any directory or file is created. **Controller
-commits:** `fix(zsign): reject duplicate ipa entry paths before extraction (ZSN-28)`
+**Acceptance:** all three tests pass with pinned messages; detection happens
+in the collect pass — including the deep-ancestor case — before any
+directory or file is created. **Controller commits:**
+`fix(zsign): reject duplicate ipa entry paths before extraction (ZSN-28)`
 
 ---
 
@@ -760,7 +983,7 @@ pre-change evidence that the suite is green before the swap (record output).
 
 - [ ] **Step 2: Remove mmap**
 
-Imports (:28-34):
+Imports (:28-34) become:
 
 ```rust
 use crate::{Error, Result};
@@ -774,7 +997,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zip::ZipArchive;
 ```
 
-(delete `use memmap2::Mmap;`, `use std::sync::Arc;`, `Cursor`; add
+(delete `use memmap2::Mmap;`, `use std::sync::Arc;`, and `Cursor`; add
 `BufReader`; keep the `AtomicU64` import added in task 2.)
 
 Open site (:142-149):
@@ -786,14 +1009,15 @@ Open site (:142-149):
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
 ```
 
-Rayon chunk open (:236 area, inside the closure):
+Rayon chunk open (inside the closure, replacing the `Cursor::new(&mmap[..])`
+lines):
 
 ```rust
             let file = File::open(ipa_path)?;
             let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
 ```
 
-Symlink-pass open (:261 area): identical replacement.
+Symlink-pass open: identical replacement.
 
 Delete: the `Arc::new(mmap)` binding, every `Cursor::new(&mmap[..])`, and
 the `// Memory-map the IPA file ...` / `// Open ZIP archive from
@@ -809,11 +1033,11 @@ below refreshes `Cargo.lock` (memmap2 has no other consumer — verified).
 - [ ] **Step 4: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass; `Cargo.lock` no longer lists `memmap2`.
+Expected: all tests pass (24 total); `Cargo.lock` no longer lists `memmap2`.
 
 - [ ] **Step 5: Confirm zero `unsafe` remains**
 
-Run: `grep -rn "unsafe" crates/` (or the grep tool)
+Run: grep tool, pattern `unsafe \{`, path `crates/`
 Expected: no `unsafe {` in `crates/zsign/src` (the workspace's only block
 was `Mmap::map`).
 
@@ -828,7 +1052,7 @@ was `Mmap::map`).
 
 **Files:**
 - Modify: `crates/zsign/src/ipa/extract.rs` (rayon copy loop, between
-  `File::create` and `BufWriter`)
+  `File::create` and the `BudgetedWriter` construction)
 
 - [ ] **Step 1: Red check**
 
@@ -842,7 +1066,7 @@ Recorded honestly; the gate proves no regression.
 - [ ] **Step 2: Implement the post-create check**
 
 Between `File::create(&entry.outpath)?;` and
-`let mut outfile = BufWriter::new(outfile);` insert:
+`let relative = entry.outpath.strip_prefix(...)` insert:
 
 ```rust
                 // Best-effort TOCTOU guard: re-verify that the path just
@@ -863,7 +1087,8 @@ Between `File::create(&entry.outpath)?;` and
 - [ ] **Step 3: Run the gate — expect PASS**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (all four adversarial symlink tests included).
+Expected: all tests pass (24 total; all four adversarial symlink tests
+included).
 
 **Acceptance:** gate green; the copy loop reads validate → create →
 re-verify → copy. **Controller commits:**
@@ -879,7 +1104,7 @@ re-verify → copy. **Controller commits:**
    no other lane's code broke):
    `cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
    — run ONCE at the end, never mid-flight.
-3. `grep` for `unsafe {` in `crates/` → zero hits.
+3. Grep tool over `crates/` for `unsafe \{` → zero hits.
 4. Commit list must be exactly: design+plan docs, then tasks 1-7 in order.
    No merges, no pushes — the orchestrator lands the branch.
 
