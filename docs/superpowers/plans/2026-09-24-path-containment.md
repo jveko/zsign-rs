@@ -2,17 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development with dispatching-parallel-agents for independent tasks to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make it impossible for `crates/zsign/src/ipa/mod.rs` to read or
-write outside the bundle root, even when the input bundle is hostile
-(traversing `CFBundleExecutable`, symlinked entries, planted symlinks).
+**Goal:** Make it impossible for `crates/zsign/src/ipa/mod.rs` to
+**write** outside the bundle root through any path derived from untrusted
+bundle content (traversing `CFBundleExecutable`, symlinked entries,
+planted symlinks), and never follow a symlink on the way to a write.
+
+**Out of scope for containment** (see the design doc's "What is and is
+not guarded"): read-only paths (`get_bundle_identifier` /
+`get_main_executable` Info.plist reads, `sign_binary`'s parent-derived
+Info.plist read, `CodeResourcesBuilder`'s scan, the CodeResources
+read-back) and the user-supplied endpoints (`provisioning_profile_path`,
+output IPA via `create_ipa`) — those inputs are configured by the
+operator, not derived from bundle content.
 
 **Architecture:** One private guard `resolve_within(root, path)` (repo
 idiom: `strip_prefix` + component check + downward symlink walk, mirroring
-`ipa/extract.rs::validate_output_path`) validates every path entering the
-signing flow; discovery walks classify with walkdir's no-follow
-`entry.file_type()`; `get_main_executable` hard-errors on any value that
-is not a relative path to an existing regular file inside the bundle
-(non-string and absolute values are rejected before resolution).
+`ipa/extract.rs::validate_output_path`) validates every **write target**
+and the raw `CFBundleExecutable` value before use; discovery walks
+classify with walkdir's no-follow `entry.file_type()`;
+`get_main_executable` hard-errors on any value that is not a relative
+path to an existing regular file inside the bundle (non-string and
+absolute values are rejected before resolution).
 
 **Tech Stack:** Rust 2021, walkdir 2.5, plist, tempfile. Tests: inline
 `#[cfg(test)] mod tests` in `crates/zsign/src/ipa/mod.rs`.
