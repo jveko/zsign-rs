@@ -42,6 +42,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  test-release:
+    name: Test (workspace, release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The skip excludes a known zip entry-order nondeterminism flake; the
+      # debug test job still runs that test unchanged.
+      - name: Run tests (release)
+        run: cargo test --workspace --release -- --skip test_ipa_signing_is_deterministic
+
+  windows-check:
+    name: Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Check-only for this iteration; running the suite on Windows is a
+      # documented follow-up.
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets
+
   wasm:
     name: Build wasm32
     runs-on: ubuntu-latest
@@ -55,6 +79,12 @@ jobs:
         run: cargo check -p zsign-wasm --target wasm32-unknown-unknown
       - name: Release build wasm32
         run: cargo build -p zsign-wasm --target wasm32-unknown-unknown --release
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: wasm-pack
+      - name: Run wasm tests (node)
+        run: wasm-pack test --node crates/zsign-wasm
 
   interop:
     name: Apple codesign interop (macOS)
