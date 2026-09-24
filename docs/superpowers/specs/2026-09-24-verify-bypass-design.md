@@ -7,9 +7,11 @@
 ## Problem
 
 A verified 8-agent review found four independent verification bypasses in
-`zsign-core`. Each lets a crafted binary produce `verified: yes`
-(`MachOVerifyReport::is_valid() == true`, which is `errors.is_empty()`,
-macho/verify.rs:42-44):
+`zsign-core`. Items 1, 3, and 4 let a crafted binary produce a slice report
+with no findings — `SliceVerifyReport::is_valid()` is `errors.is_empty()`
+(macho/verify.rs:42-44) — and the whole-binary
+`MachOVerifyReport::is_valid()` requires a non-empty slice list where every
+slice is valid (macho/verify.rs:58-60):
 
 1. **Empty-CMS strip.** `verify_slice` short-circuits any CMS slot of
    `len() <= 8` to `adhoc_report()` (valid=true) without checking
@@ -19,8 +21,18 @@ macho/verify.rs:42-44):
 2. **FAT cross-slice page check.** `check_code_pages_in_file` passes
    `data[offset..]` — everything from the slice to EOF — instead of the
    slice's own range (macho/verify.rs:205-213). A `codeLimit` beyond
-   `slice.size` hashes bytes of the *next* architecture (or trailing file
-   bytes) and can report `Matched`.
+   `slice.size` therefore hashes bytes of the *next* architecture (or
+   trailing file bytes) and reports its diagnostics over the wrong region:
+   the page count is derived from the tail (`ceil(C'/page)` over
+   `tail_len`), not from the slice. Note: a *successful* (`Matched`) check
+   under this condition is not constructible for our own output — the
+   parser forces the LC signature (and thus the CodeDirectory and its
+   stored slot hashes) to lie inside `slice.size` (parser.rs:269-278), so
+   once `codeLimit > slice.size` the hashed region covers the slot storage
+   itself and the count or the page hash can never be satisfied — but the
+   check still reads across the slice boundary, and its reported page count
+   and hashed byte range are wrong (test-strategy item 2 pins this
+   observable difference).
 3. **SuperBlob parsing gaps.** `parse_superblob` (codesign/verify.rs:60-116)
    never reads the declared total-length field (blob[4..8]); `12 + count * 8`
    (line 73) is unchecked arithmetic (wraps on wasm32, where
@@ -93,7 +105,7 @@ whose `codeLimit` exceeds the slice and returns `CountMismatch`, which
 
 **Bounds safety:** the parser already validates FAT slice ranges and that
 `LC_CODE_SIGNATURE` fits inside the declared slice (parser.rs:164-190,
-274-286), so the `checked_add`/`get` fallback is defense in depth.
+269-278), so the `checked_add`/`get` fallback is defense in depth.
 
 ### Item 3 — SuperBlob parsing hardening
 
@@ -101,9 +113,12 @@ whose `codeLimit` exceeds the slice and returns `CountMismatch`, which
 computed with `checked_mul`/`checked_add`:
 
 1. Read the declared total length `L = u32(blob[4..8])`.
-2. `L >= blob.len()`? No — require `L <= blob.len()` (tolerate trailing
-   bytes in the LC window) and `L >= 12 + count*8` with checked arithmetic
-   (overflow → error).
+2. Read `count` from `blob[8..12]` — safe because `blob.len() >= 12` was
+   already checked — and compute `index_end = 12 + count*8` with
+   `checked_mul`/`checked_add` (overflow → error). Require
+   `index_end <= L` **and** `L <= blob.len()` (trailing bytes in the LC
+   window tolerated). Because `index_end >= 12`, this rejects `L < 12`
+   *before* any slicing, so `&blob[..L]` is always at least the header.
 3. Bound **all** subsequent reads (index and children) to `&blob[..L]`.
 4. Reject: child `offset` inside the header/index (`offset < 12 + count*8`),
    `item_len < 8`, `offset + item_len > L`, and any pair of child ranges
@@ -114,16 +129,19 @@ computed with `checked_mul`/`checked_add`:
 - **B — checked arithmetic only** (no overlap/zero-length/entry-region
   checks): closes the wasm32 wrap but leaves children free to alias the
   index or each other. Insufficient per brief. Rejected.
-- **C — require `L == blob.len()` exactly:** rejects legitimate
-  zero-padding at the end of an LC window produced by third-party tools;
-  our own writer records exact sizes either way. Rejected (weaker
-  compatibility, no security gain — reads are already bounded by `L`).
+- **C — require `L == blob.len()` exactly:** our own writer records the
+  *reserved* signature space as the LC datasize (`sig_datasize =
+  new_length - code_length`, writer.rs:910/919-924), so the LC window is
+  regularly **larger** than the embedded SuperBlob — strict equality would
+  reject our own signed output (only one embed path sizes the window to
+  the exact signature, writer.rs:396). Rejected outright: not merely a
+  third-party tolerance, it is the compatibility mechanism for own output.
 
 **Compatibility:** `build_superblob` writes the true total into `blob[4..8]`
-(superblob.rs:160-167) and the writer records `datasize = signature.len()`
-(writer.rs:921-924), so our own signed output satisfies (1)-(4) by
+(superblob.rs:160-167), so our own signed output satisfies (1)-(4) by
 construction (offsets are cumulative + 4-byte aligned → strictly
-non-overlapping).
+non-overlapping), and `L <= blob.len()` absorbs the LC window's reserved
+padding (see alternative C).
 
 ### Item 4 — Zero-coverage CD accepted
 
@@ -152,14 +170,22 @@ never reach the page check, so their default `Empty` is unaffected.
 
 ## Invariants
 
-- `report.is_valid()` ⇔ `errors.is_empty()`; every new rejection is a
-  `report.errors.push(...)` in `verify_slice` (never an early `Err`), so
-  `verify_macho` keeps returning `Ok` for parseable Mach-Os.
+- Two distinct rejection channels, used consistently: **semantic
+  verification findings** (page mismatch, ad-hoc flag violations, empty
+  coverage) are `report.errors.push(...)` inside `verify_slice`, preserving
+  its `Ok(report)` contract so `verify_macho` keeps returning `Ok` for
+  parseable Mach-Os; **structural malformations** detected by the public
+  `parse_superblob` return `Error::Verification` (next bullet).
 - All structural parse failures stay `Error::Verification` inside
   `parse_superblob` (existing convention: `Err` = malformed structure,
   `report.errors` = signature findings).
 - Own signer output must remain valid end-to-end: credential-signed thin
-  (full CMS), ad-hoc thin (8-byte wrapper + `CS_ADHOC`), FAT credential.
+  (full CMS), ad-hoc thin (8-byte wrapper + `CS_ADHOC`). For FAT
+  credential output, **only the page check's contract is ours**: the
+  bounded check must keep `PageCheck::Matched` for `codeLimit <
+  slice.size`; whole-report FAT validity already fails at base under the
+  deferred dual-CDHash defect (ZSN-25) and is explicitly out of scope —
+  no test in this lane may assert overall FAT validity.
 - Out of scope, untouched: dual-CDHash binding (ZSN-25), `crypto/cms_verify.rs`
   (lane 23), `crates/zsign/src/verify.rs` (lane 26), constants/signer/writer,
   CLI main.
@@ -177,15 +203,26 @@ never reach the page check, so their default `Empty` is unaffected.
 2. **Item 2** — hand-built 2-slice FAT (header pattern from
    `make_fat_with_encrypted_second_slice`, signer.rs:1230-1258), signed via
    `sign_any_macho`; append trailing pad so the second slice's tail
-   (`data[offset..]`) is longer than its declared `fat_arch` size. Patch
-   the second slice's primary CD: `page_size_log2` 12→13, `codeLimit` set
-   beyond `slice.size` but within the tail and within the same 8 KiB page
-   bucket as the stored slot count, recompute the code slots over the new
-   region (keeps pre-fix verification internally consistent →
-   `Matched`), and shrink the CMS entry to the 8-byte wrapper so the
-   mutated CD isn't rejected by CMS binding. Pre-fix: slice verifies →
-   assert fails. Post-fix: `codeLimit > slice` → `CountMismatch` error.
-   Test asserts the invariant `ceil(C'/8192) == nCodeSlots` explicitly.
+   (`data[offset..]`) is longer than its declared `slice.size`, then patch
+   the second slice's primary CD `codeLimit` to `C' = slice_size + 0x100`
+   (fits the tail, exceeds the slice). The regression is pinned on the
+   **observable diagnostic difference**, not on validity: pre-fix the
+   page check runs over the tail, so with `slice_size = 28672`
+   (`calculate_signature_space(8192)`, writer.rs:51-55) it computes
+   `ceil(28928/4096) = 8` and reports `CountMismatch { stored: 2,
+   computed: 8 }`; post-fix the bounded region is the slice itself and
+   the `code_limit > code.len()` guard reports `{ stored: 2, computed: 7 }`
+   (`ceil(28672/4096)`). The test asserts `pages ==
+   CountMismatch { stored: nCodeSlots, computed: ceil(slice_size/page) }`
+   (read from the parsed slice + CD, not hardcoded) → RED pre-fix
+   (computed 8 ≠ 7), GREEN post-fix. A pre-fix *successful* check is
+   deliberately not targeted: the parser forces the CodeDirectory inside
+   `slice.size` (parser.rs:269-278), so a `codeLimit > slice.size` region
+   covers the CD's own slot storage and no internally consistent `Matched`
+   construction exists — the honest RED/GREEN is the computed-count
+   difference. The test asserts only `report.slices[1].pages` /
+   `report.slices[1].errors` — never slice-0 or whole-report validity
+   (slice 0's dual-CD CMS binding fails under deferred ZSN-25).
 3. **Item 3** — hand-built SuperBlobs in `codesign/verify.rs` tests:
    declared length shorter than the index extent; child inside the
    header/index; `item_len < 8`; two overlapping children. All four parse
@@ -194,40 +231,17 @@ never reach the page check, so their default `Empty` is unaffected.
    primary CD's `nCodeSlots` and `codeLimit` to 0. Pre-fix: `Empty` →
    accepted → assert fails. Post-fix: distinct zero-coverage error.
 
-**Shared fixture mechanic (items 1 + 2):** both tests neutralize CMS by
-shrinking the CMS entry's declared length field to 8 bytes, so the
-pre-fix `len() <= 8` shortcut fires and the mutated CD is not rejected by
-CDHash binding. There is no FAT ad-hoc signing API
-(`sign_macho_all_slices` requires `&SigningCredentials`,
-signer.rs:360-376), so this is the viable neutralizer for the FAT fixture.
-Consequence for item 2's assertions: post-fix, a non-ad-hoc CD behind an
-8-byte wrapper *also* triggers item 1's new error, so the test MUST assert
-the page error specifically
-(`errors.iter().any(|e| e.contains("code slot count mismatch"))`),
-never a bare `errors.nonempty()`, and MUST assert
-`slices[1].errors` (not only `!report.is_valid()`).
-
-**Item-2 fixture invariant (why a naive patch is not red pre-fix):**
-pre-fix, `check_code_pages` still compares every stored slot against the
-hashed tail region, and its `code_limit > code.len()` guard already
-returns `CountMismatch` — a bare `codeLimit` patch therefore yields
-`Mismatch`/`CountMismatch` (invalid) *pre-fix*, so a naive assert-invalid
-test would pass before the fix and violate the must-fail-before-fix rule.
-The fixture must instead be **internally consistent under pre-fix
-semantics**: patch `codeLimit` to `C'` such that
-  1. `slice.size < C' <= tail_len` (tail = bytes from `slice.offset` to
-     EOF; achieved by appending trailing pad after the last slice — the
-     parser accepts a file longer than its last slice, parser.rs:170-182),
-  2. `ceil(C' / new_page_size) == nCodeSlots` (slot count unchanged —
-     achieved by patching `page_size_log2` 12→13 so `C'` stays inside the
-     same 8 KiB bucket as the stored count), and
-  3. the stored code slots are **recomputed** over the `C'`-long region of
-     the tail at the new page size (slot area located via `hashOffset` at
-     CD+16; bytes written in place).
-
-Then pre-fix verification reports `Matched` + no errors → valid → the
-assert-invalid is RED pre-fix; post-fix the slice-bounded input makes
-`code_limit > slice.size` hit the `CountMismatch` guard → error → GREEN.
+**Fixture notes:**
+- Item 1's test truncates the CMS entry's declared length to 8 bytes so the
+  pre-fix shortcut fires and the mutated binary is otherwise clean — that
+  neutralization is specific to item 1 (it *is* the bypass under test) and
+  is not reused elsewhere.
+- Item 2's test needs no CMS neutralization: the assertion targets
+  `slices[1].pages` only, the page check runs before the CMS block, and
+  CMS/CDHash errors from the patched CD (cdhash changes when `codeLimit`
+  is patched) do not affect the `pages` field. The test asserts the exact
+  `PageCheck` variant + values, never `errors.is_empty()`/`is_valid()`,
+  so unrelated extra errors cannot make it pass or fail spuriously.
 
 Existing verify tests encode no buggy behavior (scout-verified: no test
 asserts `Empty` acceptance, truncated-CMS validity, `codeLimit=0` validity,
@@ -268,7 +282,10 @@ or FAT-tail reads) — none need adjustment beyond exercising the new errors.
 | 4 | remove `Empty` variant | breaks public API + CLI display arms |
 | 4 | return `Mismatch` from `check_code_pages` | conflates structure with hash failure |
 
-## Verbatim source under fix (as of base `ee42c12`, verified 2026-09-25)
+## Source excerpts under fix (as of base `ee42c12`, verified 2026-09-25)
+
+Headings give exact `file:line`; `…` marks elided unchanged lines (this
+section is excerpted, not re-derived).
 
 **Item 1 — macho/verify.rs:168-197 (CMS block):**
 
@@ -340,13 +357,18 @@ fn check_code_pages_in_file(cd: &CodeDirectory<'_>, data: &[u8], offset: usize) 
     }
 ```
 
-**Item 3 — codesign/verify.rs:60-101 (parse_superblob, abbreviated loop):**
+**Item 3 — codesign/verify.rs:60-101 (parse_superblob, exact lines :72-100):**
 
 ```rust
     let count = u32::from_be_bytes(blob[8..12].try_into().unwrap()) as usize;
-    if 12 + count * 8 > blob.len() {           // :73 unchecked arithmetic
-        return Err(...overruns...);
+    if 12 + count * 8 > blob.len() {
+        return Err(crate::Error::Verification(format!(
+            "SuperBlob index ({} entries) overruns blob of {} bytes",
+            count,
+            blob.len()
+        )));
     }
+
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let entry_off = 12 + i * 8;
@@ -354,11 +376,17 @@ fn check_code_pages_in_file(cd: &CodeDirectory<'_>, data: &[u8], offset: usize) 
         let offset =
             u32::from_be_bytes(blob[entry_off + 4..entry_off + 8].try_into().unwrap()) as usize;
         let Some(item) = blob.get(offset..).filter(|b| b.len() >= 8) else {
-            return Err(...points outside the blob...);
+            return Err(crate::Error::Verification(format!(
+                "SuperBlob entry {i} (slot 0x{slot:08x}) points outside the blob"
+            )));
         };
+        // Each blob carries its own magic+length header; bound it precisely so
+        // hashing a slot blob never implicitly includes later blobs.
         let item_len = u32::from_be_bytes(item[4..8].try_into().unwrap()) as usize;
         let Some(bounded) = blob.get(offset..offset.saturating_add(item_len)) else {
-            return Err(...length overruns blob...);
+            return Err(crate::Error::Verification(format!(
+                "SuperBlob entry {i} (slot 0x{slot:08x}) length overruns blob"
+            )));
         };
         entries.push(SlotEntry { slot, blob: bounded });
     }
@@ -379,10 +407,13 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
             computed: region_len.div_ceil(PAGE_SIZE),        // :406 hardcodes 4096
         };
     }
-    let stored = cd.cd_hashes...; // code_hashes()
+    let stored = cd.code_hashes();
     let expected_slots = region_len.div_ceil(page_size);
     if stored.len() != expected_slots * cd.hash_size {
-        return PageCheck::CountMismatch { ... };
+        return PageCheck::CountMismatch {
+            stored: cd.n_code_slots as usize,
+            computed: expected_slots,
+        };
     }
     if expected_slots == 0 {
         return PageCheck::Empty;                             // :418-419

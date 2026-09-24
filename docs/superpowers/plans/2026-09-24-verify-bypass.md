@@ -11,9 +11,11 @@ binaries cannot produce `verified: yes`.
 
 **Architecture:** All fixes live inside `verify_slice`
 (`crates/zsign-core/src/macho/verify.rs`) and `parse_superblob` /
-`check_code_pages` (`crates/zsign-core/src/codesign/verify.rs`). Every
-rejection is a `report.errors.push(...)` (keeps the `Ok(report)` contract);
-parse-layer failures stay `Error::Verification`.
+`check_code_pages` (`crates/zsign-core/src/codesign/verify.rs`). Two
+rejection channels: semantic findings from `verify_slice` are
+`report.errors.push(...)` (keeps its `Ok(report)` contract); structural
+malformations found by the public `parse_superblob` return
+`Error::Verification` (existing convention).
 
 **Tech Stack:** Rust 2021 workspace, `cargo test -p zsign-core` scoped
 filters, inline `#[cfg(test)] mod tests` (repo convention).
@@ -54,13 +56,21 @@ Add to `crates/zsign-core/src/macho/verify.rs` `mod tests`:
     }
 ```
 
-Extend the existing test imports to include `CSSLOT_CODEDIRECTORY`:
+Extend the existing test imports to include the sign helpers and slot
+constant (all re-exported from `crate::macho`, mod.rs:18-21; constants
+from `crate::codesign::constants`):
 
 ```rust
     use crate::codesign::constants::{
         CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT, CSMAGIC_EMBEDDED_SIGNATURE,
     };
+    use crate::macho::{sign_any_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile};
 ```
+
+(`sign_macho_sha256_only` is the existing import; keep it. The
+`sign_any_macho`/`sign_macho_adhoc` names are needed by Tasks 2 and 4
+respectively — add them with the first task that uses them if you prefer
+minimal diffs, but the combined line above is the target state.)
 
 ---
 
@@ -201,8 +211,9 @@ bytes so fixed offsets 0x1000/0x3000 work):
         let mut signed =
             sign_any_macho(&macho, "com.example.fat", None, &creds, None, None, false).unwrap();
 
-        // Trailing pad: slice 2's tail (pre-fix data[offset..]) must outlive
-        // its declared fat_arch size so an oversized codeLimit fits the tail.
+        // Trailing pad is load-bearing: without it the second slice's tail
+        // equals its slice size, and pre-fix would take the same guard path
+        // as post-fix (no observable difference).
         signed.extend_from_slice(&[0u8; 0x1000]);
 
         let m = MachOFile::parse(signed.clone()).unwrap();
@@ -213,89 +224,68 @@ bytes so fixed offsets 0x1000/0x3000 work):
         let sig_off = slice_off + s.code_sig_offset.unwrap() as usize;
         let sig_len = s.code_sig_size.unwrap() as usize;
 
-        // Neutralize CMS binding: shrink the CMS child to the 8-byte wrapper
-        // (pre-fix shortcut keeps the slice green; post-fix the page error is
-        // asserted specifically, since the wrapper also trips Task 1's error).
-        let cms = entry_offset(&signed[sig_off..sig_off + sig_len], CSSLOT_SIGNATURESLOT)
-            .expect("CMS entry")
-            + sig_off;
-        signed[cms + 4..cms + 8].copy_from_slice(&8u32.to_be_bytes());
-
-        // Patch the primary CD: 8 KiB pages, codeLimit past the slice.
+        // Patch only the primary CD's codeLimit (slot 0x0000, SHA-1 in dual
+        // mode — no hash rewrites, no page-size change, no CMS edits).
         let cd = entry_offset(&signed[sig_off..sig_off + sig_len], CSSLOT_CODEDIRECTORY)
             .expect("primary CD entry")
             + sig_off;
-        let n_slots =
-            u32::from_be_bytes(signed[cd + 28..cd + 32].try_into().unwrap()) as usize;
-        let hash_offset =
-            u32::from_be_bytes(signed[cd + 16..cd + 20].try_into().unwrap()) as usize;
-        let hash_size = signed[cd + 36] as usize;
-        assert_eq!(hash_size, 32, "primary CD must be SHA-256");
+        let n_slots = u32::from_be_bytes(signed[cd + 28..cd + 32].try_into().unwrap()) as usize;
+        let page_size = 1usize << signed[cd + 39];
 
         let c_prime = (slice_size + 0x100) as u32;
-        // Fixture invariant (design doc): slice.size < C' <= tail_len and the
-        // stored slot count must still match the region at the new page size.
-        assert!((c_prime as usize) <= tail_len, "C' must fit the tail");
-        assert_eq!(
-            (c_prime as usize).div_ceil(1 << 13),
-            n_slots,
-            "slot count must be unchanged at 8 KiB pages"
+        assert!((c_prime as usize) <= tail_len, "C' must fit the padded tail");
+        assert!(
+            (c_prime as usize).div_ceil(page_size) != slice_size.div_ceil(page_size),
+            "fixture precondition: C' must cross a page boundary of the slice"
         );
-
-        signed[cd + 39] = 13; // page_size_log2: 4 KiB -> 8 KiB
         signed[cd + 32..cd + 36].copy_from_slice(&c_prime.to_be_bytes());
-        // Recompute every code slot over the tail region at the new page size
-        // so pre-fix verification is internally consistent (Matched).
-        for i in 0..n_slots {
-            let start = i << 13;
-            let end = (((i + 1) << 13).min(c_prime as usize)).max(start + 1);
-            let d = Sha256::digest(&signed[slice_off + start..slice_off + end]);
-            let at = cd + hash_offset + i * hash_size;
-            signed[at..at + hash_size].copy_from_slice(&d);
-        }
 
         let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
-        assert_eq!(report.slices.len(), 2);
-        assert!(
-            report.slices[0].is_valid(),
-            "first slice is untouched: {:?}",
-            report.slices[0].errors
-        );
-        // Assert the page error specifically (not merely !is_valid): the
-        // post-fix wrapper error from Task 1 would make a nonempty-errors
-        // assertion ambiguous.
+        // Pre-fix the check runs over the tail, so the slot-count guard is
+        // never reached and expected_slots = ceil(C'/page) (= 8 for the
+        // canonical fixture) mismatches the stored count. Post-fix the
+        // slice-bounded region makes code_limit > len fire the guard, which
+        // reports ceil(slice_size/page) (= 7). Assert the post-fix contract:
+        // the page count is measured against the slice, not the tail.
+        let expected = PageCheck::CountMismatch {
+            stored: n_slots,
+            computed: slice_size.div_ceil(page_size),
+        };
+        assert_eq!(report.slices[1].pages, expected);
         assert!(
             report.slices[1]
                 .errors
                 .iter()
                 .any(|e| e.contains("code slot count mismatch")),
-            "codeLimit beyond the slice must fail the page check, got {:?}",
+            "oversized codeLimit must be reported, got {:?}",
             report.slices[1].errors
         );
-        assert!(!report.is_valid());
     }
 ```
 
 Notes for the implementer:
-- `sign_any_macho` is `pub` in `crate::macho::signer`; import from
-  `crate::macho` per how the module re-exports (check `macho/mod.rs`;
-  fall back to `crate::macho::signer::sign_any_macho`).
-- Slot recompute loop guard: if `end == start` cannot occur because
-  `c_prime > 0`; `.max(start + 1)` only defends an off-by-one if
-  `c_prime` lands on a page boundary — keep it.
-- If the `slot count must be unchanged` assertion fails empirically the
-  signed CMS is larger than 8 KiB headroom allows: fall back to
-  `page_size_log2 = 14` (16 KiB) with `c_prime` chosen so
-  `div_ceil(c_prime, 1 << 14) == n_slots` and `c_prime > slice_size`
-  (requires additional trailing pad), adjusting the recompute shifts to
-  `<< 14`. Record which variant was used in the report.
+- The canonical numbers (computed, not asserted): fixture content 0x2000,
+  signed slice `28672 = calculate_signature_space(8192)` (writer.rs:51-55),
+  `C' = 28928`, `page_size = 4096`, `nCodeSlots = 2`, pad `0x1000` →
+  tail `32768`. Pre-fix `ceil(28928/4096) = 8`; post-fix `ceil(28672/4096)
+  = 7`. The test derives every asserted value from the parsed bytes, so it
+  stays correct if signer sizing changes — but the two `assert!`
+  preconditions above must hold or the fixture is invalid (loudly).
+- No assertion touches `slices[0]` or whole-report validity: slice 0's
+  dual-CD CMS binding already fails at base under deferred ZSN-25, so such
+  an assertion would be red both pre- and post-fix and is not a gate for
+  this lane.
+- `sign_any_macho` is re-exported from `crate::macho` (mod.rs:18-21).
 
 - [ ] **Step 2: Run and confirm RED**
 
 Run: `cargo test -p zsign-core fat_code_limit_beyond_slice`
-Expected: FAIL at `assert!(... any(contains("code slot count mismatch")))` —
-pre-fix the oversized codeLimit is checked against the whole tail and all
-recomputed slots match, so `slices[1].errors` is empty.
+Expected: FAIL at `assert_eq!(report.slices[1].pages, expected)` —
+pre-fix the check runs over the tail, so `pages ==
+CountMismatch { stored: n_slots, computed: 8 }` while the assertion
+demands `computed: 7` (the slice-bounded count). The diagnostic message
+assertion alone would pass pre-fix (both paths report a count mismatch);
+the `pages` value is the RED trigger.
 
 - [ ] **Step 3: Fix** — change the wrapper (macho/verify.rs:205-213) and
 its call site (:141):
@@ -336,14 +326,17 @@ against the bounded slice and `verify_slice` already pushes
 - [ ] **Step 4: Run and confirm GREEN**
 
 Run: `cargo test -p zsign-core fat_code_limit_beyond_slice`
-Expected: PASS (post-fix: bounded region shorter than `codeLimit` →
-`CountMismatch` → `"code slot count mismatch"` pushed).
+Expected: PASS (post-fix: bounded region shorter than `codeLimit` → the
+`code_limit > code.len()` guard reports `CountMismatch { computed:
+ceil(slice_size/page) }` → matches the assertion and the message is
+pushed as an error).
 
 - [ ] **Step 5: Scoped gate**
 
 Run: `cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
 Expected: all PASS — thin binaries are unaffected (thin `slice.size` =
-whole file, so the bound equals the old tail).
+whole file, so the bound equals the old tail). Note: the FAT round-trip
+test itself does NOT assert slice-0/whole-report validity (ZSN-25).
 
 - [ ] **Step 6: Controller commit**
 
@@ -360,9 +353,9 @@ whole file, so the bound equals the old tail).
 - [ ] **Step 1: Write the failing tests** (append to `mod tests`)
 
 ```rust
-    /// Minimal SuperBlob: header + `entries` index + child regions.
-    /// `children` = (offset, item_len) pairs placed verbatim; child magic
-    /// bytes are written by the caller afterwards.
+    /// Minimal SuperBlob: header + index + zero-filled tail to `total`.
+    /// `entries` are `(slot, offset)` index pairs; the caller writes each
+    /// child's magic+length header bytes at its `offset` afterwards.
     fn synth_superblob(total: u32, entries: &[(u32, u32)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
@@ -451,8 +444,11 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     }
 
     // The declared total length bounds every subsequent read; trailing bytes
-    // in the LC window beyond it are tolerated (third-party pad) but never
-    // parsed.
+    // in the LC window beyond it are tolerated (own writer reserves the LC
+    // window larger than the SuperBlob) but never parsed. `count` is read
+    // from blob[8..12], safe because blob.len() >= 12 was checked above;
+    // index_end >= 12 then rejects any declared length below the header
+    // *before* slicing, so `&blob[..declared]` can never panic.
     let declared = u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize;
     if declared > blob.len() {
         return Err(crate::Error::Verification(format!(
@@ -460,9 +456,7 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
             blob.len()
         )));
     }
-    let sb = &blob[..declared];
-
-    let count = u32::from_be_bytes(sb[8..12].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(blob[8..12].try_into().unwrap()) as usize;
     let index_end = count
         .checked_mul(8)
         .and_then(|e| e.checked_add(12))
@@ -473,6 +467,7 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
             count
         )));
     }
+    let sb = &blob[..declared];
 
     let mut entries = Vec::with_capacity(count);
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(count);
@@ -543,8 +538,9 @@ Expected: 4 PASS.
 
 Run: `cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
 Expected: all PASS — `build_superblob` writes the exact total length
-(superblob.rs:160-167) and the writer records `datasize = signature.len()`
-(writer.rs:921-924), so own signer output satisfies the new bounds;
+(superblob.rs:160-167) and `L <= blob.len()` absorbs the LC window's
+reserved padding (`sig_datasize = new_length - code_length`,
+writer.rs:910/919), so own signer output satisfies the new bounds;
 `rejects_garbage` still fails on magic.
 
 - [ ] **Step 6: Controller commit**
@@ -639,15 +635,13 @@ only hardcode inside `check_code_pages`.
 Run: `cargo test -p zsign-core zero_code_coverage`
 Expected: PASS with `"code directory covers zero code bytes"`.
 
-- [ ] **Step 6: Scoped gate + whole-workspace proof**
+- [ ] **Step 6: Scoped gate**
 
 Run: `cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
-Expected: all PASS.
-
-Run: `cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
-Expected: all PASS — the only `PageCheck::Empty` matches outside scope are
+Expected: all PASS. The only `PageCheck::Empty` matches outside scope are
 display-only (cli main.rs:236/:328); no caller outside scope asserts
-`Empty` validity (scout-verified).
+`Empty` validity (scout-verified). Whole-workspace runs are the
+orchestrator's gate at merge — never run project-wide in this lane.
 
 - [ ] **Step 7: Controller commit**
 
@@ -657,8 +651,9 @@ display-only (cli main.rs:236/:328); no caller outside scope asserts
 
 ## Final verification (controller, after all four commits)
 
-1. `cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
-   → paste verbatim output as report evidence.
+1. `cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
+   → paste verbatim output as report evidence (the brief's scoped gate;
+   project-wide runs belong to the orchestrator).
 2. `git log --oneline` → four commits, none touching out-of-scope files:
    `git diff ee42c12..HEAD --stat` must list only
    `crates/zsign-core/src/macho/verify.rs`,
@@ -669,5 +664,5 @@ display-only (cli main.rs:236/:328); no caller outside scope asserts
 
 ## Plan-vs-expected deviations log
 
-Record here during execution (e.g. if Task 2 needs the `page_size_log2 = 14`
-fallback, or exact fixture offsets differ): each deviation needs its reason.
+Record here during execution: any deviation from the plan (fixture
+arithmetic, helper names, message wording) with its reason.
