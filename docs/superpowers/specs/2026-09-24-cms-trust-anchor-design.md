@@ -40,8 +40,8 @@ from the base commit; verified by four read-only scouts):
 4. **Signed `contentType` is never checked.** `parse_signed_attrs`
    (`cms_verify.rs:316-367`) parses only `messageDigest` and the Apple CDHash
    attributes; `OID_CONTENT_TYPE` is a dead constant (`cms_verify.rs:46-48`).
-   RFC 5652 §5.6 requires exactly one `contentType` attribute equal to the
-   encapsulated content type.
+   RFC 5652 requires exactly one signed `contentType` (§5.3 presence,
+   §11.1 single-valued SET) equal to the encapsulated content type (§5.6).
 5. **SHA-1 certificate signatures are accepted silently at any depth.**
    `verify_cert_signature` has a SHA-1 branch (`cms_verify.rs:945-949`) and no
    caller records that SHA-1 was used.
@@ -68,9 +68,9 @@ impl TrustAnchors {
 }
 ```
 
-Internal helpers (private): `contains_spki(&Certificate) -> bool` (byte-equality
-on DER-encoded `SubjectPublicKeyInfo`) and
-`find_by_subject(&x509_cert::name::Name) -> Option<&Certificate>` (for the
+Internal helpers (private): `contains_spki(spki_der: &[u8]) -> bool`
+(byte-equality of a DER-encoded `SubjectPublicKeyInfo` against every anchor)
+and `find_by_subject(&x509_cert::name::Name) -> Option<&Certificate>` (for the
 runs-out issuer lookup, D4).
 
 Two public entry points:
@@ -88,7 +88,9 @@ pub fn verify_code_signature_with_anchors(cms_blob, content, cd_sha1, cd_sha256,
 The 4-arg signature is preserved so the one production caller
 (`macho/verify.rs:178-183`, deferred to lane 24) needs **no migration** and
 immediately inherits the fix: attacker CMS → `valid=false` with a non-empty
-error → slice error → CLI exit 1.
+error → slice error → `report.valid()` false while the top-level
+`VerifyReport.errors` stays empty → CLI exit 1
+(`zsign-cli/src/main.rs:194-198`).
 
 ### 2.2 `verify_chain` — anchoring + purpose
 
@@ -212,12 +214,14 @@ collected so far are preserved):
 
 ### 2.5 Signed contentType (item 4)
 
-- `parse_signed_attrs` gains per-attribute contentType handling that walks
-  **every value of every** `contentType` Attribute SET: each value increments
-  an occurrence count (a value that fails OID decoding still counts — the
-  current parser's first-value-only + `continue`-on-error behaviour would let
-  a malformed duplicate evade detection) and decodable OIDs are collected.
-  `OID_CONTENT_TYPE` loses its `#[allow(dead_code)]`.
+- `parse_signed_attrs` gains per-attribute contentType handling that
+  delimits **every complete TLV** of every `contentType` Attribute SET
+  (AnyRef walk; each delimited TLV is strict-decoded as an OID separately):
+  each TLV increments an occurrence count — so a value *after* a non-OID or
+  malformed value is still counted, which the current parser's
+  first-value-only + `continue`-on-error behaviour would swallow — and
+  decodable OIDs are collected. `OID_CONTENT_TYPE` loses its
+  `#[allow(dead_code)]`.
 - Per-signer check over `(occurrences, decoded)`:
   - `0` occurrences → `signed contentType attribute missing`
   - `>1` occurrences → `duplicate signed contentType attribute`
@@ -228,7 +232,8 @@ collected so far are preserved):
   (`encapContentInfo eContentType is X (expected id-data)`), replacing the
   current warning. Because the signer copies `eContentType` into the attribute,
   the signer side (`crypto/cms.rs`, cms-crate 0.2.3 `SignerInfoBuilder`, which
-  auto-adds exactly one `contentType` = `ID_DATA`) satisfies all three checks —
+  auto-adds exactly one `contentType` = `ID_DATA`) satisfies every
+  per-signer contentType check —
   verified against `cms-0.2.3/src/builder.rs:226-255` and
   `crypto/cms.rs:103-106`.
 
@@ -386,8 +391,8 @@ test_ipa_signing_is_deterministic` (narrower filters per task).
 with their own `rsa_credentials().certificate` as anchor; `rejects_non_cms` /
 `rejects_wrong_wrapper_magic` keep the 4-arg path (parse fails first);
 `chain_accepts_sha1_signed_intermediate` gains the `anchors` argument (D8).
-A `default_anchors_reject_self_signed` test exercises the 4-arg entry point so
-the Apple default itself is pinned.
+The migrated `unanchored_structural_chain_is_invalid` stays on the 4-arg
+entry point, pinning the Apple-root default itself.
 
 **Per-item tests:**
 - Item 2: 2-cert `[leaf, root]` fixtures through `verify_chain` directly —
@@ -404,8 +409,9 @@ the Apple default itself is pinned.
   fatal report error. No byte-surgery shortcut — ancestor lengths are rebuilt
   bottom-up.
 - Item 4: parser-level tests over raw signedAttrs DER fed to the real
-  `parse_signed_attrs` — duplicate contentType attributes and a
-  malformed-second-value case must both be counted and rejected — plus the
+  `parse_signed_attrs` — duplicate contentType attributes, a
+  malformed-second-value case, and a malformed-middle-with-valid-trailing-value
+  case (asserting the full TLV count of 3) must all be counted and rejected — plus the
   pure `content_type_reason` decision cases (missing / exactly one id-data /
   duplicate / wrong OID / malformed), plus a report-level fixture that patches
   `encapContentInfo.eContentType` to a non-id-data OID (one-byte, same-length,
@@ -445,9 +451,15 @@ the deferred files themselves:
 Additionally `scripts/verify-apple-interop.sh` (macOS-only, not part of
 `cargo test`) signs a self-signed bundle that is "its own implicit trust
 anchor" (`:11-12`) and requires `zsign -V` to accept it (`agree_valid`,
-`:153-175`); with Apple-root default anchors that interop check turns red
-until the verify surface can inject the target's own certificate as an anchor
-(plumbing owned by the verify/CLI lanes, not this one).
+`:153-175`); with Apple-root default anchors that interop check turns red.
+**Handover requirement (wave-2/interop follow-up — this lane does NOT edit the
+script):** its signing certificate is `CA:TRUE`
+(`scripts/verify-apple-interop.sh:36-45`), which the unconditional leaf rules
+(D5) reject **even after anchor injection** — restoring the interop needs two
+changes together: (a) verify-surface anchor plumbing (inject the target's own
+certificate), and (b) switching the script's certificate to an end-entity
+constraint (`basicConstraints { ca: false }` plus the codeSigning EKU and
+digitalSignature keyUsage the leaf rules require).
 
 This lane edits none of those files (hard scope rule). The handover contract
 for lanes 24/26: `zsign_core::crypto::cms_verify::{TrustAnchors,
@@ -460,11 +472,10 @@ also carry codeSigning EKU, a `digitalSignature` keyUsage, and
 `keyCertSign|cRLSign`, `CA=true`) fail the leaf rules even after anchor
 injection; see plan Task 2's `rsa_credentials` migration for the exact shape.
 
-**Open question for the supervisor** (stated once, per brief): who migrates
-these four tests — (a) lanes 24/26 absorb it with the plumbing above (this
-design's default assumption; the failing-test list above is the handover), or
-(b) this lane receives an explicit scope waiver to touch *only those test
-functions*? Nothing else in this design depends on the answer.
+**Handover (settled):** lanes 24/26 own the migration of those four tests
+with the plumbing contract stated above — this lane never edits deferred test
+functions (hard scope rule; no scope-waiver path exists). The failing-test
+table is the handoff artifact.
 
 ## 7. Explicitly out of scope
 

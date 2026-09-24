@@ -955,14 +955,21 @@ intentionally red: `round_trip_rsa_signs_and_verifies`,
 assert `valid`/`chain_ok` on a `Profile::Root` credential that now fails the
 unconditional leaf rules. Two migrations make them green again:
 
-**(a) `rsa_credentials` gains the leaf extensions.** `Profile::Root` emits no
-EKU, `keyCertSign|cRLSign` keyUsage, and `CA=true` basicConstraints — this
-credential is only ever a leaf + trust anchor in these tests (it never issues
-a distinct certificate), so reshape it:
+**(a) `rsa_credentials` becomes a self-issued `Profile::Leaf`.** The leaf
+rules need codeSigning EKU plus the `Profile::Leaf` defaults (digitalSignature
+keyUsage, `CA=false` basicConstraints), and the credential must stay
+**self-signed**, so build it with `issuer == subject` and add the EKU before
+`.build()`. Never mutate extensions after `build()`: rewriting the certificate
+body invalidates its self-signature, which the anchoring regressions verify
+(chain terminus rejects it with "fails self-signature verification").
 
 ```rust
 let mut builder = CertificateBuilder::new(
-    Profile::Root,
+    Profile::Leaf {
+        issuer: subject.clone(), // self-issued: the certificate signs itself
+        enable_key_agreement: false,
+        enable_key_encipherment: false,
+    },
     serial,
     validity,
     subject,
@@ -973,22 +980,7 @@ let mut builder = CertificateBuilder::new(
 builder
     .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
     .unwrap();
-let mut cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
-// Leaf rules: keyUsage must offer digitalSignature, basicConstraints must
-// not assert CA (the profile defaults are CA-oriented).
-replace_extension(
-    &mut cert,
-    OID_KEY_USAGE,
-    &KeyUsage(KeyUsages::DigitalSignature.into()),
-);
-replace_extension(
-    &mut cert,
-    OID_BASIC_CONSTRAINTS,
-    &BasicConstraints {
-        ca: false,
-        path_len_constraint: None,
-    },
-);
+let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 (
     SigningCredentials {
         certificate: cert,
@@ -1000,9 +992,11 @@ replace_extension(
 )
 ```
 
-(`replace_extension` and the `BasicConstraints`/`KeyUsage`/`KeyUsages`
-imports come from Step 2.4; adapt the surrounding `rsa_credentials` body,
-which currently builds `cert` inline in one expression.)
+(Adapt the surrounding `rsa_credentials` body, which currently builds
+`CertificateBuilder::new(Profile::Root, …).build::<…>()` in one expression —
+`subject` is moved into the builder today, so clone it for the `issuer`
+field. The AKI the Leaf profile derives from `issuer_spk` equals the
+certificate's own key — harmless and RFC-consistent for a self-issued cert.)
 
 **(b) The SHA-1 chain fixture's leaf** chains a `Profile::Leaf` (no EKU)
 under a root and must also gain a codeSigning EKU. Split its inline leaf
@@ -1045,9 +1039,9 @@ unanchored-structural), and the SHA-256 pins.
 
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS. Acceptance: missing/malformed EKU, wrong-purpose EKU, weak
-leaf KU/BC, non-CA issuer, pathLen violation, missing issuer KU — each fails
-with its distinct reason; positive 2-cert chain anchors; the SHA-1 fixture
-still chains (warnings assertions land in Task 5).
+leaf KU/BC, non-CA issuer, pathLen violation, issuer keyUsage without
+keyCertSign — each fails with its distinct reason; positive 2-cert chain
+anchors; the SHA-1 fixture still chains (warnings assertions land in Task 5).
 Commit (controller): `feat(zsign-core): enforce x.509 purpose constraints in chain verification`
 
 ---
@@ -1448,15 +1442,24 @@ Run: `cargo test -p zsign-core crypto::cms_verify` — RED (no such function).
 
 ```rust
 if oid == OID_CONTENT_TYPE {
-    // RFC 5652 §5.6: exactly one value. Count every value — including
-    // undecodable ones — so an extra or malformed value can never evade
-    // duplicate detection.
+    // RFC 5652 §5.3/§11.1: exactly one value. Delimit every complete TLV
+    // in the SET first, then strict-decode each TLV as an OID — so a value
+    // after a non-OID or malformed one is still counted and can never
+    // evade duplicate detection.
     let mut vr = reader(vbytes, "malformed contentType value")?;
     while !vr.is_finished() {
         content_type_count += 1;
-        match ObjectIdentifier::decode(&mut vr) {
-            Ok(ct) => content_types.push(ct),
-            Err(_) => break,
+        let start = usize::try_from(vr.position()).unwrap_or(0);
+        if AnyRef::decode(&mut vr).is_err() {
+            // Not delimitable (truncated length): the broken value is
+            // counted above and nothing can follow a length error.
+            break;
+        }
+        let end = usize::try_from(vr.position()).unwrap_or(0);
+        if let Some(tlv) = vbytes.get(start..end) {
+            if let Ok(ct) = ObjectIdentifier::from_der(tlv) {
+                content_types.push(ct);
+            }
         }
     }
     continue;
@@ -1468,10 +1471,10 @@ if oid == OID_CONTENT_TYPE {
 3. The decision function:
 
 ```rust
-/// RFC 5652 §5.6: exactly one signed `contentType` value, equal to id-data —
-/// which also pins it to `encapContentInfo`'s eContentType (id-data is
-/// required separately below). `count` is every value seen, `decoded` the
-/// subset that decoded as OIDs.
+/// RFC 5652 §5.3/§11.1: exactly one signed `contentType` value; §5.6: its
+/// value must equal the encapsulated content type (id-data, required
+/// separately below). `count` is every value delimited, `decoded` the subset
+/// that strict-decoded as OIDs.
 fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<String> {
     match count {
         0 => Some("signed contentType attribute missing".into()),
@@ -1590,6 +1593,28 @@ fn extra_malformed_content_type_value_is_counted() {
     // A valid id-data first value plus a malformed extra must never read as
     // "exactly one".
     assert_eq!(attrs.content_type_count, 2);
+    let reason = content_type_reason(attrs.content_type_count, &attrs.content_types)
+        .unwrap_or_default();
+    assert!(reason.contains("duplicate"), "{reason}");
+}
+
+#[test]
+fn malformed_middle_value_does_not_hide_trailing_value() {
+    use der::Encode;
+    let id_data = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+        .to_der()
+        .unwrap();
+    let other = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2")
+        .to_der()
+        .unwrap();
+    let mut value = id_data;
+    value.extend_from_slice(&[0x05, 0x00]); // malformed middle value (NULL)
+    value.extend_from_slice(&other); // valid trailing value behind it
+    let body = attr_tlv(OID_CONTENT_TYPE, &value);
+    let attrs = parse_signed_attrs(&body).unwrap();
+    // TLV-boundary counting: the trailing value must not escape the count
+    // just because an earlier value failed OID decoding.
+    assert_eq!(attrs.content_type_count, 3);
     let reason = content_type_reason(attrs.content_type_count, &attrs.content_types)
         .unwrap_or_default();
     assert!(reason.contains("duplicate"), "{reason}");
@@ -1750,7 +1775,9 @@ force-added docs files (`docs/superpowers/specs/…-design.md`,
 
 - [ ] **Step 6.4: Assemble final report**
 
-Commit list (5 code + 1 docs commit), verbatim gate/workspace outputs, the
-design-vs-actual deviations, and the cross-lane handover note (the
-`TrustAnchors` / `verify_code_signature_with_anchors` contract for lanes
-24/26 plus the four-test failure table). Do not merge; do not push.
+Commit list (the docs commits plus this lane's task commits — take the
+actual list from `git log ee42c12..HEAD`, no assumed count), verbatim
+gate/workspace outputs, the design-vs-actual deviations, and the cross-lane
+handover note (the `TrustAnchors` / `verify_code_signature_with_anchors`
+contract for lanes 24/26 plus the four-test failure table). Do not merge; do
+not push.
