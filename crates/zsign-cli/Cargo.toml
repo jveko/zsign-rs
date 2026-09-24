@@ -2,6 +2,7 @@
 name = "zsign-cli"
 version = "0.1.1"
 edition = "2021"
+rust-version.workspace = true
 description = "Cross-platform iOS code signing CLI - Rust port of zsign"
 license = "MIT"
 repository = "https://github.com/jveko/zsign-rs"

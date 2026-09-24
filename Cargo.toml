@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/zsign", "crates/zsign-core", "crates/zsign-wasm", "crates/zsign-cli"]
+
+[workspace.package]
+rust-version = "1.88"

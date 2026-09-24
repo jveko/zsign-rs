@@ -2,6 +2,7 @@
 name = "zsign-rs"
 version = "0.1.2"
 edition = "2021"
+rust-version.workspace = true
 authors = ["jveko"]
 description = "Cross-platform iOS code signing library - Rust port of zsign"
 documentation = "https://docs.rs/zsign-rs"

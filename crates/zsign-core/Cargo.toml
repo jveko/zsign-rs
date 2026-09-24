@@ -2,6 +2,7 @@
 name = "zsign-core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 authors = ["jveko"]
 description = "Core iOS code signing library - WASM-compatible computation engine"
 license = "MIT"
