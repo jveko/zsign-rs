@@ -48,7 +48,9 @@ independently enough to let a missing, tampered, or malformed bundle verify as v
    `SignatureInputs::none()` (verify.rs:199). Core reports `NotChecked` for a
    **nonzero** declared slot with no content (zsign-core codesign/verify.rs:494-496)
    and `Missing` for zero-filled slots (same file :477-480); `SliceVerifyReport::
-   is_valid()` only fails on `Mismatch` (zsign-core macho/verify.rs:160-165). So a
+   is_valid()` is `errors.is_empty()` (zsign-core macho/verify.rs:42-44) and the
+   special-slot loop only turns `Mismatch` into a slice error (same file
+   :160-165). So a
    bundle-signed binary checked bare reports `is_valid()` with slots -1/-3 unverified.
 
 ## Research facts the design rests on
@@ -129,7 +131,7 @@ applies to genuine absence only, never to I/O failures.
 
 **C2 — content-error channel.** All CodeResources *content* problems (missing file at
 a bundle root, unparseable plist, missing dictionaries, non-dict/malformed entries,
-unsupported rules, path escapes, "sealed without a hash") are pushed as strings into
+unsupported rules, path escapes, hash-less sealed entries) are pushed as strings into
 `BundleVerification.errors` — already printed by the CLI — instead of being smuggled
 through `CodeResourcesVerification::unsealed`. After the change the four
 `CodeResourcesVerification` lists keep strict meanings:
@@ -162,8 +164,11 @@ skips them there entirely (:414-416). Bare `Data` values are legal in `files`
 (SHA-1) and malformed in `files2`. Every *present* field is type-checked before
 use: `hash`/`hash2` must be `Value::Data` and `symlink` must be `Value::String` —
 a present field of the wrong plist type is malformed (`malformed CodeResources
-entry` error, key skipped, never silently ignored via `as_data()`-style optional
+entry, key skipped, never silently ignored via `as_data()`-style optional
 extraction); a correctly-typed but wrong-length digest remains a plain `mismatched`.
+A **hybrid** dictionary carrying `symlink` together with `hash`/`hash2` is a shape
+the builder never emits (its branches are disjoint, zsign-core
+code_resources.rs:444-453) → malformed (fail-closed), never a precedence question.
 
 **C4 — rules engine (no regex crate).** Evaluate **the rules our builder emits**;
 anything else is an explicit `unsupported CodeResources rule: <pattern>` report
@@ -201,11 +206,14 @@ NOT part of the semantics; only (weight, tie_rank) decides. Path checks:
   Info.plist/PkgInfo/*.DS_Store, zsign-core code_resources.rs:435-460) while
   declaring it `omit` w=1100 (:145-152) — declaring a file outside the seal means
   its absence cannot fail verification (its presence is still hash-checked). This
-  tolerance predicate is shared verbatim by the disk→sealed exemption, the
-  sealed→disk missing decision, and Task 8's parent-`NotFound` routing — and only
-  for genuine absence (`ErrorKind::NotFound`); per-entry I/O failures propagate
-  `Err` per C1 and are never tolerated. The
-  per-entry `optional` flag (and the
+  Optional|Omit tolerance predicate is shared verbatim by the **two absence
+  decisions only** — the sealed→disk missing check and Task 8's parent-`NotFound`
+  routing; the disk→sealed unsealed-exemption is deliberately **Omit-only**
+  (Optional governs absence, never sealing: an *added* `en.lproj/evil.txt` matches
+  the optional rule at weight 1000 over the catch-all Include at 1.0 and must still
+  be flagged `unsealed`). Tolerance applies only to genuine absence
+  (`ErrorKind::NotFound`); per-entry I/O failures propagate `Err` per C1 and are
+  never tolerated. The per-entry `optional` flag (and the
   same key inside legacy `files` entries) is deliberately **not** consulted: our
   builder stamps it on every `.lproj/` path — including `Base.lproj`, which its own
   weight rule (1010 > 1000) declares *required*. Letting the entry flag override
@@ -239,7 +247,7 @@ builder emission, both dicts):
 |---|---|
 | `^.*` | always |
 | `^.*\.lproj/` | contains `.lproj/` |
-| `^.*\.lproj/locversion.plist$` | ends with `.lproj/locversion.plist` |
+| `^.*\.lproj/locversion.plist$` | contains `.lproj/locversion` + **one arbitrary character** + `plist` at end (the dot before `plist` is unescaped in the emitted pattern and stands for regex `.`, newline excluded — implemented as a real one-char wildcard, never narrowed to a literal dot; rejection is not an option while the builder emits this pattern in `rules2`) |
 | `^Base\.lproj/` | starts with `Base.lproj/` |
 | `^version\.plist$` | equals `version.plist` |
 | `.*\.dSYM($|/)` | ends with `.dSYM` or contains `.dSYM/` |
@@ -271,7 +279,9 @@ cannot be recovered from the sealed plist string alone — the lossy comparison 
 the contract; no component-wise or byte-wise comparison is used). No hash is expected either
 way — there is no hash fallback to design, because the builder emits `hash`/`hash2`
 only in the *non*-symlink branch (zsign-core code_resources.rs:444-453), so
-target-string equality is the only possible check. Conversely an entry expecting file content whose on-disk object is a symlink is
+target-string equality is the only possible check — and a hybrid entry carrying
+`symlink` *plus* hash fields is malformed per C3 rather than resolved by
+precedence. Conversely an entry expecting file content whose on-disk object is a symlink is
 `mismatched` (content replaced by a link). The disk→sealed walk includes symlinks
 (files *and* symlinks), so an unsealed symlink is flagged like any unsealed file.
 Symlinks are skipped by the binary-collection walk: their target is sealed as a

@@ -34,8 +34,9 @@ inline `#[cfg(test)]` tests using `crate::test_util` fixtures and `crate::ZSign`
   gate; the controller verifies and commits.
 - Known pre-existing failure: `test_ipa_signing_is_deterministic` (ZSN-15) — always
   skipped, never "fixed".
-- Code comments: durable behavior comments only, never ticket IDs, no backticks
-  inside comments.
+- Code comments: durable behavior comments only, never ticket IDs. (The repo-wide
+  backtick-in-comment ban is scoped to JS template-literal strings and does not
+  constrain Rust comments.)
 
 ## Shared test helpers (created by Task 1, reused by all later tasks)
 
@@ -304,12 +305,13 @@ fn tampered_nested_binary_is_detected_by_nested_frame() {
 fn signed_bundle_with_framework_symlink_verifies() {
     use std::os::unix::fs::symlink;
     let td = tempfile::TempDir::new().unwrap();
+    // Target a plain resource, never a Mach-O: the signer's binary walk follows
+    // links (ipa/mod.rs:598-620) and would re-sign a linked executable through
+    // the symlink, which is out of this test's scope.
     let app = build_signed_bundle_with(td.path(), |app| {
-        symlink(
-            "Sub",
-            app.join("Frameworks").join("Sub.framework").join("SubLink"),
-        )
-        .unwrap();
+        let framework = app.join("Frameworks").join("Sub.framework");
+        fs::write(framework.join("resource.bin"), b"framework resource").unwrap();
+        symlink("resource.bin", framework.join("reslink")).unwrap();
     });
     let report = verify_bundle(&app).unwrap();
     assert!(
@@ -321,8 +323,8 @@ fn signed_bundle_with_framework_symlink_verifies() {
 ```
 
 - [ ] **Step 2: Run and confirm FAIL** — expected: invalid, `cr.unsealed` contains
-  `… (sealed without a hash)` for `SubLink` (builder emits `{symlink: "Sub"}` with
-  no hash fields).
+  `… (sealed without a hash)` for `reslink` (builder emits `{symlink: "resource.bin"}`
+  with no hash fields).
 
 - [ ] **Step 3: Implement** (design C5)
 
@@ -350,12 +352,14 @@ fn signed_bundle_with_framework_symlink_verifies() {
      (rule-governed after Task 6), any other read error → `Err(Io)` — replace the
      current `fs::read(&file_path).ok()` collapse, which mislabels EACCES as
      absence.
-   - **Present-field type checks (design C3), before either branch:** `hash` /
-     `hash2` must be `Value::Data` and `symlink` must be `Value::String`; a
-     present field of the wrong type →
-     `errors.push(format!("malformed CodeResources entry: {rel}"))`, skip the key.
-     Correctly-typed digests of the wrong length fall through to the normal
-     comparison and land in `mismatched`.
+   - **Present-field checks (design C3), before either branch:** a dictionary
+     carrying `symlink` **together with** any `hash`/`hash2` field is a hybrid the
+     builder never emits →
+     `errors.push(format!("malformed CodeResources entry: {rel}"))`, skip the key;
+     and `hash` / `hash2` must be `Value::Data` and `symlink` must be
+     `Value::String`; a present field of the wrong type → same malformed error,
+     skip the key. Correctly-typed digests of the wrong length fall through to the
+     normal comparison and land in `mismatched`.
 2. Disk→sealed walk: include symlinks — `if !entry.file_type().is_file() &&
    !entry.file_type().is_symlink() { continue; }`.
 3. Update the `CodeResourcesVerification::matched` doc comment: "sealed entries
@@ -609,7 +613,7 @@ fn unsupported_rule_is_reported() {
    enum RulePattern {
        Always,
        Contains(&'static str),
-       Suffix(&'static str),
+       Locversion,
        Prefix(&'static str),
        Exact(&'static str),
        Dsym,
@@ -625,7 +629,7 @@ fn unsupported_rule_is_reported() {
        Some(match pattern {
            "^.*" => RulePattern::Always,
            "^.*\\.lproj/" => RulePattern::Contains(".lproj/"),
-           "^.*\\.lproj/locversion.plist$" => RulePattern::Suffix(".lproj/locversion.plist"),
+           "^.*\\.lproj/locversion.plist$" => RulePattern::Locversion,
            "^Base\\.lproj/" => RulePattern::Prefix("Base.lproj/"),
            "^version\\.plist$" => RulePattern::Exact("version.plist"),
            ".*\\.dSYM($|/)" => RulePattern::Dsym,
@@ -641,7 +645,17 @@ fn unsupported_rule_is_reported() {
        match pattern {
            RulePattern::Always => true,
            RulePattern::Contains(needle) => rel.contains(needle),
-           RulePattern::Suffix(suffix) => rel.ends_with(suffix),
+           RulePattern::Locversion => {
+               // ^.*\.lproj/locversion.plist$: the dot before "plist" is
+               // unescaped in the builder's emitted pattern, so it stands for
+               // exactly one arbitrary character (regex ".", newline excluded).
+               // Never narrow it to a literal dot.
+               rel.match_indices(".lproj/locversion").any(|(idx, _)| {
+                   let rest = &rel[idx + ".lproj/locversion".len()..];
+                   let mut chars = rest.chars();
+                   matches!(chars.next(), Some(c) if c != '\n') && chars.as_str() == "plist"
+               })
+           }
            RulePattern::Prefix(prefix) => rel.starts_with(prefix),
            RulePattern::Exact(text) => rel == *text,
            RulePattern::Dsym => rel.ends_with(".dSYM") || rel.contains(".dSYM/"),
@@ -1023,13 +1037,17 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
            if !slice.signed {
                continue;
            }
-           if slice.special_slots.first() == Some(&SpecialSlotCheck::NotChecked) {
+           if slice.special_slots.first()
+               == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
+           {
                slot_errors.push(
                    "cannot verify special slot -1 (Info.plist) without bundle context"
                        .to_string(),
                );
            }
-           if slice.special_slots.get(2) == Some(&SpecialSlotCheck::NotChecked) {
+           if slice.special_slots.get(2)
+               == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
+           {
                slot_errors.push(
                    "cannot verify special slot -3 (CodeResources) without bundle context"
                        .to_string(),
@@ -1050,7 +1068,10 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
    zero-filled — zsign-core code_directory.rs:501-533), which surfaces nothing.
    Gate on `slice.signed`; never surface indices 3/5 (`-4`/`-6` content is
    defined as unavailable at Mach-O level); `Missing` (zero-filled) stays silent.
-   `SpecialSlotCheck` is imported like the bundle loop does.
+   The comparisons are **fully qualified**
+   (`zsign_core::codesign::verify::SpecialSlotCheck`) exactly like the existing
+   bundle loop (verify.rs:312-323) — no new import is added (verify.rs imports
+   only `MachOVerifyReport`/`SliceVerifyReport` at :26-32).
 
    **Channel decision (documented, not altered):** these strings go into
    `VerifyReport.errors`, which flips `report.valid()` to false and makes the CLI's
@@ -1109,8 +1130,10 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
   `pattern_matches`, `compile_rules`, `rule_action`, `RuleAction`, `RulePattern`,
   `tie_rank`) are defined once in Task 6 and referenced only there; the shared
   missing-tolerance predicate `matches!(rule_action(rules, rel), Some(Optional) |
-  Some(Omit))` appears identically in Task 6 (both directions) and Task 8 (stage-2
-  parent-`NotFound`); `bundle_real` containment (Task 8 stage 2) is defined inside
+  Some(Omit))` appears identically in Task 6's sealed→disk missing decision and
+  Task 8 (stage-2 parent-`NotFound` routing) — the disk→sealed unsealed-exemption
+  is deliberately Omit-only (see design C4); `bundle_real` containment (Task 8
+  stage 2) is defined inside
   `check_code_resources` once; the malformed-entry message
   `malformed CodeResources entry: <rel>` first appears in Task 4 (wrong-typed
   present fields) and is re-used verbatim by Tasks 5 and 7 (whose fail-before test
