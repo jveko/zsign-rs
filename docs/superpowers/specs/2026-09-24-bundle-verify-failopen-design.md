@@ -80,9 +80,17 @@ All verified against current source (line numbers as of base `ee42c12`).
   Slot index → meaning: 0 = -1 Info.plist, 1 = -2 requirements, 2 = -3 CodeResources,
   3 = -4 application (content never available at Mach-O level), 4 = -5 entitlements,
   5 = -6, 6 = -7 DER entitlements. `NotChecked` requires a *nonzero* declared hash
-  with content `None`; zero-filled slots read `Missing` (normal, unbound). Bare
-  signing leaves -1/-3 zero-filled → `Missing`, so `bare_macho_verifies` never sees
-  `NotChecked`.
+  with content `None`; zero-filled slots read `Missing` (normal, unbound); an
+  **absent** index (vector shorter than the index) likewise reads no check — bare
+  signing binds only the always-hashed -2 (requirements, plus -5/-7 with
+  entitlements), so a bare CD typically trims to `nSpecialSlots == 2`: index 0 (-1)
+  is present but zero-filled (`Missing`), **index 2 (-3) may be absent entirely**
+  (zsign-core code_directory.rs:501-533, signer.rs:81,107-112) → `bare_macho_verifies`
+  never sees `NotChecked`. On the bundle side, only executable-typed slices get
+  frame-local Info.plist bytes at sign time (zsign ipa/mod.rs:814-828): dylib /
+  non-main framework binaries bind -3 but **not** -1, so their absent/zero -1 stays
+  silent while a nonzero -1 that cannot be verified is a genuine unverifiable
+  binding.
 - **Consumers.** CLI `print_bundle` prints `bundle.errors` (main.rs:359-361) and the
   `CodeResourcesVerification` lists; `lib.rs:59` re-exports only
   `verify_bundle/verify_ipa/verify_macho_file/VerifyReport`; no other reader of the
@@ -167,16 +175,37 @@ IndexMap-backed today (insertion order preserved) but its docs explicitly allow 
 backing store to change in a minor release, so declaration order is deliberately
 NOT part of the semantics; only (weight, tie_rank) decides. Path checks:
 
-- disk→sealed: on-disk file in neither dict → Omit rule matches → exempt,
-  otherwise `unsealed`.
-- sealed→disk: sealed entry absent on disk → tolerated only when the winning rule
-  action is Optional; otherwise `missing`. The per-entry `optional` flag (and the
+- disk→sealed, in this fixed order: (1) the **structural** `is_rule_omitted` gate
+  runs unconditionally first (`_CodeSignature`, frame main executable — neither is
+  ever sealed by the builder, and the main executable would otherwise be flagged
+  unsealed); (2) sealed-set membership → skip (its hash was checked in the
+  sealed→disk direction); (3) winning rule action Omit → exempt; (4) otherwise
+  `unsealed`.
+- sealed→disk: a sealed entry absent on disk is tolerated **iff the winning rule
+  action is Optional *or* Omit**; otherwise `missing`. Omit must tolerate too: our
+  builder *seals* `*.lproj/locversion.plist` (its files2 drop list is only
+  Info.plist/PkgInfo/*.DS_Store, zsign-core code_resources.rs:435-460) while
+  declaring it `omit` w=1100 (:145-152) — declaring a file outside the seal means
+  its absence cannot fail verification (its presence is still hash-checked). This
+  tolerance predicate is shared verbatim by the disk→sealed exemption, the
+  sealed→disk missing decision, and Task 8's parent-`NotFound` routing. The
+  per-entry `optional` flag (and the
   same key inside legacy `files` entries) is deliberately **not** consulted: our
   builder stamps it on every `.lproj/` path — including `Base.lproj`, which its own
   weight rule (1010 > 1000) declares *required*. Letting the entry flag override
   would make weight precedence unimplementable. One authority: the rules layer.
   Unknown *entry* keys (`size`, metadata from other tools) are ignored — they are
   not rules; unknown rule patterns error per C4.
+
+Rule value → action mapping (complete): `Boolean(true)` → Include,
+`Boolean(false)` → Omit; dictionary: `omit == true` → Omit, else
+`optional == true` → Optional, else → **Include** (this covers weight-only
+dictionaries such as `^Base\.lproj/ {weight: 1010}` — a real emitted shape);
+`omit` and `optional` both true, a non-Boolean `omit`/`optional`, any key outside
+`{omit, optional, weight}`, a non-numeric weight, or a **non-finite weight**
+(NaN/inf — plist parses `<real>NaN</real>` straight into `Value::Real`) →
+`unsupported CodeResources rule` error, rule dropped. Finite weights compare with
+`total_cmp` so selection never depends on iteration order.
 
 Structural omissions that no rule can express stay hard-coded in
 `is_rule_omitted`: `_CodeSignature` (root prefix/exact) and the frame's main
@@ -194,19 +223,32 @@ builder emission, both dicts):
 | `^.*\.lproj/` | contains `.lproj/` |
 | `^.*\.lproj/locversion.plist$` | ends with `.lproj/locversion.plist` |
 | `^Base\.lproj/` | starts with `Base.lproj/` |
-| `^version.plist$`, `^version\.plist$` | equals `version.plist` |
+| `^version\.plist$` | equals `version.plist` |
 | `.*\.dSYM($|/)` | ends with `.dSYM` or contains `.dSYM/` |
 | `^(.*/)?\.DS_Store$` | equals `.DS_Store` or ends with `/.DS_Store` |
 | `^Info\.plist$` | equals `Info.plist` |
 | `^PkgInfo$` | equals `PkgInfo` |
 | `^embedded\.provisionprofile$` | equals `embedded.provisionprofile` |
 
+The legacy `rules` spelling `^version.plist$` (unescaped dot — zsign-core
+code_resources.rs:109-110) is deliberately **rejected as unsupported**, never
+silently narrowed to an exact match: a true regex `.` also matches `/`, so
+"exact text" would change emitted-rule semantics. It can only be reached when
+`rules2` is absent (we compile the selected dict only), which our builder never
+produces — a rules-only CodeResources hits the explicit unsupported error and the
+bundle fails closed.
+
 If a builder pattern ever changes, verification fails closed with the explicit
 unsupported-rule error (coordination point with the builder lane, not a silent gap).
 
 **C5 — symlink semantics.** A sealed entry with a `symlink` key is verified as a
-symlink: the on-disk object must be a symlink (`symlink_metadata`) and
-`fs::read_link` must equal the sealed target string; no hash is expected either
+symlink: the on-disk object must be a symlink (`symlink_metadata`) and the target
+must match by the builder's own lossy-string contract —
+`fs::read_link(path).to_string_lossy().to_string() == sealed_target` (the builder
+seals `target.to_string_lossy().to_string()`, zsign bundle/code_resources.rs:271-277,
+so a non-Unicode target round-trips through the same lossy rendering on both sides
+and compares equal iff the raw bytes match; no component-wise or byte-wise
+comparison is used). No hash is expected either
 way — there is no hash fallback to design, because the builder emits `hash`/`hash2`
 only in the *non*-symlink branch (zsign-core code_resources.rs:444-453), so
 target-string equality is the only possible check. Conversely an entry expecting file content whose on-disk object is a symlink is
@@ -234,9 +276,20 @@ verified root"). Walk entries use `entry.file_type()` (no-follow) instead of
 (Info.plist) or 2 (CodeResources) reads `NotChecked` gets a binary-level error —
 ungated on file-presence (with C1, `NotChecked` at those indices means the content
 file is genuinely absent; a missing CodeResources *also* raises the bundle-level C2
-error). In the bare path, `NotChecked` at those indices pushes
+error). Slot -1's requirement is inherently scoped to **executable-typed bindings**:
+only executables get nonzero -1 hashes at sign time (zsign ipa/mod.rs:814-828), so
+dylib/non-main framework binaries — which bind -3 but not -1 — read `Missing` or
+absent at index 0 and stay silent. Absent indices (bare CDs may be length 2, so
+index 2 can be absent) yield no check at all and surface nothing; checks use
+`.first()` / `.get(2)`, never panicking indexing. In the bare path, `NotChecked`
+at those indices pushes
 `VerifyReport.errors` ("cannot verify … without bundle context") → the report is
-invalid rather than silently valid. Indices 3/5 (`-4`/`-6`) are never surfaced:
+invalid rather than silently valid. That routes through the CLI's *existing*
+`report.errors` exit branch (currently exit 2, zsign-cli main.rs:193-202 — a
+branch today's code never reaches because `VerifyReport.errors` is never
+populated); activating it for unverifiable bare bindings is documented as
+intentional-for-now, and any exit-code remapping is ZSN-5's (main.rs is not this
+lane's file). Indices 3/5 (`-4`/`-6`) are never surfaced:
 their content is defined as unavailable at the Mach-O level. Zero-filled slots
 (`Missing`) remain silent — unbound is normal.
 
@@ -381,7 +434,9 @@ Per-item tests: legacy SHA-1-only entry accepted at the CodeResources layer; bot
 hash fields enforced (partial re-seal detected); nested `.DS_Store` (builder
 emission: files2-dropped, `files`-kept, rules2-omitted) verifies clean E2E;
 optional `.lproj` entry deleted after signing stays valid while a deleted
-`Base.lproj` file (weight 1010 > 1000) stays invalid; injected unknown rule →
+`Base.lproj` file (weight 1010 > 1000) stays invalid, and a deleted
+`*.lproj/locversion.plist` (omit w=1100, sealed anyway) stays valid — the
+Omit-tolerates-missing predicate; injected unknown rule →
 explicit unsupported error; non-dict entry → malformed error; bare verify of a
 bundle-bound binary → invalid with a slot error; **symlink-parent traversal**
 (fixture seals `Escape -> <dir outside the bundle>`, crafted key

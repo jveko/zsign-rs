@@ -134,7 +134,7 @@ fn missing_bundle_root_is_hard_error() {
    `DirEntry`, so the same `entry.path()` / `entry.file_type()` expressions feed it.
    Apply the identical first statement to the disk walk inside
    `check_code_resources` (its current `filter_map(|e| e.ok())` disappears with the
-   loop rewrite required by Step 4.4). Do NOT put `map_err`/`?` on the iterator
+   loop rewrite in point 4 of this step). Do NOT put `map_err`/`?` on the iterator
    chain itself — that does not compile.
 4. `check_code_resources`: add `errors: &mut Vec<String>` parameter, return
    `Result<CodeResourcesVerification>`; its disk walk uses the per-item binding from
@@ -252,10 +252,16 @@ fn tampered_nested_binary_is_detected_by_nested_frame() {
    /// True when any component of `rel` names a nested bundle directory. With
    /// `ignore_last` the final component is exempt, which lets a directory entry
    /// itself be the bundle while its ancestors must not be.
-   fn has_nested_bundle_component(rel: &Path, ignore_last: bool) -> bool
+   fn has_nested_bundle_component(rel: &Path, ignore_last: bool) -> bool {
+       let mut components: Vec<_> = rel.components().collect();
+       if ignore_last {
+           components.pop();
+       }
+       components
+           .iter()
+           .any(|c| is_bundle_dir(Path::new(c.as_os_str())))
+   }
    ```
-   (`is_bundle_dir(Path::new(c.as_os_str()))` over `rel.components()`, popping the
-   last component first when `ignore_last`.)
 2. In the walk loop, compute the dir-relative path once:
    `let rel_dir = p.strip_prefix(dir).unwrap_or(p);` — use it for all membership
    decisions; keep `strip_prefix(root)` **only** for the reported `rel_str`.
@@ -322,8 +328,14 @@ fn signed_bundle_with_framework_symlink_verifies() {
    - entry dict has `symlink` (string): treat as symlink seal —
      `fs::symlink_metadata(file_path)`: `NotFound` → `missing` (unless the entry is
      later governed by rules — for now plain missing); metadata OK but not a symlink
-     → `mismatched`; symlink → `fs::read_link` equals the sealed string →
-     `matched += 1`, differs → `mismatched`. No hash expectation either way.
+     → `mismatched`; symlink → compare by the builder's lossy-string contract:
+     `fs::read_link(&file_path)` yields a `PathBuf`; compare
+     `actual.to_string_lossy().to_string() == sealed_target` (the builder seals
+     `target.to_string_lossy().to_string()` — zsign bundle/code_resources.rs:271-277 —
+     so a non-Unicode target renders identically on both sides and compares equal
+     iff the raw bytes match; equality is on the lossy strings, never component-wise
+     or byte-wise) → equal: `matched += 1`, differs → `mismatched`. No hash
+     expectation either way.
    - entry dict without `symlink`: additionally require the on-disk object to NOT be
      a symlink before hashing (`symlink_metadata` says `is_symlink` →
      `mismatched` — a sealed file must still be a file); then hash as today.
@@ -368,7 +380,7 @@ fn legacy_sha1_only_entry_verifies() {
     let key = "Frameworks/Sub.framework/Info.plist";
     rewrite_code_resources(&app, |dict| {
         let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
-        let entry = files2.get(key).unwrap().as_dictionary_mut().unwrap();
+        let entry = files2.get_mut(key).unwrap().as_dictionary_mut().unwrap();
         let sha1_hash = entry.get("hash").unwrap().clone();
         let mut legacy = plist::Dictionary::new();
         legacy.insert("hash".to_string(), sha1_hash);
@@ -510,6 +522,25 @@ fn base_lproj_deletion_is_not_optional() {
 }
 
 #[test]
+fn omitted_locversion_deletion_stays_valid() {
+    // Omit must tolerate absence: the builder seals *.lproj/locversion.plist
+    // (its files2 drop list is only Info.plist/PkgInfo/*.DS_Store) while the
+    // rules declare it omit at weight 1100.
+    let td = tempfile::TempDir::new().unwrap();
+    let app = build_signed_bundle_with(td.path(), |app| {
+        fs::create_dir_all(app.join("en.lproj")).unwrap();
+        fs::write(app.join("en.lproj").join("locversion.plist"), b"x").unwrap();
+    });
+    fs::remove_file(app.join("en.lproj").join("locversion.plist")).unwrap();
+    let report = verify_bundle(&app).unwrap();
+    assert!(
+        report.valid(),
+        "an omitted-but-sealed entry may vanish: {:?}",
+        report.bundle
+    );
+}
+
+#[test]
 fn unsupported_rule_is_reported() {
     let td = tempfile::TempDir::new().unwrap();
     let app = build_signed_bundle(td.path());
@@ -531,28 +562,68 @@ fn unsupported_rule_is_reported() {
 - [ ] **Step 2: Run and confirm FAIL** —
   - `optional_lproj…`: invalid, `cr.missing` contains the strings file (declared
     optional never consulted today);
-  - `base_lproj…`: PASSES today (everything is missing-tolerant=nothing) — it is a
-    guard against the new engine treating all `.lproj` as optional;
+  - `omitted_locversion…`: invalid, `cr.missing` contains the locversion file
+    (Omit tolerance never consulted today);
+  - `base_lproj…`: PASSES today (nothing is missing-tolerant) — it is a
+    guard against the new engine treating all `.lproj` as optional or omit;
   - `unsupported_rule…`: FAILS — no such error exists (rules are ignored today).
 
 - [ ] **Step 3: Implement** (design C4)
 
-1. New private items in `verify.rs`:
+1. New private items in `verify.rs` — complete bodies below; the matcher is plain
+   string predicates over exactly the design's C4 pattern subset (anchors,
+   literal `\.`, `.*`, `(/)?`, `($|/)`, alternation only at that level) — **no
+   regex engine** (`regex` is not an available dependency):
+
    ```rust
    #[derive(Clone, Copy, PartialEq, Eq)]
    enum RuleAction { Include, Omit, Optional }
-   enum RulePattern { Always, Contains(&'static str), Suffix(&'static str),
-                      Prefix(&'static str), Exact(&'static str), Dsym, DsStore }
-   struct Rule { pattern: RulePattern, action: RuleAction, weight: f64 }
+   enum RulePattern {
+       Always,
+       Contains(&'static str),
+       Suffix(&'static str),
+       Prefix(&'static str),
+       Exact(&'static str),
+       Dsym,
+       DsStore,
+   }
+   struct Rule {
+       pattern: RulePattern,
+       action: RuleAction,
+       weight: f64,
+   }
 
-   fn compile_rules(dict: &plist::Dictionary, errors: &mut Vec<String>) -> Vec<Rule>
-   fn rule_action(rules: &[Rule], rel: &str) -> Option<RuleAction>
-   ```
-   **Do NOT derive `PartialOrd` on `RuleAction`** — derived order would make
-   `Optional` outrank `Include` on a tie, inverting the required strictness.
-   Select with an explicit comparator instead:
-   ```rust
-   // Tie-break on equal weight, strictest first: Include beats Omit beats Optional.
+   fn compile_pattern(pattern: &str) -> Option<RulePattern> {
+       Some(match pattern {
+           "^.*" => RulePattern::Always,
+           "^.*\\.lproj/" => RulePattern::Contains(".lproj/"),
+           "^.*\\.lproj/locversion.plist$" => RulePattern::Suffix(".lproj/locversion.plist"),
+           "^Base\\.lproj/" => RulePattern::Prefix("Base.lproj/"),
+           "^version\\.plist$" => RulePattern::Exact("version.plist"),
+           ".*\\.dSYM($|/)" => RulePattern::Dsym,
+           "^(.*/)?\\.DS_Store$" => RulePattern::DsStore,
+           "^Info\\.plist$" => RulePattern::Exact("Info.plist"),
+           "^PkgInfo$" => RulePattern::Exact("PkgInfo"),
+           "^embedded\\.provisionprofile$" => RulePattern::Exact("embedded.provisionprofile"),
+           _ => return None,
+       })
+   }
+
+   fn pattern_matches(pattern: &RulePattern, rel: &str) -> bool {
+       match pattern {
+           RulePattern::Always => true,
+           RulePattern::Contains(needle) => rel.contains(needle),
+           RulePattern::Suffix(suffix) => rel.ends_with(suffix),
+           RulePattern::Prefix(prefix) => rel.starts_with(prefix),
+           RulePattern::Exact(text) => rel == *text,
+           RulePattern::Dsym => rel.ends_with(".dSYM") || rel.contains(".dSYM/"),
+           RulePattern::DsStore => rel == ".DS_Store" || rel.ends_with("/.DS_Store"),
+       }
+   }
+
+   // Tie-break on equal weight, strictest first: Include beats Omit beats
+   // Optional. Never derive PartialOrd on RuleAction — derived order would
+   // make Optional outrank Include on a tie.
    fn tie_rank(action: RuleAction) -> u8 {
        match action {
            RuleAction::Include => 0,
@@ -560,22 +631,97 @@ fn unsupported_rule_is_reported() {
            RuleAction::Optional => 2,
        }
    }
-   // rule_action: keep the current best rule r when
-   //   r.weight > best.weight
-   //   || (r.weight == best.weight && tie_rank(r.action) < tie_rank(best.action))
+
+   fn compile_rules(dict: &plist::Dictionary, errors: &mut Vec<String>) -> Vec<Rule> {
+       let mut out = Vec::new();
+       for (pattern_str, spec) in dict {
+           let Some(pattern) = compile_pattern(pattern_str) else {
+               errors.push(format!("unsupported CodeResources rule: {pattern_str}"));
+               continue;
+           };
+           let (action, weight) = match spec {
+               plist::Value::Boolean(true) => (RuleAction::Include, 1.0),
+               plist::Value::Boolean(false) => (RuleAction::Omit, 1.0),
+               plist::Value::Dictionary(d) => {
+                   let bad_key = d
+                       .keys()
+                       .any(|k| !matches!(k.as_str(), "omit" | "optional" | "weight"));
+                   let bad_type = matches!(d.get("omit"), Some(v) if !matches!(v, plist::Value::Boolean(_)))
+                       || matches!(d.get("optional"), Some(v) if !matches!(v, plist::Value::Boolean(_)))
+                       || matches!(d.get("weight"), Some(v)
+                           if !matches!(v, plist::Value::Real(_) | plist::Value::Integer(_)));
+                   let omit = matches!(d.get("omit"), Some(plist::Value::Boolean(true)));
+                   let optional = matches!(d.get("optional"), Some(plist::Value::Boolean(true)));
+                   let weight = match d.get("weight") {
+                       None => 1.0,
+                       Some(plist::Value::Integer(w)) => *w as f64,
+                       Some(plist::Value::Real(w)) => *w,
+                       _ => 1.0,
+                   };
+                   if bad_key || bad_type || (omit && optional) || !weight.is_finite() {
+                       errors.push(format!(
+                           "unsupported CodeResources rule: {pattern_str}: invalid spec"
+                       ));
+                       continue;
+                   }
+                   // Weight-only dictionaries (e.g. ^Base\.lproj/ {weight: 1010})
+                   // resolve to Include here.
+                   let action = if omit {
+                       RuleAction::Omit
+                   } else if optional {
+                       RuleAction::Optional
+                   } else {
+                       RuleAction::Include
+                   };
+                   (action, weight)
+               }
+               _ => {
+                   errors.push(format!(
+                       "unsupported CodeResources rule: {pattern_str}: invalid spec"
+                   ));
+                   continue;
+               }
+           };
+           out.push(Rule { pattern, action, weight });
+       }
+       out
+   }
+
+   fn rule_action(rules: &[Rule], rel: &str) -> Option<RuleAction> {
+       let mut best: Option<&Rule> = None;
+       for rule in rules {
+           if !pattern_matches(&rule.pattern, rel) {
+               continue;
+           }
+           best = Some(match best {
+               None => rule,
+               Some(b) => match rule.weight.total_cmp(&b.weight) {
+                   std::cmp::Ordering::Greater => rule,
+                   std::cmp::Ordering::Equal
+                       if tie_rank(rule.action) < tie_rank(b.action) =>
+                   {
+                       rule
+                   }
+                   _ => b,
+               },
+           });
+       }
+       best.map(|r| r.action)
+   }
    ```
-   `compile_rules` recognizes exactly the pattern strings in the design's C4 table
-   (both `^version.plist$` spellings map to `Exact("version.plist")`); the matcher
-   is plain string predicates over that subset — anchors, literal `\.`, `.*`,
-   `(/)?`, `($|/)`, alternation only at that level — with a literal-prefix fast
-   path where useful; **no regex engine** (`regex` is not an available dependency).
-   Unknown pattern or unknown spec key/type (or `omit`+`optional` both true) →
-   `errors.push(format!("unsupported CodeResources rule: {key}"))` and the rule is
-   dropped. `Boolean(true/false)` → Include/Omit at weight 1.0; dict keys limited to
-   `omit`/`optional`/`weight` (weight: Real or Integer → f64, default 1.0).
-   Selection is **order-independent**: highest weight wins, ties by lowest
-   `tie_rank` — never declaration order (`plist::Dictionary` is IndexMap-backed
-   today but its docs allow the backing store to change in a minor release).
+
+   The legacy `rules` spelling `^version.plist$` (unescaped dot, zsign-core
+   code_resources.rs:109-110) is intentionally absent from `compile_pattern` — it
+   falls through to the unsupported error, never an `Exact` mapping: a regex `.`
+   also matches `/`, so exact text would silently narrow emitted semantics. It is
+   reachable only when `rules2` is absent (we compile the selected dict only),
+   which our builder never produces.
+
+   Selection is **order-independent**: highest weight (`total_cmp`) wins, ties by
+   lowest `tie_rank` — never declaration order (`plist::Dictionary` is
+   IndexMap-backed today but its docs allow the backing store to change in a
+   minor release); non-finite weights are rejected at compile time, so `total_cmp`
+   only ever sees finite values.
 2. Rule source with fail-closed type handling (design C4): read
    `dict.get("rules2")` — present but not a dictionary →
    `errors.push("CodeResources rules2 is not a dictionary")`, treated as absent for
@@ -583,20 +729,29 @@ fn unsupported_rule_is_reported() {
    `rules2` when it exists, else `rules` (same wrong-type treatment for `rules`);
    **neither present** → `errors.push("CodeResources has no rules dictionary")` and
    treat lookup as "no rule matches anything" (disk check falls back to structural
-   omissions only, missing entries are never tolerated).
+   omissions only, missing entries are never tolerated). Call `compile_rules` once
+   at the top of `check_code_resources`, right after parsing the plist, passing the
+   same `errors` parameter; keep the returned `Vec<Rule>` for both check
+   directions below.
 3. `is_rule_omitted` is reduced to the two structural omissions
    (`_CodeSignature` root prefix/exact, frame main executable exact) — delete the
    `Info.plist`/`PkgInfo`/`.DS_Store`/`.lproj` arms (rules2 covers them; the
    `.lproj/` suffix arm is dead code — walked rel paths are file paths and never
    end in `/`, so it omits nothing today). Update its doc comment.
-4. Wire the two check directions:
-   - disk→sealed: not in sealed set → `rule_action == Omit` → exempt, else
-     `unsealed.push(rel)`; no rule matched → structural check only (an unmatched
-     path under a `^.*` catch-all can't happen with our rules, but don't invent
-     exemptions);
-   - sealed→disk: missing → tolerate **only** when `rule_action == Optional`
-     (entry-level `optional` deliberately ignored — see design C4), else
-     `missing.push(rel)`.
+4. Wire the checks (design C4) in this fixed order:
+   - disk→sealed: the **structural** `is_rule_omitted` gate (already invoked
+     while collecting disk files) stays unconditional and FIRST — it now holds
+     only `_CodeSignature` + the frame main executable, which the builder never
+     seals, so skipping that gate would flag the main executable unsealed and
+     regress green fixtures. Then, per remaining rel: in the sealed set → skip
+     (its hash was verified in the other direction); else
+     `rule_action(rules, rel) == Some(Omit)` → exempt; else
+     `unsealed.push(rel)`. `None` (no rule matched) invents no exemption.
+   - sealed→disk, in **both** the hash and symlink branches: a sealed entry
+     absent on disk → tolerate **iff** `matches!(rule_action(rules, rel),
+     Some(Optional) | Some(Omit))` (Omit tolerance is required: locversion is
+     sealed yet declared omit w=1100; entry-level `optional` is deliberately
+     ignored — see design C4), else `missing.push(rel)`.
 5. `use` nothing new (no regex crate — pattern predicates are plain string ops).
 
 - [ ] **Step 4: Run tests — PASS**, then the full scoped gate. Expected: all green
@@ -758,8 +913,9 @@ fn symlink_parent_traversal_is_rejected() {
    (the parent is `bundle` itself for root-level keys):
    - `Err(NotFound)` → the parent directory does not exist, so the sealed entry is
      absent: apply the **same rule-aware missing decision the sealed→disk loop
-     already uses after Task 6** — if `rule_action(rel) == Some(Optional)` →
-     tolerate (skip the entry), else `missing.push(rel)` — and `continue` without
+     already uses after Task 6** — if `matches!(rule_action(rules, rel),
+     Some(Optional) | Some(Omit))` → tolerate (skip the entry), else
+     `missing.push(rel)` — and `continue` without
      reading anything. (An unconditional `missing.push` here would break Task 6's
      `optional_lproj_deletion_after_signing_stays_valid` test, which deletes the
      whole `en.lproj` directory and expects a valid report.)
@@ -811,26 +967,70 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
 
 - [ ] **Step 3: Implement** (design C7)
 
-1. Bare path — after `verify_macho` succeeds in `verify_macho_file`, for each
-   **signed** slice:
+1. Bare path — `verify_macho_file` currently builds `VerifyReport` inline
+   (verify.rs:194-206); restructure it so the slot findings have an accumulator:
+
    ```rust
-   if slice.special_slots.first() == Some(&SpecialSlotCheck::NotChecked) {
-       macho_errors.push("cannot verify special slot -1 (Info.plist) without bundle context".to_string());
-   }
-   if slice.special_slots.get(2) == Some(&SpecialSlotCheck::NotChecked) {
-       macho_errors.push("cannot verify special slot -3 (CodeResources) without bundle context".to_string());
+   pub fn verify_macho_file(path: impl AsRef<Path>) -> Result<VerifyReport> {
+       let path = path.as_ref();
+       let data = std::fs::read(path)?;
+       let macho = zsign_core::macho::verify_macho(
+           &data,
+           &zsign_core::codesign::verify::SignatureInputs::none(),
+       )
+       .map_err(crate::Error::Core)?;
+       let mut slot_errors: Vec<String> = Vec::new();
+       for slice in &macho.slices {
+           if !slice.signed {
+               continue;
+           }
+           if slice.special_slots.first() == Some(&SpecialSlotCheck::NotChecked) {
+               slot_errors.push(
+                   "cannot verify special slot -1 (Info.plist) without bundle context"
+                       .to_string(),
+               );
+           }
+           if slice.special_slots.get(2) == Some(&SpecialSlotCheck::NotChecked) {
+               slot_errors.push(
+                   "cannot verify special slot -3 (CodeResources) without bundle context"
+                       .to_string(),
+               );
+           }
+       }
+       Ok(VerifyReport {
+           input: path.display().to_string(),
+           macho: Some(macho),
+           errors: slot_errors,
+           ..VerifyReport::default()
+       })
    }
    ```
-   push into `VerifyReport.errors` (import `SpecialSlotCheck` like the bundle loop
-   does). Gate on `slice.signed`; never surface indices 3/5 (`-4`/`-6` content is
+
+   Notes binding this to source facts: `.first()`/`.get(2)` never panic, and
+   `.get(2)` is `None` for a length-2 bare CD (index 2 can be **absent**, not just
+   zero-filled — zsign-core code_directory.rs:501-533), which surfaces nothing.
+   Gate on `slice.signed`; never surface indices 3/5 (`-4`/`-6` content is
    defined as unavailable at Mach-O level); `Missing` (zero-filled) stays silent.
+   `SpecialSlotCheck` is imported like the bundle loop does.
+
+   **Channel decision (documented, not altered):** these strings go into
+   `VerifyReport.errors`, which flips `report.valid()` to false and makes the CLI's
+   *existing* `report.errors` branch reachable (currently **exit 2**,
+   zsign-cli main.rs:193-202 — dead today because nothing populates
+   `VerifyReport.errors`). Activating exit 2 for unverifiable bare bindings is
+   intentional-for-now; main.rs is another lane's file (ZSN-5 owns exit-code
+   remapping) and is NOT touched by this task.
 2. Bundle path — in the binary loop, drop the `&& info_plist.is_none()` /
    `&& code_resources.is_none()` gates so the invariant is explicit and covers both
    required slots symmetrically: any `NotChecked` at index 0 →
    `"signature binds Info.plist (slot -1) but the file is missing"`; at index 2 →
-   `"signature binds CodeResources (slot -3) but the file is missing"`. (With Task 1,
-   `NotChecked` at these indices implies the file is genuinely absent; an unreadable
-   file is already a hard `Err`.)
+   `"signature binds CodeResources (slot -3) but the file is missing"`. Read slots
+   with `.first()` / `.get(2)` (never bracket indexing). Slot -1's requirement is
+   inherently scoped to executable-typed bindings: only executables get nonzero -1
+   hashes at sign time (zsign ipa/mod.rs:814-828), so dylib/non-main framework
+   binaries (which bind -3 but not -1) read `Missing`/absent at index 0 and stay
+   silent. (With Task 1, `NotChecked` at these indices implies the file is
+   genuinely absent; an unreadable file is already a hard `Err`.)
 
 - [ ] **Step 4: Run test — PASS**, then the full scoped gate. Expected: all green —
   `bare_macho_verifies` stays green (bare signing zero-fills -1/-3 → `Missing`,
