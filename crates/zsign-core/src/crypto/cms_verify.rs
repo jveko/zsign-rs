@@ -17,10 +17,12 @@
 //!    certificate in the embedded set, and the chain must be structurally
 //!    valid (each certificate signed by its issuer, validity windows, leaf
 //!    code-signing EKU when present).
+//! 5. **Trust anchoring**: the chain must terminate at a certificate in the
+//!    explicit trust-anchor set ([`TrustAnchors::apple_root`] by default).
 //!
-//! Trust *policy* (anchoring to Apple's roots, revocation) is deliberately left
-//! to the device/`codesign`; this module proves cryptographic integrity and
-//! chain structure.
+//! This module proves integrity, Apple-attribute binding, chain structure, and
+//! anchoring to an explicit trust-anchor set — [`TrustAnchors::apple_root`]
+//! by default; revocation remains a device concern.
 //!
 //! # Examples
 //!
@@ -35,7 +37,7 @@ use crate::{Error, Result};
 use const_oid::ObjectIdentifier;
 use der::asn1::{AnyRef, OctetStringRef};
 use der::Tagged;
-use der::{Decode, Encode, Reader, SliceReader, Tag, TagNumber};
+use der::{Decode, DecodePem, Encode, Reader, SliceReader, Tag, TagNumber};
 use pkcs8::DecodePublicKey;
 use sha2::{Digest, Sha256};
 
@@ -232,7 +234,7 @@ pub struct CmsVerifyReport {
     /// Whether the signer certificate's chain is structurally valid
     /// (issuer-signed, in-validity, leaf EKU when present).
     pub chain_ok: bool,
-    /// Whether the chain terminates at a self-signed anchor.
+    /// Whether the chain terminates at a verified trust anchor.
     pub anchored: bool,
     /// Why the chain check failed, when it did.
     pub chain_reason: Option<String>,
@@ -249,6 +251,8 @@ pub struct CmsVerifyReport {
 /// `cms_blob` is the raw signature slot blob including its 8-byte
 /// `CSMAGIC_BLOBWRAPPER` header. `cd_sha1` is `Some` only for dual
 /// SHA-1+SHA-256 output; `cd_sha256` is always the full 32-byte digest.
+/// The default trust-anchor set is [`TrustAnchors::apple_root`]; use
+/// [`verify_code_signature_with_anchors`] to supply a different policy.
 ///
 /// # Errors
 ///
@@ -261,11 +265,32 @@ pub fn verify_code_signature(
     cd_sha1: Option<&[u8; 20]>,
     cd_sha256: &[u8; 32],
 ) -> Result<CmsVerifyReport> {
+    verify_code_signature_with_anchors(
+        cms_blob,
+        content,
+        cd_sha1,
+        cd_sha256,
+        &TrustAnchors::apple_root()?,
+    )
+}
+
+/// Like [`verify_code_signature`], but against an explicit anchor set.
+///
+/// Tests inject their own root here; production callers that need a custom
+/// trust policy pass their store. The default entry point uses
+/// [`TrustAnchors::apple_root`].
+pub fn verify_code_signature_with_anchors(
+    cms_blob: &[u8],
+    content: &[u8],
+    cd_sha1: Option<&[u8; 20]>,
+    cd_sha256: &[u8; 32],
+    anchors: &TrustAnchors,
+) -> Result<CmsVerifyReport> {
     let cms = strip_blob_wrapper(cms_blob)?;
     // Some Apple-produced binaries use BER indefinite lengths; normalize to
     // strict DER before parsing (no-op on already-definite input).
     let cms = normalize_ber_lengths(cms)?;
-    verify_signed_data(&cms, content, cd_sha1, cd_sha256)
+    verify_signed_data(&cms, content, cd_sha1, cd_sha256, anchors)
 }
 
 /// Builds a verification report for an ad-hoc signature (no CMS present).
@@ -274,6 +299,55 @@ pub fn adhoc_report() -> CmsVerifyReport {
         no_signature: true,
         valid: true,
         ..CmsVerifyReport::default()
+    }
+}
+
+/// Certificates whose public keys are trusted as chain termini.
+///
+/// A chain must terminate at a certificate that either matches one of these
+/// anchors (embedded self-signed root) or whose missing issuer names one
+/// (unembedded root); otherwise verification fails as unanchored.
+#[derive(Debug, Clone, Default)]
+pub struct TrustAnchors {
+    roots: Vec<x509_cert::Certificate>,
+}
+
+impl TrustAnchors {
+    /// Wraps the given certificates as trust anchors.
+    pub fn from_certificates(roots: Vec<x509_cert::Certificate>) -> Self {
+        Self { roots }
+    }
+
+    /// The Apple Root CA embedded in [`crate::crypto::assets`].
+    ///
+    /// This is the default anchor set for [`verify_code_signature`].
+    pub fn apple_root() -> Result<Self> {
+        let cert =
+            x509_cert::Certificate::from_pem(crate::crypto::assets::APPLE_ROOT_CA_CERT.as_bytes())
+                .map_err(|e| {
+                    Error::Verification(format!(
+                        "embedded Apple root CA certificate is invalid: {e}"
+                    ))
+                })?;
+        Ok(Self { roots: vec![cert] })
+    }
+
+    /// Whether an anchor's DER-encoded SubjectPublicKeyInfo equals `spki_der`.
+    fn contains_spki(&self, spki_der: &[u8]) -> bool {
+        self.roots.iter().any(|r| {
+            r.tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .map(|d| d.as_slice() == spki_der)
+                .unwrap_or(false)
+        })
+    }
+
+    /// The anchor whose subject equals `name` (issuer lookup for unembedded roots).
+    fn find_by_subject(&self, name: &x509_cert::name::Name) -> Option<&x509_cert::Certificate> {
+        self.roots
+            .iter()
+            .find(|r| r.tbs_certificate.subject == *name)
     }
 }
 
@@ -382,6 +456,7 @@ fn verify_signed_data(
     content: &[u8],
     cd_sha1: Option<&[u8; 20]>,
     cd_sha256: &[u8; 32],
+    anchors: &TrustAnchors,
 ) -> Result<CmsVerifyReport> {
     let mut report = CmsVerifyReport::default();
 
@@ -651,12 +726,17 @@ fn verify_signed_data(
         let sig_ok = verify_signer_signature(cert, sig_oid, attrs_raw, signature);
         report.signature_ok = sig_ok;
 
-        // 4. Chain structure.
-        let (chain_ok, anchored, chain, chain_reason) = verify_chain(&certs, cert);
-        report.chain_ok = chain_ok;
-        report.anchored = anchored;
-        report.chain = chain;
-        report.chain_reason = chain_reason.clone();
+        // 4. Chain structure and trust anchoring.
+        let outcome = verify_chain(&certs, cert, anchors);
+        report.chain_ok = outcome.ok;
+        report.anchored = outcome.anchored;
+        report.chain = outcome.subjects;
+        report.chain_reason = outcome.reason.clone();
+        for w in outcome.warnings {
+            if !report.warnings.contains(&w) {
+                report.warnings.push(w);
+            }
+        }
 
         let mut errors = Vec::new();
         if !md_ok {
@@ -671,12 +751,15 @@ fn verify_signed_data(
         if !sig_ok {
             errors.push("signature does not verify over the signed attributes".into());
         }
-        if !chain_ok {
+        if !outcome.ok {
             errors.push(
-                chain_reason
+                report
+                    .chain_reason
                     .clone()
                     .unwrap_or_else(|| "certificate chain is not structurally valid".into()),
             );
+        } else if !outcome.anchored {
+            errors.push("certificate chain is not anchored to a trusted root".into());
         }
 
         if errors.is_empty() {
@@ -810,43 +893,58 @@ fn verify_signer_signature(
     false
 }
 
-/// Walks the embedded certificate set from `leaf` toward a root, verifying each
-/// certificate's signature with its issuer's public key and its validity
-/// window, and checking the leaf's code-signing EKU when one is present.
-///
-/// Returns `(chain_ok, anchored, chain_subjects_leaf_to_root)`.
+/// The result of walking a certificate chain toward a trust anchor.
+struct ChainOutcome {
+    /// Structural + cryptographic checks passed (every link verified).
+    ok: bool,
+    /// The terminus was matched against the trust anchors.
+    anchored: bool,
+    /// Certificate subjects, leaf first.
+    subjects: Vec<String>,
+    /// Why `ok` is false, when it is.
+    reason: Option<String>,
+    /// Non-fatal observations (SHA-1 signatures — added by queue item 5).
+    warnings: Vec<String>,
+}
+
+/// Walks the embedded certificate set from `leaf` toward a trust anchor,
+/// verifying each certificate's signature with its issuer's public key and
+/// its validity window.
 fn verify_chain(
     certs: &[x509_cert::Certificate],
     leaf: &x509_cert::Certificate,
-) -> (bool, bool, Vec<String>, Option<String>) {
-    let mut chain = vec![leaf];
+    anchors: &TrustAnchors,
+) -> ChainOutcome {
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
+    let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
     let now = time_now();
 
     // Leaf code-signing EKU check (only when an EKU extension is present).
     if let Some(eku) = leaf_eku(leaf) {
         if !eku.contains(&OID_CODE_SIGNING) {
-            return (
-                false,
-                false,
-                names,
-                Some(format!("leaf EKU lacks codeSigning: {eku:?}")),
-            );
+            return ChainOutcome {
+                ok: false,
+                anchored: false,
+                subjects: names,
+                reason: Some(format!("leaf EKU lacks codeSigning: {eku:?}")),
+                warnings,
+            };
         }
     }
     if !in_validity(leaf, now) {
         let v = &leaf.tbs_certificate.validity;
-        return (
-            false,
-            false,
-            names,
-            Some(format!(
+        return ChainOutcome {
+            ok: false,
+            anchored: false,
+            subjects: names,
+            reason: Some(format!(
                 "leaf outside validity (not_before={}, not_after={})",
                 fmt_time(&v.not_before),
                 fmt_time(&v.not_after)
             )),
-        );
+            warnings,
+        };
     }
 
     for depth in 0..=certs.len() {
@@ -861,58 +959,112 @@ fn verify_chain(
             Some(p) if !std::ptr::eq(p, current) => {
                 if !in_validity(p, now) {
                     let v = &p.tbs_certificate.validity;
-                    return (
-                        false,
-                        false,
-                        names,
-                        Some(format!(
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(format!(
                             "issuer outside validity (not_before={}, not_after={})",
                             fmt_time(&v.not_before),
                             fmt_time(&v.not_after)
                         )),
-                    );
+                        warnings,
+                    };
                 }
                 if !verify_cert_signature(current, p) {
-                    return (
-                        false,
-                        false,
-                        names,
-                        Some(format!(
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(format!(
                             "certificate at depth {depth} fails issuer-signature verification"
                         )),
-                    );
+                        warnings,
+                    };
                 }
-                chain.push(p);
                 names.push(p.tbs_certificate.subject.to_string());
                 current = p;
                 continue;
             }
             _ => {
                 if self_signed {
-                    // Anchor found (leaf or an ancestor is self-signed).
-                    return (true, true, names, None);
+                    if !verify_cert_signature(current, current) {
+                        return ChainOutcome {
+                            ok: false,
+                            anchored: false,
+                            subjects: names,
+                            reason: Some(format!(
+                                "self-signed certificate at depth {depth} fails self-signature verification"
+                            )),
+                            warnings,
+                        };
+                    }
+                    let spki_der = current
+                        .tbs_certificate
+                        .subject_public_key_info
+                        .to_der()
+                        .map(|d| d.to_vec())
+                        .unwrap_or_default();
+                    if anchors.contains_spki(&spki_der) {
+                        return ChainOutcome {
+                            ok: true,
+                            anchored: true,
+                            subjects: names,
+                            reason: None,
+                            warnings,
+                        };
+                    }
+                    // Structure complete, trust not granted — `valid` is gated on `anchored`.
+                    return ChainOutcome {
+                        ok: true,
+                        anchored: false,
+                        subjects: names,
+                        reason: None,
+                        warnings,
+                    };
                 }
-                // Chain runs out without an anchor: structural checks pass,
-                // trust is not established (device policy decides).
-                let missing = current.tbs_certificate.issuer.to_string();
-                return (
-                    true,
-                    false,
-                    names,
-                    Some(format!(
-                        "issuer \"{missing}\" not present in the embedded set"
+                // Chain runs out: try the trust anchors for the missing issuer before failing.
+                let missing = current.tbs_certificate.issuer.clone();
+                if let Some(anchor) = anchors.find_by_subject(&missing) {
+                    if verify_cert_signature(current, anchor) {
+                        names.push(anchor.tbs_certificate.subject.to_string());
+                        return ChainOutcome {
+                            ok: true,
+                            anchored: true,
+                            subjects: names,
+                            reason: None,
+                            warnings,
+                        };
+                    }
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(format!(
+                            "certificate at depth {depth} fails trust-anchor signature verification"
+                        )),
+                        warnings,
+                    };
+                }
+                return ChainOutcome {
+                    ok: false,
+                    anchored: false,
+                    subjects: names,
+                    reason: Some(format!(
+                        "issuer \"{missing}\" not present in the embedded set or trust anchors"
                     )),
-                );
+                    warnings,
+                };
             }
         }
     }
-    let _ = chain;
-    (
-        false,
-        false,
-        names,
-        Some("chain longer than the embedded certificate set".into()),
-    )
+    ChainOutcome {
+        ok: false,
+        anchored: false,
+        subjects: names,
+        reason: Some("chain longer than the embedded certificate set".into()),
+        warnings,
+    }
 }
 
 fn fmt_time(t: &x509_cert::time::Time) -> String {
@@ -999,7 +1151,6 @@ fn leaf_eku(cert: &x509_cert::Certificate) -> Option<Vec<ObjectIdentifier>> {
     }
     None
 }
-
 fn in_validity(cert: &x509_cert::Certificate, now: time::OffsetDateTime) -> bool {
     let v = &cert.tbs_certificate.validity;
     let nb = v.not_before.to_date_time().unix_duration().as_secs() as i64;
@@ -1037,6 +1188,7 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
     use x509_cert::name::Name;
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::time::Validity;
@@ -1072,6 +1224,10 @@ mod tests {
         )
     }
 
+    fn anchors_for(creds: &SigningCredentials) -> TrustAnchors {
+        TrustAnchors::from_certificates(vec![creds.certificate.clone()])
+    }
+
     fn wrap(cms: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + cms.len());
         out.extend_from_slice(&0xfade_0b01u32.to_be_bytes());
@@ -1086,7 +1242,14 @@ mod tests {
         let content: &[u8] = b"the code directory bytes";
         let cd_sha256: [u8; 32] = Sha256::digest(content).into();
         let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
-        let report = verify_code_signature(&wrap(&cms), content, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
         assert!(report.valid, "errors: {:?}", report.errors);
         assert!(report.signature_ok);
         assert!(report.message_digest_ok);
@@ -1107,7 +1270,14 @@ mod tests {
         let cd_sha256: [u8; 32] = Sha256::digest(content).into();
         let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
         let tampered: &[u8] = b"the code directory bytes!";
-        let report = verify_code_signature(&wrap(&cms), tampered, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            tampered,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
         assert!(!report.valid);
         assert!(!report.message_digest_ok);
     }
@@ -1122,7 +1292,14 @@ mod tests {
         // Flip a bit near the end of the CMS (inside the signature value).
         let n = wrapped.len();
         wrapped[n - 1] ^= 0x01;
-        let report = verify_code_signature(&wrapped, content, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrapped,
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
         assert!(!report.valid);
         assert!(!report.signature_ok);
     }
@@ -1134,7 +1311,14 @@ mod tests {
         let cd_sha256: [u8; 32] = Sha256::digest(content).into();
         let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
         let other: [u8; 32] = [0xEE; 32];
-        let report = verify_code_signature(&wrap(&cms), content, None, &other).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &other,
+            &anchors_for(&creds),
+        )
+        .unwrap();
         assert!(!report.valid);
         assert!(!report.cdhash_v1_ok);
         assert!(!report.cdhash_v2_ok);
@@ -1210,7 +1394,14 @@ mod tests {
         // Wrap the CMS (ContentInfo, SignedData, etc.) in indefinite form.
         let indefinite = to_indefinite(&cms);
         assert_ne!(indefinite, cms, "re-encode must differ");
-        let report = verify_code_signature(&wrap(&indefinite), content, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&indefinite),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
         assert!(
             report.valid,
             "BER-indefinite CMS must verify after normalization: {:?}",
@@ -1272,9 +1463,17 @@ mod tests {
         .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
 
-        let (ok, anchored, _names, reason) = verify_chain(&[root.clone(), leaf.clone()], &leaf);
-        assert!(ok, "SHA-1-signed intermediate must chain: {reason:?}");
-        assert!(anchored);
+        let outcome = verify_chain(
+            &[root.clone(), leaf.clone()],
+            &leaf,
+            &TrustAnchors::from_certificates(vec![root.clone()]),
+        );
+        assert!(
+            outcome.ok,
+            "SHA-1-signed intermediate must chain: {:?}",
+            outcome.reason
+        );
+        assert!(outcome.anchored);
     }
 
     #[test]
@@ -1286,5 +1485,141 @@ mod tests {
     fn rejects_wrong_wrapper_magic() {
         let blob = vec![0u8; 16];
         assert!(verify_code_signature(&blob, b"x", None, &[0u8; 32]).is_err());
+    }
+
+    fn build_rsa_root(
+        cn: &str,
+    ) -> (
+        rsa::RsaPrivateKey,
+        x509_cert::Certificate,
+        rsa::pkcs1v15::SigningKey<Sha256>,
+    ) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str(cn).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(9u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+        (key, cert, signing_key)
+    }
+
+    #[test]
+    fn attacker_self_signed_resign_is_invalid() {
+        let (victim, _k1) = rsa_credentials();
+        let (attacker, _k2) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        // The attacker re-signs the same CodeDirectory (same CDHash binding)
+        // with a fresh self-signed certificate that nobody trusts.
+        let cms = sign_code_directory(content, &attacker, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&victim),
+        )
+        .unwrap();
+        assert!(
+            !report.valid,
+            "attacker re-sign must not verify: {:?}",
+            report.errors
+        );
+        assert!(!report.errors.is_empty());
+        assert!(!report.anchored);
+    }
+
+    #[test]
+    fn chain_missing_issuer_is_invalid() {
+        // leaf issued by `root`, but only the leaf gets embedded (cert_chain empty);
+        // the anchors available at verification time are an UNRELATED root.
+        let (unrelated, _uk) = rsa_credentials();
+        let (_root_key, root, root_signer) = build_rsa_root("CN=zsign missing issuer root");
+        let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let leaf_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(leaf_key.clone());
+        let leaf_subject = Name::from_str("CN=zsign missing issuer leaf").unwrap();
+        let mut leaf_builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root.tbs_certificate.subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(7u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            leaf_subject,
+            SubjectPublicKeyInfoOwned::from_der(
+                leaf_key
+                    .to_public_key()
+                    .to_public_key_der()
+                    .unwrap()
+                    .as_ref(),
+            )
+            .unwrap(),
+            &root_signer,
+        )
+        .unwrap();
+        leaf_builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let leaf = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+        let creds = SigningCredentials {
+            certificate: leaf,
+            signing_key: SigningKeyType::Rsa(leaf_signing),
+            cert_chain: vec![],
+            team_id: None,
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&unrelated),
+        )
+        .unwrap();
+        assert!(
+            !report.valid,
+            "unanchored missing-issuer chain: {:?}",
+            report.errors
+        );
+        assert!(!report.errors.is_empty());
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("not present in the embedded set or trust anchors")));
+    }
+
+    #[test]
+    fn unanchored_structural_chain_is_invalid() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        // Default anchors = Apple Root CA: this self-signed test root is not one.
+        let report = verify_code_signature(&wrap(&cms), content, None, &cd_sha256).unwrap();
+        assert!(
+            !report.valid,
+            "structural-but-unanchored chain must be invalid"
+        );
+        assert!(
+            report.chain_ok,
+            "structure itself is fine: {:?}",
+            report.chain_reason
+        );
+        assert!(!report.anchored);
     }
 }
