@@ -150,20 +150,17 @@ fn is_bundle_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// True when `path` (relative to `root`) passes through a nested bundle
-/// directory before reaching `path` itself.
-fn inside_nested_bundle(rel: &Path) -> bool {
-    // The main bundle's own extension is the first component; nested bundle
-    // directories are any LATER component with a bundle extension.
-    let mut components = rel.components().peekable();
-    if let Some(first) = components.peek() {
-        if is_bundle_dir(Path::new(first.as_os_str())) {
-            components.next();
-        }
+/// True when any component of `rel` names a nested bundle directory. With
+/// `ignore_last` the final component is exempt, which lets a directory entry
+/// itself be the bundle while its ancestors must not be.
+fn has_nested_bundle_component(rel: &Path, ignore_last: bool) -> bool {
+    let mut components: Vec<_> = rel.components().collect();
+    if ignore_last {
+        components.pop();
     }
     components
-        .find(|c| is_bundle_dir(Path::new(c.as_os_str())))
-        .is_some()
+        .iter()
+        .any(|c| is_bundle_dir(Path::new(c.as_os_str())))
 }
 
 /// Determines whether a file should be omitted from the unsealed-file scan,
@@ -280,8 +277,12 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
             )))
         })?;
         let p = entry.path();
-        if p.is_dir() {
-            if p != dir && is_bundle_dir(p) {
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        let rel_dir = p.strip_prefix(dir).unwrap_or(p);
+        if entry.file_type().is_dir() {
+            if is_bundle_dir(p) && !has_nested_bundle_component(rel_dir, true) {
                 nested_dirs.push(p.to_path_buf());
             }
             continue;
@@ -291,10 +292,10 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         if rel_str.contains("_CodeSignature/") {
             continue;
         }
+        if has_nested_bundle_component(rel_dir, false) {
+            continue;
+        }
         if is_macho_file(p)? {
-            if inside_nested_bundle(rel_path) {
-                continue; // handled by the nested bundle recursion
-            }
             direct_binaries.push((p.to_path_buf(), rel_str));
         }
     }
@@ -790,6 +791,31 @@ mod tests {
             "bundle-level error required (a binary-level slot error exists already); got {:?}",
             bundle.errors
         );
+    }
+
+    #[test]
+    fn tampered_nested_binary_is_detected_by_nested_frame() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        let sub = app.join("Frameworks").join("Sub.framework").join("Sub");
+        let mut data = fs::read(&sub).unwrap();
+        data[0x1000] ^= 0x04;
+        fs::write(&sub, data).unwrap();
+
+        let report = verify_bundle(&app).unwrap();
+        let bundle = report.bundle.as_ref().unwrap();
+        assert_eq!(bundle.nested.len(), 1);
+        let frame = &bundle.nested[0];
+        assert!(
+            !frame.binaries.is_empty(),
+            "nested frame binaries must be Mach-O verified, got none"
+        );
+        let sub_bin = frame
+            .binaries
+            .iter()
+            .find(|b| b.path.ends_with("/Sub") || b.path == "Sub")
+            .expect("Sub binary reported by the nested frame");
+        assert!(!sub_bin.valid(), "tampered nested binary must not verify");
     }
 
     #[test]
