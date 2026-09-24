@@ -7,6 +7,7 @@
 //! This is the "verify one binary" entry point used by the CLI and by
 //! bundle-level verification; it never touches the filesystem.
 
+use crate::codesign::constants::CSMAGIC_BLOBWRAPPER;
 use crate::codesign::verify::{
     check_code_pages, check_special_slots, parse_superblob, self_consistent_blobs, CodeDirectory,
     PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
@@ -165,11 +166,19 @@ fn verify_slice(
         }
     }
 
-    // CMS signature. An empty signature slot (wrapper header only) is what
-    // codesign emits for ad-hoc output.
+    // CMS signature. An exact 8-byte CSMAGIC_BLOBWRAPPER header is what
+    // codesign emits for ad-hoc output; the shortcut also requires CS_ADHOC.
     if let Some(cms_blob) = superblob.cms {
-        if cms_blob.len() <= 8 {
-            report.cms = Some(crate::crypto::cms_verify::adhoc_report());
+        let empty_wrapper =
+            cms_blob.len() == 8 && cms_blob[0..4] == CSMAGIC_BLOBWRAPPER.to_be_bytes();
+        if empty_wrapper {
+            if primary.is_adhoc() {
+                report.cms = Some(crate::crypto::cms_verify::adhoc_report());
+            } else {
+                report
+                    .errors
+                    .push("empty CMS wrapper but not ad-hoc flagged".into());
+            }
             return Ok(report);
         }
 
@@ -272,7 +281,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::codesign::constants::{CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_SIGNATURESLOT};
+    use crate::codesign::constants::{
+        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
+    };
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
     use crate::macho::fixtures::make_minimal_macho;
@@ -328,6 +339,17 @@ mod tests {
             slice.code_sig_size.unwrap() as usize,
         );
         data[off..off + size].to_vec()
+    }
+
+    /// Offset of the child blob whose header carries `slot`, relative to the
+    /// SuperBlob start.
+    fn entry_offset(sb: &[u8], slot: u32) -> Option<usize> {
+        let count = u32::from_be_bytes(sb[8..12].try_into().unwrap()) as usize;
+        (0..count).find_map(|i| {
+            let e = 12 + i * 8;
+            let s = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
+            (s == slot).then(|| u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize)
+        })
     }
 
     #[test]
@@ -401,6 +423,36 @@ mod tests {
         let slice = &report.slices[0];
         assert!(
             slice.errors.iter().any(|e| e.contains("CMS")) || !slice.cms.as_ref().unwrap().valid
+        );
+    }
+
+    #[test]
+    fn non_adhoc_truncated_cms_is_rejected() {
+        let creds = rsa_credentials();
+        let mut signed = sign_round_trip(&creds, "com.example.trunc");
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+
+        // Truncate the CMS child to its 8-byte blob-wrapper header, leaving
+        // everything else intact.
+        let sb = &mut signed[sig_off..sig_off + sig_len];
+        let cms_off = entry_offset(sb, CSSLOT_SIGNATURESLOT).expect("CMS entry");
+        sb[cms_off + 4..cms_off + 8].copy_from_slice(&8u32.to_be_bytes());
+
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        let slice = &report.slices[0];
+        assert!(!slice.adhoc, "credential-signed CD must stay non-ad-hoc");
+        assert!(
+            !report.is_valid(),
+            "8-byte CMS wrapper on a non-ad-hoc CD must not verify: {:?}",
+            slice.errors
+        );
+        assert!(
+            slice.errors.iter().any(|e| e.contains("empty CMS wrapper")),
+            "expected the empty-wrapper rejection, got {:?}",
+            slice.errors
         );
     }
 
