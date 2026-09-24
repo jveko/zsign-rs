@@ -86,11 +86,15 @@ All verified against current source (line numbers as of base `ee42c12`).
   entitlements), so a bare CD typically trims to `nSpecialSlots == 2`: index 0 (-1)
   is present but zero-filled (`Missing`), **index 2 (-3) may be absent entirely**
   (zsign-core code_directory.rs:501-533, signer.rs:81,107-112) → `bare_macho_verifies`
-  never sees `NotChecked`. On the bundle side, only executable-typed slices get
-  frame-local Info.plist bytes at sign time (zsign ipa/mod.rs:814-828): dylib /
-  non-main framework binaries bind -3 but **not** -1, so their absent/zero -1 stays
-  silent while a nonzero -1 that cannot be verified is a genuine unverifiable
-  binding.
+  never sees `NotChecked`. On the bundle side, non-main bundle binaries (dylibs,
+  non-main framework Mach-Os) are signed with `code_resources = None` and receive
+  Info.plist bytes only when the call is executable *and* has resources (zsign
+  ipa/mod.rs:542-550, :817-828) — so they bind **neither -1 nor -3** here, only the
+  always-hashed -2 (entitlements are main-only, ipa/mod.rs:381-382); for FAT
+  binaries the binding decision is taken from the *first slice*, not per-slice
+  (zsign-core signer.rs:167-170, :369-380). A nonzero slot hash that cannot be
+  verified reads `NotChecked` — that stored state, never a slice-type inference,
+  is what item 9 surfaces.
 - **Consumers.** CLI `print_bundle` prints `bundle.errors` (main.rs:359-361) and the
   `CodeResourcesVerification` lists; `lib.rs:59` re-exports only
   `verify_bundle/verify_ipa/verify_macho_file/VerifyReport`; no other reader of the
@@ -115,7 +119,13 @@ All verified against current source (line numbers as of base `ee42c12`).
   CodeResources content, path-escape keys, unverifiable required slot bindings.
 
 `read_opt` becomes `Result<Option<Vec<u8>>>`: `NotFound → Ok(None)`, any other
-I/O error → `Err`. Nothing is swallowed anymore.
+I/O error → `Err`. Nothing is swallowed anymore. The same split governs **per-entry
+checks inside `check_code_resources`**: only a genuine `ErrorKind::NotFound`
+(symlink_metadata, content read, parent canonicalize) means *absence* and enters
+the rule-aware missing machinery; every other per-entry I/O failure (EACCES,
+ELOOP, ENAMETOOLONG, …) propagates `Err(crate::Error::Io(e))` — a permission
+problem must never be mislabeled as content state, and Optional/Omit tolerance
+applies to genuine absence only, never to I/O failures.
 
 **C2 — content-error channel.** All CodeResources *content* problems (missing file at
 a bundle root, unparseable plist, missing dictionaries, non-dict/malformed entries,
@@ -149,7 +159,11 @@ shapes are **not uniform** and both are handled: `.lproj/` entries are dictionar
 `{hash, optional}` (zsign-core code_resources.rs:418-423), everything else is a
 bare `Value::Data(sha1)` (:426); symlinks never appear in `files` — the builder
 skips them there entirely (:414-416). Bare `Data` values are legal in `files`
-(SHA-1) and malformed in `files2`.
+(SHA-1) and malformed in `files2`. Every *present* field is type-checked before
+use: `hash`/`hash2` must be `Value::Data` and `symlink` must be `Value::String` —
+a present field of the wrong plist type is malformed (`malformed CodeResources
+entry` error, key skipped, never silently ignored via `as_data()`-style optional
+extraction); a correctly-typed but wrong-length digest remains a plain `mismatched`.
 
 **C4 — rules engine (no regex crate).** Evaluate **the rules our builder emits**;
 anything else is an explicit `unsupported CodeResources rule: <pattern>` report
@@ -188,7 +202,9 @@ NOT part of the semantics; only (weight, tie_rank) decides. Path checks:
   declaring it `omit` w=1100 (:145-152) — declaring a file outside the seal means
   its absence cannot fail verification (its presence is still hash-checked). This
   tolerance predicate is shared verbatim by the disk→sealed exemption, the
-  sealed→disk missing decision, and Task 8's parent-`NotFound` routing. The
+  sealed→disk missing decision, and Task 8's parent-`NotFound` routing — and only
+  for genuine absence (`ErrorKind::NotFound`); per-entry I/O failures propagate
+  `Err` per C1 and are never tolerated. The
   per-entry `optional` flag (and the
   same key inside legacy `files` entries) is deliberately **not** consulted: our
   builder stamps it on every `.lproj/` path — including `Base.lproj`, which its own
@@ -202,8 +218,10 @@ Rule value → action mapping (complete): `Boolean(true)` → Include,
 `optional == true` → Optional, else → **Include** (this covers weight-only
 dictionaries such as `^Base\.lproj/ {weight: 1010}` — a real emitted shape);
 `omit` and `optional` both true, a non-Boolean `omit`/`optional`, any key outside
-`{omit, optional, weight}`, a non-numeric weight, or a **non-finite weight**
-(NaN/inf — plist parses `<real>NaN</real>` straight into `Value::Real`) →
+`{omit, optional, weight}`, a non-numeric weight, a **non-finite weight**
+(NaN/inf — plist parses `<real>NaN</real>` straight into `Value::Real`), or an
+integer weight outside the `i64`/`u64` range (plist `Integer` stores `i128`;
+convert via `as_signed()`/`as_unsigned()` and fail closed the same way) →
 `unsupported CodeResources rule` error, rule dropped. Finite weights compare with
 `total_cmp` so selection never depends on iteration order.
 
@@ -246,9 +264,11 @@ symlink: the on-disk object must be a symlink (`symlink_metadata`) and the targe
 must match by the builder's own lossy-string contract —
 `fs::read_link(path).to_string_lossy().to_string() == sealed_target` (the builder
 seals `target.to_string_lossy().to_string()`, zsign bundle/code_resources.rs:271-277,
-so a non-Unicode target round-trips through the same lossy rendering on both sides
-and compares equal iff the raw bytes match; no component-wise or byte-wise
-comparison is used). No hash is expected either
+so both sides render through the same lossy conversion; note this is a string
+comparison with a documented collision: two distinct non-Unicode byte sequences
+can render to the identical U+FFFD replacement text, and exact raw-byte equality
+cannot be recovered from the sealed plist string alone — the lossy comparison IS
+the contract; no component-wise or byte-wise comparison is used). No hash is expected either
 way — there is no hash fallback to design, because the builder emits `hash`/`hash2`
 only in the *non*-symlink branch (zsign-core code_resources.rs:444-453), so
 target-string equality is the only possible check. Conversely an entry expecting file content whose on-disk object is a symlink is
@@ -276,10 +296,15 @@ verified root"). Walk entries use `entry.file_type()` (no-follow) instead of
 (Info.plist) or 2 (CodeResources) reads `NotChecked` gets a binary-level error —
 ungated on file-presence (with C1, `NotChecked` at those indices means the content
 file is genuinely absent; a missing CodeResources *also* raises the bundle-level C2
-error). Slot -1's requirement is inherently scoped to **executable-typed bindings**:
-only executables get nonzero -1 hashes at sign time (zsign ipa/mod.rs:814-828), so
-dylib/non-main framework binaries — which bind -3 but not -1 — read `Missing` or
-absent at index 0 and stay silent. Absent indices (bare CDs may be length 2, so
+error). The surfaced condition is always the CD's **stored nonzero hash reading
+`NotChecked`** — never an inference from slice type. For context: non-main bundle
+binaries (dylibs, non-main framework Mach-Os) are signed with
+`code_resources = None` and get Info.plist bytes only for executable calls with
+resources (zsign ipa/mod.rs:542-550, :817-828), so they bind **neither -1 nor -3**
+here (only the always-hashed -2; entitlements are main-only), and for FAT
+binaries the binding decision comes from the first slice, not per-slice
+(zsign-core signer.rs:167-170, :369-380) — such slots read `Missing`/absent and
+stay silent. Absent indices (bare CDs may be length 2, so
 index 2 can be absent) yield no check at all and surface nothing; checks use
 `.first()` / `.get(2)`, never panicking indexing. In the bare path, `NotChecked`
 at those indices pushes
@@ -303,10 +328,12 @@ directory (`Escape -> /etc`, key `Escape/passwd`) because `fs::read` and
 entry, canonicalize the entry's parent directory against `canonicalize(bundle)`:
 `Err(NotFound)` → the parent directory does not exist, so the sealed entry is
 absent: route through the **same rule-aware missing decision the sealed→disk
-check uses** (C4) — tolerate only when the winning rule action is Optional,
-otherwise `missing.push(rel)` — and `continue` without reading anything (no
-content is read, so no oracle); resolution outside the bundle → the same escape
-error, entry skipped; any other I/O error → content error. Stage 2 runs for
+check uses** (C4) — tolerate iff the winning action is `Optional` *or* `Omit`
+(the shared C4 predicate), otherwise `missing.push(rel)` — and `continue` without
+reading anything (no content is read, so no oracle); resolution outside the
+bundle → the same escape error, entry skipped; any other I/O error → `Err(Io)`
+per C1 — only genuine `NotFound` is absence, never the report-errors channel.
+Stage 2 runs for
 **both** dispatch branches (hash reads *and*
 symlink target reads — `read_link` resolves intermediate links too). Resolving the
 parent instead of an `openat`-style no-follow traversal is a deliberate trade: the

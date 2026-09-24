@@ -329,19 +329,33 @@ fn signed_bundle_with_framework_symlink_verifies() {
 1. Sealed→disk entry dispatch (this lands before the rules/hash rework of Tasks 5–6;
    keep the current structure otherwise):
    - entry dict has `symlink` (string): treat as symlink seal —
-     `fs::symlink_metadata(file_path)`: `NotFound` → `missing` (unless the entry is
-     later governed by rules — for now plain missing); metadata OK but not a symlink
+     `fs::symlink_metadata(file_path)`: `Err(NotFound)` → `missing` (rule-governed
+     tolerance attaches in Task 6 — for now plain `missing`); any **other**
+     metadata error (EACCES, ELOOP, …) → `Err(crate::Error::Io(e))` per design C1 —
+     only genuine `NotFound` is absence; metadata OK but not a symlink
      → `mismatched`; symlink → compare by the builder's lossy-string contract:
      `fs::read_link(&file_path)` yields a `PathBuf`; compare
      `actual.to_string_lossy().to_string() == sealed_target` (the builder seals
      `target.to_string_lossy().to_string()` — zsign bundle/code_resources.rs:271-277 —
-     so a non-Unicode target renders identically on both sides and compares equal
-     iff the raw bytes match; equality is on the lossy strings, never component-wise
-     or byte-wise) → equal: `matched += 1`, differs → `mismatched`. No hash
-     expectation either way.
+     so both sides render through the same lossy conversion; this is a string
+     comparison with a documented U+FFFD collision for distinct non-Unicode byte
+     sequences — exact raw-byte equality cannot be recovered from the sealed
+     string, so the lossy comparison IS the contract; never component-wise) →
+     equal: `matched += 1`, differs → `mismatched`; `read_link` failing with
+     anything other than `NotFound` → `Err(Io)`. No hash expectation either way.
    - entry dict without `symlink`: additionally require the on-disk object to NOT be
      a symlink before hashing (`symlink_metadata` says `is_symlink` →
-     `mismatched` — a sealed file must still be a file); then hash as today.
+     `mismatched` — a sealed file must still be a file; non-`NotFound` metadata
+     errors → `Err(Io)`); then read the content: `Err(NotFound)` → `missing`
+     (rule-governed after Task 6), any other read error → `Err(Io)` — replace the
+     current `fs::read(&file_path).ok()` collapse, which mislabels EACCES as
+     absence.
+   - **Present-field type checks (design C3), before either branch:** `hash` /
+     `hash2` must be `Value::Data` and `symlink` must be `Value::String`; a
+     present field of the wrong type →
+     `errors.push(format!("malformed CodeResources entry: {rel}"))`, skip the key.
+     Correctly-typed digests of the wrong length fall through to the normal
+     comparison and land in `mismatched`.
 2. Disk→sealed walk: include symlinks — `if !entry.file_type().is_file() &&
    !entry.file_type().is_symlink() { continue; }`.
 3. Update the `CodeResourcesVerification::matched` doc comment: "sealed entries
@@ -480,7 +494,11 @@ fn partial_reseal_with_updated_hash2_is_detected() {
      no hash fields → the same malformed message); anything else (e.g. `String`) →
      `errors.push(format!("malformed CodeResources entry: {rel}"))`;
    - per-field hash dispatch: `hash2` → `Sha256`, `hash` → `Sha1`; all present
-     fields must match, else `mismatched`.
+     fields must match, else `mismatched`. Task 4's present-field type checks
+     (`hash`/`hash2` must be `Data`, `symlink` must be `String` → malformed) and
+     its per-entry I/O contract (genuine `NotFound` → absence; any other
+     metadata/content-read failure → `Err(Io)`, never collapsed by `.ok()`) carry
+     over unchanged into this restructured loop.
 4. Missing-file handling stays as today (Task 6 adds rule-governed tolerance).
 5. Disk→sealed membership test becomes `!sealed_set.contains(&rel)` (plus the rule
    lookup added in Task 6).
@@ -664,7 +682,14 @@ fn unsupported_rule_is_reported() {
                    let optional = matches!(d.get("optional"), Some(plist::Value::Boolean(true)));
                    let weight = match d.get("weight") {
                        None => 1.0,
-                       Some(plist::Value::Integer(w)) => *w as f64,
+                       // plist::Integer is a struct, not a primitive: convert
+                       // through as_signed/as_unsigned and fail closed on
+                       // out-of-range values via the is_finite() check below.
+                       Some(plist::Value::Integer(w)) => w
+                           .as_signed()
+                           .or_else(|| w.as_unsigned())
+                           .map(|v| v as f64)
+                           .unwrap_or(f64::NAN),
                        Some(plist::Value::Real(w)) => *w,
                        _ => 1.0,
                    };
@@ -761,7 +786,9 @@ fn unsupported_rule_is_reported() {
      absent on disk → tolerate **iff** `matches!(rule_action(rules, rel),
      Some(Optional) | Some(Omit))` (Omit tolerance is required: locversion is
      sealed yet declared omit w=1100; entry-level `optional` is deliberately
-     ignored — see design C4), else `missing.push(rel)`.
+     ignored — see design C4), else `missing.push(rel)`. "Absent" here means
+     genuine `ErrorKind::NotFound` only, per Task 4's per-entry I/O contract —
+     EACCES and friends propagate `Err` and are never tolerated.
 5. `use` nothing new (no regex crate — pattern predicates are plain string ops).
 
 - [ ] **Step 4: Run tests — PASS**, then the full scoped gate. Expected: all green
@@ -931,8 +958,9 @@ fn symlink_parent_traversal_is_rejected() {
    - `Ok(resolved)` where `!resolved.starts_with(&bundle_real)` →
      `errors.push(format!("CodeResources entry path escapes the bundle: {rel}"))`
      and `continue`;
-   - other `Err(e)` → `errors.push(format!("cannot resolve CodeResources entry path {rel}: {e}"))`
-     and `continue`;
+   - other `Err(e)` → `Err(crate::Error::Io(e))` per design C1 — only genuine
+     `NotFound` is absence; a non-`NotFound` canonicalize failure (EACCES, …) is
+     verification-impossible I/O, never the report-errors channel;
    - `Ok(resolved)` inside the bundle → proceed to the dispatch.
    The residual TOCTOU window between canonicalize and read is documented as out of
    threat model in design C8 (the verified tree is read-only to us by contract).
@@ -1033,13 +1061,20 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
    `&& code_resources.is_none()` gates so the invariant is explicit and covers both
    required slots symmetrically: any `NotChecked` at index 0 →
    `"signature binds Info.plist (slot -1) but the file is missing"`; at index 2 →
-   `"signature binds CodeResources (slot -3) but the file is missing"`. Read slots
-   with `.first()` / `.get(2)` (never bracket indexing). Slot -1's requirement is
-   inherently scoped to executable-typed bindings: only executables get nonzero -1
-   hashes at sign time (zsign ipa/mod.rs:814-828), so dylib/non-main framework
-   binaries (which bind -3 but not -1) read `Missing`/absent at index 0 and stay
-   silent. (With Task 1, `NotChecked` at these indices implies the file is
-   genuinely absent; an unreadable file is already a hard `Err`.)
+   `"signature binds CodeResources (slot -3) but the file is missing"`. Replace the
+   existing bracket indexing and its guards at verify.rs:310-331
+   (`special_slots[0]` behind `!is_empty()`, `special_slots[2]` behind
+   `len() >= 3`, both conjoined with the file-missing gates) with null-safe
+   `.first()` / `.get(2)` reads and no file-missing gates — the surfaced condition
+   is always the stored nonzero hash reading `NotChecked`, never an inference from
+   slice type. Context for why the common fixtures stay silent: non-main bundle
+   binaries are signed with `code_resources = None` and receive Info.plist bytes
+   only for executable calls with resources (zsign ipa/mod.rs:542-550, :817-828),
+   so they bind **neither -1 nor -3** here (only the always-hashed -2;
+   entitlements are main-only), and FAT binding is decided from the first slice
+   (zsign-core signer.rs:167-170, :369-380) — those slots read `Missing`/absent
+   and stay silent. (With Task 1, `NotChecked` at these indices implies the file
+   is genuinely absent; an unreadable file is already a hard `Err`.)
 
 - [ ] **Step 4: Run test — PASS**, then the full scoped gate. Expected: all green —
   `bare_macho_verifies` stays green (bare signing binds only -2: index 0 (-1) is
@@ -1075,16 +1110,22 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
   Some(Omit))` appears identically in Task 6 (both directions) and Task 8 (stage-2
   parent-`NotFound`); `bundle_real` containment (Task 8 stage 2) is defined inside
   `check_code_resources` once; the malformed-entry message
-  `malformed CodeResources entry: <rel>` is owned by Task 5 and re-used verbatim by
-  Task 7 (whose fail-before test depends on Task 5 keeping the non-dict `files2`
-  skip).
+  `malformed CodeResources entry: <rel>` first appears in Task 4 (wrong-typed
+  present fields) and is re-used verbatim by Tasks 5 and 7 (whose fail-before test
+  depends on Task 5 keeping the non-dict `files2` skip); the per-entry I/O contract (genuine `NotFound` = absence entering the
+  `Optional|Omit` tolerance; every other metadata/read/canonicalize failure →
+  `Err(Io)`) is stated identically in design C1, C4, C8 and plan Tasks 4/5/6/8;
+  the present-field type rule (`hash`/`hash2`: `Data`, `symlink`: `String`, else
+  malformed) is stated identically in design C3 and plan Tasks 4/5.
 - **Deviations recorded:** entry-level `optional` is not honored (rules are the
   single authority — design C4); `base_lproj_deletion_is_not_optional` is a guard
   test that passes pre-fix by construction; mandated regression #3 is a keep-green
   guard per the brief's own wording (see Spec coverage); Task 9 deliberately
   activates the CLI's existing exit-2 `report.errors` branch and documents it as
   intentional-for-now (ZSN-5 owns remapping); the legacy `^version.plist$` rule
-  spelling is rejected as unsupported rather than reinterpreted.
+  spelling is rejected as unsupported rather than reinterpreted; symlink target
+  equality is lossy-string comparison with a documented U+FFFD collision
+  (raw-byte equality is unrecoverable from the sealed plist string).
 
 ## Execution handoff
 
