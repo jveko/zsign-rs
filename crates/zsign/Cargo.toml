@@ -22,7 +22,6 @@ plist = "1.7"
 sha1 = { version = "0.10" }
 sha2 = { version = "0.10", features = ["asm"] }
 thiserror = "2.0"
-memmap2 = "0.9"
 walkdir = "2.5"
 tempfile = "3.10"
 base64 = "0.22"

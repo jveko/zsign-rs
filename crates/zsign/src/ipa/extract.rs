@@ -6,7 +6,7 @@
 //!
 //! # Features
 //!
-//! - Memory-mapped file access for performance
+//! - Buffered file reads with bounded memory use
 //! - Parallel file extraction using rayon
 //! - Preserves Unix symlinks and file permissions
 //!
@@ -25,15 +25,13 @@
 //! ```
 
 use crate::{Error, Result};
-use memmap2::Mmap;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Cursor, Read};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use zip::ZipArchive;
 
 /// Metadata for a ZIP entry during parallel extraction.
@@ -327,14 +325,10 @@ pub fn extract_ipa_with_limits(
         )));
     }
 
-    // Memory-map the IPA file for faster reading
+    // Buffered reads; rayon already parallelizes across entries, so
+    // re-opening the archive per pass keeps memory bounded without mmap.
     let file = File::open(ipa_path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mmap = Arc::new(mmap);
-
-    // Open ZIP archive from memory-mapped data
-    let cursor = Cursor::new(&mmap[..]);
-    let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
+    let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
 
     // Create destination directory if it doesn't exist
     fs::create_dir_all(dest_dir)?;
@@ -476,8 +470,8 @@ pub fn extract_ipa_with_limits(
     regular_entries
         .par_chunks(chunk_size)
         .try_for_each(|chunk| -> Result<()> {
-            let cursor = Cursor::new(&mmap[..]);
-            let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
+            let file = File::open(ipa_path)?;
+            let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
 
             for entry in chunk {
                 let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
@@ -512,8 +506,8 @@ pub fn extract_ipa_with_limits(
     // Phase 2: Sequential symlink creation (after all files exist)
     #[cfg(unix)]
     {
-        let cursor = Cursor::new(&mmap[..]);
-        let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
+        let file = File::open(ipa_path)?;
+        let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
 
         for entry in &symlink_entries {
             let file = archive.by_index(entry.index).map_err(Error::Zip)?;
