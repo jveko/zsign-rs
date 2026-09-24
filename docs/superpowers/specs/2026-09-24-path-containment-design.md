@@ -14,9 +14,13 @@ bundle root during signing:
    `bundle_path` (`:732`) with no sanitization. A value like
    `../outside_macho` or `/tmp/outside_macho` replaces/escapes the base;
    `sign_binary` later `fs::write`s the signed bytes there (`:810`, `:867`).
-   This is the **only** written path not pinned by a literal `join` or by
-   WalkDir enumeration (verified: every other `fs::write` at `:517`, `:556`,
-   `:659`, `:897` receives a literal-derived path under the bundle).
+   Provenance inventory of all seven write/mkdir sites in this file:
+   `:517` is WalkDir-derived (root-prefixed by construction); `:556`,
+   `:659`, `:894`, `:897` are literal-derived under the bundle; `:810`
+   and `:867` receive either the WalkDir-derived non-main path **or** the
+   plist-derived `main_executable` — that plist-derived variant is the
+   only escape. `main_executable` is therefore the only written path not
+   pinned by a literal `join` or by WalkDir enumeration.
 2. **Symlink-following classification.** The three discovery walks classify
    with `Path::is_dir()`/`is_file()`, which follow the final symlink:
    `collect_nested_bundles` (`:404`), `find_standalone_dylibs` (`:458`),
@@ -44,19 +48,27 @@ callers `:538` / `:593` untouched):
    flow this branch was already unreachable (`get_bundle_identifier` fires
    first on the same condition), so no live behavior moves.
 2. Parse failure → unchanged existing error.
-3. Key present (string) → value used verbatim but validated:
-   - `resolve_within(bundle_path, Path::new(&value))?` (item 3 helper)
-     rejects `RootDir`/`ParentDir`/`Prefix` components and any pre-existing
-     symlink component, and requires the path to sit under the root —
-     absolute values fail `strip_prefix`, `..` fails the component check.
-   - `fs::symlink_metadata` must report a **regular file**; otherwise a
-     hard `Error::Core(Signing(...))` naming the offending
-     `CFBundleExecutable` value and the bundle. This fires for missing
-     files, directories, and (final or intermediate) symlinks.
-4. Key absent / not a string → keep the file-stem fallback, still passed
-   through `resolve_within`, with **no** existence requirement (callers'
-   `.exists()` guards at `:575`/`:594` stay load-bearing only for this
-   branch).
+3. Key present but not a string → hard `Error::Core(Signing(...))`
+   (`"CFBundleExecutable in {} must be a string"`). No fallback: the
+   file-stem fallback is reserved for an *absent* key, per the brief.
+4. Key present as a string → the value must be **relative**; an absolute
+   value — whether it points outside or *inside* the root — is rejected
+   up front with an actionable error naming the value and the bundle.
+   Then `resolve_within(bundle_path, Path::new(value))?` (item 3 helper)
+   rejects `RootDir`/`ParentDir`/`Prefix` components and any pre-existing
+   symlink component (`..` fails the component check).
+   `fs::symlink_metadata` must report a **regular file**; otherwise a
+   hard `Error::Core(Signing(...))` naming the offending value and the
+   bundle. This fires for missing files, directories, and (final or
+   intermediate) symlinks — so a layout whose `CFBundleExecutable` names
+   a symlink (e.g. a versioned-framework root link) is rejected by
+   design; naming the real in-root file is the supported form (see
+   Item 2).
+5. Key absent — or an Info.plist whose root is not a dictionary, which
+   carries no value to validate — → keep the file-stem fallback, still
+   passed through `resolve_within`, with **no** existence requirement
+   (callers' `.exists()` guards at `:575`/`:594` stay load-bearing only
+   for this branch).
 
 The returned path is `root.join(relative)` — the same lexical shape
 WalkDir produces. It is **never canonicalized** (see Invariants).
@@ -79,10 +91,17 @@ exactly how `CodeResourcesBuilder` already classifies
 (`crates/zsign/src/bundle/code_resources.rs:150-171`: explicit
 `.follow_links(false)` + `entry.file_type()`, symlinks recorded as symlinks
 via `hash_symlink_entry`), so discovery and CodeResources scanning now agree
-on what a symlink *is*. Real in-tree targets remain discoverable as regular
-files; versioned-framework symlinked *binaries* are signed once via their
-real path instead of twice (through the link and directly — a pre-existing
-double-sign hazard today).
+on what a symlink *is*. Real in-tree targets remain discoverable as
+regular files, and the root symlink is never a signing target — so where
+such a layout signs at all, it is signed exactly once through the real
+path instead of twice (through the link and directly — a pre-existing
+double-sign hazard today). Composed with Item 1's regular-file rule, the
+policy is explicit: a bundle whose `CFBundleExecutable` *names* the root
+symlink is **rejected** with an actionable error; the supported form
+names the real in-root file (`Versions/A/Foo`), which dedups normally
+via the `:620`/`:543` equality checks. The `code_resources.rs:456-468`
+fixture is scan-only and unaffected — `CodeResourcesBuilder` records
+symlinks as symlinks.
 
 ### Item 3 — `resolve_within` guard for every write
 
@@ -113,16 +132,23 @@ Mechanism (repo idiom, not canonicalize — the workspace uses no
 2. Reject `Component::ParentDir | RootDir | Prefix(_)` in `relative` with
    `"Path {} escapes the bundle root {}"`.
 3. Downward walk: push each component onto a `current` buffer starting at
-   `root`; if `fs::symlink_metadata(&current)` says symlink →
-   `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:79-86`);
-   first `NotFound` stops the walk (fresh tail is safe).
+   root; if `fs::symlink_metadata(&current)` says symlink →
+   `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:79-86`).
+   The first `ErrorKind::NotFound` stops the walk (fresh tail is safe);
+   any *other* metadata failure (permission, I/O) becomes a hard
+   `Error::Core(Signing("Failed to inspect signing path {}: {}"))` — it
+   is never treated as proof of absence.
 4. Return `root.join(relative)` — lexical, never canonicalized.
 
 All errors are `Error::Core(zsign_core::Error::Signing(format!(...)))`,
 the established idiom of this file for signing-flow complaints.
 
-Wiring — the guard runs at function entry of every function that writes,
-so each `fs::write` is preceded by exactly one validation:
+Wiring — every `fs::write`/`create_dir_all` is preceded by exactly one
+validation: at function entry where the function also reads or dispatches
+through the path (`rewrite_plist_string`, `sign_binary`,
+`sign_standalone_dylib`), immediately before the write for the literal
+paths inside `sign_single_bundle` and `generate_code_resources` (both
+may run after earlier in-bundle writes):
 
 | Site | Root | Input |
 |---|---|---|
@@ -130,10 +156,14 @@ so each `fs::write` is preceded by exactly one validation:
 | `sign_standalone_dylib` `:517` (+ its open) | **new `root` param** from `sign_bundle :370` | `dylib_path` at entry |
 | `sign_single_bundle` profile `:556` | `bundle_path` | literal `"embedded.mobileprovision"` |
 | `generate_code_resources` mkdir `:894` / write `:897` | `bundle_path` | literals `"_CodeSignature"` and `"_CodeSignature/CodeResources"` |
-| `sign_binary` `:810`, `:867` (+ its open, and the `parent()`-derived Info.plist read `:821`) | **new `root` param** from `sign_single_bundle :550`/`:576` | `binary_path` at entry |
+| `sign_binary` `:810`, `:867` (+ its open) | **new `root` param** from `sign_single_bundle :550`/`:576` | `binary_path` at entry |
 
-The validated value shadows the parameter, so every downstream use
-(open, read, write, `parent()`) operates on the contained path.
+The validated value shadows the parameter, so every downstream use of
+`binary_path` (open, read, both writes) operates on the contained path.
+The `parent()`-derived Info.plist read at `:821` is thereby lexically
+contained (no `..` can appear below a validated path) but is *not*
+symlink-checked — see "What is and is not guarded" under Design
+decisions.
 
 ## Invariants (verified against source; must survive the change)
 
@@ -169,8 +199,9 @@ built inline exactly like `test_ipa_signer_refuses_encrypted_bundle`
 `fs::write` executable from `crate::test_util::minimal_macho()`. Symlink
 tests are `#[cfg(unix)]` + `std::os::unix::fs::symlink` (precedent:
 `ipa/extract.rs:470`, `ipa/archive.rs:426`,
-`bundle/code_resources.rs:441`). Each test fails before its fix and
-asserts the external target's bytes are byte-identical afterwards.
+`bundle/code_resources.rs:441`). Each test fails before its fix; where an
+external or target file exists, its bytes must be byte-identical
+afterwards.
 
 1. `test_sign_rejects_executable_path_outside_bundle` — `CFBundleExecutable`
    = `"../outside_macho"` (real Mach-O written beside the `.app` in the
@@ -178,19 +209,37 @@ asserts the external target's bytes are byte-identical afterwards.
    escaping path; outside bytes unchanged. Covers item 1.
 2. `test_sign_rejects_absolute_executable_path` — same with the absolute
    path of the outside Mach-O as the value; error contains
-   `"is not under root"`; outside bytes unchanged. Covers item 1.
-3. `test_symlinked_dylib_is_skipped_and_target_untouched` — bundle with
+   `"must be a relative path"`; outside bytes unchanged. Covers item 1.
+3. `test_sign_rejects_absolute_executable_path_inside_bundle` — the value
+   is the absolute path of the *in-bundle* executable; must fail with
+   `"must be a relative path"` (absolute rejected even when it points
+   inside the root). Covers item 1's absolute rejection.
+4. `test_sign_rejects_non_string_executable_value` — `CFBundleExecutable`
+   is an `<integer>`; must fail with `"must be a string"` (the fallback
+   is reserved for an absent key). Covers the fallback boundary.
+5. `test_sign_rejects_symlinked_main_executable` (`#[cfg(unix)]`) —
+   `CFBundleExecutable` names an in-root symlink whose target is a real
+   in-bundle file; sign must fail (`"Pre-existing symlink"`) and the real
+   target's bytes must stay unchanged — documents that layouts whose
+   plist names the root link are rejected (Item 1 × Item 2 composition).
+6. `test_sign_errors_on_unreadable_path_component` (`#[cfg(unix)]`) — a
+   bundle subdirectory is chmod'd unreadable and `CFBundleExecutable`
+   points through it; sign must fail with
+   `"Failed to inspect signing path"` — the metadata-error hard-error arm
+   of `resolve_within`. Probe-guarded: environments that bypass DAC
+   permission checks skip the assertions.
+7. `test_symlinked_dylib_is_skipped_and_target_untouched` — bundle with
    real executable plus `lib.dylib` → `../outside.dylib` symlink.
    `find_standalone_dylibs` and `find_immediate_macho_binaries` (private,
    called directly from the inline tests) must not list it; a full
    `sign_folder_in_place` succeeds and `outside.dylib` bytes are
    unchanged. Covers item 2 (both walks that can see a file at bundle root).
-4. `test_symlinked_framework_is_not_collected_and_target_untouched` —
+8. `test_symlinked_framework_is_not_collected_and_target_untouched` —
    `Evil.framework` symlink → external dir containing `Info.plist` +
    executable; `collect_nested_bundles` must not list it; full sign
    succeeds; external executable bytes unchanged and no external
    `_CodeSignature` appears. Covers item 2.
-5. `test_sign_rejects_symlinked_info_plist_rewrite` — `Info.plist` is a
+9. `test_sign_rejects_symlinked_info_plist_rewrite` — `Info.plist` is a
    symlink to a valid external plist; `.bundle_id("com.x")` triggers
    `rewrite_plist_string` first; sign must `Err` and the external plist
    bytes must be unchanged. This is the failing-first test for the
@@ -209,9 +258,10 @@ failure, ZSN-15).
 ## Design decisions (brainstorm record)
 
 **Item 1**
-- *Chosen:* component rejection + `resolve_within` + `symlink_metadata`
-  regular-file requirement; hard errors with the offending value in the
-  message.
+- *Chosen:* non-string values rejected; absolute values (inside or
+  outside the root) rejected; then component rejection via
+  `resolve_within` + `symlink_metadata` regular-file requirement; hard
+  errors with the offending value in the message.
 - *Rejected — canonicalize-only:* no component pre-check gives poor
   messages ("No such file" instead of naming the bad value) and cannot
   validate nonexistent targets; also inconsistent with the workspace,
@@ -231,10 +281,13 @@ failure, ZSN-15).
   through links, contradicts a walker that never descends them, more
   complex, and re-introduces the double-sign hazard for versioned
   frameworks.
-- *Rejected — hard error on any symlink:* bundles legitimately contain
-  symlinks (the repo's own fixture `code_resources.rs:457-468` is a
-  versioned framework); erroring would break them for no safety gain,
-  since nothing follows the link after this change.
+- *Rejected — hard error on any symlink at walk level:* bundles
+  legitimately contain symlinks (the repo's own fixture
+  `code_resources.rs:457-468` is a versioned framework); erroring would
+  break them for no safety gain, since nothing follows the link after
+  this change. The one exception is the *declared main executable*, which
+  the brief requires to be a regular file — walk-level skip, hard error
+  for that single path.
 - Note: a symlinked *directory* named `*.framework` stops being collected.
   Its contents were never walked anyway (walkdir does not descend symlink
   roots with `follow_links(false)`), so today's "collection" only produced
@@ -256,9 +309,24 @@ failure, ZSN-15).
   nonexistent write targets and dangling symlinks without a
   deepest-existing-ancestor dance, and keeps error messages naming the
   first bad component.
-- *Decision — guard reads too:* validation runs at function entry, before
-  `File::open`/`fs::read`, so a planted symlink can neither be read into
-  the artifact nor written through.
+- *Decision — what is and is not guarded:* `resolve_within` precedes
+  every `fs::write`/`create_dir_all` and, for `rewrite_plist_string`,
+  `sign_binary`, and `sign_standalone_dylib`, runs at function entry —
+  which also guards those functions' reads of their write targets (the
+  Info.plist read in `rewrite_plist_string`, the binary opens in
+  `sign_binary`/`sign_standalone_dylib`). Deliberately **not** guarded,
+  because they are read-only and outside the brief's write mandate:
+  `get_bundle_identifier`'s and `get_main_executable`'s Info.plist reads,
+  `sign_binary`'s parent-derived Info.plist read `:821`,
+  `sign_single_bundle`'s CodeResources read-back, and
+  `CodeResourcesBuilder`'s scan (a different file — lane scope). A read
+  through an in-tree symlink yields content the bundle owner could have
+  placed in the bundle directly, and no bytes are written outside the
+  root; the `sign()` flow in addition cannot contain an escaping symlink
+  at all, because `extract.rs`'s `is_safe_symlink_target` refuses
+  absolute and `..` symlink targets at extraction
+  (`extract.rs:49-55,269`), and `sign_folder_in_place` trusts the
+  operator-supplied directory exactly as it trusts its file contents.
 
 ## Non-goals
 

@@ -10,8 +10,9 @@ write outside the bundle root, even when the input bundle is hostile
 idiom: `strip_prefix` + component check + downward symlink walk, mirroring
 `ipa/extract.rs::validate_output_path`) validates every path entering the
 signing flow; discovery walks classify with walkdir's no-follow
-`entry.file_type()`; `get_main_executable` hard-errors on anything that is
-not an existing regular file under the bundle.
+`entry.file_type()`; `get_main_executable` hard-errors on any value that
+is not a relative path to an existing regular file inside the bundle
+(non-string and absolute values are rejected before resolution).
 
 **Tech Stack:** Rust 2021, walkdir 2.5, plist, tempfile. Tests: inline
 `#[cfg(test)] mod tests` in `crates/zsign/src/ipa/mod.rs`.
@@ -43,7 +44,7 @@ Line numbers below are pre-fix anchors on branch `zsn-27-path-contain`
   - imports at `:66`
   - new free fn after `type ProfilePayload` (`:109`)
   - `get_main_executable` at `:700-733`
-- Test: inline tests module (`:904+`), new helper + 2 tests
+- Test: inline tests module (`:904+`), new helper + 6 tests
 
 - [ ] **Step 1.1: Write the failing tests**
 
@@ -114,8 +115,8 @@ fixture helper they use:
             .expect_err("absolute CFBundleExecutable must be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("is not under root"),
-            "error must report the containment failure: {message}"
+            message.contains("must be a relative path"),
+            "error must reject the absolute value: {message}"
         );
         assert_eq!(
             std::fs::read(&outside).unwrap(),
@@ -123,19 +124,130 @@ fixture helper they use:
             "outside file must stay untouched"
         );
     }
+
+    #[test]
+    fn test_sign_rejects_absolute_executable_path_inside_bundle() {
+        let temp = TempDir::new().unwrap();
+        let in_bundle = temp.path().join("App.app").join("Test");
+        let app = create_folder_bundle(temp.path(), in_bundle.to_str().unwrap(), true);
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("absolute CFBundleExecutable must be rejected even inside the bundle");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be a relative path"),
+            "error must reject the absolute value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_non_string_executable_value() {
+        let temp = TempDir::new().unwrap();
+        let app = temp.path().join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleExecutable</key>
+    <integer>42</integer>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a non-string CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("CFBundleExecutable") && message.contains("must be a string"),
+            "error must name the wrong-typed value: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_symlinked_main_executable() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", false);
+        let real = app.join("RealTest");
+        std::fs::write(&real, crate::test_util::minimal_macho()).unwrap();
+        symlink(&real, app.join("Test")).unwrap();
+        let before = std::fs::read(&real).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a symlinked main executable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Pre-existing symlink"),
+            "error must name the cause: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            before,
+            "the symlink target must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_errors_on_unreadable_path_component() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "locked/tool", true);
+        let locked = app.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Environments that bypass DAC checks (e.g. running as root) cannot
+        // exercise the metadata-error arm; skip the assertions there.
+        match std::fs::metadata(locked.join("tool")) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            _ => {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                return;
+            }
+        }
+
+        let result = IpaSigner::new_adhoc().sign_folder_in_place(&app);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unreadable path component must be a hard error");
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to inspect signing path"),
+            "error must surface the metadata failure: {message}"
+        );
+    }
 ```
 
-Notes: `new_adhoc()` is deliberate — both tests fail before any
-credential/crypto work. Tempdir names are alphanumeric, so the raw path in
-XML is safe.
+Notes: `new_adhoc()` is deliberate — every Task 1 test fails before any
+credential/crypto work. Tempdir names are alphanumeric, so raw paths in
+XML are safe. The non-string test builds its plist inline because the
+fixture helper's value parameter is a `&str`.
 
 - [ ] **Step 1.2: Run the gate, expect RED**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: **2 failed** (`test_sign_rejects_executable_path_outside_bundle`,
-`test_sign_rejects_absolute_executable_path` — both panic at
-`expect_err` because the traversal currently signs successfully), all
-other tests pass. Record the output.
+Expected: **6 failed** — five at `expect_err` (the unhardened signer
+accepts the traversal/absolute/non-string/symlinked input and returns
+success) and `test_sign_errors_on_unreadable_path_component` at its
+message assertion (the walk error is swallowed, so `scan` fails first
+with `"Failed to walk directory"` — `code_resources.rs:154-159` — and the
+`"Failed to inspect signing path"` assertion cannot hold). The 4 other
+tests pass (1 filtered out). Record the output.
 
 - [ ] **Step 1.3: Add the `resolve_within` helper**
 
@@ -192,7 +304,14 @@ fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
                 ))));
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(Error::Core(zsign_core::Error::Signing(format!(
+                    "Failed to inspect signing path {}: {}",
+                    current.display(),
+                    e
+                ))))
+            }
         }
     }
 
@@ -207,10 +326,11 @@ Replace the whole body of `fn get_main_executable` (`:700-733`) with:
 ```rust
     /// Get the main executable path from Info.plist.
     ///
-    /// A present `CFBundleExecutable` value must resolve to an existing
-    /// regular file inside the bundle; traversal, absolute paths and
-    /// symlinked components are rejected. The file-stem fallback applies
-    /// only when the key is absent.
+    /// A present `CFBundleExecutable` must be a string naming a relative
+    /// path to an existing regular file inside the bundle; non-string
+    /// values, absolute values, traversal, and symlinked components are
+    /// rejected. The file-stem fallback applies only when the key is
+    /// absent.
     fn get_main_executable(&self, bundle_path: &Path) -> Result<PathBuf> {
         let info_plist_path = bundle_path.join("Info.plist");
 
@@ -232,9 +352,26 @@ Replace the whole body of `fn get_main_executable` (`:700-733`) with:
         let executable_value = match plist
             .as_dictionary()
             .and_then(|d| d.get("CFBundleExecutable"))
-            .and_then(|v| v.as_string())
         {
+            None => bundle_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
             Some(value) => {
+                let value = value.as_string().ok_or_else(|| {
+                    Error::Core(zsign_core::Error::Signing(format!(
+                        "CFBundleExecutable in {} must be a string",
+                        bundle_path.display()
+                    )))
+                })?;
+                if Path::new(value).is_absolute() {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "CFBundleExecutable \"{}\" must be a relative path inside the bundle {}",
+                        value,
+                        bundle_path.display()
+                    ))));
+                }
                 let executable = resolve_within(bundle_path, Path::new(value))?;
                 match fs::symlink_metadata(&executable) {
                     Ok(metadata) if metadata.is_file() => return Ok(executable),
@@ -255,11 +392,6 @@ Replace the whole body of `fn get_main_executable` (`:700-733`) with:
                     }
                 }
             }
-            None => bundle_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
         };
 
         resolve_within(bundle_path, Path::new(&executable_value))
@@ -270,9 +402,14 @@ Behavior changes (intended, recorded in the design doc):
 - missing `Info.plist` → hard error (previously returned a file-stem
   join); in the signing flow `get_bundle_identifier` already errored
   first with the same message, so no caller-visible change;
-- key present + non-regular/missing target → hard error naming the value
-  (previously: silent skip via `.exists()` guards at `:575`/`:594`, or
-  write-through escape);
+- key present but not a string → hard error naming the key (previously:
+  silent fallback to the file stem);
+- key present as an absolute value — inside or outside the root → hard
+  error naming the value (previously: `join` replaced the base for
+  outside paths, and inside-root absolute paths signed successfully);
+- key present + non-regular/missing/symlinked target → hard error naming
+  the value (previously: silent skip via `.exists()` guards at
+  `:575`/`:594`, or write-through escape);
 - key absent → file-stem fallback preserved, now routed through
   `resolve_within`, still without an existence requirement (the
   `.exists()` guards stay).
@@ -280,7 +417,7 @@ Behavior changes (intended, recorded in the design doc):
 - [ ] **Step 1.5: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (2 new + 4 existing; 1 filtered out).
+Expected: all tests pass (6 new + 4 existing; 1 filtered out).
 
 - [ ] **Step 1.6: Commit**
 
@@ -456,7 +593,7 @@ exact idiom (`bundle/code_resources.rs:166-171`).
 - [ ] **Step 2.4: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (4 new + 4 existing; 1 filtered out).
+Expected: all tests pass (8 new + 4 existing; 1 filtered out).
 
 - [ ] **Step 2.5: Commit**
 
@@ -632,7 +769,7 @@ and at `:576`:
 - [ ] **Step 3.8: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass (5 new + 4 existing; 1 filtered out).
+Expected: all tests pass (9 new + 4 existing; 1 filtered out).
 
 - [ ] **Step 3.9: Commit**
 
@@ -649,9 +786,9 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
 
 ## Self-review
 
-- **Spec coverage:** item 1 → Task 1 (helper + hardening + tests 1-2);
-  item 2 → Task 2 (four predicates + tests 3-4); item 3 → Task 3 (guard
-  at all seven write/mkdir sites + test 5); design doc's invariants are
+- **Spec coverage:** item 1 → Task 1 (helper + hardening + tests 1-6);
+  item 2 → Task 2 (four predicates + tests 7-8); item 3 → Task 3 (guard
+  at all seven write/mkdir sites + test 9); design doc's invariants are
   restated as constraints in each task (lexical returns, no flow
   restructure, `.exists()` guards kept).
 - **Placeholders:** none — every step carries complete code, exact
@@ -661,6 +798,7 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
   `sign_binary(&self, root, binary_path, identifier, code_resources,
   entitlements)` and `sign_standalone_dylib(&self, root, dylib_path)`
   match their single call sites; `create_folder_bundle(dir, executable_value,
-  write_executable)` matches all five tests that use it.
+  write_executable)` matches all eight tests that use it (the non-string
+  test builds its plist inline).
 - **Verification:** per-task scoped gate only; full-suite claim reserved
   for the orchestrator's merge gates (with the ZSN-15 skip).
