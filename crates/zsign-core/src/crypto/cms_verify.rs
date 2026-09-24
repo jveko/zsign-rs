@@ -7,21 +7,23 @@
 //!
 //! 1. **Message digest**: the `messageDigest` signed attribute must equal the
 //!    digest of the signed content (the CodeDirectory bytes).
-//! 2. **Apple CDHash attributes**: the `1.2.840.113635.100.9.1` plist and
+//! 2. **Signed content type**: the signed `contentType` attribute must occur
+//!    exactly once and contain `id-data`.
+//! 3. **Apple CDHash attributes**: the `1.2.840.113635.100.9.1` plist and
 //!    `1.2.840.113635.100.9.2` sequence must carry this CodeDirectory's actual
 //!    cdhash (truncated-20 for v1, full 32 bytes for v2).
-//! 3. **Signature**: the signerInfo signature must verify over the DER encoding
+//! 4. **Signature**: the signerInfo signature must verify over the DER encoding
 //!    of the `signedAttrs` field as-is (the CMS rule: the `[0]`-tagged SET OF
 //!    Attribute is the signed message, not a re-encoded copy).
-//! 4. **Signer binding**: the signerInfo issuer+serial must identify a
+//! 5. **Signer binding**: the signerInfo issuer+serial must identify a
 //!    certificate in the embedded set, and the chain must be structurally
 //!    valid (each certificate signed by its issuer and within its validity
 //!    window).
-//! 5. **X.509 purpose enforcement**: the leaf must carry codeSigning EKU and
+//! 6. **X.509 purpose enforcement**: the leaf must carry codeSigning EKU and
 //!    end-entity constraints; each climbed issuer must satisfy CA constraints.
-//! 6. **Trust anchoring**: the chain must terminate at a certificate in the
+//! 7. **Trust anchoring**: the chain must terminate at a certificate in the
 //!    explicit trust-anchor set ([`TrustAnchors::apple_root`] by default).
-//! 7. **SKI SignerInfo resolution**: a signer identified by its
+//! 8. **SKI SignerInfo resolution**: a signer identified by its
 //!    `subjectKeyIdentifier` must match a certificate in the embedded set.
 //!
 //! This module proves integrity, Apple-attribute binding, chain structure, and
@@ -50,7 +52,6 @@ const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.
 /// id-data content type: `1.2.840.113549.1.7.1`
 const OID_ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 /// contentType attribute: `1.2.840.113549.1.9.3`
-#[allow(dead_code)]
 const OID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 /// messageDigest attribute: `1.2.840.113549.1.9.4`
 const OID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
@@ -391,6 +392,8 @@ fn reader<'a>(bytes: &'a [u8], ctx: &str) -> Result<SliceReader<'a>> {
 /// The raw signed attributes (the `[0]`-tagged SET OF Attribute field), plus
 /// the parsed attribute values we care about.
 struct SignedAttrs<'a> {
+    content_type_count: usize,
+    content_types: Vec<ObjectIdentifier>,
     message_digest: Option<&'a [u8]>,
     cdhash_v1_plist: Option<&'a [u8]>,
     cdhash_v2_der: Option<&'a [u8]>,
@@ -399,10 +402,11 @@ struct SignedAttrs<'a> {
 /// Parses a signedAttrs `[0]` field's content into the attributes we need.
 fn parse_signed_attrs(content: &[u8]) -> Result<SignedAttrs<'_>> {
     let mut r = reader(content, "malformed signedAttrs")?;
+    let mut content_type_count = 0;
+    let mut content_types = Vec::new();
     let mut message_digest = None;
     let mut cdhash_v1_plist = None;
     let mut cdhash_v2_der = None;
-
     while !r.is_finished() {
         let attr = AnyRef::decode(&mut r)
             .map_err(|e| Error::Verification(format!("malformed signed attribute: {e}")))?;
@@ -421,6 +425,29 @@ fn parse_signed_attrs(content: &[u8]) -> Result<SignedAttrs<'_>> {
         }
         // First value of the SET.
         let vbytes = values.value();
+        if oid == OID_CONTENT_TYPE {
+            // RFC 5652 §5.3/§11.1: exactly one value. Delimit every complete TLV
+            // in the SET first, then strict-decode each TLV as an OID — so a value
+            // after a non-OID or malformed one is still counted and can never
+            // evade duplicate detection.
+            let mut vr = reader(vbytes, "malformed contentType value")?;
+            while !vr.is_finished() {
+                content_type_count += 1;
+                let start = usize::try_from(vr.position()).unwrap_or(0);
+                if AnyRef::decode(&mut vr).is_err() {
+                    // Not delimitable (truncated length): the broken value is
+                    // counted above and nothing can follow a length error.
+                    break;
+                }
+                let end = usize::try_from(vr.position()).unwrap_or(0);
+                if let Some(tlv) = vbytes.get(start..end) {
+                    if let Ok(ct) = ObjectIdentifier::from_der(tlv) {
+                        content_types.push(ct);
+                    }
+                }
+            }
+            continue;
+        }
         let mut vr = reader(vbytes, "malformed attribute value")?;
         let vstart = usize::try_from(vr.position()).unwrap_or(0);
         let value = match AnyRef::decode(&mut vr) {
@@ -444,10 +471,40 @@ fn parse_signed_attrs(content: &[u8]) -> Result<SignedAttrs<'_>> {
     }
 
     Ok(SignedAttrs {
+        content_type_count,
+        content_types,
         message_digest,
         cdhash_v1_plist,
         cdhash_v2_der,
     })
+}
+
+/// RFC 5652 §5.3/§11.1: exactly one signed `contentType` value; §5.6: its
+/// value must equal the encapsulated content type (id-data, required
+/// separately below). `count` is every value delimited, `decoded` the subset
+/// that strict-decoded as OIDs.
+fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<String> {
+    match count {
+        0 => Some("signed contentType attribute missing".into()),
+        1 => match decoded.first() {
+            Some(only) if *only == OID_ID_DATA => None,
+            Some(only) => Some(format!(
+                "signed contentType attribute is {only} (expected id-data)"
+            )),
+            None => Some("signed contentType attribute is malformed".into()),
+        },
+        _ => Some("duplicate signed contentType attribute".into()),
+    }
+}
+
+/// Attaches SignedData-level errors to the report on every `Ok` exit so
+/// an early return inside the SignerInfo loop can never drop them.
+fn seal(mut report: CmsVerifyReport, mut global_errors: Vec<String>) -> Result<CmsVerifyReport> {
+    if !global_errors.is_empty() {
+        global_errors.append(&mut report.errors);
+        report.errors = global_errors;
+    }
+    Ok(report)
 }
 
 /// `[0]`-constructed context tag.
@@ -469,6 +526,7 @@ fn verify_signed_data(
     anchors: &TrustAnchors,
 ) -> Result<CmsVerifyReport> {
     let mut report = CmsVerifyReport::default();
+    let mut global_errors: Vec<String> = Vec::new();
 
     let mut r = reader(cms, "malformed ContentInfo")?;
     // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
@@ -523,8 +581,8 @@ fn verify_signed_data(
     let econtent_type = ObjectIdentifier::decode(&mut encap_r)
         .map_err(|e| Error::Verification(format!("malformed eContentType: {e}")))?;
     if econtent_type != OID_ID_DATA {
-        report.warnings.push(format!(
-            "unusual eContentType {econtent_type} (expected id-data)"
+        global_errors.push(format!(
+            "encapContentInfo eContentType is {econtent_type} (expected id-data)"
         ));
     }
     // Skip an optional [0] eContent if present (detached signatures omit it).
@@ -594,7 +652,7 @@ fn verify_signed_data(
 
     if signer_infos_raw.is_empty() {
         report.errors.push("no SignerInfo present".into());
-        return Ok(report);
+        return seal(report, global_errors);
     }
 
     // Verify each SignerInfo; the report reflects the best (valid) one.
@@ -675,7 +733,7 @@ fn verify_signed_data(
             report.errors.push(format!(
                 "unsupported digest algorithm {dig_oid} (only SHA-256 is supported)"
             ));
-            return Ok(report);
+            return seal(report, global_errors);
         }
 
         // signedAttrs [0] — capture raw bytes (the signed message).
@@ -727,7 +785,7 @@ fn verify_signed_data(
             report
                 .errors
                 .push("signing certificate not found in embedded set".into());
-            return Ok(report);
+            return seal(report, global_errors);
         };
 
         let cn = cert.tbs_certificate.subject.to_string();
@@ -798,18 +856,25 @@ fn verify_signed_data(
         } else if !outcome.anchored {
             errors.push("certificate chain is not anchored to a trusted root".into());
         }
+        if let Some(reason) = content_type_reason(attrs.content_type_count, &attrs.content_types) {
+            errors.push(reason);
+        }
 
         if errors.is_empty() {
-            report.valid = true;
-            report.errors.clear();
-            return Ok(report);
+            if global_errors.is_empty() {
+                report.valid = true;
+                report.errors.clear();
+            }
+            // No-op when globals are empty; otherwise the structural errors
+            // land first and keep `valid` false.
+            return seal(report, global_errors);
         }
         if report.errors.is_empty() {
             report.errors = errors;
         }
     }
 
-    Ok(report)
+    seal(report, global_errors)
 }
 
 /// Checks the Apple CDHash v1 plist attribute (a plist with a `cdhashes`
@@ -2103,6 +2168,87 @@ mod tests {
         out
     }
 
+    /// An Attribute SEQUENCE { OID, SET { value } } for parser-level fixtures.
+    fn attr_tlv(oid: ObjectIdentifier, value_tlv: &[u8]) -> Vec<u8> {
+        use der::Encode;
+        let mut body = oid.to_der().unwrap();
+        body.extend_from_slice(&der_tlv(0x31, value_tlv)); // SET OF
+        der_tlv(0x30, &body)
+    }
+
+    #[test]
+    fn signed_content_type_must_be_single_id_data() {
+        assert!(content_type_reason(0, &[])
+            .unwrap_or_default()
+            .contains("missing"));
+        assert_eq!(content_type_reason(1, &[OID_ID_DATA]), None);
+        assert!(content_type_reason(2, &[OID_ID_DATA, OID_ID_DATA])
+            .unwrap_or_default()
+            .contains("duplicate"));
+        let other = ObjectIdentifier::new_unwrap("1.2.840.113635.100.9.1");
+        assert!(content_type_reason(1, &[other])
+            .unwrap_or_default()
+            .contains("expected id-data"));
+        // One occurrence whose value did not decode: malformed, not "missing".
+        assert!(content_type_reason(1, &[])
+            .unwrap_or_default()
+            .contains("malformed"));
+    }
+
+    #[test]
+    fn duplicate_signed_content_type_attributes_are_counted() {
+        use der::Encode;
+        let id_data = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+            .to_der()
+            .unwrap();
+        let mut body = attr_tlv(OID_CONTENT_TYPE, &id_data);
+        body.extend_from_slice(&attr_tlv(OID_CONTENT_TYPE, &id_data));
+        let attrs = parse_signed_attrs(&body).unwrap();
+        assert_eq!(attrs.content_type_count, 2);
+        let reason =
+            content_type_reason(attrs.content_type_count, &attrs.content_types).unwrap_or_default();
+        assert!(reason.contains("duplicate"), "{reason}");
+    }
+
+    #[test]
+    fn extra_malformed_content_type_value_is_counted() {
+        use der::Encode;
+        let mut value = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+            .to_der()
+            .unwrap();
+        value.extend_from_slice(&[0x05, 0x00]); // malformed second value (NULL)
+        let body = attr_tlv(OID_CONTENT_TYPE, &value);
+        let attrs = parse_signed_attrs(&body).unwrap();
+        // A valid id-data first value plus a malformed extra must never read as
+        // "exactly one".
+        assert_eq!(attrs.content_type_count, 2);
+        let reason =
+            content_type_reason(attrs.content_type_count, &attrs.content_types).unwrap_or_default();
+        assert!(reason.contains("duplicate"), "{reason}");
+    }
+
+    #[test]
+    fn malformed_middle_value_does_not_hide_trailing_value() {
+        use der::Encode;
+        let id_data = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+            .to_der()
+            .unwrap();
+        let other = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2")
+            .to_der()
+            .unwrap();
+        let mut value = id_data;
+        value.extend_from_slice(&[0x05, 0x00]); // malformed middle value (NULL)
+        value.extend_from_slice(&other); // valid trailing value behind it
+        let body = attr_tlv(OID_CONTENT_TYPE, &value);
+        let attrs = parse_signed_attrs(&body).unwrap();
+        // TLV-boundary counting: the trailing value must not escape the count
+        // just because an earlier value failed OID decoding.
+        assert_eq!(attrs.content_type_count, 3);
+        let reason =
+            content_type_reason(attrs.content_type_count, &attrs.content_types).unwrap_or_default();
+        assert!(reason.contains("duplicate"), "{reason}");
+    }
+
     /// Re-encodes the raw CMS with the first SignerInfo's sid swapped for
     /// `new_sid` (a complete TLV). Assumes the single-SignerInfo output of
     /// `sign_code_directory` (asserted below).
@@ -2280,5 +2426,52 @@ mod tests {
         // the certificate must be skipped, not panic.
         replace_extension(&mut cert_a, OID_SUBJECT_KEY_IDENTIFIER, &der::asn1::Null);
         assert!(find_cert_by_ski(&[cert_a.clone()], b"any key id").is_none());
+    }
+    #[test]
+    fn global_econtent_type_error_beats_clean_signer() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+        // encapContentInfo.eContentType is the first id-data OID TLV in the CMS:
+        // everything preceding it (ContentInfo's signedData OID `…1.7.2`, the
+        // version INTEGER, digestAlgorithms' SHA-256 OID) shares no bytes with
+        // the 11-byte pattern — which includes the OID's own `06 09` header, so
+        // a mid-TLV match cannot start — while the signedAttrs copy of id-data
+        // and the CDHash payload live much later. Patch the trailing arc 1 → 2:
+        // id-data becomes id-signedData, same DER length, and the field is
+        // outside signedAttrs, so every per-signer check stays green. (A wrong
+        // landing would fail the `encapContentInfo` assertion below loudly.)
+        let id_data: &[u8] = &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01,
+        ];
+        let pos = cms
+            .windows(id_data.len())
+            .position(|w| w == id_data)
+            .expect("id-data OID must be present");
+        let mut patched = cms.clone();
+        patched[pos + id_data.len() - 1] = 0x02;
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&patched),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(
+            report.signature_ok,
+            "unsigned field must not break the signature"
+        );
+        assert!(!report.valid, "global error must block a clean signer");
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "clean signer must not clear or mask the global error: {:?}",
+            report.errors
+        );
+        assert!(report.errors[0].contains("encapContentInfo eContentType"));
     }
 }
