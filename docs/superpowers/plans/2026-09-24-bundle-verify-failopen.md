@@ -109,7 +109,10 @@ fn missing_bundle_root_is_hard_error() {
 
 1. `read_opt` → `Result<Option<Vec<u8>>>`:
    `Ok(bytes) → Some`, `Err` with `ErrorKind::NotFound → None`, any other `Err` →
-   `Err(crate::Error::Io(e))`. Callers in `verify_bundle_dir` use `?`.
+   `Err(crate::Error::Io(e))`. Callers in `verify_bundle_dir` use `?`. Its doc
+   comment (verify.rs:366-367, "Reads a file if it exists; None otherwise") is
+   obsolete after this change — rewrite it to document the `NotFound`-only `None`
+   contract (delete the stale wording, don't stack a second comment).
 2. At the top of `verify_bundle_dir`, before any read:
    ```rust
    let meta = std::fs::metadata(dir).map_err(crate::Error::Io)?;
@@ -462,15 +465,22 @@ fn partial_reseal_with_updated_hash2_is_detected() {
    - no delegation of this error's ownership to Tasks 6/7 — it is fully handled here.
 3. Sealed→disk: iterate `files2` entries first; then iterate `files` entries whose
    key is **not** in `files2` (files2 wins a collision — it carries both algorithms
-   already). Per entry:
-   - `symlink` dispatch from Task 4 unchanged;
-   - value is `Data` (legal legacy form) → SHA-1 compare of the file bytes;
-   - value is a dict → verify **every** declared hash field with its own
-     algorithm: `hash2` → `Sha256`, `hash` → `Sha1`; all present fields must match,
-     else `mismatched`; no fields at all → the existing
-     "sealed without a hash" string, now pushed to `errors` (C2);
-   - `String` values in `files` are malformed → `errors` (defer the message to
-     Task 7's wording; pushing to `errors` now keeps one channel).
+   already). Dispatch is **source-aware** (design C3 — bare `Data` is legal only in
+   `files`):
+   - a `files2` value that is a dictionary: `symlink` dispatch from Task 4
+     unchanged when the key is present; otherwise per-field hash dispatch below; a
+     dictionary with neither `hash2` nor `hash` nor `symlink` →
+     `errors.push(format!("malformed CodeResources entry: {rel}"))`;
+   - a `files2` value that is **not** a dictionary (`Data`, `String`, …) → keep the
+     status-quo silent `continue` **for now** — Task 7 converts exactly this skip
+     into the malformed error, and its fail-before test depends on the skip
+     remaining here;
+   - a `files`-only value: `Data` → SHA-1 compare of the file bytes; dictionary →
+     `symlink` dispatch if present, else per-field hash dispatch (dictionary with
+     no hash fields → the same malformed message); anything else (e.g. `String`) →
+     `errors.push(format!("malformed CodeResources entry: {rel}"))`;
+   - per-field hash dispatch: `hash2` → `Sha256`, `hash` → `Sha1`; all present
+     fields must match, else `mismatched`.
 4. Missing-file handling stays as today (Task 6 adds rule-governed tolerance).
 5. Disk→sealed membership test becomes `!sealed_set.contains(&rel)` (plus the rule
    lookup added in Task 6).
@@ -798,14 +808,13 @@ fn malformed_entry_is_reported() {
 - [ ] **Step 2: Run and confirm FAIL** — expected: the non-dict entry is silently
   skipped today (`continue`), `bundle.errors` has no malformed message.
 
-- [ ] **Step 3: Implement** — in the sealed→disk entry dispatch: a `files2` value
-  that is not a dictionary (and not reached via the Task 5 legacy-`Data` path —
-  `Data` is only legal for `files`) →
-  `errors.push(format!("malformed CodeResources entry: {rel}"))`, skip hash
-  verification for that key, continue the loop. Same treatment for a `files` value
-  that is neither `Data` nor a dictionary (Task 5 already routed it to `errors`;
-  unify on this message). The bundle is invalid via `bundle.errors` regardless of
-  the hash lists.
+- [ ] **Step 3: Implement** — the one remaining silent skip is a non-dictionary
+  `files2` value (Task 5 deliberately keeps it as `continue` so this test fails
+  here). Convert it: `errors.push(format!("malformed CodeResources entry: {rel}"))`,
+  skip hash verification for that key, continue the loop. (Task 5 already routed
+  `files` String values and hash-less dictionaries to the same message; no other
+  dispatch changes.) The bundle is invalid via `bundle.errors` regardless of the
+  hash lists.
 
 - [ ] **Step 4: Run test — PASS**, then the full scoped gate. Expected: all green.
 
@@ -1033,8 +1042,9 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
    genuinely absent; an unreadable file is already a hard `Err`.)
 
 - [ ] **Step 4: Run test — PASS**, then the full scoped gate. Expected: all green —
-  `bare_macho_verifies` stays green (bare signing zero-fills -1/-3 → `Missing`,
-  not `NotChecked`), `signed_bundle_*` unaffected (slots matched against present
+  `bare_macho_verifies` stays green (bare signing binds only -2: index 0 (-1) is
+  zero-filled → `Missing`, index 2 absent → `.get(2)` is `None`; neither is
+  `NotChecked`), `signed_bundle_*` unaffected (slots matched against present
   files).
 
 - [ ] **Step 5: Commit** (controller): `fix(zsign): surface unchecked required special slots (ZSN-26)`
@@ -1049,21 +1059,32 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
   in every gate — the brief defines it as "existing tests keep passing" and they
   pass at baseline 7/7; traversal keys + symlink-parent containment → Task 8;
   missing CodeResources → Task 2; tampered nested binary → Task 3).
-- **Placeholders:** none — every task carries literal test code, literal error
-  strings, and literal commands; the shared helper refactor is specified as
-  verbatim-move instructions outside any code stub.
+- **Placeholders:** none — every task carries literal test code (complete function
+  bodies for `has_nested_bundle_component`, `compile_pattern`, `pattern_matches`,
+  `tie_rank`, `compile_rules`, `rule_action`, `is_safe_bundle_key`,
+  `verify_macho_file`), literal error strings, and literal commands; the shared
+  helper refactor is specified as verbatim-move instructions outside any code stub.
 - **Type consistency:** `read_opt → Result<Option<Vec<u8>>>` (Task 1) is used
   identically by Tasks 2/9; `check_code_resources(…, errors: &mut Vec<String>) ->
   Result<CodeResourcesVerification>` (Task 1) carries the `errors` channel consumed
   by Tasks 5–8; `build_signed_bundle_with` / `rewrite_code_resources` (Task 1) are
-  used verbatim by Tasks 3–8; rule-engine names (`compile_rules`, `rule_action`,
-  `RuleAction`, `RulePattern`, `tie_rank`) are defined once in Task 6 and referenced
-  only there; `bundle_real` containment (Task 8 stage 2) is defined inside
-  `check_code_resources` once.
+  used verbatim by Tasks 3–8; rule-engine names (`compile_pattern`,
+  `pattern_matches`, `compile_rules`, `rule_action`, `RuleAction`, `RulePattern`,
+  `tie_rank`) are defined once in Task 6 and referenced only there; the shared
+  missing-tolerance predicate `matches!(rule_action(rules, rel), Some(Optional) |
+  Some(Omit))` appears identically in Task 6 (both directions) and Task 8 (stage-2
+  parent-`NotFound`); `bundle_real` containment (Task 8 stage 2) is defined inside
+  `check_code_resources` once; the malformed-entry message
+  `malformed CodeResources entry: <rel>` is owned by Task 5 and re-used verbatim by
+  Task 7 (whose fail-before test depends on Task 5 keeping the non-dict `files2`
+  skip).
 - **Deviations recorded:** entry-level `optional` is not honored (rules are the
   single authority — design C4); `base_lproj_deletion_is_not_optional` is a guard
   test that passes pre-fix by construction; mandated regression #3 is a keep-green
-  guard per the brief's own wording (see Spec coverage).
+  guard per the brief's own wording (see Spec coverage); Task 9 deliberately
+  activates the CLI's existing exit-2 `report.errors` branch and documents it as
+  intentional-for-now (ZSN-5 owns remapping); the legacy `^version.plist$` rule
+  spelling is rejected as unsupported rather than reinterpreted.
 
 ## Execution handoff
 
