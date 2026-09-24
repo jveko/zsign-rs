@@ -102,6 +102,14 @@ fn is_safe_symlink_target(target: &str) -> bool {
     target.split('/').all(|component| component != "..")
 }
 
+/// Maximum symlink target length accepted during extraction.
+///
+/// Matches Linux `PATH_MAX`: longer targets can never be created by
+/// `symlink(2)`, and bounding the read keeps a hostile entry from buffering
+/// gigabytes before validation. Unix-only, like the symlink pass that uses it.
+#[cfg(unix)]
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
+
 /// Returns true if an archive entry name is absolute, uses `..` traversal,
 /// or has no substantive component.
 ///
@@ -422,9 +430,23 @@ pub fn extract_ipa_with_limits(
         let mut archive = ZipArchive::new(cursor).map_err(Error::Zip)?;
 
         for entry in &symlink_entries {
-            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
+            let file = archive.by_index(entry.index).map_err(Error::Zip)?;
+            // Bound the read before validation: a hostile symlink entry must
+            // never buffer more than the limit into memory.
             let mut target = String::new();
-            file.read_to_string(&mut target)?;
+            file.take(MAX_SYMLINK_TARGET_BYTES as u64 + 1)
+                .read_to_string(&mut target)?;
+            if target.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Symlink target too long in IPA: {} ({} bytes, limit {})",
+                        entry.outpath.display(),
+                        target.len(),
+                        MAX_SYMLINK_TARGET_BYTES
+                    ),
+                )));
+            }
 
             // Symlink targets count toward both budgets, reserved before
             // the link is created.
@@ -758,6 +780,34 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(msg.contains("total"), "error must mention the total: {msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_long_symlink_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("long_target.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link", "a".repeat(5000), options)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("oversized symlink target must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Symlink target too long in IPA"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
