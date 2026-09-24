@@ -1193,21 +1193,23 @@ fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
     let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
     let sd_tlv = wrap.value(); // the SignedData TLV inside [0]
 
-    // SignedData fields; signerInfos SET is the last one.
+    // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms is
+    // also a SET — select by position, never by tag, or it gets dropped).
     let mut sd_r = SliceReader::new(sd_tlv).unwrap();
-    let mut fixed: Vec<&[u8]> = Vec::new(); // version, digestAlgs, encap, certs
-    let mut set_tlv: &[u8] = &[];
+    let mut fields: Vec<&[u8]> = Vec::new(); // version, digestAlgs, encap, certs, set
     while !sd_r.is_finished() {
         let start = usize::try_from(sd_r.position()).unwrap();
-        let f = AnyRef::decode(&mut sd_r).unwrap();
+        let _field = AnyRef::decode(&mut sd_r).unwrap();
         let end = usize::try_from(sd_r.position()).unwrap();
-        if f.tag() == Tag::Set {
-            set_tlv = &sd_tlv[start..end];
-        } else {
-            fixed.push(&sd_tlv[start..end]);
-        }
+        fields.push(&sd_tlv[start..end]);
     }
-    assert!(!set_tlv.is_empty(), "signerInfos SET required");
+    let set_tlv = fields.pop().expect("SignedData fields required");
+    assert_eq!(
+        AnyRef::from_der(set_tlv).unwrap().tag(),
+        Tag::Set,
+        "signerInfos SET must be the last SignedData field"
+    );
+    let fixed: Vec<&[u8]> = fields;
 
     // SignerInfo: replace the sid (the field after version).
     let set_any = AnyRef::from_der(set_tlv).unwrap();
