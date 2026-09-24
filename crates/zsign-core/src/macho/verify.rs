@@ -139,7 +139,7 @@ fn verify_slice(
     report.identifier = primary.identifier().map(str::to_owned);
 
     // Code pages: hash the declared code region.
-    report.pages = check_code_pages_in_file(primary, data, slice.offset);
+    report.pages = check_code_pages_in_file(primary, data, slice);
     match &report.pages {
         PageCheck::Matched | PageCheck::Empty => {}
         PageCheck::Mismatch { page_index } => {
@@ -209,16 +209,26 @@ fn verify_slice(
     Ok(report)
 }
 
-/// Page check variant that reads the region straight from the file at the
-/// slice's offset, using the CodeDirectory `codeLimit` as authoritative.
-fn check_code_pages_in_file(cd: &CodeDirectory<'_>, data: &[u8], offset: usize) -> PageCheck {
-    let Some(tail) = data.get(offset..) else {
+/// Page check variant that reads exactly the slice's byte range from the
+/// file, using the CodeDirectory `codeLimit` as authoritative. A codeLimit
+/// beyond the slice therefore overruns the bounded region and reports
+/// `CountMismatch` instead of hashing the next architecture.
+fn check_code_pages_in_file(
+    cd: &CodeDirectory<'_>,
+    data: &[u8],
+    slice: &crate::macho::ArchSlice,
+) -> PageCheck {
+    let Some(range) = slice
+        .offset
+        .checked_add(slice.size)
+        .and_then(|end| data.get(slice.offset..end))
+    else {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
             computed: 0,
         };
     };
-    check_code_pages(cd, tail)
+    check_code_pages(cd, range)
 }
 
 /// SHA-1 digest of the alternate (SHA-1) CodeDirectory, for the CDHash v1
@@ -287,7 +297,7 @@ mod tests {
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
     use crate::macho::fixtures::make_minimal_macho;
-    use crate::macho::{sign_macho_sha256_only, MachOFile};
+    use crate::macho::{sign_any_macho, sign_macho_sha256_only, MachOFile};
     use der::Decode;
     use sha2::{Digest, Sha256};
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -350,6 +360,89 @@ mod tests {
             let s = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
             (s == slot).then(|| u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize)
         })
+    }
+
+    fn build_two_slice_fat() -> Vec<u8> {
+        let a = make_minimal_macho();
+        let b = make_minimal_macho();
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xcafebabeu32.to_be_bytes()); // FAT_MAGIC
+        out.extend_from_slice(&2u32.to_be_bytes());
+        for (offset, size) in [(0x1000u32, a.len() as u32), (0x3000u32, b.len() as u32)] {
+            out.extend_from_slice(&0x0100_000cu32.to_be_bytes()); // CPU_TYPE_ARM64
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&offset.to_be_bytes());
+            out.extend_from_slice(&size.to_be_bytes());
+            out.extend_from_slice(&12u32.to_be_bytes()); // align 2^12
+        }
+        out.resize(0x1000, 0);
+        out.extend_from_slice(&a);
+        out.resize(0x3000, 0);
+        out.extend_from_slice(&b);
+        out
+    }
+
+    #[test]
+    fn fat_code_limit_beyond_slice_is_rejected() {
+        let fat = build_two_slice_fat();
+        let macho = MachOFile::parse(fat).unwrap();
+        assert_eq!(macho.slices().len(), 2);
+        let creds = rsa_credentials();
+        let mut signed =
+            sign_any_macho(&macho, "com.example.fat", None, &creds, None, None, false).unwrap();
+
+        // Trailing pad is load-bearing: without it the second slice's tail
+        // equals its slice size, and pre-fix would take the same guard path
+        // as post-fix (no observable difference).
+        signed.extend_from_slice(&[0u8; 0x1000]);
+
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let s = &m.slices()[1];
+        let slice_off = s.offset as usize;
+        let slice_size = s.size as usize;
+        let tail_len = signed.len() - slice_off;
+        let sig_off = slice_off + s.code_sig_offset.unwrap() as usize;
+        let sig_len = s.code_sig_size.unwrap() as usize;
+
+        // Patch only the primary CD's codeLimit (slot 0x0000, SHA-1 in dual
+        // mode — no hash rewrites, no page-size change, no CMS edits).
+        let cd = entry_offset(&signed[sig_off..sig_off + sig_len], CSSLOT_CODEDIRECTORY)
+            .expect("primary CD entry")
+            + sig_off;
+        let n_slots = u32::from_be_bytes(signed[cd + 28..cd + 32].try_into().unwrap()) as usize;
+        let page_size = 1usize << signed[cd + 39];
+
+        let c_prime = (slice_size + 0x100) as u32;
+        assert!(
+            (c_prime as usize) <= tail_len,
+            "C' must fit the padded tail"
+        );
+        assert!(
+            (c_prime as usize).div_ceil(page_size) != slice_size.div_ceil(page_size),
+            "fixture precondition: C' must cross a page boundary of the slice"
+        );
+        signed[cd + 32..cd + 36].copy_from_slice(&c_prime.to_be_bytes());
+
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        // Pre-fix the check runs over the tail, so the slot-count guard is
+        // never reached and expected_slots = ceil(C'/page) mismatches the
+        // stored count. Post-fix the slice-bounded region makes
+        // code_limit > len fire the guard, which reports ceil(slice_size/page).
+        // Assert the post-fix contract: the page count is measured against
+        // the slice, not the tail.
+        let expected = PageCheck::CountMismatch {
+            stored: n_slots,
+            computed: slice_size.div_ceil(page_size),
+        };
+        assert_eq!(report.slices[1].pages, expected);
+        assert!(
+            report.slices[1]
+                .errors
+                .iter()
+                .any(|e| e.contains("code slot count mismatch")),
+            "oversized codeLimit must be reported, got {:?}",
+            report.slices[1].errors
+        );
     }
 
     #[test]
