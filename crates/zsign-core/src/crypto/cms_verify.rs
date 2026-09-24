@@ -924,7 +924,6 @@ fn verify_chain(
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
-    let mut chain = vec![leaf];
     let now = time_now();
 
     if let Some(reason) = leaf_purpose_reason(leaf) {
@@ -975,7 +974,7 @@ fn verify_chain(
                         warnings,
                     };
                 }
-                if let Some(reason) = issuer_ca_reason(p, chain.len().saturating_sub(1)) {
+                if let Some(reason) = issuer_ca_reason(p, names.len().saturating_sub(1)) {
                     return ChainOutcome {
                         ok: false,
                         anchored: false,
@@ -996,7 +995,6 @@ fn verify_chain(
                     };
                 }
                 names.push(p.tbs_certificate.subject.to_string());
-                chain.push(p);
                 current = p;
                 continue;
             }
