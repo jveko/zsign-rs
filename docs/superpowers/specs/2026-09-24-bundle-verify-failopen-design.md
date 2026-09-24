@@ -1,6 +1,7 @@
 # Bundle/CodeResources Verify Fail-Opens — Design (ZSN-26)
 
-Status: implemented by lane 26 (branch `zsn-26-bundle-verify`).
+Status: planned — design and plan reviewed on this branch; implementation has not
+started yet (the source still matches base `ee42c12` until phase 5 lands).
 Scope: **`crates/zsign/src/verify.rs` and its inline tests only.** Everything else is
 explicitly deferred (see "Out of scope").
 
@@ -91,7 +92,8 @@ All verified against current source (line numbers as of base `ee42c12`).
   dev-dependency of zsign-core) → the rules engine cannot use a regex crate.
 - **In-repo error pattern.** Walk failures are mapped as
   `Error::Io(std::io::Error::other(format!("Failed to walk directory: {e}")))`
-  (zsign bundle/code_resources.rs:154-158, ipa/archive.rs:225-226).
+  (zsign bundle/code_resources.rs:154-158 — collect-then-map variant;
+  ipa/archive.rs:224-226 — the per-item loop binding Task 1 mirrors).
 
 ## Cross-cutting contracts
 
@@ -134,12 +136,23 @@ and legacy `files` keys, with explicit dictionary ownership:
 Per sealed entry, *every* declared hash field is checked with its own algorithm
 (`hash2` → SHA-256, `hash` → SHA-1); all present fields must match. `files2` wins a
 key collision (its entries carry both algorithms, so SHA-1 is covered anyway);
-`files`-only keys are verified with their declared value type. Bare `Data` values
-are legal in `files` (SHA-1) and malformed in `files2`.
+`files`-only keys are verified with their declared value type. The `files` value
+shapes are **not uniform** and both are handled: `.lproj/` entries are dictionaries
+`{hash, optional}` (zsign-core code_resources.rs:418-423), everything else is a
+bare `Value::Data(sha1)` (:426); symlinks never appear in `files` — the builder
+skips them there entirely (:414-416). Bare `Data` values are legal in `files`
+(SHA-1) and malformed in `files2`.
 
 **C4 — rules engine (no regex crate).** Evaluate **the rules our builder emits**;
 anything else is an explicit `unsupported CodeResources rule: <pattern>` report
-error — never a silent ignore. Rule source: `rules2` when present, else `rules`;
+error — never a silent ignore. `regex` is not a dependency of any workspace member
+(only reachable inside criterion, a dev-dependency), and adding one is out of
+scope — so the engine is a small **in-file matcher covering exactly the builder's
+emitted subset** (the C4 table below): anchored `^`/`$`, literal `\.`, `.*`,
+`(/)?`, `($|/)`, and alternation only at that level, translated to plain string
+predicates with a literal-prefix fast path where useful. A pattern outside that
+subset (or a spec key/type we don't understand) → `unsupported CodeResources rule`
+error. Rule source: `rules2` when present, else `rules`;
 `rules2` *present but not a dictionary* → content error
 `CodeResources rules2 is not a dictionary`, treated as absent for evaluation (the
 report is already invalid — no silent fallback); **neither** present → report error
@@ -147,8 +160,12 @@ report is already invalid — no silent fallback); **neither** present → repor
 `Boolean(true)` → Include, `Boolean(false)` → Omit; dictionary keys restricted to
 `{omit, optional, weight}` (both `omit` and `optional` true, or any other key/type →
 unsupported error); `weight` default 1.0. Among *matching* rules the highest weight
-wins; ties resolve strictest first: Include > Omit > Optional (the builder's own
-weights never tie). Path checks:
+wins; ties resolve strictest first: Include > Omit > Optional via an explicit
+`tie_rank` (never derived `PartialOrd` — that order is inverted). **Weight
+semantics are settled and order-independent**: `plist::Dictionary` is
+IndexMap-backed today (insertion order preserved) but its docs explicitly allow the
+backing store to change in a minor release, so declaration order is deliberately
+NOT part of the semantics; only (weight, tie_rank) decides. Path checks:
 
 - disk→sealed: on-disk file in neither dict → Omit rule matches → exempt,
   otherwise `unsealed`.
@@ -190,7 +207,9 @@ unsupported-rule error (coordination point with the builder lane, not a silent g
 **C5 — symlink semantics.** A sealed entry with a `symlink` key is verified as a
 symlink: the on-disk object must be a symlink (`symlink_metadata`) and
 `fs::read_link` must equal the sealed target string; no hash is expected either
-way. Conversely an entry expecting file content whose on-disk object is a symlink is
+way — there is no hash fallback to design, because the builder emits `hash`/`hash2`
+only in the *non*-symlink branch (zsign-core code_resources.rs:444-453), so
+target-string equality is the only possible check. Conversely an entry expecting file content whose on-disk object is a symlink is
 `mismatched` (content replaced by a link). The disk→sealed walk includes symlinks
 (files *and* symlinks), so an unsealed symlink is flagged like any unsealed file.
 Symlinks are skipped by the binary-collection walk: their target is sealed as a
@@ -229,15 +248,20 @@ resolved containment: a lexical-clean key can still traverse an in-bundle symlin
 directory (`Escape -> /etc`, key `Escape/passwd`) because `fs::read` and
 `fs::read_link` both resolve intermediate links. Before *reading* anything for an
 entry, canonicalize the entry's parent directory against `canonicalize(bundle)`:
-`NotFound` → the entry is `missing` (no content is read, so no oracle); resolution
-outside the bundle → the same escape error, entry skipped; any other I/O error →
-content error. Stage 2 runs for **both** dispatch branches (hash reads *and*
+`Err(NotFound)` → the parent directory does not exist, so the sealed entry is
+absent: route through the **same rule-aware missing decision the sealed→disk
+check uses** (C4) — tolerate only when the winning rule action is Optional,
+otherwise `missing.push(rel)` — and `continue` without reading anything (no
+content is read, so no oracle); resolution outside the bundle → the same escape
+error, entry skipped; any other I/O error → content error. Stage 2 runs for
+**both** dispatch branches (hash reads *and*
 symlink target reads — `read_link` resolves intermediate links too). Resolving the
 parent instead of an `openat`-style no-follow traversal is a deliberate trade: the
 residual TOCTOU window (an attacker mutating the tree *during* verification) is out
 of threat model — the tree being verified is read-only to us by contract. Our
-builder never emits symlink-traversing keys (both sealing walks use
-`follow_links(false)`), so stage 2 only ever fires for crafted keys — exactly the
+builder never emits symlink-traversing keys (the sealing walk uses
+`follow_links(false)`, zsign bundle/code_resources.rs:150-153), so stage 2 only
+ever fires for crafted keys — exactly the
 oracle to close. The disk→sealed direction is inherently safe (keys come from the
 filesystem walk, which does not follow links).
 

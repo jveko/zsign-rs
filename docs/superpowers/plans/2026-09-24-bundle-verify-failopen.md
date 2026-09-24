@@ -123,17 +123,16 @@ fn missing_bundle_root_is_hard_error() {
 3. Walk error propagation. `WalkDir`'s iterator yields `Result<DirEntry,
    walkdir::Error>` **items** — there is no `Iterator::map_err` and the iterator
    itself is not `Try`, so bind each item inside the loop (the in-repo pattern,
-   `crates/zsign/src/ipa/archive.rs:225-226`):
+   `crates/zsign/src/ipa/archive.rs:224-226`). This statement becomes the first
+   statement inside `for entry in WalkDir::new(dir).min_depth(1) { … }`:
    ```rust
-   for entry in WalkDir::new(dir).min_depth(1) {
-       let entry = entry.map_err(|e| {
-           crate::Error::Io(std::io::Error::other(format!("Failed to walk directory: {e}")))
-       })?;
-       let p = entry.path();
-       // ... existing loop body ...
-   }
+   let entry = entry.map_err(|e| {
+       crate::Error::Io(std::io::Error::other(format!("Failed to walk directory: {e}")))
+   })?;
    ```
-   Apply the identical per-item binding to the disk walk inside
+   The remainder of the existing loop body follows it unchanged — `entry` is now a
+   `DirEntry`, so the same `entry.path()` / `entry.file_type()` expressions feed it.
+   Apply the identical first statement to the disk walk inside
    `check_code_resources` (its current `filter_map(|e| e.ok())` disappears with the
    loop rewrite required by Step 4.4). Do NOT put `map_err`/`?` on the iterator
    chain itself — that does not compile.
@@ -566,11 +565,17 @@ fn unsupported_rule_is_reported() {
    //   || (r.weight == best.weight && tie_rank(r.action) < tie_rank(best.action))
    ```
    `compile_rules` recognizes exactly the pattern strings in the design's C4 table
-   (both `^version.plist$` spellings map to `Exact("version.plist")`); unknown
-   pattern or unknown spec key/type (or `omit`+`optional` both true) →
+   (both `^version.plist$` spellings map to `Exact("version.plist")`); the matcher
+   is plain string predicates over that subset — anchors, literal `\.`, `.*`,
+   `(/)?`, `($|/)`, alternation only at that level — with a literal-prefix fast
+   path where useful; **no regex engine** (`regex` is not an available dependency).
+   Unknown pattern or unknown spec key/type (or `omit`+`optional` both true) →
    `errors.push(format!("unsupported CodeResources rule: {key}"))` and the rule is
    dropped. `Boolean(true/false)` → Include/Omit at weight 1.0; dict keys limited to
    `omit`/`optional`/`weight` (weight: Real or Integer → f64, default 1.0).
+   Selection is **order-independent**: highest weight wins, ties by lowest
+   `tie_rank` — never declaration order (`plist::Dictionary` is IndexMap-backed
+   today but its docs allow the backing store to change in a minor release).
 2. Rule source with fail-closed type handling (design C4): read
    `dict.get("rules2")` — present but not a dictionary →
    `errors.push("CodeResources rules2 is not a dictionary")`, treated as absent for
@@ -582,7 +587,8 @@ fn unsupported_rule_is_reported() {
 3. `is_rule_omitted` is reduced to the two structural omissions
    (`_CodeSignature` root prefix/exact, frame main executable exact) — delete the
    `Info.plist`/`PkgInfo`/`.DS_Store`/`.lproj` arms (rules2 covers them; the
-   `.lproj/` suffix arm was dead). Update its doc comment.
+   `.lproj/` suffix arm is dead code — walked rel paths are file paths and never
+   end in `/`, so it omits nothing today). Update its doc comment.
 4. Wire the two check directions:
    - disk→sealed: not in sealed set → `rule_action == Omit` → exempt, else
      `unsealed.push(rel)`; no rule matched → structural check only (an unmatched
@@ -750,8 +756,13 @@ fn symlink_parent_traversal_is_rejected() {
    Then, for **every** entry — before *any* content access, i.e. before both the
    `symlink` dispatch and the hash read — canonicalize the entry's parent directory
    (the parent is `bundle` itself for root-level keys):
-   - `Err(NotFound)` → `missing.push(rel)` and `continue` (parent directory absent
-     → the entry cannot exist; **no content is read, so no oracle**);
+   - `Err(NotFound)` → the parent directory does not exist, so the sealed entry is
+     absent: apply the **same rule-aware missing decision the sealed→disk loop
+     already uses after Task 6** — if `rule_action(rel) == Some(Optional)` →
+     tolerate (skip the entry), else `missing.push(rel)` — and `continue` without
+     reading anything. (An unconditional `missing.push` here would break Task 6's
+     `optional_lproj_deletion_after_signing_stays_valid` test, which deletes the
+     whole `en.lproj` directory and expects a valid report.)
    - `Ok(resolved)` where `!resolved.starts_with(&bundle_real)` →
      `errors.push(format!("CodeResources entry path escapes the bundle: {rel}"))`
      and `continue`;
