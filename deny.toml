@@ -1,0 +1,32 @@
+# cargo-deny policy: no yanked crates, permissive license allowlist,
+# no duplicate dependency versions (warn), crates.io as the only source.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # Marvin timing side channel in rsa private-key operations; upstream has
+    # no fix (patched = []). The advisory's own guidance allows local use on
+    # a non-compromised machine, which is this offline CLI's threat model.
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

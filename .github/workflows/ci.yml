@@ -97,3 +97,12 @@ jobs:
         run: cargo build -p zsign-cli --release
       - name: Sign + verify with Apple codesign
         run: scripts/verify-apple-interop.sh
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          rust-version: "1.88.0"
