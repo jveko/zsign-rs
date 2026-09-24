@@ -56,7 +56,10 @@ pub struct SuperBlob<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Verification`] if the blob is truncated or the magic is wrong.
+/// Returns [`Error::Verification`] if the blob is truncated, the magic is wrong,
+/// the declared length or index extent is invalid, or any child is shorter than
+/// eight bytes, aliases the header/index, lies out of bounds, or overlaps another
+/// child.
 pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     if blob.len() < 12 {
         return Err(crate::Error::Verification(
@@ -69,22 +72,44 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
         ));
     }
 
-    let count = u32::from_be_bytes(blob[8..12].try_into().unwrap()) as usize;
-    if 12 + count * 8 > blob.len() {
+    // The declared total length bounds every subsequent read; trailing bytes
+    // in the LC window beyond it are tolerated (own writer reserves the LC
+    // window larger than the SuperBlob) but never parsed. `count` is read
+    // from blob[8..12], safe because blob.len() >= 12 was checked above;
+    // index_end >= 12 then rejects any declared length below the header
+    // *before* slicing, so `&blob[..declared]` can never panic.
+    let declared = u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize;
+    if declared > blob.len() {
         return Err(crate::Error::Verification(format!(
-            "SuperBlob index ({} entries) overruns blob of {} bytes",
-            count,
+            "SuperBlob declared length ({declared}) overruns blob of {} bytes",
             blob.len()
         )));
     }
+    let count = u32::from_be_bytes(blob[8..12].try_into().unwrap()) as usize;
+    let index_end = count
+        .checked_mul(8)
+        .and_then(|e| e.checked_add(12))
+        .ok_or_else(|| crate::Error::Verification("SuperBlob index extent overflow".into()))?;
+    if index_end > declared {
+        return Err(crate::Error::Verification(format!(
+            "SuperBlob index ({count} entries) overruns declared length of {declared} bytes"
+        )));
+    }
+    let sb = &blob[..declared];
 
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count.min(declared / 8));
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(count.min(declared / 8));
     for i in 0..count {
         let entry_off = 12 + i * 8;
-        let slot = u32::from_be_bytes(blob[entry_off..entry_off + 4].try_into().unwrap());
+        let slot = u32::from_be_bytes(sb[entry_off..entry_off + 4].try_into().unwrap());
         let offset =
-            u32::from_be_bytes(blob[entry_off + 4..entry_off + 8].try_into().unwrap()) as usize;
-        let Some(item) = blob.get(offset..).filter(|b| b.len() >= 8) else {
+            u32::from_be_bytes(sb[entry_off + 4..entry_off + 8].try_into().unwrap()) as usize;
+        if offset < index_end {
+            return Err(crate::Error::Verification(format!(
+                "SuperBlob entry {i} (slot 0x{slot:08x}) points inside the header/index"
+            )));
+        }
+        let Some(item) = sb.get(offset..).filter(|b| b.len() >= 8) else {
             return Err(crate::Error::Verification(format!(
                 "SuperBlob entry {i} (slot 0x{slot:08x}) points outside the blob"
             )));
@@ -92,15 +117,35 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
         // Each blob carries its own magic+length header; bound it precisely so
         // hashing a slot blob never implicitly includes later blobs.
         let item_len = u32::from_be_bytes(item[4..8].try_into().unwrap()) as usize;
-        let Some(bounded) = blob.get(offset..offset.saturating_add(item_len)) else {
+        if item_len < 8 {
             return Err(crate::Error::Verification(format!(
-                "SuperBlob entry {i} (slot 0x{slot:08x}) length overruns blob"
+                "SuperBlob entry {i} (slot 0x{slot:08x}) declares a {item_len}-byte blob"
             )));
-        };
+        }
+        let end = offset
+            .checked_add(item_len)
+            .filter(|end| *end <= declared)
+            .ok_or_else(|| {
+                crate::Error::Verification(format!(
+                    "SuperBlob entry {i} (slot 0x{slot:08x}) length overruns blob"
+                ))
+            })?;
+        ranges.push((offset, end));
         entries.push(SlotEntry {
             slot,
-            blob: bounded,
+            blob: &sb[offset..end],
         });
+    }
+
+    // Children must be pairwise disjoint (duplicates overlap identically).
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            return Err(crate::Error::Verification(format!(
+                "SuperBlob entries at {} and {} overlap",
+                pair[0].0, pair[1].0
+            )));
+        }
     }
 
     let mut code_directory = None;
@@ -552,6 +597,82 @@ mod tests {
             sb = sb.code_directory_sha1(sb1);
         }
         sb.build()
+    }
+
+    /// Minimal SuperBlob: header + index + zero-filled tail to `total`.
+    /// `entries` are `(slot, offset)` index pairs; the caller writes each
+    /// child's magic+length header bytes at its `offset` afterwards.
+    fn synth_superblob(total: u32, entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+        b.extend_from_slice(&total.to_be_bytes());
+        b.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (slot, off) in entries {
+            b.extend_from_slice(&slot.to_be_bytes());
+            b.extend_from_slice(&off.to_be_bytes());
+        }
+        b.resize(total as usize, 0);
+        b
+    }
+
+    #[test]
+    fn superblob_shorter_declared_length_is_rejected() {
+        // Declared total below the index extent: pre-fix this parses
+        // because bytes 4..8 are never read.
+        let mut b = build_blob(true);
+        b[4..8].copy_from_slice(&4u32.to_be_bytes());
+        assert!(
+            parse_superblob(&b).is_err(),
+            "declared length below index extent"
+        );
+
+        // Declared length past the actual buffer.
+        let mut b = build_blob(true);
+        let len = b.len() as u32;
+        b[4..8].copy_from_slice(&(len + 64).to_be_bytes());
+        assert!(
+            parse_superblob(&b).is_err(),
+            "declared length overruns buffer"
+        );
+
+        // Declared length inside the index but with children beyond it:
+        // bound all reads to blob[..declared].
+        let mut b = build_blob(true);
+        let count = u32::from_be_bytes(b[8..12].try_into().unwrap());
+        let index_end = 12 + count * 8;
+        b[4..8].copy_from_slice(&(index_end + 4).to_be_bytes());
+        assert!(
+            parse_superblob(&b).is_err(),
+            "children outside declared length"
+        );
+    }
+
+    #[test]
+    fn superblob_entry_inside_header_is_rejected() {
+        // Child offset 0 aliases the SuperBlob header itself.
+        let b = synth_superblob(40, &[(0, 0)]);
+        assert!(parse_superblob(&b).is_err(), "entry inside header/index");
+    }
+
+    #[test]
+    fn superblob_short_child_is_rejected() {
+        // Valid index (12 + 8 = 20), child at 20 declares item_len 4 (< 8).
+        let mut b = synth_superblob(28, &[(0, 20)]);
+        b[20..24].copy_from_slice(&0xfade0c00u32.to_be_bytes());
+        b[24..28].copy_from_slice(&4u32.to_be_bytes());
+        assert!(parse_superblob(&b).is_err(), "item_len < 8");
+    }
+
+    #[test]
+    fn superblob_overlapping_children_are_rejected() {
+        // Index ends at 28. Child A [28,44), child B [36,44) — B sits
+        // inside A; duplicates would overlap identically.
+        let mut b = synth_superblob(44, &[(0, 28), (1, 36)]);
+        b[28..32].copy_from_slice(&0xfade0c00u32.to_be_bytes());
+        b[32..36].copy_from_slice(&16u32.to_be_bytes());
+        b[36..40].copy_from_slice(&0xfade0c01u32.to_be_bytes());
+        b[40..44].copy_from_slice(&8u32.to_be_bytes());
+        assert!(parse_superblob(&b).is_err(), "overlapping children");
     }
 
     #[test]
