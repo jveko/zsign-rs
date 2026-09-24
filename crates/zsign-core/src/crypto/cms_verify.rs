@@ -25,6 +25,8 @@
 //!    explicit trust-anchor set ([`TrustAnchors::apple_root`] by default).
 //! 8. **SKI SignerInfo resolution**: a signer identified by its
 //!    `subjectKeyIdentifier` must match a certificate in the embedded set.
+//! 9. **SHA-1 certificate signatures**: accepted, but recorded as non-fatal
+//!    verification warnings naming the affected certificate subject.
 //!
 //! This module proves integrity, Apple-attribute binding, chain structure, and
 //! anchoring to an explicit trust-anchor set — [`TrustAnchors::apple_root`]
@@ -1009,6 +1011,17 @@ struct ChainOutcome {
     warnings: Vec<String>,
 }
 
+/// Notes that a certificate's own signature uses SHA-1 (accepted, but
+/// recorded so consumers can surface weak-crypto usage).
+fn sha1_warning(child: &x509_cert::Certificate) -> Option<String> {
+    (child.signature_algorithm.oid == OID_SHA1_WITH_RSA).then(|| {
+        format!(
+            "certificate \"{}\" is signed with SHA-1",
+            child.tbs_certificate.subject
+        )
+    })
+}
+
 /// Walks the embedded certificate set from `leaf` toward a trust anchor,
 /// enforcing leaf and issuer purpose constraints, then verifying each
 /// certificate's signature with its issuer's public key and validity window.
@@ -1079,6 +1092,9 @@ fn verify_chain(
                         warnings,
                     };
                 }
+                if let Some(w) = sha1_warning(current) {
+                    warnings.push(w);
+                }
                 if !verify_cert_signature(current, p) {
                     return ChainOutcome {
                         ok: false,
@@ -1096,6 +1112,9 @@ fn verify_chain(
             }
             _ => {
                 if self_signed {
+                    if let Some(w) = sha1_warning(current) {
+                        warnings.push(w);
+                    }
                     if !verify_cert_signature(current, current) {
                         return ChainOutcome {
                             ok: false,
@@ -1134,6 +1153,9 @@ fn verify_chain(
                 // Chain runs out: try the trust anchors for the missing issuer before failing.
                 let missing = current.tbs_certificate.issuer.clone();
                 if let Some(anchor) = anchors.find_by_subject(&missing) {
+                    if let Some(w) = sha1_warning(current) {
+                        warnings.push(w);
+                    }
                     if verify_cert_signature(current, anchor) {
                         names.push(anchor.tbs_certificate.subject.to_string());
                         return ChainOutcome {
@@ -1652,6 +1674,11 @@ mod tests {
             outcome.reason
         );
         assert!(outcome.anchored);
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("SHA-1")),
+            "SHA-1 chain must warn: {:?}",
+            outcome.warnings
+        );
     }
 
     #[test]
@@ -1783,6 +1810,11 @@ mod tests {
         let outcome = chain_with(&root, &leaf);
         assert!(outcome.ok, "{:?}", outcome.reason);
         assert!(outcome.anchored);
+        assert!(
+            outcome.warnings.is_empty(),
+            "SHA-256 chain must not warn: {:?}",
+            outcome.warnings
+        );
     }
 
     #[test]
