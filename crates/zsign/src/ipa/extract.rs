@@ -32,6 +32,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use zip::ZipArchive;
 
@@ -43,6 +44,54 @@ struct ExtractEntry {
     is_symlink: bool,
     #[cfg(unix)]
     unix_mode: Option<u32>,
+}
+
+/// Wraps the extraction output and enforces byte budgets before any data
+/// reaches the underlying writer.
+///
+/// Every buffer is checked against the entry cap and reserved from the
+/// shared total first, so parallel workers cannot overshoot either cap: what
+/// reaches disk stays within budget.
+struct BudgetedWriter<'a, W> {
+    inner: W,
+    relative: &'a Path,
+    entry_written: u64,
+    max_entry_bytes: u64,
+    total: &'a AtomicU64,
+    max_total_bytes: u64,
+}
+
+impl<W: io::Write> io::Write for BudgetedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len() as u64;
+        if self.entry_written + n > self.max_entry_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                    self.relative.display(),
+                    self.max_entry_bytes
+                ),
+            ));
+        }
+        let total = self.total.fetch_add(n, Ordering::Relaxed) + n;
+        if total > self.max_total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                    self.max_total_bytes
+                ),
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.entry_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Validates that a symlink target is safe (not absolute, no `..` traversal).
@@ -59,8 +108,8 @@ fn is_safe_symlink_target(target: &str) -> bool {
 /// Both separator spellings are checked because the zip reader
 /// componentizes names with Windows-path semantics (`Utf8WindowsPath`):
 /// `C:/evil` and `\evil` would otherwise be silently relocated inside the
-/// destination instead of rejected. Empty and dot-only names (``, `.`,
-/// `./`) are rejected too: zip encloses them as an empty path that resolves
+/// destination instead of rejected. Empty and dot-only names (the empty string,
+/// `.`, and `./`) are rejected too: zip encloses them as an empty path that resolves
 /// to the destination directory itself.
 fn is_unsafe_entry_name(name: &str) -> bool {
     if name.starts_with('/') || name.starts_with('\\') {
@@ -121,6 +170,26 @@ fn validate_output_path(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Byte budgets enforced while writing extracted archive contents.
+///
+/// Defaults (used by [`extract_ipa`]): 2 GiB per entry, 8 GiB total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractionLimits {
+    /// Maximum uncompressed size of a single archive entry, in bytes.
+    pub max_entry_bytes: u64,
+    /// Maximum total uncompressed size across all entries, in bytes.
+    pub max_total_bytes: u64,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        ExtractionLimits {
+            max_entry_bytes: 2 * 1024 * 1024 * 1024,
+            max_total_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Extracts an IPA file to a destination directory.
 ///
 /// IPA files are ZIP archives containing a `Payload/` directory with the `.app` bundle.
@@ -153,11 +222,47 @@ fn validate_output_path(root: &Path, path: &Path) -> Result<()> {
 /// - The IPA file cannot be opened or read
 /// - Extraction fails due to I/O errors
 /// - Returns [`Error::Io`] if an archive entry name is unsafe (traversal or absolute)
+/// - Returns [`Error::Io`] if an archive entry or the archive total exceeds the default extraction limits (2 GiB per entry, 8 GiB total)
 ///
 /// Returns [`Error::Zip`] if:
 /// - The IPA is not a valid ZIP archive
 /// - No `.app` bundle is found in `Payload/`
 pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
+    extract_ipa_with_limits(ipa_path, dest_dir, ExtractionLimits::default())
+}
+
+/// Extracts an IPA file with explicit extraction byte budgets.
+///
+/// Same as [`extract_ipa`], but the caller chooses the zip-bomb limits.
+/// Extraction fails with [`Error::Io`] (`InvalidData`) as soon as an entry
+/// or the archive total exceeds its budget — the check runs before each
+/// buffer is written, so no unbudgeted bytes reach disk.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign_rs::ipa::extract::{extract_ipa_with_limits, ExtractionLimits};
+///
+/// let limits = ExtractionLimits {
+///     max_entry_bytes: 512 * 1024 * 1024,
+///     max_total_bytes: 2 * 1024 * 1024 * 1024,
+/// };
+/// let app_bundle = extract_ipa_with_limits("MyApp.ipa", "extracted", limits)?;
+/// println!("Extracted to: {}", app_bundle.display());
+/// # Ok::<(), zsign_rs::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the IPA is missing, an entry name is unsafe, a
+/// path is a pre-existing symlink, or an extraction byte budget is exceeded.
+/// Returns [`Error::Zip`] if the file is not a valid ZIP archive or no
+/// `.app` bundle is found in `Payload/`.
+pub fn extract_ipa_with_limits(
+    ipa_path: impl AsRef<Path>,
+    dest_dir: impl AsRef<Path>,
+    limits: ExtractionLimits,
+) -> Result<PathBuf> {
     let ipa_path = ipa_path.as_ref();
     let dest_dir = dest_dir.as_ref();
 
@@ -272,6 +377,7 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
 
     // Phase 1: Parallel extraction of regular files
     let dest_dir_ref = dest_dir;
+    let total_written = AtomicU64::new(0);
     let chunk_size = (regular_entries.len() / rayon::current_num_threads()).max(1);
     regular_entries
         .par_chunks(chunk_size)
@@ -283,8 +389,19 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
                 let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
                 validate_output_path(dest_dir_ref, &entry.outpath)?;
                 let outfile = File::create(&entry.outpath)?;
-                let mut outfile = BufWriter::new(outfile);
-                io::copy(&mut file, &mut outfile)?;
+                let relative = entry
+                    .outpath
+                    .strip_prefix(dest_dir_ref)
+                    .unwrap_or(&entry.outpath);
+                let mut budgeted = BudgetedWriter {
+                    inner: BufWriter::new(outfile),
+                    relative,
+                    entry_written: 0,
+                    max_entry_bytes: limits.max_entry_bytes,
+                    total: &total_written,
+                    max_total_bytes: limits.max_total_bytes,
+                };
+                io::copy(&mut file, &mut budgeted)?;
 
                 #[cfg(unix)]
                 {
@@ -308,6 +425,34 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
             let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
             let mut target = String::new();
             file.read_to_string(&mut target)?;
+
+            // Symlink targets count toward both budgets, reserved before
+            // the link is created.
+            if target.len() as u64 > limits.max_entry_bytes {
+                let relative = entry
+                    .outpath
+                    .strip_prefix(dest_dir)
+                    .unwrap_or(&entry.outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                        relative.display(),
+                        limits.max_entry_bytes
+                    ),
+                )));
+            }
+            let target_bytes = target.len() as u64;
+            let total = total_written.fetch_add(target_bytes, Ordering::Relaxed) + target_bytes;
+            if total > limits.max_total_bytes {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                        limits.max_total_bytes
+                    ),
+                )));
+            }
 
             if !is_safe_symlink_target(&target) {
                 return Err(Error::Io(io::Error::new(
@@ -515,6 +660,104 @@ mod tests {
         // Backslash traversal that Windows-path componentization pops
         // instead of rejecting.
         assert_rejects_hostile_entry("Payload\\sub\\..\\evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_oversized_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("entry_bomb.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(&vec![b'A'; 2048]).unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 100,
+            max_total_bytes: 100_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("oversized entry must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Payload/Test.app/Info.plist"),
+            "error must name the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_oversized_total() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("total_bomb.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(&vec![b'A'; 600]).unwrap();
+        zip.start_file("Payload/Test.app/Test", options).unwrap();
+        zip.write_all(&vec![b'B'; 600]).unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 1_000,
+            max_total_bytes: 1_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("total size over budget must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("total"), "error must mention the total: {msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_total_overflow_from_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("symlink_budget.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link1", "a".repeat(4090), options)
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link2", "a".repeat(4090), options)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 1_000_000,
+            max_total_bytes: 5_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("symlink bytes over the total budget must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("total"), "error must mention the total: {msg}");
     }
 
     #[test]
