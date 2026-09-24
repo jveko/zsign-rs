@@ -15,9 +15,11 @@
 //!    Attribute is the signed message, not a re-encoded copy).
 //! 4. **Signer binding**: the signerInfo issuer+serial must identify a
 //!    certificate in the embedded set, and the chain must be structurally
-//!    valid (each certificate signed by its issuer, validity windows, leaf
-//!    code-signing EKU when present).
-//! 5. **Trust anchoring**: the chain must terminate at a certificate in the
+//!    valid (each certificate signed by its issuer and within its validity
+//!    window).
+//! 5. **X.509 purpose enforcement**: the leaf must carry codeSigning EKU and
+//!    end-entity constraints; each climbed issuer must satisfy CA constraints.
+//! 6. **Trust anchoring**: the chain must terminate at a certificate in the
 //!    explicit trust-anchor set ([`TrustAnchors::apple_root`] by default).
 //!
 //! This module proves integrity, Apple-attribute binding, chain structure, and
@@ -75,6 +77,10 @@ const OID_SHA512_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.
 const OID_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 /// id-ecPublicKey: `1.2.840.10045.2.1`
 const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+/// keyUsage extension: `2.5.29.15`
+const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+/// basicConstraints extension: `2.5.29.19`
+const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
 /// extended key usage extension: `2.5.29.37`
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`
@@ -908,8 +914,8 @@ struct ChainOutcome {
 }
 
 /// Walks the embedded certificate set from `leaf` toward a trust anchor,
-/// verifying each certificate's signature with its issuer's public key and
-/// its validity window.
+/// enforcing leaf and issuer purpose constraints, then verifying each
+/// certificate's signature with its issuer's public key and validity window.
 fn verify_chain(
     certs: &[x509_cert::Certificate],
     leaf: &x509_cert::Certificate,
@@ -918,19 +924,17 @@ fn verify_chain(
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
+    let mut chain = vec![leaf];
     let now = time_now();
 
-    // Leaf code-signing EKU check (only when an EKU extension is present).
-    if let Some(eku) = leaf_eku(leaf) {
-        if !eku.contains(&OID_CODE_SIGNING) {
-            return ChainOutcome {
-                ok: false,
-                anchored: false,
-                subjects: names,
-                reason: Some(format!("leaf EKU lacks codeSigning: {eku:?}")),
-                warnings,
-            };
-        }
+    if let Some(reason) = leaf_purpose_reason(leaf) {
+        return ChainOutcome {
+            ok: false,
+            anchored: false,
+            subjects: names,
+            reason: Some(reason),
+            warnings,
+        };
     }
     if !in_validity(leaf, now) {
         let v = &leaf.tbs_certificate.validity;
@@ -971,6 +975,15 @@ fn verify_chain(
                         warnings,
                     };
                 }
+                if let Some(reason) = issuer_ca_reason(p, chain.len().saturating_sub(1)) {
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(reason),
+                        warnings,
+                    };
+                }
                 if !verify_cert_signature(current, p) {
                     return ChainOutcome {
                         ok: false,
@@ -983,6 +996,7 @@ fn verify_chain(
                     };
                 }
                 names.push(p.tbs_certificate.subject.to_string());
+                chain.push(p);
                 current = p;
                 continue;
             }
@@ -1125,32 +1139,75 @@ fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Cer
         false
     }
 }
-
-/// Returns the leaf's extended key usage OIDs, if the extension is present.
-fn leaf_eku(cert: &x509_cert::Certificate) -> Option<Vec<ObjectIdentifier>> {
+/// The DER value of extension `id`, or `None` when the extension is absent.
+fn ext_value<'a>(cert: &'a x509_cert::Certificate, id: ObjectIdentifier) -> Option<&'a [u8]> {
     let exts = cert.tbs_certificate.extensions.as_ref()?;
-    for ext in exts {
-        if ext.extn_id == OID_EXT_KEY_USAGE {
-            let mut r = reader(ext.extn_value.as_bytes(), "malformed EKU").ok()?;
-            // EKU is itself a SEQUENCE in the extension value.
-            let seq = AnyRef::decode(&mut r).ok()?;
-            if seq.tag() != Tag::Sequence {
-                return None;
-            }
-            let mut sr = reader(seq.value(), "malformed EKU body").ok()?;
-            let mut oids = Vec::new();
-            while !sr.is_finished() {
-                if let Ok(oid) = ObjectIdentifier::decode(&mut sr) {
-                    oids.push(oid);
-                } else {
-                    break;
-                }
-            }
-            return Some(oids);
+    exts.iter()
+        .find(|e| e.extn_id == id)
+        .map(|e| e.extn_value.as_bytes())
+}
+
+/// End-entity purpose constraints; applied unconditionally to the leaf.
+fn leaf_purpose_reason(leaf: &x509_cert::Certificate) -> Option<String> {
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+    let Some(eku_bytes) = ext_value(leaf, OID_EXT_KEY_USAGE) else {
+        return Some("leaf lacks codeSigning EKU extension".into());
+    };
+    let Ok(eku) = ExtendedKeyUsage::from_der(eku_bytes) else {
+        return Some("leaf EKU extension is malformed".into());
+    };
+    if !eku.0.contains(&OID_CODE_SIGNING) {
+        return Some(format!("leaf EKU lacks codeSigning: {:?}", eku.0));
+    }
+    if let Some(ku_bytes) = ext_value(leaf, OID_KEY_USAGE) {
+        let Ok(ku) = KeyUsage::from_der(ku_bytes) else {
+            return Some("leaf keyUsage extension is malformed".into());
+        };
+        if !ku.digital_signature() {
+            return Some("leaf keyUsage lacks digitalSignature".into());
+        }
+    }
+    if let Some(bc_bytes) = ext_value(leaf, OID_BASIC_CONSTRAINTS) {
+        let Ok(bc) = BasicConstraints::from_der(bc_bytes) else {
+            return Some("leaf basicConstraints extension is malformed".into());
+        };
+        if bc.ca {
+            return Some("leaf basicConstraints asserts CA".into());
         }
     }
     None
 }
+
+/// CA constraints for a certificate used to issue another.
+fn issuer_ca_reason(issuer: &x509_cert::Certificate, cas_below: usize) -> Option<String> {
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
+    let Some(bc_bytes) = ext_value(issuer, OID_BASIC_CONSTRAINTS) else {
+        return Some("issuer lacks basicConstraints extension".into());
+    };
+    let Ok(bc) = BasicConstraints::from_der(bc_bytes) else {
+        return Some("issuer basicConstraints extension is malformed".into());
+    };
+    if !bc.ca {
+        return Some("issuer basicConstraints is not CA".into());
+    }
+    if let Some(path_len) = bc.path_len_constraint {
+        if cas_below > path_len as usize {
+            return Some(format!(
+                "issuer pathLen constraint violated ({cas_below} CA certificates below, pathLen {path_len})"
+            ));
+        }
+    }
+    if let Some(ku_bytes) = ext_value(issuer, OID_KEY_USAGE) {
+        let Ok(ku) = KeyUsage::from_der(ku_bytes) else {
+            return Some("issuer keyUsage extension is malformed".into());
+        };
+        if !ku.key_cert_sign() {
+            return Some("issuer keyUsage lacks keyCertSign".into());
+        }
+    }
+    None
+}
+
 fn in_validity(cert: &x509_cert::Certificate, now: time::OffsetDateTime) -> bool {
     let v = &cert.tbs_certificate.validity;
     let nb = v.not_before.to_date_time().unix_duration().as_secs() as i64;
@@ -1188,7 +1245,7 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
     use x509_cert::name::Name;
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::time::Validity;
@@ -1202,17 +1259,23 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_der = key.to_public_key().to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &signing_key,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
         (
             SigningCredentials {
                 certificate: cert,
@@ -1446,7 +1509,7 @@ mod tests {
         let leaf_validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let leaf_pub_der = leaf_key.to_public_key().to_public_key_der().unwrap();
         let leaf_pub = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_ref()).unwrap();
-        let leaf = CertificateBuilder::new(
+        let mut leaf_builder = CertificateBuilder::new(
             // End-entity signed by the SHA-1 root.
             Profile::Leaf {
                 issuer: root_subject.clone(),
@@ -1459,9 +1522,11 @@ mod tests {
             leaf_pub,
             &root_signing,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        leaf_builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let leaf = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
         let outcome = verify_chain(
             &[root.clone(), leaf.clone()],
@@ -1513,6 +1578,116 @@ mod tests {
         .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
         (key, cert, signing_key)
+    }
+
+    fn chain_with(root: &x509_cert::Certificate, leaf: &x509_cert::Certificate) -> ChainOutcome {
+        verify_chain(
+            &[root.clone(), leaf.clone()],
+            leaf,
+            &TrustAnchors::from_certificates(vec![root.clone()]),
+        )
+    }
+
+    /// Builds `Profile::Leaf` signed by `root_signing`, optionally adding EKU.
+    fn build_leaf(
+        cn: &str,
+        issuer: &x509_cert::name::Name,
+        root_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+        eku: Option<x509_cert::ext::pkix::ExtendedKeyUsage>,
+    ) -> (rsa::RsaPrivateKey, x509_cert::Certificate) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: issuer.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(3u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str(cn).unwrap(),
+            pub_key,
+            root_signing,
+        )
+        .unwrap();
+        if let Some(eku) = &eku {
+            b.add_extension(eku).unwrap();
+        }
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (key, cert)
+    }
+
+    #[test]
+    fn leaf_without_eku_fails_purpose() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign purpose root");
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign no eku leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            None,
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf lacks codeSigning EKU"));
+    }
+
+    #[test]
+    fn leaf_wrong_purpose_eku_fails() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign purpose root");
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign tls leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap(
+                "1.3.6.1.5.5.7.3.1", // serverAuth — a purpose that is not codeSigning
+            )])),
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf EKU lacks codeSigning"));
+    }
+
+    #[test]
+    fn leaf_with_code_signing_eku_chains() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign purpose root");
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign good leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(outcome.ok, "{:?}", outcome.reason);
+        assert!(outcome.anchored);
+    }
+
+    #[test]
+    fn self_signed_leaf_still_needs_code_signing_eku() {
+        // D5 has no self-signed carve-out: a self-signed signer is still the leaf
+        // of its own chain and must pass the leaf purpose rules.
+        let (_k, self_signed, _s) = build_rsa_root("CN=zsign bare self-signed");
+        let outcome = verify_chain(
+            &[self_signed.clone()],
+            &self_signed,
+            &TrustAnchors::from_certificates(vec![self_signed.clone()]),
+        );
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf lacks codeSigning EKU"));
     }
 
     #[test]
@@ -1621,5 +1796,242 @@ mod tests {
             report.chain_reason
         );
         assert!(!report.anchored);
+    }
+    /// Self-issued `Profile::SubCA` acting as the chain root (subject == issuer).
+    fn build_subca(
+        cn: &str,
+        path_len: Option<u8>,
+    ) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str(cn).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: subject.clone(),
+                path_len_constraint: path_len,
+            },
+            SerialNumber::from(11u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+        (cert, signing_key)
+    }
+
+    /// `Profile::SubCA` issued by `issuer`, no pathLen constraint.
+    fn build_subca_issued_by(
+        cn: &str,
+        issuer: &x509_cert::name::Name,
+        issuer_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+    ) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: issuer.clone(),
+                path_len_constraint: None,
+            },
+            SerialNumber::from(12u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str(cn).unwrap(),
+            pub_key,
+            issuer_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+        (cert, signing_key)
+    }
+
+    /// Replaces (or appends) extension `id` on `cert` with `value`'s DER.
+    ///
+    /// Mutation invalidates the mutated certificate's own signature; every
+    /// fixture below only exercises checks that run before any verification of
+    /// that certificate's signature (leaf purpose checks first, issuer CA checks
+    /// before the child-signature check).
+    fn replace_extension(
+        cert: &mut x509_cert::Certificate,
+        id: ObjectIdentifier,
+        value: &impl der::Encode,
+    ) {
+        let bytes = value.to_der().unwrap();
+        // x509_cert::ext::Extensions is a plain Vec<Extension>.
+        let exts = cert.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+        exts.retain(|e| e.extn_id != id);
+        exts.push(x509_cert::ext::Extension {
+            extn_id: id,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(bytes).unwrap(),
+        });
+    }
+
+    #[test]
+    fn issuer_without_ca_bit_fails() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign seed root");
+        // A Profile::Leaf certificate carries basicConstraints CA=false; using it
+        // to issue another certificate must be rejected before any signature check.
+        let (issuer_key, issuer_like) = build_leaf(
+            "CN=zsign not a ca",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            None,
+        );
+        let issuer_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(issuer_key);
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign child leaf",
+            &issuer_like.tbs_certificate.subject,
+            &issuer_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let outcome = verify_chain(
+            &[issuer_like.clone(), leaf.clone()],
+            &leaf,
+            &TrustAnchors::from_certificates(vec![issuer_like.clone()]),
+        );
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issuer basicConstraints"));
+    }
+
+    #[test]
+    fn issuer_key_usage_without_key_cert_sign_fails() {
+        let (_k, mut root, root_signing) = build_rsa_root("CN=zsign ku issuer root");
+        // Root profile KU is keyCertSign|cRLSign; flip it to digitalSignature only.
+        replace_extension(
+            &mut root,
+            OID_KEY_USAGE,
+            &KeyUsage(KeyUsages::DigitalSignature.into()),
+        );
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign ku issuer leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("keyUsage lacks keyCertSign"));
+    }
+
+    #[test]
+    fn parent_path_len_violation_fails() {
+        // subca: self-issued Profile::SubCA with pathLen 0, one CA (int) below it.
+        let (subca, subca_signing) = build_subca("CN=zsign pathlen subca", Some(0));
+        let (int, int_signing) = build_subca_issued_by(
+            "CN=zsign pathlen int",
+            &subca.tbs_certificate.subject,
+            &subca_signing,
+        );
+        let (_lk, leaf) = build_leaf(
+            "CN=zsign pathlen leaf",
+            &int.tbs_certificate.subject,
+            &int_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let outcome = verify_chain(
+            &[leaf.clone(), int.clone(), subca.clone()],
+            &leaf,
+            &TrustAnchors::from_certificates(vec![subca.clone()]),
+        );
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pathLen"));
+    }
+
+    #[test]
+    fn leaf_without_digital_signature_fails() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign weak ku root");
+        let (_lk, mut leaf) = build_leaf(
+            "CN=zsign weak ku leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        replace_extension(
+            &mut leaf,
+            OID_KEY_USAGE,
+            &KeyUsage(KeyUsages::KeyCertSign.into()),
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf keyUsage lacks digitalSignature"));
+    }
+
+    #[test]
+    fn leaf_asserting_ca_fails() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign bc root");
+        let (_lk, mut leaf) = build_leaf(
+            "CN=zsign ca leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        replace_extension(
+            &mut leaf,
+            OID_BASIC_CONSTRAINTS,
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            },
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf basicConstraints asserts CA"));
+    }
+
+    #[test]
+    fn malformed_leaf_eku_fails() {
+        let (_k, root, root_signing) = build_rsa_root("CN=zsign bad eku root");
+        let (_lk, mut leaf) = build_leaf(
+            "CN=zsign bad eku leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        // `replace_extension` stores the argument's DER inside `extn_value`, so
+        // the extension value becomes the OCTET STRING TLV `04 02 05 00` — not a
+        // DER SEQUENCE of OIDs, hence a malformed EKU.
+        replace_extension(
+            &mut leaf,
+            OID_EXT_KEY_USAGE,
+            &der::asn1::OctetString::new(b"\x05\x00").unwrap(),
+        );
+        let outcome = chain_with(&root, &leaf);
+        assert!(!outcome.ok);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("leaf EKU extension is malformed"));
     }
 }
