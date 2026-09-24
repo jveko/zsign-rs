@@ -96,10 +96,12 @@ lines and were re-anchored.
 ### Item 1 — fail closed on unsafe entry names
 - **A (chosen):** In the collect pass, reject any raw entry name that is
   absolute in either spelling — starts with `/` or `\`, or carries an
-  alphabetic `X:` drive prefix — or whose `/`- **and** `\`-separated segments
-  contain `..`; additionally turn the `None` arm into `Err` naming the entry.
-  Both checks use the raw `file.name()` and run before any directory or file
-  is written. The dual spelling matters: the reader componentizes names with
+  alphabetic `X:` drive prefix — whose `/`- **and** `\`-separated segments
+  contain `..`, or that has no substantive component at all (``, `.`, `./`;
+  zip encloses these as an empty path resolving to the destination itself).
+  Additionally the `enclosed_name()` arm errors on `None` **and** on an
+  empty enclosed path, naming the raw entry. Both checks use the raw
+  `file.name()` and run before any directory or file is written. The dual spelling matters: the reader componentizes names with
   Windows-path semantics (`Utf8WindowsPath`), so `C:/evil` and `\evil` would
   otherwise be silently relocated inside the dest instead of rejected.
 - **B:** Rely on `enclosed_name() == None` alone. Rejected: does not catch
@@ -140,8 +142,9 @@ lines and were re-anchored.
   read.
 
 ### Item 3 — bound the symlink-target read
-- **A (chosen):** `const MAX_SYMLINK_TARGET_BYTES: usize = 4096` (Linux
-  `PATH_MAX`; longer targets can never be `symlink()`ed anyway). Read via
+- **A (chosen):** A `#[cfg(unix)]` const `MAX_SYMLINK_TARGET_BYTES: usize
+  = 4096` (Linux `PATH_MAX`; longer targets can never be `symlink()`ed
+  anyway). Read via
   `file.take(MAX + 1).read_to_string(&mut target)`, then reject
   `target.len() > MAX` **before** the budget accounting and
   `is_safe_symlink_target`. Peak memory bounded at ~4097 bytes.
@@ -173,8 +176,9 @@ lines and were re-anchored.
     `Payload/a` → `Payload/a/b/c` **and** `Payload/a/b/c` → `Payload/a`
     fail identically, both naming `Payload/a`;
   - dir entry whose path is in `file_paths` → conflict;
-  - any ancestor of the current entry (walk up to, excluding, `dest_dir`)
-    already in `file_paths` → conflict naming that ancestor.
+  - any ancestor of the current entry (walk bounded by
+    `starts_with(dest_dir)` — it stops at `dest_dir` and never proceeds
+    above it) already in `file_paths` → conflict naming that ancestor.
   Because every entry claims its full ancestor chain when seen, detection is
   order-independent: whichever of the two contradictory entries comes second
   finds the claim. The dir branch adds claims but no new rejection: a dir
@@ -307,14 +311,14 @@ Twelve new tests across tasks 1-5.
 |---|---|---|
 | `test_extract_ipa_rejects_parent_traversal_entry` | `start_file("../evil")` inside an otherwise-valid IPA | pre-fix: skipped silently, extraction *succeeds* → test fails |
 | `test_extract_ipa_rejects_nested_traversal_entry` | `start_file("Payload/../../evil")` plus the accepted `start_file("Payload/../evil")` spelling | pre-fix: first → `None` skipped, second → silently normalized to `evil`; extraction succeeds → fails |
-| `test_extract_ipa_rejects_absolute_entry_name` | `start_file("/abs/evil")` | pre-fix: relocated to `<dest>/abs/evil`, succeeds → fails |
+| `test_extract_ipa_rejects_absolute_entry_name` | `start_file("/abs/evil")`, component-less `""`/`"."`/`"./"`, and a NUL name `Payload/\0evil` (the only form reaching the non-`Some` enclosure arm) | pre-fix: `/abs…` relocated, empty/dot resolve to `dest_dir` (unpinned dir error), NUL skipped silently — extraction succeeds or errs unpinned → fails |
 | `test_extract_ipa_rejects_windows_style_absolute_entry_name` | `start_file("C:/abs/evil")`, `start_file("\\abs\\evil")`, and backslash traversal `start_file("Payload\\sub\\..\\evil")` | pre-fix: prefix/root ignored or `..` popped, relocated inside dest, succeeds → fails |
 | `test_extract_ipa_rejects_oversized_entry` | 2048-byte entry, `ExtractionLimits { max_entry_bytes: 100, ... }` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_oversized_total` | two 600-byte entries, `max_total_bytes: 1000` | pre-fix: no limits API → red at compile |
-| `test_extract_ipa_rejects_total_overflow_from_symlinks` | small file + two 4090-byte symlink targets, `max_total_bytes: 5000` | pre-fix: no limits API → red at compile |
+| `test_extract_ipa_rejects_total_overflow_from_symlinks` (unix) | small file + two 4090-byte symlink targets, `max_total_bytes: 5000` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_strips_setuid_bit` (unix) | CDE-patched `0o104755` mode on `Info.plist`; assert on-disk `mode & 0o7777 == 0o755` | pre-fix: on-disk `0o4755` → fails |
 | `test_extract_ipa_rejects_duplicate_normalized_paths` | `Payload/Test.app/Info.plist` + `./Payload/Test.app/Info.plist` | pre-fix: last-write-wins, succeeds → fails |
-| `test_extract_ipa_rejects_type_conflicting_entries` | `add_directory("Payload/D")` + `start_file("Payload/D")` | pre-fix: raw OS error at write, message unpinned → fails message assert |
+| `test_extract_ipa_rejects_type_conflicting_entries` | one helper, four orderings: dir→file and file→dir at `Payload/D`, then file→dir-under-file and dir→file-ancestor at `Payload/a`; asserts pinned message **and** `!Payload` written | pre-fix: dir pass runs, `File::create` → `Is a directory (os error 21)`, unpinned → fails message assert |
 | `test_extract_ipa_rejects_descendant_of_file_entry` | both archive orders in one test fn: file `Payload/a` → file `Payload/a/b/c`, and `Payload/a/b/c` → `Payload/a` | pre-fix: dir pass creates `Payload/a`, then `File::create(Payload/a)` → `Is a directory (os error 21)`, unpinned → fails message assert |
 | `test_extract_ipa_rejects_long_symlink_target` (unix) | `add_symlink` with a 5000-char safe target | pre-fix: fails later at `symlink()` with `File name too long`; message assert on `Symlink target too long in IPA` → fails |
 
@@ -337,10 +341,10 @@ cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic
 
 1. Skipped-entry silent skip → hard error (fail-closed over partial
    extraction). — item 1
-2. Raw-name check **and** `None => Err`: `enclosed_name` alone cannot see
-   absolute names; `None` alone misses them; the raw check is Windows-form
-   aware (both separators, drive/UNC prefixes) to match the reader's
-   componentization. — item 1
+2. Raw-name check **and** non-`Some`/empty enclosure → `Err`:
+   `enclosed_name` alone cannot see absolute names or component-less names;
+   the raw check is Windows-form aware (both separators, drive/UNC prefixes)
+   and rejects names with no substantive segment (``, `.`, `./`). — item 1
 3. Write-time byte counting over declared-size prechecks; no redundant
    preflight. — item 2
 4. Sibling `extract_ipa_with_limits` + `Copy` struct over changing

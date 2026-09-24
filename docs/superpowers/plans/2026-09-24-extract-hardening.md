@@ -30,6 +30,11 @@ Known pre-existing failure `test_ipa_signing_is_deterministic` (ZSN-15) is
 skipped by that command; everything else must stay green. Do NOT run
 `cargo fmt` / `cargo clippy` / `hk` — the orchestrator runs those at merge.
 
+**Anchors:** every `extract.rs:N` reference below is the base `ee42c12`
+line. Tasks 1-4 add lines above the collect pass, so later tasks' numbers
+drift — locate statements by their code text, not the number. Counts
+(16/19/20/21/24) assume the Unix target.
+
 **Design reference:** `docs/superpowers/specs/2026-09-24-extract-hardening-design.md`
 (error messages, invariants, rejected alternatives are fixed there; this plan
 must not contradict it).
@@ -100,6 +105,14 @@ must not contradict it).
     #[test]
     fn test_extract_ipa_rejects_absolute_entry_name() {
         assert_rejects_hostile_entry("/abs/evil");
+        // Names with no real component: zip encloses these as an empty path
+        // resolving to the destination itself.
+        assert_rejects_hostile_entry("");
+        assert_rejects_hostile_entry(".");
+        assert_rejects_hostile_entry("./");
+        // A NUL name is the one form that reaches the `enclosed_name()`
+        // non-`Some` arm (the raw check passes) — this pins that arm.
+        assert_rejects_hostile_entry("Payload/\0evil");
     }
 
     #[test]
@@ -123,12 +136,15 @@ or relocated, so extraction *succeeds*); all pre-existing tests PASS.
 Add the helper after `is_safe_symlink_target` (:49-54):
 
 ```rust
-/// Returns true if an archive entry name is absolute or uses `..` traversal.
+/// Returns true if an archive entry name is absolute, uses `..` traversal,
+/// or has no substantive component.
 ///
 /// Both separator spellings are checked because the zip reader
 /// componentizes names with Windows-path semantics (`Utf8WindowsPath`):
 /// `C:/evil` and `\evil` would otherwise be silently relocated inside the
-/// destination instead of rejected.
+/// destination instead of rejected. Empty and dot-only names (``, `.`,
+/// `./`) are rejected too: zip encloses them as an empty path that resolves
+/// to the destination directory itself.
 fn is_unsafe_entry_name(name: &str) -> bool {
     if name.starts_with('/') || name.starts_with('\\') {
         return true;
@@ -137,7 +153,16 @@ fn is_unsafe_entry_name(name: &str) -> bool {
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
-    name.split(['/', '\\']).any(|segment| segment == "..")
+    let mut substantive = false;
+    for segment in name.split(['/', '\\']) {
+        if segment == ".." {
+            return true;
+        }
+        if !segment.is_empty() && segment != "." {
+            substantive = true;
+        }
+    }
+    !substantive
 }
 ```
 
@@ -153,8 +178,8 @@ In the collect pass, replace the `enclosed_name` match (:173-176) with:
         }
 
         let outpath = match file.enclosed_name() {
-            Some(path) => dest_dir.join(path),
-            None => {
+            Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
+            _ => {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Unsafe entry name in IPA: {}", name),
@@ -252,6 +277,7 @@ or relocated; gate green. **Controller commits:**
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_extract_ipa_rejects_total_overflow_from_symlinks() {
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = temp_dir.path().join("symlink_budget.ipa");
@@ -564,7 +590,8 @@ Add near `is_safe_symlink_target`:
 ///
 /// Matches Linux `PATH_MAX`: longer targets can never be created by
 /// `symlink(2)`, and bounding the read keeps a hostile entry from buffering
-/// gigabytes before validation.
+/// gigabytes before validation. Unix-only, like the symlink pass that uses it.
+#[cfg(unix)]
 const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 ```
 
@@ -795,34 +822,61 @@ archive entry. **Controller commits:**
         );
     }
 
-    #[test]
-    fn test_extract_ipa_rejects_type_conflicting_entries() {
+    /// Build an IPA from `build`, extract it, and assert a collect-pass
+    /// type conflict naming `expected` with no payload content written.
+    fn assert_type_conflict(expected: &str, build: impl FnOnce(&mut ZipWriter<File>, SimpleFileOptions)) {
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = temp_dir.path().join("conflict.ipa");
         let file = File::create(&ipa_path).unwrap();
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default();
         zip.add_directory("Payload/", options).unwrap();
-        zip.add_directory("Payload/Test.app/", options).unwrap();
-        // Same normalized path as a directory, then again as a file.
-        zip.add_directory("Payload/D", options).unwrap();
-        zip.start_file("Payload/Test.app/Info.plist", options)
-            .unwrap();
-        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
-            .unwrap();
-        zip.start_file("Payload/D", options).unwrap();
-        zip.write_all(b"file where a directory is").unwrap();
+        build(&mut zip, options);
         zip.finish().unwrap();
 
         let extract_dir = temp_dir.path().join("extracted");
         let err = extract_ipa(&ipa_path, &extract_dir)
-            .expect_err("file-vs-directory conflict must be rejected");
+            .expect_err("type conflict must be rejected in the collect pass");
         let msg = err.to_string();
         assert!(
             msg.contains("Conflicting entry path in IPA"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("Payload/D"), "error must name the path: {msg}");
+        assert!(msg.contains(expected), "error must name {expected}: {msg}");
+        assert!(
+            !extract_dir.join("Payload").exists(),
+            "collect-pass rejection must write no payload content"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_type_conflicting_entries() {
+        // Same path, directory entry first.
+        assert_type_conflict("Payload/D", |zip, options| {
+            zip.add_directory("Payload/D", options).unwrap();
+            zip.start_file("Payload/D", options).unwrap();
+            zip.write_all(b"file where a directory is").unwrap();
+        });
+        // Same path, file entry first — the dir branch's same-path check.
+        assert_type_conflict("Payload/D", |zip, options| {
+            zip.start_file("Payload/D", options).unwrap();
+            zip.write_all(b"file where a directory will be").unwrap();
+            zip.add_directory("Payload/D", options).unwrap();
+        });
+        // Directory entry under an already-registered file — the dir
+        // branch's ancestor walk.
+        assert_type_conflict("Payload/a", |zip, options| {
+            zip.start_file("Payload/a", options).unwrap();
+            zip.write_all(b"i am a file").unwrap();
+            zip.add_directory("Payload/a/b", options).unwrap();
+        });
+        // File entry after a directory chain claimed its path — the
+        // ancestor claim registered by the dir branch.
+        assert_type_conflict("Payload/a", |zip, options| {
+            zip.add_directory("Payload/a/b", options).unwrap();
+            zip.start_file("Payload/a", options).unwrap();
+            zip.write_all(b"i am a file").unwrap();
+        });
     }
 
     #[test]
@@ -883,7 +937,7 @@ Expected: all three new tests FAIL. Duplicate: pre-fix last write wins and
 extraction *succeeds*. Type conflict: pre-fix the directory pass creates
 `Payload/D` as a directory, then `File::create(Payload/D)` fails with
 `IO error: Is a directory (os error 21)`. Descendant: pre-fix the
-directory pass (`extract.rs:215-218`) creates `Payload/a` as a directory
+directory pass (`extract.rs:217-220`) creates `Payload/a` as a directory
 before any archive file exists, then phase 1 fails at
 `File::create(Payload/a)` with `IO error: Is a directory (os error 21)` —
 in both archive orders. None match the pinned messages.
@@ -897,7 +951,8 @@ Add the ancestor helper next to `is_unsafe_entry_name`:
 /// registered as a file entry, if any.
 ///
 /// Walks the whole parent chain: a file `Payload/a` must also reject
-/// `Payload/a/b/c`, whose immediate parent is not itself registered.
+/// `Payload/a/b/c`, whose immediate parent is not itself registered. The
+/// walk stops at `dest_dir` and never proceeds above it.
 fn file_ancestor<'a>(
     path: &Path,
     dest_dir: &Path,
@@ -905,7 +960,7 @@ fn file_ancestor<'a>(
 ) -> Option<&'a PathBuf> {
     let mut ancestor = path.parent();
     while let Some(dir) = ancestor {
-        if dir == dest_dir {
+        if dir == dest_dir || !dir.starts_with(dest_dir) {
             return None;
         }
         if let Some(hit) = file_paths.get(dir) {
@@ -925,11 +980,13 @@ Add the ancestor-claim helper next to it:
 ///
 /// Claims are recorded when each entry is seen so conflict detection is
 /// order-independent: an archive listing `Payload/a/b/c` before
-/// `Payload/a` is rejected the same way as the reverse order.
+/// `Payload/a` is rejected the same way as the reverse order. The walk
+/// stops at `dest_dir` and never claims the destination or anything above
+/// it, even if a name encloses to the destination itself.
 fn register_ancestor_dirs(path: &Path, dest_dir: &Path, dirs: &mut HashSet<PathBuf>) {
     let mut ancestor = path.parent();
     while let Some(dir) = ancestor {
-        if dir == dest_dir {
+        if dir == dest_dir || !dir.starts_with(dest_dir) {
             break;
         }
         if !dirs.contains(dir) {
@@ -947,7 +1004,9 @@ Declare next to `dirs_to_create` (:168):
 ```
 
 Replace the dir branch's `dirs_to_create.insert(outpath.clone());`
-(:191-197 region) with the checks plus registration:
+statement (base `extract.rs:190`; the `entries.push(ExtractEntry { ... })`
+for the directory entry at base `:191-198` immediately below stays
+untouched) with the checks plus registration:
 
 ```rust
             if file_paths.contains(&outpath) {
@@ -1088,7 +1147,7 @@ Symlink-pass open: identical replacement.
 
 Delete: the `Arc::new(mmap)` binding, every `Cursor::new(&mmap[..])`, and
 the `// Memory-map the IPA file ...` / `// Open ZIP archive from
-memory-mapped data` comments. Update the module feature bullet (:8)
+memory-mapped data` comments. Update the module feature bullet (`extract.rs:9`)
 `- Memory-mapped file access for performance` →
 `- Buffered file reads with bounded memory use`.
 
