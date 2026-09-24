@@ -24,6 +24,7 @@
 //! ```
 
 use crate::Result;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use std::collections::BTreeSet;
@@ -418,6 +419,107 @@ fn is_macho_file(path: &Path) -> Result<bool> {
     ))
 }
 
+/// Verifies one CodeResources entry against the bundle on disk.
+fn verify_code_resource_entry(
+    bundle: &Path,
+    rel: &str,
+    entry: &plist::Value,
+    out: &mut CodeResourcesVerification,
+    errors: &mut Vec<String>,
+) -> Result<()> {
+    let entry_dict = match entry.as_dictionary() {
+        Some(d) => d,
+        None => {
+            errors.push(format!("malformed CodeResources entry: {rel}"));
+            return Ok(());
+        }
+    };
+
+    let symlink = entry_dict.get("symlink");
+    let has_hash = entry_dict.get("hash").is_some();
+    let has_hash2 = entry_dict.get("hash2").is_some();
+    let malformed = (symlink.is_some() && (has_hash || has_hash2))
+        || (has_hash
+            && entry_dict
+                .get("hash")
+                .is_some_and(|value| value.as_data().is_none()))
+        || (has_hash2
+            && entry_dict
+                .get("hash2")
+                .is_some_and(|value| value.as_data().is_none()))
+        || (symlink.is_some() && symlink.is_some_and(|value| value.as_string().is_none()))
+        || (symlink.is_none() && !has_hash && !has_hash2);
+    if malformed {
+        errors.push(format!("malformed CodeResources entry: {rel}"));
+        return Ok(());
+    }
+
+    let file_path = bundle.join(rel);
+    if let Some(sealed_target) = symlink.and_then(|value| value.as_string()) {
+        let metadata = match std::fs::symlink_metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.missing.push(rel.to_string());
+                return Ok(());
+            }
+            Err(e) => return Err(crate::Error::Io(e)),
+        };
+        if !metadata.is_symlink() {
+            out.mismatched.push(rel.to_string());
+            return Ok(());
+        }
+        match std::fs::read_link(&file_path) {
+            Ok(actual) => {
+                if actual.to_string_lossy().to_string() == sealed_target {
+                    out.matched += 1;
+                } else {
+                    out.mismatched.push(rel.to_string());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.missing.push(rel.to_string());
+            }
+            Err(e) => return Err(crate::Error::Io(e)),
+        }
+        return Ok(());
+    }
+
+    let metadata = match std::fs::symlink_metadata(&file_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.missing.push(rel.to_string());
+            return Ok(());
+        }
+        Err(e) => return Err(crate::Error::Io(e)),
+    };
+    if metadata.is_symlink() {
+        out.mismatched.push(rel.to_string());
+        return Ok(());
+    }
+    let data = match std::fs::read(&file_path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.missing.push(rel.to_string());
+            return Ok(());
+        }
+        Err(e) => return Err(crate::Error::Io(e)),
+    };
+
+    let mut matched = true;
+    if let Some(sealed_hash) = entry_dict.get("hash2").and_then(|value| value.as_data()) {
+        matched &= sealed_hash == Sha256::digest(&data).as_slice();
+    }
+    if let Some(sealed_hash) = entry_dict.get("hash").and_then(|value| value.as_data()) {
+        matched &= sealed_hash == Sha1::digest(&data).as_slice();
+    }
+    if matched {
+        out.matched += 1;
+    } else {
+        out.mismatched.push(rel.to_string());
+    }
+    Ok(())
+}
+
 /// Verifies the sealed-file hashes of a CodeResources plist against the
 /// bundle on disk (both directions: sealed→disk and disk→sealed).
 fn check_code_resources(
@@ -432,105 +534,72 @@ fn check_code_resources(
         errors.push("CodeResources is not a parseable plist".into());
         return Ok(out);
     };
-    let Some(files2) = value
-        .as_dictionary()
-        .and_then(|d| d.get("files2"))
-        .and_then(|v| v.as_dictionary())
-    else {
+    let Some(root) = value.as_dictionary() else {
         errors.push("CodeResources has no files2 dictionary".into());
         return Ok(out);
     };
+    let Some(files2_value) = root.get("files2") else {
+        errors.push("CodeResources has no files2 dictionary".into());
+        return Ok(out);
+    };
+    let files2 = match files2_value.as_dictionary() {
+        Some(files2) => Some(files2),
+        None => {
+            errors.push("CodeResources files2 is not a dictionary".into());
+            None
+        }
+    };
+    let files = match root.get("files") {
+        Some(files) => match files.as_dictionary() {
+            Some(files) => Some(files),
+            None => {
+                errors.push("CodeResources files is not a dictionary".into());
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut sealed_set = BTreeSet::new();
+    if let Some(files2) = files2 {
+        sealed_set.extend(files2.keys().cloned());
+    }
+    if let Some(files) = files {
+        sealed_set.extend(files.keys().cloned());
+    }
 
     // Sealed → disk: every entry must exist and match its recorded seal.
-    for (rel, entry) in files2 {
-        let file_path = bundle.join(rel.as_str());
-        let entry_dict = match entry.as_dictionary() {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let symlink = entry_dict.get("symlink");
-        let has_hash = entry_dict.get("hash").is_some();
-        let has_hash2 = entry_dict.get("hash2").is_some();
-        let malformed = (symlink.is_some() && (has_hash || has_hash2))
-            || (has_hash
-                && entry_dict
-                    .get("hash")
-                    .is_some_and(|value| value.as_data().is_none()))
-            || (has_hash2
-                && entry_dict
-                    .get("hash2")
-                    .is_some_and(|value| value.as_data().is_none()))
-            || (symlink.is_some() && symlink.is_some_and(|value| value.as_string().is_none()));
-        if malformed {
-            errors.push(format!("malformed CodeResources entry: {rel}"));
-            continue;
-        }
-
-        if let Some(sealed_target) = symlink.and_then(|value| value.as_string()) {
-            let metadata = match std::fs::symlink_metadata(&file_path) {
-                Ok(metadata) => metadata,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    out.missing.push(rel.clone());
-                    continue;
-                }
-                Err(e) => return Err(crate::Error::Io(e)),
-            };
-            if !metadata.is_symlink() {
-                out.mismatched.push(rel.clone());
+    if let Some(files2) = files2 {
+        for (rel, entry) in files2 {
+            if entry.as_dictionary().is_none() {
                 continue;
             }
-            match std::fs::read_link(&file_path) {
-                Ok(actual) => {
-                    if actual.to_string_lossy().to_string() == sealed_target {
-                        out.matched += 1;
-                    } else {
-                        out.mismatched.push(rel.clone());
+            verify_code_resource_entry(bundle, rel, entry, &mut out, errors)?;
+        }
+    }
+    if let Some(files) = files {
+        for (rel, entry) in files {
+            if files2.is_some_and(|files2| files2.contains_key(rel)) {
+                continue;
+            }
+            if let Some(sealed_hash) = entry.as_data() {
+                let file_path = bundle.join(rel.as_str());
+                let data = match std::fs::read(&file_path) {
+                    Ok(data) => data,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        out.missing.push(rel.clone());
+                        continue;
                     }
+                    Err(e) => return Err(crate::Error::Io(e)),
+                };
+                if sealed_hash == Sha1::digest(&data).as_slice() {
+                    out.matched += 1;
+                } else {
+                    out.mismatched.push(rel.clone());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    out.missing.push(rel.clone());
-                }
-                Err(e) => return Err(crate::Error::Io(e)),
+            } else {
+                verify_code_resource_entry(bundle, rel, entry, &mut out, errors)?;
             }
-            continue;
-        }
-
-        let metadata = match std::fs::symlink_metadata(&file_path) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                out.missing.push(rel.clone());
-                continue;
-            }
-            Err(e) => return Err(crate::Error::Io(e)),
-        };
-        if metadata.is_symlink() {
-            out.mismatched.push(rel.clone());
-            continue;
-        }
-        let data = match std::fs::read(&file_path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                out.missing.push(rel.clone());
-                continue;
-            }
-            Err(e) => return Err(crate::Error::Io(e)),
-        };
-        let computed = Sha256::digest(&data);
-        let sealed = entry_dict
-            .get("hash2")
-            .and_then(|v| v.as_data())
-            .map(|d| d.to_vec());
-        let sealed = sealed.or_else(|| {
-            entry_dict
-                .get("hash")
-                .and_then(|v| v.as_data())
-                .map(|d| d.to_vec())
-        });
-        match sealed {
-            Some(hash) if hash.as_slice() == computed.as_slice() => out.matched += 1,
-            Some(_) => out.mismatched.push(rel.clone()),
-            None => out.unsealed.push(format!("{rel} (sealed without a hash)")),
         }
     }
 
@@ -556,7 +625,7 @@ fn check_code_resources(
         disk_files.insert(rel);
     }
     for rel in disk_files {
-        if !files2.contains_key(&rel) {
+        if !sealed_set.contains(&rel) {
             out.unsealed.push(rel);
         }
     }
@@ -910,6 +979,87 @@ mod tests {
             result.is_err(),
             "a nonexistent bundle must not verify: {:?}",
             result.map(|r| r.valid())
+        );
+    }
+
+    #[test]
+    fn nested_ds_store_is_not_flagged_unsealed() {
+        // Builder emission: any *.DS_Store is dropped from files2 at build, kept in
+        // the legacy files dict, and omitted by rules2 (weight 2000).
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle_with(td.path(), |app| {
+            fs::write(app.join("Frameworks").join(".DS_Store"), b"junk").unwrap();
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            report.valid(),
+            "files-only keys are sealed; bundle: {:?}",
+            report.bundle
+        );
+    }
+
+    #[test]
+    fn legacy_sha1_only_entry_verifies() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        let key = "Frameworks/Sub.framework/Info.plist";
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            let entry = files2.get_mut(key).unwrap().as_dictionary_mut().unwrap();
+            let sha1_hash = entry.get("hash").unwrap().clone();
+            let mut legacy = plist::Dictionary::new();
+            legacy.insert("hash".to_string(), sha1_hash);
+            files2.insert(key.to_string(), plist::Value::Dictionary(legacy));
+        });
+        let report = verify_bundle(&app).unwrap();
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        // Deliberately CR-layer only: rewriting CodeResources also breaks the main
+        // executable's slot -3 binding, which is outside this test's unit.
+        assert!(cr.valid(), "SHA-1-only entries must verify: {:?}", cr);
+    }
+
+    #[test]
+    fn partial_reseal_with_updated_hash2_is_detected() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        let target = app
+            .join("Frameworks")
+            .join("Sub.framework")
+            .join("Info.plist");
+        let original = fs::read(&target).unwrap();
+        let mut modified = original.clone();
+        modified.extend_from_slice(b"\n<!-- tampered -->\n");
+        fs::write(&target, &modified).unwrap();
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            let key = "Frameworks/Sub.framework/Info.plist";
+            let entry = files2.get_mut(key).unwrap().as_dictionary_mut().unwrap();
+            use sha2::{Digest, Sha256};
+            entry.insert(
+                "hash2".to_string(),
+                plist::Value::Data(Sha256::digest(&modified).to_vec()),
+            );
+            // "hash" (SHA-1) intentionally left stale: every declared field is verified.
+        });
+        let report = verify_bundle(&app).unwrap();
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        assert!(!cr.valid(), "a partial re-seal must be detected: {:?}", cr);
+        assert!(
+            cr.mismatched.iter().any(|m| m.contains("Info.plist")),
+            "{:?}",
+            cr.mismatched
         );
     }
 }
