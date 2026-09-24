@@ -110,9 +110,9 @@ fn verify_chain(certs: &[Certificate], leaf: &Certificate,
 Walk order (all failures return immediately with `reason` set; `warnings`
 collected so far are preserved):
 
-1. **Leaf purpose rules** — applied only when `leaf.subject != leaf.issuer`
-   (D5). Strict-decode each extension with `Type::from_der` (rejects trailing
-   bytes, per der 0.7 `Decode::from_der` → `reader.finish`):
+1. **Leaf purpose rules** — applied unconditionally to the leaf, including a
+   self-signed one (D5). Strict-decode each extension with `Type::from_der`
+   (rejects trailing bytes, per der 0.7 `Decode::from_der` → `reader.finish`):
    - EKU (`2.5.29.37`) **required**; malformed → error; decoded list must
      contain `1.3.6.1.5.5.7.3.3` (codeSigning), else error.
    - `keyUsage` (`2.5.29.15`), if present: must include `digitalSignature`.
@@ -163,6 +163,15 @@ collected so far are preserved):
   **and** no global error exists. The current unconditional
   `report.errors.clear()` on success (`cms_verify.rs:684`) is removed so
   global errors can never be wiped by a clean signer.
+- **Every `Ok(report)` exit re-attaches global errors through a small
+  `seal(report, global_errors)` helper** — several paths inside the
+  SignerInfo loop return early (unsupported digest algorithm, signing
+  certificate not found, the clean-signer gate, the no-SignerInfo check, the
+  post-loop fallthrough); a bare early return would silently drop the
+  SignedData-level diagnostic. `seal` prepends `global_errors` to
+  `report.errors` when non-empty (a clean signer cannot clear structural
+  errors); it is a no-op for `Err` returns, where the whole report is
+  discarded anyway.
 - **Anchoring gate:** when `chain_ok` holds but `anchored` is false, push
   `certificate chain is not anchored to a trusted root` into that signer's
   errors (the "gate `valid` on anchoring" requirement, kept observable as a
@@ -278,20 +287,25 @@ injected anchor.
 - Rejected: trusting an unverified runs-out position (status quo) — the
   vulnerability.
 
-**D5 — Purpose rules (EKU/KU/leaf-BC) apply to non-self-signed leaves only.**
-- Chosen: `if leaf.subject != leaf.issuer` then enforce EKU/KU/leaf-BC.
-  A self-signed terminal is either an explicitly trusted anchor (membership is
-  the stronger, operator-granted trust — RFC 5280 does not validate trust-anchor
-  constraints) or it fails the anchoring gate anyway. Every meaningful path
-  (real Apple chains, attacker chains under a trusted root, misissued leaves)
-  has a non-self-signed leaf and is fully purpose-checked.
-- Rejected: unconditional leaf rules — would require every test credential to
-  be a synthetic "CA that is also an end-entity" (Profile::Root certs carry
-  `keyCertSign|cRLSign` KU and `CA=true` BC by construction,
-  `x509-cert-0.2.5/src/builder.rs:162-192`), i.e. the fixture could never
-  satisfy both its anchor role and its leaf role. This is the design's one
-  deliberate carve-out; it is what keeps the security property (no untrusted
-  key ever validates) while making the rules consistent.
+**D5 — Purpose rules apply to the leaf unconditionally; anchor treatment
+governs only the terminus.**
+- Chosen: `leaf_purpose_reason(leaf)` runs for every leaf, self-signed or not:
+  EKU codeSigning required, `keyUsage` → `digitalSignature` when present,
+  `basicConstraints` → `CA=false` when present. The brief's item 2 is
+  unconditional ("missing/malformed code-signing EKU on leaf → error") and the
+  brief is authoritative; a self-signed signer is still the leaf of its own
+  chain. CA rules (`CA=true`, `pathLen`, `keyCertSign`) apply only to
+  certificates climbed to as *distinct* issuers — never to the leaf, so a
+  single self-signed certificate is never asked to be both CA and end-entity.
+  Anchor membership (self-signature + SPKI) remains the separate terminus
+  grant.
+- Rejected: exempting self-signed termini from purpose rules (the original
+  D5 carve-out) — it contradicts the brief's literal leaf requirement. It
+  would also have kept round-trip fixtures working without extension updates;
+  under the chosen rule every self-signed test credential must carry
+  codeSigning EKU, a digitalSignature `keyUsage`, and `CA=false`
+  basicConstraints (plan Task 2 migrates the fixture), and the cross-lane
+  handover (§6) must say the same about lanes 24/26's credentials.
 
 **D6 — `assets.rs` and `cert.rs` stay untouched.**
 - `APPLE_ROOT_CA_CERT` already exists (`assets.rs:126`) with a PEM-parsing
@@ -439,7 +453,12 @@ This lane edits none of those files (hard scope rule). The handover contract
 for lanes 24/26: `zsign_core::crypto::cms_verify::{TrustAnchors,
 verify_code_signature_with_anchors}` — plumb an optional `&TrustAnchors`
 (lease: `TrustAnchors::from_certificates(vec![creds.certificate.clone()])` in
-tests, `TrustAnchors::apple_root()` in production defaults).
+tests, `TrustAnchors::apple_root()` in production defaults). **Because leaf
+purpose rules are unconditional (D5), their self-signed test credentials must
+also carry codeSigning EKU, a `digitalSignature` keyUsage, and
+`basicConstraints { ca: false }`** — `Profile::Root` defaults (no EKU,
+`keyCertSign|cRLSign`, `CA=true`) fail the leaf rules even after anchor
+injection; see plan Task 2's `rsa_credentials` migration for the exact shape.
 
 **Open question for the supervisor** (stated once, per brief): who migrates
 these four tests — (a) lanes 24/26 absorb it with the plumbing above (this

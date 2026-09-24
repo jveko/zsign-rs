@@ -556,16 +556,35 @@ fn leaf_with_code_signing_eku_chains() {
     assert!(outcome.ok, "{:?}", outcome.reason);
     assert!(outcome.anchored);
 }
+
+#[test]
+fn self_signed_leaf_still_needs_code_signing_eku() {
+    // D5 has no self-signed carve-out: a self-signed signer is still the leaf
+    // of its own chain and must pass the leaf purpose rules.
+    let (_k, self_signed, _s) = build_rsa_root("CN=zsign bare self-signed");
+    let outcome = verify_chain(
+        &[self_signed.clone()],
+        &self_signed,
+        &TrustAnchors::from_certificates(vec![self_signed.clone()]),
+    );
+    assert!(!outcome.ok);
+    assert!(outcome
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("leaf lacks codeSigning EKU"));
+}
 ```
 
 - [ ] **Step 2.2: Run to confirm RED**
 
 Run: `cargo test -p zsign-core crypto::cms_verify`
-Expected: `leaf_without_eku_fails_purpose` FAILS — after Task 1 the EKU rule
-is still "consulted only when present", so an EKU-less leaf chains
-(`outcome.ok == true`) and the assertion is RED. `leaf_wrong_purpose_eku_fails`
+Expected: `leaf_without_eku_fails_purpose` and
+`self_signed_leaf_still_needs_code_signing_eku` FAIL — after Task 1 the EKU
+rule is still "consulted only when present", so an EKU-less leaf chains
+(`outcome.ok == true`) and the assertions are RED. `leaf_wrong_purpose_eku_fails`
 PASSES already (the base containment check rejects a serverAuth-only EKU) —
-it is a pin, not a witness; the missing-EKU test is the RED witness.
+it is a pin, not a witness; the two missing-EKU tests are the RED witnesses.
 `leaf_with_code_signing_eku_chains` PASSES. Record which of these behaved as
 predicted in the final report.
 
@@ -590,8 +609,8 @@ fn ext_value<'a>(cert: &'a x509_cert::Certificate, id: ObjectIdentifier) -> Opti
     exts.iter().find(|e| e.extn_id == id).map(|e| e.extn_value.as_bytes())
 }
 
-/// End-entity purpose constraints for a leaf that is not itself a
-/// trust-anchor candidate (design D5).
+/// End-entity purpose constraints; applied unconditionally to the leaf
+/// (design D5 — a self-signed signer is still a leaf).
 fn leaf_purpose_reason(leaf: &x509_cert::Certificate) -> Option<String> {
     use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
     let Some(eku_bytes) = ext_value(leaf, OID_EXT_KEY_USAGE) else {
@@ -657,14 +676,13 @@ fn issuer_ca_reason(issuer: &x509_cert::Certificate, cas_below: usize) -> Option
 Wire into `verify_chain`:
 
 1. **Replace** the current `if let Some(eku) = leaf_eku(leaf) { … }` block
-   (~:827-837) with the D5 condition (before the leaf-validity check, keeping
-   today's EKU-first precedence):
+   (~:827-837) with the unconditional purpose check (before the leaf-validity
+   check, keeping today's EKU-first precedence — design D5: no self-signed
+   carve-out; the brief's item 2 has no exception):
    ```rust
-   if leaf.tbs_certificate.subject != leaf.tbs_certificate.issuer {
-       if let Some(reason) = leaf_purpose_reason(leaf) {
-           return ChainOutcome { ok: false, anchored: false, subjects: names,
-                                 reason: Some(reason), warnings };
-       }
+   if let Some(reason) = leaf_purpose_reason(leaf) {
+       return ChainOutcome { ok: false, anchored: false, subjects: names,
+                             reason: Some(reason), warnings };
    }
    ```
 2. In the `Some(p) if !std::ptr::eq(p, current)` branch, after the existing
@@ -929,12 +947,66 @@ fn malformed_leaf_eku_fails() {
 }
 ```
 
-- [ ] **Step 2.5: Migrate the SHA-1 chain fixture to the leaf rules (D5)**
+- [ ] **Step 2.5: Migrate self-signed fixtures to the leaf rules (D5)**
 
-`chain_accepts_sha1_signed_intermediate` chains a `Profile::Leaf` (which has
-no EKU) under a root — Task 2's leaf rules turn it red until the fixture gains
-a codeSigning EKU. Split its inline leaf build into a mutable binding and add
-the extension before `.build()`:
+Between Step 2.3 and this step the self-signed-credential tests are
+intentionally red: `round_trip_rsa_signs_and_verifies`,
+`ber_indefinite_cms_verifies`, and `unanchored_structural_chain_is_invalid`
+assert `valid`/`chain_ok` on a `Profile::Root` credential that now fails the
+unconditional leaf rules. Two migrations make them green again:
+
+**(a) `rsa_credentials` gains the leaf extensions.** `Profile::Root` emits no
+EKU, `keyCertSign|cRLSign` keyUsage, and `CA=true` basicConstraints — this
+credential is only ever a leaf + trust anchor in these tests (it never issues
+a distinct certificate), so reshape it:
+
+```rust
+let mut builder = CertificateBuilder::new(
+    Profile::Root,
+    serial,
+    validity,
+    subject,
+    pub_key,
+    &signing_key,
+)
+.unwrap();
+builder
+    .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+    .unwrap();
+let mut cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+// Leaf rules: keyUsage must offer digitalSignature, basicConstraints must
+// not assert CA (the profile defaults are CA-oriented).
+replace_extension(
+    &mut cert,
+    OID_KEY_USAGE,
+    &KeyUsage(KeyUsages::DigitalSignature.into()),
+);
+replace_extension(
+    &mut cert,
+    OID_BASIC_CONSTRAINTS,
+    &BasicConstraints {
+        ca: false,
+        path_len_constraint: None,
+    },
+);
+(
+    SigningCredentials {
+        certificate: cert,
+        signing_key: SigningKeyType::Rsa(signing_key),
+        cert_chain: vec![],
+        team_id: None,
+    },
+    key,
+)
+```
+
+(`replace_extension` and the `BasicConstraints`/`KeyUsage`/`KeyUsages`
+imports come from Step 2.4; adapt the surrounding `rsa_credentials` body,
+which currently builds `cert` inline in one expression.)
+
+**(b) The SHA-1 chain fixture's leaf** chains a `Profile::Leaf` (no EKU)
+under a root and must also gain a codeSigning EKU. Split its inline leaf
+build into a mutable binding and add the extension before `.build()`:
 
 ```rust
 let mut leaf_builder = CertificateBuilder::new(
@@ -965,8 +1037,9 @@ in this file.)
 - [ ] **Step 2.6: Run GREEN**
 
 Run: `cargo test -p zsign-core crypto::cms_verify`
-Expected: all purpose tests GREEN, including the migrated SHA-1 fixture and
-the SHA-256 pins.
+Expected: all purpose tests GREEN — including the migrated SHA-1 fixture, the
+upgraded self-signed credential tests (round trip, BER-indefinite,
+unanchored-structural), and the SHA-256 pins.
 
 - [ ] **Step 2.7: Run the lane gate + acceptance**
 
@@ -1191,17 +1264,22 @@ fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
     let wrap = AnyRef::decode(&mut ci_r).unwrap();
     assert_eq!(wrap.tag(), TAG_CTX0);
     let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
-    let sd_tlv = wrap.value(); // the SignedData TLV inside [0]
+    // [0] is EXPLICIT: its value carries the full SignedData TLV (`30 …`),
+    // so the SEQUENCE must be decoded before its fields can be iterated.
+    let sd_tlv = wrap.value();
+    let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+    assert_eq!(sd_seq.tag(), Tag::Sequence);
+    let sd_body_src = sd_seq.value();
 
     // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms is
     // also a SET — select by position, never by tag, or it gets dropped).
-    let mut sd_r = SliceReader::new(sd_tlv).unwrap();
+    let mut sd_r = SliceReader::new(sd_body_src).unwrap();
     let mut fields: Vec<&[u8]> = Vec::new(); // version, digestAlgs, encap, certs, set
     while !sd_r.is_finished() {
         let start = usize::try_from(sd_r.position()).unwrap();
         let _field = AnyRef::decode(&mut sd_r).unwrap();
         let end = usize::try_from(sd_r.position()).unwrap();
-        fields.push(&sd_tlv[start..end]);
+        fields.push(&sd_body_src[start..end]);
     }
     let set_tlv = fields.pop().expect("SignedData fields required");
     assert_eq!(
@@ -1409,9 +1487,26 @@ fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<Str
 }
 ```
 
-4. Global-error tier (eContentType is SignedData-level, design D10):
+4. Global-error tier (eContentType is SignedData-level, design D10 — and
+   **every** `Ok(report)` exit must re-attach it, or an early return inside
+   the SignerInfo loop silently drops the diagnostic):
    - After `let mut report = CmsVerifyReport::default();` add
      `let mut global_errors: Vec<String> = Vec::new();`.
+   - Add the seal helper beside `content_type_reason`:
+     ```rust
+     /// Attaches SignedData-level errors to the report on every `Ok` exit so
+     /// an early return inside the SignerInfo loop can never drop them.
+     fn seal(
+         mut report: CmsVerifyReport,
+         mut global_errors: Vec<String>,
+     ) -> Result<CmsVerifyReport> {
+         if !global_errors.is_empty() {
+             global_errors.append(&mut report.errors);
+             report.errors = global_errors;
+         }
+         Ok(report)
+     }
+     ```
    - Replace the `unusual eContentType` warning (~:440-443) with:
      ```rust
      if econtent_type != OID_ID_DATA {
@@ -1420,15 +1515,16 @@ fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<Str
          ));
      }
      ```
-   - The `no SignerInfo present` early return becomes:
+   - The `no SignerInfo present` early return (~:511-512) becomes:
      ```rust
      if signer_infos_raw.is_empty() {
-         let mut errs = global_errors;
-         errs.push("no SignerInfo present".into());
-         report.errors = errs;
-         return Ok(report);
+         report.errors.push("no SignerInfo present".into());
+         return seal(report, global_errors);
      }
      ```
+   - The other two in-loop bare returns — unsupported digest algorithm
+     (~:569) and signing certificate not found (~:618) — keep their pushes
+     and become `return seal(report, global_errors);`.
    - In the per-signer error-accumulation block (after the CDHash pushes, ~:661-680):
      ```rust
      if let Some(reason) = content_type_reason(attrs.content_type_count, &attrs.content_types) {
@@ -1441,23 +1537,15 @@ fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<Str
          if global_errors.is_empty() {
              report.valid = true;
              report.errors.clear();
-         } else {
-             // The signer is clean, but the SignedData itself is not:
-             // structural errors survive and keep `valid` false.
-             global_errors.append(&mut report.errors);
-             report.errors = global_errors;
          }
-         return Ok(report);
+         // No-op when globals are empty; otherwise the structural errors
+         // land first and keep `valid` false.
+         return seal(report, global_errors);
      }
      ```
-   - Before the final `Ok(report)` (~:692):
-     ```rust
-     if !global_errors.is_empty() {
-         global_errors.append(&mut report.errors);
-         report.errors = global_errors;
-     }
-     Ok(report)
-     ```
+     (The `if report.errors.is_empty() { report.errors = errors; }` store
+     below stays unchanged.)
+   - The final `Ok(report)` (~:692) becomes `seal(report, global_errors)`.
 
 - [ ] **Step 4.3: Parser-level and report-level fixtures**
 
@@ -1514,11 +1602,15 @@ fn global_econtent_type_error_beats_clean_signer() {
     let cd_sha256: [u8; 32] = Sha256::digest(content).into();
     let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
 
-    // encapContentInfo.eContentType is the first id-data OID TLV in the CMS
-    // (SignedData's third field precedes signedAttrs, whose copy lives much
-    // later). Patch the trailing arc 1 → 2: id-data becomes id-signedData,
-    // same DER length, and the field is outside signedAttrs, so every
-    // per-signer check stays green.
+    // encapContentInfo.eContentType is the first id-data OID TLV in the CMS:
+    // everything preceding it (ContentInfo's signedData OID `…1.7.2`, the
+    // version INTEGER, digestAlgorithms' SHA-256 OID) shares no bytes with
+    // the 11-byte pattern — which includes the OID's own `06 09` header, so
+    // a mid-TLV match cannot start — while the signedAttrs copy of id-data
+    // and the CDHash payload live much later. Patch the trailing arc 1 → 2:
+    // id-data becomes id-signedData, same DER length, and the field is
+    // outside signedAttrs, so every per-signer check stays green. (A wrong
+    // landing would fail the `encapContentInfo` assertion below loudly.)
     let id_data: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
     let pos = cms
         .windows(id_data.len())
