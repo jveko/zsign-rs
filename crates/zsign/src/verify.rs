@@ -261,6 +261,10 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
 
     let info_plist = read_opt(&dir.join("Info.plist"))?;
     let code_resources = read_opt(&dir.join("_CodeSignature").join("CodeResources"))?;
+    if code_resources.is_none() {
+        out.errors
+            .push("missing _CodeSignature/CodeResources".to_string());
+    }
     let main_executable = info_plist
         .as_deref()
         .and_then(|bytes| plist_executable(bytes).ok().flatten());
@@ -765,6 +769,27 @@ mod tests {
         fs::write(app.join("Test"), minimal_macho()).unwrap();
         let report = verify_bundle(&app).unwrap();
         assert!(!report.valid());
+    }
+
+    #[test]
+    fn missing_code_resources_is_reported_invalid() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        fs::remove_dir_all(app.join("_CodeSignature")).unwrap();
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            !report.valid(),
+            "bundle without CodeResources must be invalid"
+        );
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle
+                .errors
+                .iter()
+                .any(|e| e.contains("_CodeSignature/CodeResources")),
+            "bundle-level error required (a binary-level slot error exists already); got {:?}",
+            bundle.errors
+        );
     }
 
     #[test]
