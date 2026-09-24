@@ -1,0 +1,890 @@
+# ZSN-28 Hostile-Archive Extraction Hardening — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development
+> with dispatching-parallel-agents where tasks are independent (here they are
+> NOT — all tasks edit one file, so execution is strictly sequential).
+> Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make `crates/zsign/src/ipa/extract.rs` fail closed and stay bounded
+against hostile IPA archives: unsafe names, zip bombs, huge symlink targets,
+setuid bits, duplicate/conflicting paths, undocumented mmap, TOCTOU.
+
+**Architecture:** Seven ordered, independently-green tasks, all inside
+`crates/zsign/src/ipa/extract.rs` + its inline tests (task 6 also drops the
+obsolete `memmap2` dependency from `crates/zsign/Cargo.toml`/`Cargo.lock`).
+Each task follows red-green: Tester subagent writes the failing test first,
+implementer subagents green it, controller runs the scoped gate and commits.
+
+**Tech Stack:** Rust 2021, zip 7.2.0 (writer fixtures), rayon (unchanged),
+`std::sync::atomic::AtomicU64` (new), tempfile (existing tests).
+
+**Scoped gate after every task (never project-wide):**
+
+```
+cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic
+```
+
+Known pre-existing failure `test_ipa_signing_is_deterministic` (ZSN-15) is
+skipped by that command; everything else must stay green. Do NOT run
+`cargo fmt` / `cargo clippy` / `hk` — the orchestrator runs those at merge.
+
+**Design reference:** `docs/superpowers/specs/2026-09-24-extract-hardening-design.md`
+(error messages, invariants, rejected alternatives are fixed there; this plan
+must not contradict it).
+
+---
+
+### Task 1: Fail closed on unsafe entry names
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (helper next to
+  `is_safe_symlink_target` ~:49; collect pass :170-176; tests `mod tests`)
+
+- [ ] **Step 1: Write the failing tests** (append to `mod tests`, with the
+  helper next to `create_test_ipa`)
+
+```rust
+    /// Build an otherwise-valid IPA that additionally contains `hostile_name`.
+    fn create_ipa_with_hostile_entry(dir: &Path, hostile_name: &str) -> PathBuf {
+        let ipa_path = dir.join("hostile.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+
+        zip.start_file(hostile_name, options).unwrap();
+        zip.write_all(b"evil content").unwrap();
+
+        zip.finish().unwrap();
+        ipa_path
+    }
+
+    fn assert_rejects_hostile_entry(hostile_name: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_ipa_with_hostile_entry(temp_dir.path(), hostile_name);
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("hostile entry name must fail the extraction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsafe entry name in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains(hostile_name),
+            "error must name the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_parent_traversal_entry() {
+        assert_rejects_hostile_entry("../evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_nested_traversal_entry() {
+        assert_rejects_hostile_entry("Payload/../../evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_absolute_entry_name() {
+        assert_rejects_hostile_entry("/abs/evil");
+    }
+```
+
+- [ ] **Step 2: Run the gate — expect FAIL**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: the three new tests FAIL (pre-fix the entries are silently skipped
+or relocated, so extraction *succeeds*); all pre-existing tests PASS.
+
+- [ ] **Step 3: Implement fail-closed name validation**
+
+Add the helper after `is_safe_symlink_target` (:49-54):
+
+```rust
+/// Returns true if an archive entry name uses `..` traversal or is absolute.
+///
+/// `zip`'s `enclosed_name()` sanitizes such names rather than rejecting them,
+/// so the raw name must be checked explicitly to fail closed.
+fn is_unsafe_entry_name(name: &str) -> bool {
+    name.starts_with('/') || name.split('/').any(|segment| segment == "..")
+}
+```
+
+In the collect pass, replace the `enclosed_name` match (:173-176) with:
+
+```rust
+        let name = file.name();
+        if is_unsafe_entry_name(name) {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unsafe entry name in IPA: {}", name),
+            )));
+        }
+
+        let outpath = match file.enclosed_name() {
+            Some(path) => dest_dir.join(path),
+            None => {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unsafe entry name in IPA: {}", name),
+                )))
+            }
+        };
+```
+
+- [ ] **Step 4: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass (3 new + 12 existing).
+
+- [ ] **Step 5: Update `extract_ipa`'s `# Errors` doc** (:122-129) — add a
+  bullet: `- Returns [`Error::Io`] if an archive entry name is unsafe
+  (traversal or absolute)`
+
+**Acceptance:** the three tests above pass; no entry can be silently skipped;
+gate green. **Controller commits:** `fix(zsign): fail closed on unsafe ipa entry names (ZSN-28)`
+
+---
+
+### Task 2: Zip-bomb budgets with injectable limits
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (new `ExtractionLimits` +
+  `extract_ipa_with_limits` above `extract_ipa` :130; rayon copy loop
+  :239-254; imports; tests)
+
+- [ ] **Step 1: Write the failing tests** (append to `mod tests`)
+
+```rust
+    #[test]
+    fn test_extract_ipa_rejects_oversized_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("entry_bomb.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(&vec![b'A'; 2048]).unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 100,
+            max_total_bytes: 100_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("oversized entry must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Payload/Test.app/Info.plist"),
+            "error must name the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_oversized_total() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("total_bomb.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(&vec![b'A'; 600]).unwrap();
+        zip.start_file("Payload/Test.app/Test", options).unwrap();
+        zip.write_all(&vec![b'B'; 600]).unwrap();
+        zip.finish().unwrap();
+
+        let limits = ExtractionLimits {
+            max_entry_bytes: 1_000,
+            max_total_bytes: 1_000,
+        };
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa_with_limits(&ipa_path, &extract_dir, limits)
+            .expect_err("total size over budget must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Archive exceeds extraction limit"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("total"), "error must mention the total: {msg}");
+    }
+```
+
+Determinism note: the two 600-byte entries sum to 1200 > 1000, so at least
+one `fetch_add` observes an over-total value regardless of chunk scheduling.
+
+- [ ] **Step 2: Run the gate — expect FAIL**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: FAIL to compile (`ExtractionLimits` / `extract_ipa_with_limits`
+not found) — that is the red state.
+
+- [ ] **Step 3: Implement the limits API**
+
+Add above `extract_ipa` (:130), imports updated to
+`use std::io::{self, BufReader, BufWriter, Cursor, Read};` is NOT yet touched
+(that is task 6) — only add
+`use std::sync::atomic::{AtomicU64, Ordering};`:
+
+```rust
+/// Byte budgets enforced while writing extracted archive contents.
+///
+/// Defaults (used by [`extract_ipa`]): 2 GiB per entry, 8 GiB total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractionLimits {
+    /// Maximum uncompressed size of a single archive entry, in bytes.
+    pub max_entry_bytes: u64,
+    /// Maximum total uncompressed size across all entries, in bytes.
+    pub max_total_bytes: u64,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        ExtractionLimits {
+            max_entry_bytes: 2 * 1024 * 1024 * 1024,
+            max_total_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+}
+```
+
+Convert the existing `extract_ipa` body into the delegating pair:
+
+```rust
+pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Result<PathBuf> {
+    extract_ipa_with_limits(ipa_path, dest_dir, ExtractionLimits::default())
+}
+
+/// Extracts an IPA file with explicit extraction byte budgets.
+///
+/// Same as [`extract_ipa`], but the caller chooses the zip-bomb limits.
+/// Extraction fails with [`Error::Io`] (`InvalidData`) as soon as an entry
+/// or the archive total exceeds its budget.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zsign_rs::ipa::extract::{extract_ipa_with_limits, ExtractionLimits};
+///
+/// let limits = ExtractionLimits {
+///     max_entry_bytes: 512 * 1024 * 1024,
+///     max_total_bytes: 2 * 1024 * 1024 * 1024,
+/// };
+/// let app_bundle = extract_ipa_with_limits("MyApp.ipa", "extracted", limits)?;
+/// println!("Extracted to: {}", app_bundle.display());
+/// # Ok::<(), zsign_rs::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the IPA is missing, an entry name is unsafe, a
+/// path is a pre-existing symlink, or the extraction byte budget is
+/// exceeded.
+/// Returns [`Error::Zip`] if the file is not a valid ZIP archive or no
+/// `.app` bundle is found in `Payload/`.
+pub fn extract_ipa_with_limits(
+    ipa_path: impl AsRef<Path>,
+    dest_dir: impl AsRef<Path>,
+    limits: ExtractionLimits,
+) -> Result<PathBuf> {
+    // ... existing extract_ipa body verbatim ...
+}
+```
+
+(The original `extract_ipa` doc comment stays on `extract_ipa`; give it the
+same `# Errors` bullet for budgets as task 1 adds for unsafe names.)
+
+- [ ] **Step 4: Enforce budgets in the copy loop**
+
+Before the rayon phase (:230), add:
+
+```rust
+    let total_written = AtomicU64::new(0);
+```
+
+Inside the per-entry loop, replace the bare `io::copy` (:244) with:
+
+```rust
+                let mut outfile = BufWriter::new(outfile);
+                // Read at most one byte past the cap so an over-budget entry
+                // is detected without ever buffering more than the limit.
+                let written = io::copy(
+                    &mut (&mut file).take(limits.max_entry_bytes.saturating_add(1)),
+                    &mut outfile,
+                )?;
+                if written > limits.max_entry_bytes {
+                    let relative = entry
+                        .outpath
+                        .strip_prefix(dest_dir_ref)
+                        .unwrap_or(&entry.outpath);
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                            relative.display(),
+                            limits.max_entry_bytes
+                        ),
+                    )));
+                }
+                let total = total_written.fetch_add(written, Ordering::Relaxed) + written;
+                if total > limits.max_total_bytes {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                            limits.max_total_bytes
+                        ),
+                    )));
+                }
+```
+
+The closure captures `limits` (Copy) and `&total_written` by reference; both
+live in the function scope. `Ordering::Relaxed` suffices — only atomicity of
+the tally matters.
+
+- [ ] **Step 5: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass (2 new + 14 from earlier tasks; the pre-existing
+happy-path tests prove the 2 GiB/8 GiB defaults do not trip on tiny IPAs).
+
+**Acceptance:** both budget tests pass with injected low limits; `extract_ipa`
+signature unchanged (callers `ipa/mod.rs:277`, `verify.rs:234` compile
+untouched). **Controller commits:**
+`feat(zsign): enforce extraction byte limits for ipa archives (ZSN-28)`
+
+---
+
+### Task 3: Bound the symlink-target read
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (new const near
+  `is_safe_symlink_target`; symlink pass :265-269; tests)
+
+- [ ] **Step 1: Write the failing test** (append to `mod tests`)
+
+```rust
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_rejects_long_symlink_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("long_target.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        zip.add_symlink("Payload/Test.app/link", "a".repeat(5000), options)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("oversized symlink target must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Symlink target too long in IPA"),
+            "unexpected error: {msg}"
+        );
+    }
+```
+
+- [ ] **Step 2: Run the gate — expect FAIL**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: the new test FAILS. Pre-fix the message comes from `symlink(2)`
+(`IO error: File name too long ...`), which does not contain
+`Symlink target too long in IPA`, so the assertion cannot false-green.
+
+- [ ] **Step 3: Implement the bounded read**
+
+Add near `is_safe_symlink_target`:
+
+```rust
+/// Maximum symlink target length accepted during extraction.
+///
+/// Matches Linux `PATH_MAX`: longer targets can never be created by
+/// `symlink(2)`, and bounding the read keeps a hostile entry from buffering
+/// gigabytes before validation.
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
+```
+
+In the symlink pass, replace (:265-268):
+
+```rust
+            let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
+            let mut target = String::new();
+            file.read_to_string(&mut target)?;
+```
+
+with:
+
+```rust
+            let file = archive.by_index(entry.index).map_err(Error::Zip)?;
+            // Bound the read before validation: a hostile symlink entry must
+            // never buffer more than the limit into memory.
+            let mut target = String::new();
+            file.take(MAX_SYMLINK_TARGET_BYTES as u64 + 1)
+                .read_to_string(&mut target)?;
+            if target.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Symlink target too long in IPA: {} ({} bytes, limit {})",
+                        entry.outpath.display(),
+                        target.len(),
+                        MAX_SYMLINK_TARGET_BYTES
+                    ),
+                )));
+            }
+```
+
+The length check runs **before** `is_safe_symlink_target` (:269 onwards,
+unchanged). `file` is consumed by `take`, so its binding loses `mut`.
+
+- [ ] **Step 4: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass, including the four adversarial symlink tests.
+
+**Acceptance:** long-target test passes with the pinned message; peak
+symlink-read memory ≤ 4097 bytes. **Controller commits:**
+`fix(zsign): bound symlink target reads during ipa extraction (ZSN-28)`
+
+---
+
+### Task 4: Strip setuid/setgid/sticky bits
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (permission restore :249-252;
+  tests: CDE patch helper + regression test)
+
+- [ ] **Step 1: Write the failing test + fixture helper** (append to
+  `mod tests`)
+
+```rust
+    /// Overwrite one central-directory entry's unix mode.
+    ///
+    /// The zip write API masks modes through `unix_permissions(0o777)`, so a
+    /// setuid fixture has to patch the central-directory record directly.
+    /// `external_file_attributes` (offset 38) stores the mode in its high 16
+    /// bits; the low 16 bits hold DOS attributes and are preserved.
+    #[cfg(unix)]
+    fn patch_central_dir_unix_mode(archive_path: &Path, entry_name: &str, mode: u32) {
+        let mut bytes = fs::read(archive_path).unwrap();
+
+        let eocd = bytes
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .expect("end-of-central-directory record not found");
+        let entry_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut pos = u32::from_le_bytes([
+            bytes[eocd + 16],
+            bytes[eocd + 17],
+            bytes[eocd + 18],
+            bytes[eocd + 19],
+        ]) as usize;
+
+        for _ in 0..entry_count {
+            assert_eq!(&bytes[pos..pos + 4], b"PK\x01\x02", "bad central directory entry");
+            let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[pos + 30], bytes[pos + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[pos + 32], bytes[pos + 33]]) as usize;
+            let name = std::str::from_utf8(&bytes[pos + 46..pos + 46 + name_len]).unwrap();
+            if name == entry_name {
+                let attr_pos = pos + 38;
+                let mut attr = [0u8; 4];
+                attr.copy_from_slice(&bytes[attr_pos..attr_pos + 4]);
+                let old = u32::from_le_bytes(attr);
+                let patched = (mode << 16) | (old & 0xffff);
+                bytes[attr_pos..attr_pos + 4].copy_from_slice(&patched.to_le_bytes());
+                fs::write(archive_path, &bytes).unwrap();
+                return;
+            }
+            pos += 46 + name_len + extra_len + comment_len;
+        }
+        panic!("entry {entry_name} not found in central directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_strips_setuid_bit() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_test_ipa(temp_dir.path());
+        // 0o104755 = S_IFREG | setuid | rwxr-xr-x
+        patch_central_dir_unix_mode(&ipa_path, "Payload/Test.app/Info.plist", 0o104755);
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let app = extract_ipa(&ipa_path, &extract_dir).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = app
+            .join("Info.plist")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o7777,
+            0o755,
+            "setuid must not survive extraction, got {mode:o}"
+        );
+    }
+```
+
+Note the assertion masks with `0o7777`: `0o4755 & 0o777` is still `0o755`,
+so a `& 0o777` assert would not see the setuid bit at all.
+
+- [ ] **Step 2: Run the gate — expect FAIL**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: `test_extract_ipa_strips_setuid_bit` FAILS with
+`setuid must not survive extraction, got 104755`.
+
+- [ ] **Step 3: Implement the mask change**
+
+Replace :250:
+
+```rust
+                        let perms = mode & 0o7777;
+```
+
+with:
+
+```rust
+                        let perms = mode & 0o777;
+```
+
+- [ ] **Step 4: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass.
+
+**Acceptance:** extracted `Info.plist` lands as `0o755` from a `0o104755`
+archive entry. **Controller commits:**
+`fix(zsign): strip setuid and setgid bits from extracted files (ZSN-28)`
+
+---
+
+### Task 5: Reject duplicate/conflicting entry paths before any write
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (collect pass :166-215; tests)
+
+- [ ] **Step 1: Write the failing tests** (append to `mod tests`)
+
+```rust
+    #[test]
+    fn test_extract_ipa_rejects_duplicate_normalized_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("duplicate.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        // Textually distinct raw name, identical path once normalized.
+        zip.start_file("./Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"second copy").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("duplicate normalized path must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duplicate entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Payload/Test.app/Info.plist"),
+            "error must name the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_type_conflicting_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("conflict.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        // Same normalized path as a directory, then again as a file.
+        zip.add_directory("Payload/D", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        zip.start_file("Payload/D", options).unwrap();
+        zip.write_all(b"file where a directory is").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("file-vs-directory conflict must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Payload/D"), "error must name the path: {msg}");
+    }
+```
+
+- [ ] **Step 2: Run the gate — expect FAIL**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: duplicate test FAILS (pre-fix: last write wins, extraction
+succeeds); conflict test FAILS (pre-fix the error is
+`IO error: Is a directory (os error 21)`, which does not match the pinned
+message).
+
+- [ ] **Step 3: Implement collect-pass detection**
+
+Declare next to `dirs_to_create` (:168):
+
+```rust
+    let mut file_paths: HashSet<PathBuf> = HashSet::new();
+```
+
+In the dir branch (:191-197), before `dirs_to_create.insert`:
+
+```rust
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+```
+
+Replace the file branch (:200-214) with:
+
+```rust
+        } else {
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Duplicate entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if dirs_to_create.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            // Collect parent directories; a parent that is itself a file is a
+            // conflict, not something to discover at create time.
+            if let Some(parent) = outpath.parent() {
+                if file_paths.contains(parent) {
+                    let relative = parent.strip_prefix(dest_dir).unwrap_or(parent);
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Conflicting entry path in IPA: {}", relative.display()),
+                    )));
+                }
+                dirs_to_create.insert(parent.to_path_buf());
+            }
+            file_paths.insert(outpath.clone());
+            entries.push(ExtractEntry {
+                index: i,
+                outpath,
+                is_dir: false,
+                is_symlink,
+                #[cfg(unix)]
+                unix_mode,
+            });
+        }
+```
+
+Directory duplicates stay legal: explicit dir entries and implicit parents
+legitimately collide in every normal IPA.
+
+- [ ] **Step 4: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass (2 new + 17 accumulated).
+
+**Acceptance:** both tests pass with pinned messages; detection happens in
+the collect pass, before any directory or file is created. **Controller
+commits:** `fix(zsign): reject duplicate ipa entry paths before extraction (ZSN-28)`
+
+---
+
+### Task 6: Replace mmap with buffered reads (remove the only `unsafe`)
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (module docs :7-12, imports
+  :28-34, open site :142-149, rayon chunk open :236, symlink pass open :261)
+- Modify: `crates/zsign/Cargo.toml` (delete line 24 `memmap2 = "0.9"`)
+- Modify: `Cargo.lock` (regenerated by the gate run)
+
+- [ ] **Step 1: Red check**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: PASS — this is a behavior-preserving refactor; the red state is the
+pre-change evidence that the suite is green before the swap (record output).
+
+- [ ] **Step 2: Remove mmap**
+
+Imports (:28-34):
+
+```rust
+use crate::{Error, Result};
+use rayon::prelude::*;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use zip::ZipArchive;
+```
+
+(delete `use memmap2::Mmap;`, `use std::sync::Arc;`, `Cursor`; add
+`BufReader`; keep the `AtomicU64` import added in task 2.)
+
+Open site (:142-149):
+
+```rust
+    // Buffered reads; rayon already parallelizes across entries, so
+    // re-opening the archive per pass keeps memory bounded without mmap.
+    let file = File::open(ipa_path)?;
+    let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
+```
+
+Rayon chunk open (:236 area, inside the closure):
+
+```rust
+            let file = File::open(ipa_path)?;
+            let mut archive = ZipArchive::new(BufReader::new(file)).map_err(Error::Zip)?;
+```
+
+Symlink-pass open (:261 area): identical replacement.
+
+Delete: the `Arc::new(mmap)` binding, every `Cursor::new(&mmap[..])`, and
+the `// Memory-map the IPA file ...` / `// Open ZIP archive from
+memory-mapped data` comments. Update the module feature bullet (:8)
+`- Memory-mapped file access for performance` →
+`- Buffered file reads with bounded memory use`.
+
+- [ ] **Step 3: Drop the obsolete dependency**
+
+Delete `memmap2 = "0.9"` from `crates/zsign/Cargo.toml:24`. The gate run
+below refreshes `Cargo.lock` (memmap2 has no other consumer — verified).
+
+- [ ] **Step 4: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass; `Cargo.lock` no longer lists `memmap2`.
+
+- [ ] **Step 5: Confirm zero `unsafe` remains**
+
+Run: `grep -rn "unsafe" crates/` (or the grep tool)
+Expected: no `unsafe {` in `crates/zsign/src` (the workspace's only block
+was `Mmap::map`).
+
+**Acceptance:** identical test results before/after; no `unsafe` left;
+`memmap2` gone from `Cargo.toml` + `Cargo.lock`. **Controller commits:**
+`refactor(zsign): replace ipa mmap with buffered reads (ZSN-28)`
+(Cargo.toml + Cargo.lock ride in this commit as the obsolete-code cleanup.)
+
+---
+
+### Task 7: Re-verify the extraction path after `File::create`
+
+**Files:**
+- Modify: `crates/zsign/src/ipa/extract.rs` (rayon copy loop, between
+  `File::create` and `BufWriter`)
+
+- [ ] **Step 1: Red check**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: PASS (baseline). There is no deterministic test for this
+best-effort race guard — a window between `validate_output_path` and
+`File::create` cannot be triggered without instrumentation, and the existing
+`test_extract_ipa_rejects_descendant_symlink` covers the pre-create check.
+Recorded honestly; the gate proves no regression.
+
+- [ ] **Step 2: Implement the post-create check**
+
+Between `File::create(&entry.outpath)?;` and
+`let mut outfile = BufWriter::new(outfile);` insert:
+
+```rust
+                // Best-effort TOCTOU guard: re-verify that the path just
+                // created is still a regular file before any bytes are
+                // written. A full openat(O_NOFOLLOW) rework is out of scope.
+                let created = fs::symlink_metadata(&entry.outpath)?;
+                if !created.file_type().is_file() {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Extraction path is not a regular file: {}",
+                            entry.outpath.display()
+                        ),
+                    )));
+                }
+```
+
+- [ ] **Step 3: Run the gate — expect PASS**
+
+Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests pass (all four adversarial symlink tests included).
+
+**Acceptance:** gate green; the copy loop reads validate → create →
+re-verify → copy. **Controller commits:**
+`fix(zsign): recheck extraction path after file creation (ZSN-28)`
+
+---
+
+## Final verification (after task 7)
+
+1. Full scoped gate: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
+   — paste verbatim output into the final report.
+2. Whole-workspace compile with the known-failing test skipped (evidence that
+   no other lane's code broke):
+   `cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
+   — run ONCE at the end, never mid-flight.
+3. `grep` for `unsafe {` in `crates/` → zero hits.
+4. Commit list must be exactly: design+plan docs, then tasks 1-7 in order.
+   No merges, no pushes — the orchestrator lands the branch.
+
+## Task dependency map
+
+All seven tasks edit `crates/zsign/src/ipa/extract.rs` → strictly sequential,
+one task = one commit, gate green before the next task starts. No parallel
+subagent batches are safe on this queue.
