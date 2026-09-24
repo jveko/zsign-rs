@@ -162,8 +162,9 @@ All errors are `Error::Core(zsign_core::Error::Signing(format!(...)))`,
 the established idiom of this file for signing-flow complaints.
 
 Root handling: the bundle root itself is validated once, at
-`sign_bundle_from_options` — `fs::symlink_metadata(bundle_path)` must
-not report a symlink, otherwise hard error
+`sign_bundle_from_options` — `fs::symlink_metadata` on the
+component-rebuilt `bundle_path` (trailing separators stripped) must not
+report a symlink, otherwise hard error
 (`"Bundle root must not be a symlink: {}"`). walkdir 2.5 follows a
 symlinked walk root even with `follow_links(false)`
 (`follow_root_links` defaults to true — walkdir 2.5.0 lib.rs:853, and
@@ -232,8 +233,9 @@ decisions.
    (`:368-370`, `:545`); validation is per-path and stateless, safe inside
    or before the parallel closures. No shared mutable state introduced.
 5. **Error surfacing.** `is_macho_binary` keeps swallowing open failures
-   into `Ok(false)` (resource files depend on it); the new hard errors come
-   only from `get_main_executable` and `resolve_within`.
+   into `Ok(false)` (resource files depend on it); the new hard errors
+   come from `get_main_executable`, `resolve_within`, and the
+   bundle-root check in `sign_bundle_from_options`.
 6. **Scope.** Only `crates/zsign/src/ipa/mod.rs` changes. `extract.rs`,
    `archive.rs`, `builder.rs`, `verify.rs`, `.github/**`, nested
    profile/entitlement semantics are other lanes' (see brief DEFERRED).
