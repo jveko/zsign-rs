@@ -139,6 +139,51 @@ fn is_unsafe_entry_name(name: &str) -> bool {
     !substantive
 }
 
+/// Returns an ancestor of `path` strictly below `dest_dir` that is already
+/// registered as a file entry, if any.
+///
+/// Walks the whole parent chain: a file `Payload/a` must also reject
+/// `Payload/a/b/c`, whose immediate parent is not itself registered. The
+/// walk stops at `dest_dir` and never proceeds above it.
+fn file_ancestor<'a>(
+    path: &Path,
+    dest_dir: &Path,
+    file_paths: &'a HashSet<PathBuf>,
+) -> Option<&'a PathBuf> {
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir == dest_dir || !dir.starts_with(dest_dir) {
+            return None;
+        }
+        if let Some(hit) = file_paths.get(dir) {
+            return Some(hit);
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
+
+/// Registers every ancestor of `path` strictly below `dest_dir` as a path
+/// that must exist as a directory.
+///
+/// Claims are recorded when each entry is seen so conflict detection is
+/// order-independent: an archive listing `Payload/a/b/c` before
+/// `Payload/a` is rejected the same way as the reverse order. The walk
+/// stops at `dest_dir` and never claims the destination or anything above
+/// it, even if a name encloses to the destination itself.
+fn register_ancestor_dirs(path: &Path, dest_dir: &Path, dirs: &mut HashSet<PathBuf>) {
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir == dest_dir || !dir.starts_with(dest_dir) {
+            break;
+        }
+        if !dirs.contains(dir) {
+            dirs.insert(dir.to_path_buf());
+        }
+        ancestor = dir.parent();
+    }
+}
+
 /// Validates that no pre-existing symlink exists in the path from root to the target.
 ///
 /// Walks from `root` downward toward `path`, checking each existing component.
@@ -309,6 +354,7 @@ pub fn extract_ipa_with_limits(
     // First pass: collect entry metadata and create directories
     let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
     let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
+    let mut file_paths: HashSet<PathBuf> = HashSet::new();
 
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(Error::Zip)?;
@@ -343,7 +389,27 @@ pub fn extract_ipa_with_limits(
         let is_symlink = false;
 
         if file.is_dir() {
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
             dirs_to_create.insert(outpath.clone());
+            // Claim every implied ancestor as a must-be-directory so a
+            // later file at the same path is rejected in the collect pass,
+            // whichever order the archive lists them. A dir entry that
+            // contains registered files stays legal — claims add no new
+            // rejection here.
+            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
             entries.push(ExtractEntry {
                 index: i,
                 outpath,
@@ -353,12 +419,32 @@ pub fn extract_ipa_with_limits(
                 unix_mode,
             });
         } else {
-            // Collect parent directories
-            if let Some(parent) = outpath.parent() {
-                if !dirs_to_create.contains(&parent.to_path_buf()) {
-                    dirs_to_create.insert(parent.to_path_buf());
-                }
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Duplicate entry path in IPA: {}", relative.display()),
+                )));
             }
+            if dirs_to_create.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            // Claim this entry's ancestor chain as must-be-directories; the
+            // walk above already rejected file ancestors, and a later file
+            // at any claimed path conflicts below.
+            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
+            file_paths.insert(outpath.clone());
             entries.push(ExtractEntry {
                 index: i,
                 outpath,
@@ -894,6 +980,149 @@ mod tests {
             0o755,
             "setuid must not survive extraction, got {mode:o}"
         );
+    }
+
+    /// Build an IPA from `build`, extract it, and assert a collect-pass
+    /// type conflict naming `expected` with no payload content written.
+    fn assert_type_conflict(
+        expected: &str,
+        build: impl FnOnce(&mut ZipWriter<File>, SimpleFileOptions),
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("conflict.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        build(&mut zip, options);
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("type conflict must be rejected in the collect pass");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains(expected), "error must name {expected}: {msg}");
+        assert!(
+            !extract_dir.join("Payload").exists(),
+            "collect-pass rejection must write no payload content"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_duplicate_normalized_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("duplicate.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+        // Textually distinct raw name, identical path once normalized.
+        zip.start_file("./Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"second copy").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("duplicate normalized path must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duplicate entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Payload/Test.app/Info.plist"),
+            "error must name the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_type_conflicting_entries() {
+        // Same path, directory entry first.
+        assert_type_conflict("Payload/D", |zip, options| {
+            zip.add_directory("Payload/D", options).unwrap();
+            zip.start_file("Payload/D", options).unwrap();
+            zip.write_all(b"file where a directory is").unwrap();
+        });
+        // Same path, file entry first — the dir branch's same-path check.
+        assert_type_conflict("Payload/D", |zip, options| {
+            zip.start_file("Payload/D", options).unwrap();
+            zip.write_all(b"file where a directory will be").unwrap();
+            zip.add_directory("Payload/D", options).unwrap();
+        });
+        // Directory entry under an already-registered file — the dir
+        // branch's ancestor walk.
+        assert_type_conflict("Payload/a", |zip, options| {
+            zip.start_file("Payload/a", options).unwrap();
+            zip.write_all(b"i am a file").unwrap();
+            zip.add_directory("Payload/a/b", options).unwrap();
+        });
+        // File entry after a directory chain claimed its path — the
+        // ancestor claim registered by the dir branch.
+        assert_type_conflict("Payload/a", |zip, options| {
+            zip.add_directory("Payload/a/b", options).unwrap();
+            zip.start_file("Payload/a", options).unwrap();
+            zip.write_all(b"i am a file").unwrap();
+        });
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_descendant_of_file_entry() {
+        // Order 1: file ancestor first, then its descendant.
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("descendant.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.start_file("Payload/a", options).unwrap();
+        zip.write_all(b"i am a file").unwrap();
+        zip.start_file("Payload/a/b/c", options).unwrap();
+        zip.write_all(b"descendant of a file").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("entry under a file must be rejected in the collect pass");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Payload/a"), "error must name the path: {msg}");
+
+        // Order 2: descendant registered first — the later ancestor file
+        // must hit the same collect-pass conflict, not an OS error after
+        // directories have been created.
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("descendant_first.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        zip.add_directory("Payload/", options).unwrap();
+        zip.start_file("Payload/a/b/c", options).unwrap();
+        zip.write_all(b"descendant of a file").unwrap();
+        zip.start_file("Payload/a", options).unwrap();
+        zip.write_all(b"i am a file").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("ancestor file after its descendant must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Conflicting entry path in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Payload/a"), "error must name the path: {msg}");
     }
 
     #[test]
