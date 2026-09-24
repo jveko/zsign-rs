@@ -415,7 +415,7 @@ pub fn extract_ipa_with_limits(
                 {
                     use std::os::unix::fs::PermissionsExt;
                     if let Some(mode) = entry.unix_mode {
-                        let perms = mode & 0o7777;
+                        let perms = mode & 0o777;
                         fs::set_permissions(&entry.outpath, fs::Permissions::from_mode(perms))?;
                     }
                 }
@@ -807,6 +807,92 @@ mod tests {
         assert!(
             msg.contains("Symlink target too long in IPA"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// Overwrite one central-directory entry's unix mode.
+    ///
+    /// The zip write API masks modes through `unix_permissions(0o777)`, so a
+    /// setuid fixture has to patch the central-directory record directly.
+    /// `external_file_attributes` (offset 38) stores the mode in its high 16
+    /// bits; the low 16 bits hold DOS attributes and are preserved.
+    #[cfg(unix)]
+    fn patch_central_dir_unix_mode(archive_path: &Path, entry_name: &str, mode: u32) {
+        let mut bytes = fs::read(archive_path).unwrap();
+
+        let eocd = bytes
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .expect("end-of-central-directory record not found");
+        let entry_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut pos = u32::from_le_bytes([
+            bytes[eocd + 16],
+            bytes[eocd + 17],
+            bytes[eocd + 18],
+            bytes[eocd + 19],
+        ]) as usize;
+
+        for _ in 0..entry_count {
+            assert_eq!(
+                &bytes[pos..pos + 4],
+                b"PK\x01\x02",
+                "bad central directory entry"
+            );
+            let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[pos + 30], bytes[pos + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[pos + 32], bytes[pos + 33]]) as usize;
+            let name = std::str::from_utf8(&bytes[pos + 46..pos + 46 + name_len]).unwrap();
+            if name == entry_name {
+                let attr_pos = pos + 38;
+                let mut attr = [0u8; 4];
+                attr.copy_from_slice(&bytes[attr_pos..attr_pos + 4]);
+                let old = u32::from_le_bytes(attr);
+                let patched = (mode << 16) | (old & 0xffff);
+                bytes[attr_pos..attr_pos + 4].copy_from_slice(&patched.to_le_bytes());
+                fs::write(archive_path, &bytes).unwrap();
+                return;
+            }
+            pos += 46 + name_len + extra_len + comment_len;
+        }
+        panic!("entry {entry_name} not found in central directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_ipa_strips_setuid_bit() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("setuid.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        // Empty content on purpose: the kernel strips setuid/setgid on any
+        // write, and production chmods before the BufWriter's final flush.
+        // With zero bytes the permission restore is the last filesystem
+        // operation, so a surviving setuid bit stays observable — otherwise
+        // the post-chmod flush would clear it and this test would false-green.
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.finish().unwrap();
+
+        // 0o104755 = S_IFREG | setuid | rwxr-xr-x
+        patch_central_dir_unix_mode(&ipa_path, "Payload/Test.app/Info.plist", 0o104755);
+
+        let extract_dir = temp_dir.path().join("extracted");
+        let app = extract_ipa(&ipa_path, &extract_dir).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = app
+            .join("Info.plist")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o7777,
+            0o755,
+            "setuid must not survive extraction, got {mode:o}"
         );
     }
 
