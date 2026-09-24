@@ -42,8 +42,10 @@ fixtures (manifest has no include/exclude).
 - Existing jobs stay intact: `lint` (hk check), `test` (debug, full suite),
   `wasm` (compile-only), `interop` (macOS interop script).
 - Known failure `test_ipa_signing_is_deterministic` (ZSN-15, zip entry-order
-  nondeterminism): the existing `test` job keeps running it unchanged; **new**
-  jobs that execute the suite skip it so the flake cannot block unrelated PRs.
+  nondeterminism): the existing `test` job keeps running it unchanged; **new
+  PR-facing** jobs that execute the suite skip it so the flake cannot block
+  unrelated PRs. The tag-only publish `verify` jobs deliberately run the full
+  suite (the brief's verbatim spec) — those jobs never run on pull requests.
 - Validation: `actionlint` (baseline captured: exit 0 on `ee42c12`) after every
   workflow change; targeted `cargo check` / `cargo package` for manifest changes;
   `cargo deny check` locally if installable. Never `cargo fmt` / `cargo clippy` /
@@ -64,6 +66,9 @@ fixtures (manifest has no include/exclude).
 | actionlint 1.7.12 present; baseline run exit 0, zero output. cargo-deny/wasm-pack/cargo-msrv NOT installed locally; rustup present with `stable`/`1.98.0`/`1.98.1`/nightly | ScoutMsrvTools |
 | cargo-deny current schema (0.20 era): `advisories.yanked`, `[licenses] allow`, `[bans] multiple-versions`, `[sources] unknown-registry/unknown-git`; pre-0.15 keys removed | ScoutActionPins (cargo-deny book) |
 | `cargo-deny-action@v2.1.1` (bundles cargo-deny 0.20.2) runs all four checks by default; `taiki-e/install-action` current `v2` line, latest `v2.87.20`, supports `tool: wasm-pack`; `dtolnay/rust-toolchain@1.88.0` version branches exist upstream | ScoutActionPins (GitHub API/READMEs) |
+| Local cargo-deny 0.20.2 run with the planned policy: advisories FAIL on RUSTSEC-2023-0071 (rsa 0.9.10, `patched = []`); scoped ignore entry → all four checks ok, exit 0, 3 non-fatal license warnings | own local run |
+| Action arg assembly `cargo-deny … --all-features check` (flags precede subcommand); image default rust:1.85.0; `rust-version` input supported; upload-artifact current major = v7 (v7.0.1; v4 stale) | own local run (action.yml/entrypoint.sh/Dockerfile @v2.1.1, GitHub tags API) |
+| `wasm-pack test --node crates/zsign-wasm` exits 0 with today's zero tests ("no tests to run", 0 passed / 0 failed) | own local run (wasm-pack 0.15.0) |
 | `wasm-pack test --node <path>` targets wasm32-unknown-unknown and auto-installs it via rustup | ScoutActionPins (wasm-pack docs) |
 | examples/web: `npm run build` = `vite build`, `package-lock.json` present, but depends on `file:../../crates/zsign-wasm/pkg` which must be produced by `wasm-pack build` first | ScoutWorkflowMap |
 
@@ -130,6 +135,19 @@ and PR regardless of which files changed, reusing the job's existing toolchain
   runs all four checks by default; exact tag pinned — see cross-cutting decision).
 - New `.github/dependabot.yml`: `cargo` (workspace root) + `github-actions`,
   both weekly.
+
+Empirical policy validation (cargo-deny 0.20.2 — the exact version the CI
+action bundles): with the config above, the locked graph fails advisories on
+RUSTSEC-2023-0071 (`rsa 0.9.10`, `patched = []`, "No safe upgrade is
+available"). The config therefore carries a scoped, commented `ignore` entry
+for that advisory: upstream has no fix and the advisory's own guidance permits
+local use on a non-compromised machine, which is this offline CLI's threat
+model. With the ignore: `advisories ok, bans ok, licenses ok, sources ok`,
+exit 0. Three `license-not-encountered` warnings (ISC, CC0-1.0,
+Unicode-DFS-2016) are non-fatal and kept deliberately — the brief mandates
+those ids in the allowlist. The deny job passes `rust-version: "1.88.0"` to
+the action so its container runs cargo at/above the workspace MSRV (image
+default is rust:1.85.0) once item 4 declares `rust-version = "1.88"`.
 
 **Alternatives considered:**
 - *`cargo audit` instead of cargo-deny* — rejected: advisories-only; the brief
@@ -229,7 +247,7 @@ builds are the slow paths). For interop diagnostics: the script writes
 .gitignore edit) containing an environment header (uname/sw_vers/openssl/date),
 every `fail()` message plus a `ls -laR` snapshot of `$WORK`, and the
 `codesign -d --verbose=4` dump; ci.yml uploads it with
-`actions/upload-artifact@v4` under `if: failure()`.
+`actions/upload-artifact@v7.0.1` under `if: failure()`.
 
 **Alternatives considered:**
 - *Diagnostics file in the repo root* — rejected: creates an untracked file and
@@ -260,12 +278,21 @@ examples/web consumes the unscoped `zsign-wasm` file: dependency) → setup-node
 
 ## Cross-cutting decisions
 
-1. **Pinning convention for NEW action refs:** exact release tags
-   (`cargo-deny-action@v2.1.1`, `install-action@v2.87.20`) because the brief
-   demands pinned tags and these are supply-chain additions. Existing refs
-   (`@v4`, `@v2`) stay untouched — converting the repo to SHA-pinning is a
-   separate, repo-wide decision, deliberately rejected here (second convention
-   risk vs. existing files; SHA-pinning everything belongs in its own lane).
+1. **Action-ref convention (one rule, covering every ref this lane writes):**
+   - (a) The two supply-chain tools the brief names are pinned to exact
+     release tags: `EmbarkStudios/cargo-deny-action@v2.1.1`,
+     `taiki-e/install-action@v2.87.20`.
+   - (b) A new reference to an action already used in the repo reuses the
+     repo's existing ref string — no second convention for the same action:
+     `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`,
+     `Swatinem/rust-cache@v2`, `actions/setup-node@v4`.
+   - (c) A newly introduced action used nowhere else in the repo
+     (`actions/upload-artifact`) is pinned to an exact current tag verified
+     at implementation time: `@v7.0.1` (the v4 line is three majors stale).
+   - (d) Toolchain pins follow the brief: `dtolnay/rust-toolchain@1.88.0`
+     for the MSRV job.
+   Existing refs stay untouched; converting the whole repo to SHA-pinning is
+   deliberately rejected here (a repo-wide decision for a dedicated lane).
 2. **Known-failure policy:** existing `test` job unchanged (runs
    `test_ipa_signing_is_deterministic`); new suite-executing jobs
    (`test-release`, publish `verify`) — `test-release` skips it (blocks no PR);
@@ -278,14 +305,18 @@ examples/web consumes the unscoped `zsign-wasm` file: dependency) → setup-node
 ## Validation strategy
 
 - `actionlint` after every commit touching workflows (baseline: clean on
-  `ee42c12`); final run over all five workflow files.
+  `ee42c12`); final run over all four workflow files.
 - Item 4: `rustup toolchain install 1.88.0` + `cargo +1.88.0 check
   --workspace --all-targets` (manifest claim == observed build).
 - Item 6: `cargo package -p zsign-core --allow-dirty --list` (assert no `.p12`)
   then full `cargo package -p zsign-core --allow-dirty`.
-- Item 3: install cargo-deny (prebuilt release binary; `cargo install` fallback)
-  and run `cargo deny check`; if neither is feasible, keep config to the
-  documented schema and say so honestly.
+- Item 3: cargo-deny 0.20.2 (prebuilt release binary, sha256-verified against
+  the upstream checksum; same version the CI action bundles) runs as
+  `cargo-deny --all-features check` — flags precede the subcommand, matching
+  the action's own arg assembly. Expected: `advisories ok, bans ok, licenses
+  ok, sources ok`, exit 0, plus three known non-fatal
+  `license-not-encountered` warnings (ISC, CC0-1.0, Unicode-DFS-2016 —
+  brief-mandated allowlist ids).
 - Item 2/8: install wasm-pack (prebuilt) and run `wasm-pack test --node
   crates/zsign-wasm`; for examples/web run `npm ci && npm run build` locally.
   Network-dependent steps that fail once are recorded as unvalidated, not
