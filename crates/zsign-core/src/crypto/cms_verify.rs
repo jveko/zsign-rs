@@ -1028,58 +1028,6 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn debug_certs_dump() {
-        let (creds, _key) = rsa_credentials();
-        let content: &[u8] = b"the code directory bytes";
-        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
-        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
-        let wrapped = wrap(&cms);
-        let cms_bytes = strip_blob_wrapper(&wrapped).unwrap();
-        // find certificates: parse SignedData manually with a cursor
-        let mut r = SliceReader::new(cms_bytes).unwrap();
-        let ci = AnyRef::decode(&mut r).unwrap();
-        let mut cir = SliceReader::new(ci.value()).unwrap();
-        let _ct = ObjectIdentifier::decode(&mut cir).unwrap();
-        let sd_wrap = AnyRef::decode(&mut cir).unwrap();
-        let mut sdr = SliceReader::new(sd_wrap.value()).unwrap();
-        let sd = AnyRef::decode(&mut sdr).unwrap();
-        let mut sd_body = SliceReader::new(sd.value()).unwrap();
-        let _v = u32::decode(&mut sd_body).unwrap();
-        let _da = AnyRef::decode(&mut sd_body).unwrap();
-        let _encap = AnyRef::decode(&mut sd_body).unwrap();
-        let certs0 = AnyRef::decode(&mut sd_body).unwrap();
-        println!(
-            "certs tag: {:?}, total value len: {}",
-            certs0.tag(),
-            certs0.value().len()
-        );
-        let v = certs0.value();
-
-        let mut cr = SliceReader::new(certs0.value()).unwrap();
-        let elem = AnyRef::decode(&mut cr).unwrap();
-        println!(
-            "elem tag: {:?}, elem value len: {}",
-            elem.tag(),
-            elem.value().len()
-        );
-        match x509_cert::Certificate::from_der(elem.value()) {
-            Ok(_) => println!("from_der OK"),
-            Err(e) => println!("from_der ERR: {e}"),
-        }
-        let show = v.len().min(128);
-        for (i, b) in v[..show].iter().enumerate() {
-            if i % 16 == 0 {
-                print!("{:04x}: ", i);
-            }
-            print!("{b:02x} ");
-            if i % 16 == 15 {
-                println!();
-            }
-        }
-        println!();
-    }
-
     use super::*;
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::cms::sign_code_directory;

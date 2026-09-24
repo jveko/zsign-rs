@@ -399,24 +399,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_signing_key_type_enum_exists() {
-        let _rsa: fn(rsa::pkcs1v15::SigningKey<sha2::Sha256>) -> SigningKeyType =
-            SigningKeyType::Rsa;
-        let _ecdsa: fn(EcdsaSigningKey) -> SigningKeyType = SigningKeyType::Ecdsa;
-    }
-
-    #[test]
-    fn test_signing_credentials_struct_exists() {
-        fn check_field_types(_creds: &SigningCredentials) {
-            let _cert: &Certificate = &_creds.certificate;
-            let _key: &SigningKeyType = &_creds.signing_key;
-            let _chain: &Vec<Certificate> = &_creds.cert_chain;
-            let _team: &Option<String> = &_creds.team_id;
-        }
-        let _ = check_field_types;
-    }
-
-    #[test]
     fn test_from_pem_invalid_cert() {
         let result = SigningCredentials::from_pem(b"not a cert", b"not a key", None);
         assert!(result.is_err());

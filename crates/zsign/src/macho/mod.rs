@@ -169,6 +169,3 @@ pub fn sign_any_macho(
         allow_encrypted,
     )?)
 }
-
-#[cfg(test)]
-mod tests {}

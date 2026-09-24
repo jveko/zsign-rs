@@ -24,9 +24,20 @@ local lint = new Mapping<String, Step> {
   ["actionlint"] = Builtins.actionlint
 }
 
+// The suite is a whole-project command: no glob so it runs even when a PR
+// touches no .rs files, exclusive because cargo test writes outside the
+// selected file set (target/).
+local test = new Mapping<String, Step> {
+  ["cargo-test"] = new Step {
+    check = "cargo test --workspace"
+    exclusive = true
+  }
+}
+
 local static = new Mapping<String, Step> {
   ...lint
   ...clippy
+  ...test
 }
 
 hooks {

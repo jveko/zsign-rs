@@ -60,14 +60,3 @@ impl MachOFile {
         self.inner.slice_data(slice)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_minimal() {
-        let result = MachOFile::parse(vec![0; 100]);
-        assert!(result.is_err());
-    }
-}

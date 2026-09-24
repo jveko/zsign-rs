@@ -454,13 +454,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_minimal() {
-        // This will fail without a real Mach-O, but validates the API compiles
-        let result = MachOFile::parse(vec![0; 100]);
-        assert!(result.is_err()); // Expected: not a valid Mach-O
-    }
-
-    #[test]
     fn test_parse_rejects_garbage() {
         let result = MachOFile::parse(vec![0xFF; 1000]);
         assert!(result.is_err());
