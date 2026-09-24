@@ -163,8 +163,12 @@ collected so far are preserved):
     today, first failing signer kept for diagnostics.
 - A SignerInfo sets `report.valid = true` only when **its** errors are empty
   **and** no global error exists. The current unconditional
-  `report.errors.clear()` on success (`cms_verify.rs:684`) is removed so
-  global errors can never be wiped by a clean signer.
+  `report.errors.clear()` on success (`cms_verify.rs:684`) becomes a
+  **conditional** clear: a clean signer still clears previously stored
+  *signer* errors (best-signer-wins across a multi-signer set is preserved),
+  but only when `global_errors` is empty — structural errors live in
+  `global_errors` until `seal` attaches them and are never wiped by a clean
+  signer.
 - **Every `Ok(report)` exit re-attaches global errors through a small
   `seal(report, global_errors)` helper** — several paths inside the
   SignerInfo loop return early (unsupported digest algorithm, signing
@@ -320,10 +324,12 @@ governs only the terminus.**
 **D7 — Parse the Apple root PEM per call; no `OnceLock`.**
 - Rejected: `std::sync::OnceLock` cache — zero precedent in this repo (scout:
   no `OnceLock`/`lazy_static`/`once_cell` in `crates/`), adds global state and
-  wasm32 reasoning for a PEM parse that is ~1000× cheaper than the RSA
-  verification that immediately follows it.
-- Rejects per-call cost concern with evidence: one `Certificate::from_pem` of a
-  ~1.2 KB PEM vs one RSA-2048 PKCS#1 v1.5 verify (milliseconds).
+  wasm32 reasoning for no benefit: a PEM parse of a small embedded constant is
+  qualitatively far cheaper than the RSA verification that immediately
+  follows it (design rationale — no benchmark was run, so no numeric ratio is
+  claimed).
+- Per-call cost in context: one `Certificate::from_pem` of a ~1.2 KB PEM
+  versus one RSA-2048 PKCS#1 v1.5 modular exponentiation.
 
 **D8 — `chain_accepts_sha1_signed_intermediate` migrates, never weakens.**
 - The test calls `verify_chain` directly; it gains the `anchors` argument with
@@ -366,9 +372,12 @@ if the SignedData itself is well-formed.
    `adhoc_report()` semantics unchanged, ad-hoc and error-path behavior
    unchanged.
 6. Round-trip verification of this repo's own signatures still succeeds when
-   the signer's own root is injected (cms 0.2.3 emits exactly one `contentType`
-   = id-data; `Profile::Root` fixtures terminate at an injectable self-signed
-   root).
+   the signer's own certificate is injected as an anchor: the signer fixture
+   is a self-issued `Profile::Leaf` carrying codeSigning EKU, a
+   digitalSignature keyUsage, and `CA=false` basicConstraints, and it
+   terminates at itself as its own anchor (cms 0.2.3 emits exactly one
+   id-data `contentType`). `Profile::Root` is reserved for issuer fixtures,
+   which face the CA rules rather than the leaf rules.
 
 ## 5. Test strategy
 
@@ -418,7 +427,8 @@ entry point, pinning the Apple-root default itself.
   outside `signedAttrs`) asserting the global error lands in `errors` and a
   clean SignerInfo cannot clear it (`valid == false`, `errors` non-empty), plus
   the round trip staying green (signer emits exactly one id-data contentType —
-  pinned by scout evidence and `cms.rs:584-599`).
+  pinned by `cms-0.2.3/src/builder.rs:240-254` for the single auto-added
+  value and `crypto/cms.rs:103-106` for the value being `ID_DATA`).
 - Item 5: migrated SHA-1 chain asserts `warnings` mention SHA-1 while `ok &&
   anchored` still hold; a SHA-256 chain asserts no SHA-1 warning.
 

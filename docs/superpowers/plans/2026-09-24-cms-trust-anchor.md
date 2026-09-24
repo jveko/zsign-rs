@@ -205,7 +205,8 @@ impl TrustAnchors {
 
 (Imports: `Certificate::from_pem` requires `der::DecodePem` in scope — it is
 currently missing from the `der` imports at the top of `cms_verify.rs
-(~:35-40)`; `to_der` requires `der::Encode`. Add both explicitly.)
+(~:35-40)`. Add **only** `DecodePem` to that list; `der::Encode` is already
+imported (`cms_verify.rs:39`) and a duplicate import is E0252.)
 
 Change `verify_code_signature` to delegate and add the new function:
 
@@ -265,8 +266,9 @@ Keep the existing leaf-validity check and climb loop intact, changing only:
 1. Every `return (false, false, names, Some(...))` /
    `return (true, _, names, ...)` becomes
    `return ChainOutcome { ok: …, anchored: …, subjects: names, reason: …,
-   warnings }` (initialise `let warnings: Vec<String> = Vec::new();` next to
-   `let mut names = …`).
+   warnings }` (initialise `let mut warnings: Vec<String> = Vec::new();` next to
+   `let mut names = …` — `mut` from the start: Task 5 pushes SHA-1
+   observations into it).
 2. The self-signed terminus branch (currently `:890-894`) becomes:
 
 ```rust
@@ -424,7 +426,9 @@ fn anchors_for(creds: &SigningCredentials) -> TrustAnchors {
   **and anchoring to an explicit trust-anchor set —
   [`TrustAnchors::apple_root`] by default; revocation remains a device
   concern.** Extend the numbered check list with: certificate chain anchored
-  to a trusted root.
+  to a trusted root (the remaining new entries — purpose enforcement, signed
+  contentType, SKI resolution, SHA-1 warnings — are added by Tasks 2/3/4/5
+  below, per design §8).
 - `CmsVerifyReport::anchored` field doc (~:235-236): "Whether the chain
   terminates at a verified trust anchor" (was "…at a self-signed anchor").
 - `verify_code_signature` doc (~:250-257): note the default anchor set and
@@ -1042,6 +1046,8 @@ Expected: PASS. Acceptance: missing/malformed EKU, wrong-purpose EKU, weak
 leaf KU/BC, non-CA issuer, pathLen violation, issuer keyUsage without
 keyCertSign — each fails with its distinct reason; positive 2-cert chain
 anchors; the SHA-1 fixture still chains (warnings assertions land in Task 5).
+Documentation: extend the module-header numbered check list (design §8) with:
+X.509 purpose enforcement.
 Commit (controller): `feat(zsign-core): enforce x.509 purpose constraints in chain verification`
 
 ---
@@ -1063,8 +1069,9 @@ const OID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("2.5.29.14");
 ```
 
-Tests (they compile only after Step 3.2 adds `find_cert_by_ski` — new-function
-TDD; the pure-function choice is design D9, sanctioned by the brief):
+Tests (the first three compile only after Step 3.3 adds `find_cert_by_ski` —
+new-function TDD; the pure-function choice is design D9, sanctioned by the
+brief):
 
 ```rust
 /// The SubjectKeyIdentifier key id of `cert` (Profile::Root fixtures always
@@ -1117,119 +1124,7 @@ fn ski_malformed_extension_is_skipped() {
 and `der::asn1::Null` are in `der` 0.7. If `ext_value` is `pub(crate)`/private, the
 test module accesses it via `use super::*` as with the other helpers.)
 
-- [ ] **Step 3.2: Implement resolution + wiring**
-
-1. Add the pure function next to `ext_value`:
-
-```rust
-/// Finds the embedded certificate whose SubjectKeyIdentifier equals `key_id`.
-///
-/// Malformed SKI extensions are skipped; `None` means the SignerInfo cannot
-/// be resolved and must be rejected with a fatal report error.
-fn find_cert_by_ski<'a>(
-    certs: &'a [x509_cert::Certificate],
-    key_id: &[u8],
-) -> Option<&'a x509_cert::Certificate> {
-    use der::Decode;
-    certs.iter().find(|c| {
-        let Some(bytes) = ext_value(c, OID_SUBJECT_KEY_IDENTIFIER) else {
-            return false;
-        };
-        der::asn1::OctetString::from_der(bytes)
-            .map(|ski| ski.as_bytes() == key_id)
-            .unwrap_or(false)
-    })
-}
-```
-
-2. In `verify_signed_data`, restructure the sid block (~:521-554) — the
-   issuerAndSerialNumber arm keeps its exact slice-capture logic; the SKI arm
-   resolves instead of skipping:
-
-```rust
-// sid: issuerAndSerialNumber SEQUENCE or [0] subjectKeyIdentifier.
-let sid = AnyRef::decode(&mut si_r)
-    .map_err(|e| Error::Verification(format!("malformed signer id: {e}")))?;
-let sid_body = sid.value();
-let mut ski_cert: Option<&x509_cert::Certificate> = None;
-let mut issuer_der: &[u8] = &[];
-let mut serial_der: &[u8] = &[];
-match sid.tag() {
-    Tag::Sequence => {
-        let mut sidr = reader(sid_body, "malformed issuerAndSerialNumber")?;
-        let ib = usize::try_from(sidr.position()).unwrap_or(0);
-        let _issuer_any = AnyRef::decode(&mut sidr)
-            .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
-        let ie = usize::try_from(sidr.position()).unwrap_or(0);
-        let sb = usize::try_from(sidr.position()).unwrap_or(0);
-        let _serial_any = AnyRef::decode(&mut sidr)
-            .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
-        let se = usize::try_from(sidr.position()).unwrap_or(0);
-        issuer_der = sid_body.get(ib..ie).unwrap_or_default();
-        serial_der = sid_body.get(sb..se).unwrap_or_default();
-    }
-    // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
-    // STRING (der-derive default); tolerate a constructed wrapper too — its
-    // value is then the inner OCTET STRING TLV rather than the raw key id.
-    Tag::ContextSpecific { number, constructed } if number == TagNumber::new(0) => {
-        let key_id: Option<Vec<u8>> = if constructed {
-            der::asn1::OctetString::from_der(sid_body)
-                .ok()
-                .map(|o| o.as_bytes().to_vec())
-        } else {
-            Some(sid_body.to_vec())
-        };
-        let resolved = key_id
-            .as_deref()
-            .and_then(|kid| find_cert_by_ski(&certs, kid));
-        match resolved {
-            Some(c) => ski_cert = Some(c),
-            None => {
-                // Never leave the report invalid-with-empty-errors: record why
-                // this SignerInfo was unusable and move to the next one.
-                if report.errors.is_empty() {
-                    report.errors.push(
-                        "signer subjectKeyIdentifier does not match any embedded certificate"
-                            .into(),
-                    );
-                }
-                continue;
-            }
-        }
-    }
-    other => {
-        return Err(Error::Verification(format!(
-            "unexpected signer id tag {other:?}"
-        )));
-    }
-}
-```
-
-3. At the signing-certificate lookup (~:600-613), honour the pre-resolved SKI:
-
-```rust
-let signer_cert = match ski_cert {
-    Some(c) => Some(c),
-    None => certs.iter().find(|c| {
-        c.tbs_certificate
-            .issuer
-            .to_der()
-            .map(|d| d.as_slice() == issuer_der)
-            .unwrap_or(false)
-            && c.tbs_certificate
-                .serial_number
-                .to_der()
-                .map(|d| d.as_slice() == serial_der)
-                .unwrap_or(false)
-    }),
-};
-```
-
-4. Delete the obsolete warning
-   `signer identified by subjectKeyIdentifier; skipping` (grep to confirm no
-   other occurrence).
-
-- [ ] **Step 3.3: Report-level fixtures (sid splice — RED first, GREEN after Step 3.2)**
+- [ ] **Step 3.2: Report-level fixtures (sid splice — RED)**
 
 The sid sits *outside* `signedAttrs`, so a fixture can swap it without
 invalidating the signature; ancestor lengths are rebuilt bottom-up so every
@@ -1382,10 +1277,126 @@ fn ski_signer_with_unknown_key_id_is_fatal() {
 }
 ```
 
-Write the two tests first and run them: `ski_signer_resolves_end_to_end` is
-RED on Step 3.1/3.2 state only if the wiring is wrong — on the *base* code the
-splice lands in the unexpected-tag/`warning+continue` path, so it fails there
-(combine Steps 3.1-3.3 in one red/green cycle: tests first, wiring second).
+Both fixtures are RED on the pre-Task-3 code: the spliced primitive sid
+falls into the `other` arm and `verify_code_signature` returns a hard `Err`
+(`unexpected signer id tag`). Write and run them before Step 3.3 — the wiring
+turns them green.
+
+- [ ] **Step 3.3: Implement resolution + wiring**
+
+(The Step 3.1 unit tests compile once this step defines `find_cert_by_ski`;
+the Step 3.2 splice fixtures already compile and stay RED until this wiring
+lands.)
+
+1. Add the pure function next to `ext_value`:
+
+```rust
+/// Finds the embedded certificate whose SubjectKeyIdentifier equals `key_id`.
+///
+/// Malformed SKI extensions are skipped; `None` means the SignerInfo cannot
+/// be resolved and must be rejected with a fatal report error.
+fn find_cert_by_ski<'a>(
+    certs: &'a [x509_cert::Certificate],
+    key_id: &[u8],
+) -> Option<&'a x509_cert::Certificate> {
+    use der::Decode;
+    certs.iter().find(|c| {
+        let Some(bytes) = ext_value(c, OID_SUBJECT_KEY_IDENTIFIER) else {
+            return false;
+        };
+        der::asn1::OctetString::from_der(bytes)
+            .map(|ski| ski.as_bytes() == key_id)
+            .unwrap_or(false)
+    })
+}
+```
+
+2. In `verify_signed_data`, restructure the sid block (~:521-554) — the
+   issuerAndSerialNumber arm keeps its exact slice-capture logic; the SKI arm
+   resolves instead of skipping:
+
+```rust
+// sid: issuerAndSerialNumber SEQUENCE or [0] subjectKeyIdentifier.
+let sid = AnyRef::decode(&mut si_r)
+    .map_err(|e| Error::Verification(format!("malformed signer id: {e}")))?;
+let sid_body = sid.value();
+let mut ski_cert: Option<&x509_cert::Certificate> = None;
+let mut issuer_der: &[u8] = &[];
+let mut serial_der: &[u8] = &[];
+match sid.tag() {
+    Tag::Sequence => {
+        let mut sidr = reader(sid_body, "malformed issuerAndSerialNumber")?;
+        let ib = usize::try_from(sidr.position()).unwrap_or(0);
+        let _issuer_any = AnyRef::decode(&mut sidr)
+            .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
+        let ie = usize::try_from(sidr.position()).unwrap_or(0);
+        let sb = usize::try_from(sidr.position()).unwrap_or(0);
+        let _serial_any = AnyRef::decode(&mut sidr)
+            .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
+        let se = usize::try_from(sidr.position()).unwrap_or(0);
+        issuer_der = sid_body.get(ib..ie).unwrap_or_default();
+        serial_der = sid_body.get(sb..se).unwrap_or_default();
+    }
+    // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
+    // STRING (der-derive default); tolerate a constructed wrapper too — its
+    // value is then the inner OCTET STRING TLV rather than the raw key id.
+    Tag::ContextSpecific { number, constructed } if number == TagNumber::new(0) => {
+        let key_id: Option<Vec<u8>> = if constructed {
+            der::asn1::OctetString::from_der(sid_body)
+                .ok()
+                .map(|o| o.as_bytes().to_vec())
+        } else {
+            Some(sid_body.to_vec())
+        };
+        let resolved = key_id
+            .as_deref()
+            .and_then(|kid| find_cert_by_ski(&certs, kid));
+        match resolved {
+            Some(c) => ski_cert = Some(c),
+            None => {
+                // Never leave the report invalid-with-empty-errors: record why
+                // this SignerInfo was unusable and move to the next one.
+                if report.errors.is_empty() {
+                    report.errors.push(
+                        "signer subjectKeyIdentifier does not match any embedded certificate"
+                            .into(),
+                    );
+                }
+                continue;
+            }
+        }
+    }
+    other => {
+        return Err(Error::Verification(format!(
+            "unexpected signer id tag {other:?}"
+        )));
+    }
+}
+```
+
+3. At the signing-certificate lookup (~:600-613), honour the pre-resolved SKI:
+
+```rust
+let signer_cert = match ski_cert {
+    Some(c) => Some(c),
+    None => certs.iter().find(|c| {
+        c.tbs_certificate
+            .issuer
+            .to_der()
+            .map(|d| d.as_slice() == issuer_der)
+            .unwrap_or(false)
+            && c.tbs_certificate
+                .serial_number
+                .to_der()
+                .map(|d| d.as_slice() == serial_der)
+                .unwrap_or(false)
+    }),
+};
+```
+
+4. Delete the obsolete warning
+   `signer identified by subjectKeyIdentifier; skipping` (grep to confirm no
+   other occurrence).
 
 - [ ] **Step 3.4: Run GREEN + acceptance**
 
@@ -1398,6 +1409,8 @@ returns `valid = false` with an empty `errors`); a conformant **primitive**
 `[0]` sid resolves end-to-end (`valid == true`, `signer_subject` set);
 resolution unit tests green; multi-signer best-signer-wins behaviour
 unchanged.
+Documentation: extend the module-header numbered check list (design §8) with:
+SKI SignerInfo resolution.
 Commit (controller): `fix(zsign-core): resolve subjectkeyidentifier signers against embedded certificates`
 
 ---
@@ -1514,7 +1527,7 @@ fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<Str
      ```rust
      if econtent_type != OID_ID_DATA {
          global_errors.push(format!(
-             "encapContentInfo eContentType {econtent_type} (expected id-data)"
+             "encapContentInfo eContentType is {econtent_type} (expected id-data)"
          ));
      }
      ```
@@ -1678,6 +1691,8 @@ the extra-malformed-value evasion from the review is closed; `eContentType !=
 id-data` is a global error that a clean SignerInfo cannot clear
 (`global_econtent_type_error_beats_clean_signer`: `valid == false`, exactly
 one error, `signature_ok == true`).
+Documentation: extend the module-header numbered check list (design §8) with:
+signed contentType requirement.
 Commit (controller): `feat(zsign-core): require signed contenttype attribute in cms verification`
 
 ---
@@ -1741,6 +1756,8 @@ multi-signer CMS repeats the walk once per SignerInfo).
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS — SHA-1 chains still verify (anchored under an injected root)
 but report warnings; SHA-256 chains stay silent.
+Documentation: extend the module-header numbered check list (design §8) with:
+SHA-1 certificate-signature warnings.
 Commit (controller): `feat(zsign-core): report sha-1 certificate signatures as verification warnings`
 
 ---
