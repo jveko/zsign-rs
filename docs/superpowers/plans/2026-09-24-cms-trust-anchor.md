@@ -1219,7 +1219,13 @@ fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
     assert_eq!(si_any.tag(), Tag::Sequence);
     assert!(set_r.is_finished(), "fixture assumes a single SignerInfo");
     let si_body = si_any.value();
-    let mut si_r = SliceReader::new(si_body).unwrap();
+    // RFC 5652 §5.3: a subjectKeyIdentifier sid requires SignerInfo version 3,
+    // and one v3 SignerInfo forces SignedData version 3. Both are `INTEGER 1`
+    // today — bump each with a one-byte patch so lengths never change.
+    assert_eq!(&si_body[..3], &[0x02, 0x01, 0x01], "SignerInfo.version assumed INTEGER 1");
+    let mut si_body = si_body.to_vec();
+    si_body[2] = 0x03;
+    let mut si_r = SliceReader::new(&si_body).unwrap();
     let _version = AnyRef::decode(&mut si_r).unwrap();
     let sid_start = usize::try_from(si_r.position()).unwrap();
     let _sid = AnyRef::decode(&mut si_r).unwrap();
@@ -1233,8 +1239,13 @@ fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
     let new_si = der_tlv(si_list[0], &new_si_body);
     let new_set = der_tlv(set_tlv[0], &new_si);
     let mut sd_body = Vec::new();
-    for f in &fixed {
-        sd_body.extend_from_slice(f);
+    for (i, f) in fixed.iter().enumerate() {
+        if i == 0 {
+            assert_eq!(*f, &[0x02, 0x01, 0x01], "SignedData.version assumed INTEGER 1");
+            sd_body.extend_from_slice(&[0x02, 0x01, 0x03]);
+        } else {
+            sd_body.extend_from_slice(f);
+        }
     }
     sd_body.extend_from_slice(&new_set);
     let new_sd = der_tlv(sd_tlv[0], &sd_body);
