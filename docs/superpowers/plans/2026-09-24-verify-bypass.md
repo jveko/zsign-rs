@@ -562,7 +562,7 @@ writer.rs:910/919), so own signer output satisfies the new bounds;
     #[test]
     fn zero_code_coverage_is_rejected() {
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let signed = sign_macho_adhoc(
+        let mut signed = sign_macho_adhoc(
             &macho,
             "com.example.zero",
             None,
