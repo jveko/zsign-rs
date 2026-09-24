@@ -27,10 +27,26 @@ if [[ ! -x "$ZIGN" ]]; then
     exit 2
 fi
 
+DIAG="${ROOT}/target/interop-diagnostics.log"
+{
+    echo "=== zsign interop diagnostics: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    uname -a
+    sw_vers
+    openssl version
+} >"$DIAG"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() {
+    echo "FAIL: $*" >&2
+    {
+        echo "FAIL: $*"
+        echo "--- workdir at failure ---"
+        ls -laR "$WORK" 2>/dev/null || true
+    } >>"$DIAG"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # 1. Self-signed code-signing certificate.
@@ -116,6 +132,7 @@ sign_and_verify "$WORK/adhoc" "ad-hoc" -a
 # ---------------------------------------------------------------------------
 app="$WORK/cert/Test.app"
 D=$(codesign -d --verbose=4 "$app/Test" 2>&1)
+printf '%s\n' "$D" >>"$DIAG"
 grep -q "CodeDirectory v=20400" <<<"$D"   || fail "CD version must be 0x20400"
 grep -q "Hash type=sha256"       <<<"$D" || fail "primary CD must be SHA-256"
 if grep -q "Hash choices=sha1" <<<"$D"; then
