@@ -685,10 +685,12 @@ fn unsupported_rule_is_reported() {
                        // plist::Integer is a struct, not a primitive: convert
                        // through as_signed/as_unsigned and fail closed on
                        // out-of-range values via the is_finite() check below.
+                       // Map each Option to f64 BEFORE combining — or_else
+                       // requires the same T, and the arms differ (i64/u64).
                        Some(plist::Value::Integer(w)) => w
                            .as_signed()
-                           .or_else(|| w.as_unsigned())
                            .map(|v| v as f64)
+                           .or_else(|| w.as_unsigned().map(|v| v as f64))
                            .unwrap_or(f64::NAN),
                        Some(plist::Value::Real(w)) => *w,
                        _ => 1.0,
