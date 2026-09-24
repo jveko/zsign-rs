@@ -12,13 +12,45 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Assert tag matches crate versions
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          meta="$(cargo metadata --no-deps --format-version 1)"
+          status=0
+          for crate in zsign-core zsign-rs zsign-cli; do
+            version="$(jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version' <<<"$meta")"
+            if [[ "$version" != "$tag_version" ]]; then
+              echo "::error::$crate version $version does not match tag $GITHUB_REF_NAME"
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Check formatting (all files)
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace
+
   publish:
     name: Publish
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Dry-run package zsign-core
+        run: cargo publish -p zsign-core --dry-run
       - name: Publish zsign-core
         run: cargo publish -p zsign-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
       - name: Publish zsign-rs

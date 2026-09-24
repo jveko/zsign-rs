@@ -10,7 +10,24 @@ permissions:
   id-token: write
 
 jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting (all files)
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +38,9 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: wasm-pack
 
       - name: Build wasm package
         run: wasm-pack build crates/zsign-wasm --target web --release --scope jveko
