@@ -724,7 +724,21 @@ symlink-read memory ≤ 4097 bytes. **Controller commits:**
     #[cfg(unix)]
     fn test_extract_ipa_strips_setuid_bit() {
         let temp_dir = TempDir::new().unwrap();
-        let ipa_path = create_test_ipa(temp_dir.path());
+        let ipa_path = temp_dir.path().join("setuid.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        // Empty content on purpose: the kernel strips setuid/setgid on any
+        // write, and production chmods before the BufWriter's final flush.
+        // With zero bytes the permission restore is the last filesystem
+        // operation, so a surviving setuid bit stays observable — otherwise
+        // the post-chmod flush would clear it and this test would false-green.
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.finish().unwrap();
+
         // 0o104755 = S_IFREG | setuid | rwxr-xr-x
         patch_central_dir_unix_mode(&ipa_path, "Payload/Test.app/Info.plist", 0o104755);
 
@@ -934,8 +948,9 @@ archive entry. **Controller commits:**
 
 Run: `cargo test -p zsign-rs ipa::extract -- --skip test_ipa_signing_is_deterministic`
 Expected: all three new tests FAIL. Duplicate: pre-fix last write wins and
-extraction *succeeds*. Type conflict: pre-fix the directory pass creates
-`Payload/D` as a directory, then `File::create(Payload/D)` fails with
+extraction *succeeds*. Type conflict (all four orderings): pre-fix the
+directory pass creates the conflicting directory (`Payload/D` or
+`Payload/a`), then `File::create` fails with
 `IO error: Is a directory (os error 21)`. Descendant: pre-fix the
 directory pass (`extract.rs:217-220`) creates `Payload/a` as a directory
 before any archive file exists, then phase 1 fails at

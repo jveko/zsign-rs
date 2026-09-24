@@ -160,7 +160,12 @@ lines and were re-anchored.
 - **B:** `mode & 0o7777 & !0o7000` (strip setuid/setgid only, keep sticky).
   Rejected: identical result to `0o777` for every value where sticky matters
   nothing for bundle content, and the brief specifies `0o777`.
-- Fixture: CDE byte-patch helper in the inline tests (premise correction 2).
+- Fixture: CDE byte-patch helper in the inline tests (premise correction 2),
+  applied to an **empty** entry. The kernel strips setuid/setgid on any
+  write, and production chmods before the `BufWriter`'s final flush — with
+  content, the post-chmod flush would clear a pre-fix setuid bit and the
+  regression would false-green; an empty entry makes the permission restore
+  the last filesystem operation, so the bit's presence is observable.
 
 ### Item 5 — duplicate/conflicting paths
 - **A (chosen):** In the collect pass, maintain two claims per path —
@@ -316,7 +321,7 @@ Twelve new tests across tasks 1-5.
 | `test_extract_ipa_rejects_oversized_entry` | 2048-byte entry, `ExtractionLimits { max_entry_bytes: 100, ... }` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_oversized_total` | two 600-byte entries, `max_total_bytes: 1000` | pre-fix: no limits API → red at compile |
 | `test_extract_ipa_rejects_total_overflow_from_symlinks` (unix) | small file + two 4090-byte symlink targets, `max_total_bytes: 5000` | pre-fix: no limits API → red at compile |
-| `test_extract_ipa_strips_setuid_bit` (unix) | CDE-patched `0o104755` mode on `Info.plist`; assert on-disk `mode & 0o7777 == 0o755` | pre-fix: on-disk `0o4755` → fails |
+| `test_extract_ipa_strips_setuid_bit` (unix) | CDE-patched `0o104755` mode on an **empty** `Info.plist` (no write may follow the chmod — the kernel strips setuid/setgid on any write, and production chmods before the final `BufWriter` flush); assert on-disk `mode & 0o7777 == 0o755` | pre-fix: chmod runs last (nothing buffered) → on-disk `0o4755` → fails |
 | `test_extract_ipa_rejects_duplicate_normalized_paths` | `Payload/Test.app/Info.plist` + `./Payload/Test.app/Info.plist` | pre-fix: last-write-wins, succeeds → fails |
 | `test_extract_ipa_rejects_type_conflicting_entries` | one helper, four orderings: dir→file and file→dir at `Payload/D`, then file→dir-under-file and dir→file-ancestor at `Payload/a`; asserts pinned message **and** `!Payload` written | pre-fix: dir pass runs, `File::create` → `Is a directory (os error 21)`, unpinned → fails message assert |
 | `test_extract_ipa_rejects_descendant_of_file_entry` | both archive orders in one test fn: file `Payload/a` → file `Payload/a/b/c`, and `Payload/a/b/c` → `Payload/a` | pre-fix: dir pass creates `Payload/a`, then `File::create(Payload/a)` → `Is a directory (os error 21)`, unpinned → fails message assert |
