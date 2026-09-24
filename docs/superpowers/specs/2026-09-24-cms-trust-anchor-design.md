@@ -38,7 +38,7 @@ from the base commit; verified by four read-only scouts):
    `SliceVerifyReport::is_valid()` (`macho/verify.rs:40-44`) returns `true` —
    the Mach-O layer reports a skipped signer as valid.
 4. **Signed `contentType` is never checked.** `parse_signed_attrs`
-   (`cms_verify.rs:316-378`) parses only `messageDigest` and the Apple CDHash
+   (`cms_verify.rs:316-367`) parses only `messageDigest` and the Apple CDHash
    attributes; `OID_CONTENT_TYPE` is a dead constant (`cms_verify.rs:46-48`).
    RFC 5652 §5.6 requires exactly one `contentType` attribute equal to the
    encapsulated content type.
@@ -121,9 +121,11 @@ collected so far are preserved):
 3. **Climb** — for each parent `p` found in `certs` (distinct from `current`),
    before verifying its signature over `current`:
    - `p`'s `basicConstraints` required, strict-decoded, `ca == true`.
-   - `p`'s `pathLenConstraint`, if present: number of CA certificates below
-     `p` in the built chain (`chain.len() - 1` after `p` is appended) must be
-     `<= pathLen`.
+   - `p`'s `pathLenConstraint`, if present: the number of CA certificates
+     already chained below `p` must be `<= pathLen`. That count is the
+     pre-append `chain.len() - 1` (the built chain holds `[leaf … current]`,
+     the leaf is never a CA under the leaf rules, so everything except the
+     leaf counts; after appending `p` it would be `chain.len() - 2`).
    - `p`'s `keyUsage`, if present: must include `keyCertSign`.
    - validity window (unchanged) and signature verification (unchanged).
    - Whenever a certificate's signature is verified with SHA-1
@@ -170,32 +172,48 @@ collected so far are preserved):
 
 ### 2.4 SKI-only SignerInfo (item 3)
 
-- The sid is decoded into `SignerId::IssuerAndSerialNumber { issuer_der,
-  serial_der }` or `SignerId::SubjectKeyIdentifier(Vec<u8>)` and resolution
-  happens where the signing certificate is located today
-  (`cms_verify.rs:600-613`).
+- **Wire format (reviewer-verified):** cms 0.2.3 encodes
+  `SignerIdentifier::SubjectKeyIdentifier` as an *IMPLICIT primitive* `[0]`
+  OCTET STRING (`cms-0.2.3/src/signed_data.rs:170-174`; der-derive defaults to
+  primitive), so the sid arm must match `Tag::ContextSpecific { number: 0, .. }`
+  **regardless of the constructed bit** — matching only the constructed
+  `TAG_CTX0` const would send every conformant SKI SignerInfo down the
+  unexpected-tag error path. For the primitive form `sid.value()` is the raw
+  key id; for a constructed wrapper it is the inner OCTET STRING TLV, which is
+  decoded before comparison.
+- The sid resolves into either issuer+serial lookup (existing) or a
+  pre-resolved `&Certificate` from `find_cert_by_ski`.
 - New pure function (unit-testable per brief):
   `fn find_cert_by_ski(certs: &[Certificate], key_id: &[u8]) -> Option<&
   Certificate>` — for each certificate, strict-decode extension `2.5.29.14`
-  (`x509_cert::ext::pkix::SubjectKeyIdentifier`, an `OctetString` newtype) from
-  `extn_value` and byte-compare the inner key id against `key_id`; malformed
-  SKI extensions are skipped.
+  from `extn_value` as an OCTET STRING and byte-compare the inner key id
+  against `key_id`; malformed SKI extensions are skipped.
 - No match → per-signer error
   `signer subjectKeyIdentifier does not match any embedded certificate`, then
   `continue` to the next SignerInfo (multi-signer semantics preserved; the
   error lands in `report.errors` when no signer validates).
 - The obsolete warning
   `signer identified by subjectKeyIdentifier; skipping` is deleted.
+- **Report-level coverage:** the sid sits outside `signedAttrs` (unsigned), so
+  a fixture utility re-encodes a round-trip CMS with its sid replaced by
+  `80 <len> <key id>` (ancestor lengths rebuilt bottom-up). Positive: own key
+  id → full verification succeeds through `verify_signed_data`; negative: a
+  wrong key id → `valid == false` with the fatal message above. Unit tests on
+  `find_cert_by_ski` remain as edge coverage.
 
 ### 2.5 Signed contentType (item 4)
 
-- `parse_signed_attrs` gains `content_types: Vec<ObjectIdentifier>` (all
-  occurrences of `1.2.840.113549.1.9.3` in the SET); `OID_CONTENT_TYPE` loses
-  its `#[allow(dead_code)]`.
-- Per-signer check, feeding the per-signer error tier:
+- `parse_signed_attrs` gains per-attribute contentType handling that walks
+  **every value of every** `contentType` Attribute SET: each value increments
+  an occurrence count (a value that fails OID decoding still counts — the
+  current parser's first-value-only + `continue`-on-error behaviour would let
+  a malformed duplicate evade detection) and decodable OIDs are collected.
+  `OID_CONTENT_TYPE` loses its `#[allow(dead_code)]`.
+- Per-signer check over `(occurrences, decoded)`:
   - `0` occurrences → `signed contentType attribute missing`
   - `>1` occurrences → `duplicate signed contentType attribute`
-  - the single value must be `1.2.840.113549.1.7.1` (id-data) →
+  - one occurrence, undecodable → `signed contentType attribute is malformed`
+  - one occurrence, decoded ≠ id-data →
     `signed contentType attribute is X (expected id-data)`
 - `eContentType != id-data` in `encapContentInfo` becomes a global error
   (`encapContentInfo eContentType is X (expected id-data)`), replacing the
@@ -207,11 +225,15 @@ collected so far are preserved):
 
 ### 2.6 SHA-1 warnings (item 5)
 
-Warnings originate in `verify_chain` (§2.2 step 3/4/5) and are appended to
-`report.warnings`. SHA-1 verification behavior itself is unchanged (still
-accepted) — anchoring already confines it to chains under trusted roots, and
-the existing `chain_accepts_sha1_signed_intermediate` fixture must keep passing
-under an injected anchor.
+Warnings originate in `verify_chain` (§2.2 steps 3/4/5) and are appended to
+`report.warnings` **with deduplication** (`if !report.warnings.contains(w)`):
+a multi-signer CMS where each SignerInfo walks the same chain would otherwise
+repeat identical entries, and the walk itself has no visited-set protection
+against pathological cyclic subject-name chains. No other uniqueness guarantee
+is made. SHA-1 verification behavior itself is unchanged (still accepted) —
+anchoring already confines it to chains under trusted roots, and the existing
+`chain_accepts_sha1_signed_intermediate` fixture must keep passing under an
+injected anchor.
 
 ## 3. Design decisions (alternatives considered)
 
@@ -289,15 +311,20 @@ under an injected anchor.
   its own root injected and keeps `ok && anchored` assertions; item 5 adds
   warning assertions to it. Brief explicitly protects this fixture.
 
-**D9 — SKI resolution is a pure function + inline wiring; no full SKI CMS
-fixture.**
-- The signer side (`crypto/cms.rs`) always builds
-  `IssuerAndSerialNumber`; fabricating a complete SKI-identified CMS with
-  matching Apple CDHash attributes by hand would duplicate the signer in the
-  test. The brief explicitly allows factoring the decision into a pure
-  function (`find_cert_by_ski`) and unit-testing it (positive, negative,
+**D9 — SKI coverage: pure function (brief-sanctioned) + sid-splice
+report-level fixtures.**
+- Chosen: `find_cert_by_ski` unit tests (positive, negative,
   malformed-SKI-extension cases, using `Profile::Root` fixtures which always
-  carry `2.5.29.14`).
+  carry `2.5.29.14`) **plus** two report-level fixtures built by re-encoding a
+  round-trip CMS with a spliced primitive `[0]` sid — the sid is outside
+  `signedAttrs`, so the signature survives, and ancestor lengths are rebuilt
+  bottom-up (no fragile in-place byte surgery). Added after cold review found
+  that pure tests alone could not establish SID dispatch end-to-end.
+- Rejected: replicating the cms 0.2.3 signer in the test to mint a SKI
+  SignerInfo from scratch — duplicates `crypto/cms.rs` build logic, which the
+  scope forbids touching.
+- Rejected: in-place sid byte replacement without length rebuild — shrinks the
+  SignerInfo and desynchronises every ancestor DER length.
 
 **D10 — contentType failures are per-signer errors; `eContentType` failure is
 global.** Mirrors RFC 5652: `eContentType` is SignedData-level, the attribute
@@ -355,14 +382,23 @@ the Apple default itself is pinned.
   leaf-CA-true / issuer-not-CA / violated `pathLen` ⇒ fail, each asserting the
   matching `reason` substring; positive: Profile::Leaf + codeSigning EKU under
   a `Profile::Root` issuer ⇒ `ok && anchored`.
-- Item 3: `find_cert_by_ski` unit tests — own key id resolves, wrong bytes do
-  not, malformed SKI extension is skipped; wiring: the deleted warning and the
-  new error string are asserted absent/present via a report-level path where
-  reachable.
-- Item 4: pure-function tests over the contentType decision (missing / exactly
-  one id-data / duplicate / wrong OID), plus the round trip staying green
-  (signer emits exactly one id-data contentType — pinned by scout evidence and
-  `cms.rs:584-599`).
+- Item 3: `find_cert_by_ski` unit tests (own key id resolves, wrong bytes do
+  not, malformed SKI extension skipped) **plus report-level fixtures** built by
+  re-encoding a round-trip CMS with a spliced primitive `[0]` sid (unsigned
+  field): positive proves resolution through `verify_signed_data`
+  (`valid == true`, `signer_subject` set); negative (wrong key id) proves the
+  fatal report error. No byte-surgery shortcut — ancestor lengths are rebuilt
+  bottom-up.
+- Item 4: parser-level tests over raw signedAttrs DER fed to the real
+  `parse_signed_attrs` — duplicate contentType attributes and a
+  malformed-second-value case must both be counted and rejected — plus the
+  pure `content_type_reason` decision cases (missing / exactly one id-data /
+  duplicate / wrong OID / malformed), plus a report-level fixture that patches
+  `encapContentInfo.eContentType` to a non-id-data OID (one-byte, same-length,
+  outside `signedAttrs`) asserting the global error lands in `errors` and a
+  clean SignerInfo cannot clear it (`valid == false`, `errors` non-empty), plus
+  the round trip staying green (signer emits exactly one id-data contentType —
+  pinned by scout evidence and `cms.rs:584-599`).
 - Item 5: migrated SHA-1 chain asserts `warnings` mention SHA-1 while `ok &&
   anchored` still hold; a SHA-256 chain asserts no SHA-1 warning.
 
@@ -391,6 +427,13 @@ the deferred files themselves:
 | `zsign-core/src/macho/verify.rs::special_slots_bind_info_and_resources` | `:431-435` |
 | `zsign/src/verify.rs::signed_bundle_verifies` | `:539-548`, `:551-559` |
 | `zsign/src/verify.rs::bare_macho_verifies` | `:621-622` |
+
+Additionally `scripts/verify-apple-interop.sh` (macOS-only, not part of
+`cargo test`) signs a self-signed bundle that is "its own implicit trust
+anchor" (`:11-12`) and requires `zsign -V` to accept it (`agree_valid`,
+`:153-175`); with Apple-root default anchors that interop check turns red
+until the verify surface can inject the target's own certificate as an anchor
+(plumbing owned by the verify/CLI lanes, not this one).
 
 This lane edits none of those files (hard scope rule). The handover contract
 for lanes 24/26: `zsign_core::crypto::cms_verify::{TrustAnchors,

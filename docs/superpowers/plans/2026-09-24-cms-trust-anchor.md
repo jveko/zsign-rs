@@ -203,8 +203,9 @@ impl TrustAnchors {
 }
 ```
 
-(`to_der` needs `der::Encode` in scope — check whether the file already
-imports it; the module imports `der::{Decode, ...}`-style items at the top.)
+(Imports: `Certificate::from_pem` requires `der::DecodePem` in scope — it is
+currently missing from the `der` imports at the top of `cms_verify.rs
+(~:35-40)`; `to_der` requires `der::Encode`. Add both explicitly.)
 
 Change `verify_code_signature` to delegate and add the new function:
 
@@ -348,7 +349,11 @@ report.chain_ok = outcome.ok;
 report.anchored = outcome.anchored;
 report.chain = outcome.subjects;
 report.chain_reason = outcome.reason.clone();
-report.warnings.extend(outcome.warnings);
+for w in outcome.warnings {
+    if !report.warnings.contains(&w) {
+        report.warnings.push(w);
+    }
+}
 ```
 
 and in the error-accumulation block below it, replace the `!chain_ok` push
@@ -429,18 +434,32 @@ fn anchors_for(creds: &SigningCredentials) -> TrustAnchors {
 - [ ] **Step 1.8: Run the gate**
 
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
-Expected: PASS — including the three regression tests now green and every
-migrated test green. (If any pre-existing crypto test outside
-`cms_verify.rs` fails because it verifies through the default anchors, report
-it as a finding — no such test was found by research.)
+Expected: PASS — the three regression tests green, every migrated test green.
+This is the task's definition of green (the lane's scoped gate).
+
+Known red **outside this lane's scope**, produced deliberately by this change
+and documented in design §6 — do NOT touch them, report them in the handover:
+- `crates/zsign-core/src/macho/verify.rs::verify_signed_binary_round_trip` and
+  `::special_slots_bind_info_and_resources` (positive self-signed round trips
+  through the production caller → default Apple anchors);
+- `crates/zsign/src/verify.rs::signed_bundle_verifies` and
+  `::bare_macho_verifies` (same, one layer up);
+- `scripts/verify-apple-interop.sh` (macOS-only; requires `zsign -V` to accept
+  a self-signed bundle — `scripts/verify-apple-interop.sh:11-12,153-175`).
+They need anchor injection in deferred files (design §6 handover contract),
+which this lane may not edit.
 
 - [ ] **Step 1.9: Acceptance**
 
 - Regression trio passes: attacker re-sign invalid + non-empty errors;
   missing-issuer chain invalid; structural-unanchored chain invalid with
   `chain_ok` true / `anchored` false.
-- `macho/verify.rs` and all other non-crypto files show zero diff
-  (`git diff --stat` limited to `crypto/cms_verify.rs`).
+- The scoped gate (Step 1.8) is fully green; the known deferred/interop reds
+  are exactly the ones enumerated there — no others.
+- Scope audit: `macho/verify.rs` and all other non-crypto files show zero
+  diff (`git diff --stat ee42c12..HEAD` limited to `crypto/cms_verify.rs`).
+  Zero diff is a *scope* guarantee only — it deliberately does not make the
+  deferred tests green (design §6 owns that handover).
 - Commit (controller): `feat(zsign-core): anchor cms verification to explicit trust anchors`
 
 ---
@@ -746,7 +765,7 @@ fn replace_extension(
     exts.push(x509_cert::ext::Extension {
         extn_id: id,
         critical: false,
-        extn_value: der::OctetString::new(bytes).unwrap(),
+        extn_value: der::asn1::OctetString::new(bytes).unwrap(),
     });
 }
 ```
@@ -892,11 +911,13 @@ fn malformed_leaf_eku_fails() {
         &root_signing,
         Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
     );
-    // The EKU extension value must be a DER SEQUENCE of OIDs; a NULL is not.
+    // `replace_extension` stores the argument's DER inside `extn_value`, so
+    // the extension value becomes the OCTET STRING TLV `04 02 05 00` — not a
+    // DER SEQUENCE of OIDs, hence a malformed EKU.
     replace_extension(
         &mut leaf,
         OID_EXT_KEY_USAGE,
-        &der::OctetString::new(b"\x05\x00").unwrap(),
+        &der::asn1::OctetString::new(b"\x05\x00").unwrap(),
     );
     let outcome = chain_with(&root, &leaf);
     assert!(!outcome.ok);
@@ -908,20 +929,52 @@ fn malformed_leaf_eku_fails() {
 }
 ```
 
-Run: `cargo test -p zsign-core crypto::cms_verify`
-Expected: all purpose tests GREEN; `chain_accepts_sha1_signed_intermediate`
-still green (its leaf gains no EKU — **it is a 2-cert chain, so the D5 leaf
-rules now apply to it**: add
-`Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING]))` EKU to its leaf via
-`add_extension`, or the test fails "leaf lacks codeSigning EKU". Do the same
-wherever `Profile::Leaf` fixtures feed a non-self-signed chain.)
+- [ ] **Step 2.5: Migrate the SHA-1 chain fixture to the leaf rules (D5)**
 
-- [ ] **Step 2.5: Run the lane gate + acceptance**
+`chain_accepts_sha1_signed_intermediate` chains a `Profile::Leaf` (which has
+no EKU) under a root — Task 2's leaf rules turn it red until the fixture gains
+a codeSigning EKU. Split its inline leaf build into a mutable binding and add
+the extension before `.build()`:
+
+```rust
+let mut leaf_builder = CertificateBuilder::new(
+    Profile::Leaf {
+        issuer: root_subject.clone(),
+        enable_key_agreement: false,
+        enable_key_encipherment: false,
+    },
+    leaf_serial,
+    leaf_validity,
+    leaf_subject,
+    leaf_pub,
+    &root_signing,
+)
+.unwrap();
+leaf_builder
+    .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+    .unwrap();
+let leaf = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+```
+
+(The current fixture inlines `CertificateBuilder::new(…).build::<…>()` and
+binds its values directly — introduce `leaf_serial`/`leaf_validity`/
+`leaf_subject`/`leaf_pub` bindings first if they are not already bound. The
+same requirement applies to any other non-self-signed `Profile::Leaf` fixture
+in this file.)
+
+- [ ] **Step 2.6: Run GREEN**
+
+Run: `cargo test -p zsign-core crypto::cms_verify`
+Expected: all purpose tests GREEN, including the migrated SHA-1 fixture and
+the SHA-256 pins.
+
+- [ ] **Step 2.7: Run the lane gate + acceptance**
 
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS. Acceptance: missing/malformed EKU, wrong-purpose EKU, weak
 leaf KU/BC, non-CA issuer, pathLen violation, missing issuer KU — each fails
-with its distinct reason; positive 2-cert chain anchors.
+with its distinct reason; positive 2-cert chain anchors; the SHA-1 fixture
+still chains (warnings assertions land in Task 5).
 Commit (controller): `feat(zsign-core): enforce x.509 purpose constraints in chain verification`
 
 ---
@@ -987,14 +1040,14 @@ fn ski_malformed_extension_is_skipped() {
     replace_extension(
         &mut cert_a,
         OID_SUBJECT_KEY_IDENTIFIER,
-        &der::Null,
+        &der::asn1::Null,
     );
     assert!(find_cert_by_ski(&[cert_a.clone()], b"any key id").is_none());
 }
 ```
 
 (`ext_value` and `replace_extension` come from Task 2; `der::asn1::OctetString`
-and `der::Null` are in `der` 0.7. If `ext_value` is `pub(crate)`/private, the
+and `der::asn1::Null` are in `der` 0.7. If `ext_value` is `pub(crate)`/private, the
 test module accesses it via `use super::*` as with the other helpers.)
 
 - [ ] **Step 3.2: Implement resolution + wiring**
@@ -1048,19 +1101,35 @@ match sid.tag() {
         issuer_der = sid_body.get(ib..ie).unwrap_or_default();
         serial_der = sid_body.get(sb..se).unwrap_or_default();
     }
-    TAG_CTX0 => match find_cert_by_ski(&certs, sid_body) {
-        Some(c) => ski_cert = Some(c),
-        None => {
-            // Never leave the report invalid-with-empty-errors: record why
-            // this SignerInfo was unusable and move to the next one.
-            if report.errors.is_empty() {
-                report.errors.push(
-                    "signer subjectKeyIdentifier does not match any embedded certificate".into(),
-                );
+    // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
+    // STRING (der-derive default); tolerate a constructed wrapper too — its
+    // value is then the inner OCTET STRING TLV rather than the raw key id.
+    Tag::ContextSpecific { number, constructed } if number == TagNumber::new(0) => {
+        let key_id: Option<Vec<u8>> = if constructed {
+            der::asn1::OctetString::from_der(sid_body)
+                .ok()
+                .map(|o| o.as_bytes().to_vec())
+        } else {
+            Some(sid_body.to_vec())
+        };
+        let resolved = key_id
+            .as_deref()
+            .and_then(|kid| find_cert_by_ski(&certs, kid));
+        match resolved {
+            Some(c) => ski_cert = Some(c),
+            None => {
+                // Never leave the report invalid-with-empty-errors: record why
+                // this SignerInfo was unusable and move to the next one.
+                if report.errors.is_empty() {
+                    report.errors.push(
+                        "signer subjectKeyIdentifier does not match any embedded certificate"
+                            .into(),
+                    );
+                }
+                continue;
             }
-            continue;
         }
-    },
+    }
     other => {
         return Err(Error::Verification(format!(
             "unexpected signer id tag {other:?}"
@@ -1093,15 +1162,157 @@ let signer_cert = match ski_cert {
    `signer identified by subjectKeyIdentifier; skipping` (grep to confirm no
    other occurrence).
 
-- [ ] **Step 3.3: Run GREEN + acceptance**
+- [ ] **Step 3.3: Report-level fixtures (sid splice — RED first, GREEN after Step 3.2)**
+
+The sid sits *outside* `signedAttrs`, so a fixture can swap it without
+invalidating the signature; ancestor lengths are rebuilt bottom-up so every
+DER length stays consistent. Add to the test module:
+
+```rust
+/// tag byte + minimal DER length (module's own `write_len`) + body.
+fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    write_len(&mut out, body.len());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Re-encodes the raw CMS with the first SignerInfo's sid swapped for
+/// `new_sid` (a complete TLV). Assumes the single-SignerInfo output of
+/// `sign_code_directory` (asserted below).
+fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
+    // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
+    let ci = AnyRef::from_der(cms).unwrap();
+    assert_eq!(ci.tag(), Tag::Sequence);
+    let ci_body = ci.value();
+    let mut ci_r = SliceReader::new(ci_body).unwrap();
+    let _oid = AnyRef::decode(&mut ci_r).unwrap();
+    let oid_end = usize::try_from(ci_r.position()).unwrap();
+    let wrap = AnyRef::decode(&mut ci_r).unwrap();
+    assert_eq!(wrap.tag(), TAG_CTX0);
+    let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
+    let sd_tlv = wrap.value(); // the SignedData TLV inside [0]
+
+    // SignedData fields; signerInfos SET is the last one.
+    let mut sd_r = SliceReader::new(sd_tlv).unwrap();
+    let mut fixed: Vec<&[u8]> = Vec::new(); // version, digestAlgs, encap, certs
+    let mut set_tlv: &[u8] = &[];
+    while !sd_r.is_finished() {
+        let start = usize::try_from(sd_r.position()).unwrap();
+        let f = AnyRef::decode(&mut sd_r).unwrap();
+        let end = usize::try_from(sd_r.position()).unwrap();
+        if f.tag() == Tag::Set {
+            set_tlv = &sd_tlv[start..end];
+        } else {
+            fixed.push(&sd_tlv[start..end]);
+        }
+    }
+    assert!(!set_tlv.is_empty(), "signerInfos SET required");
+
+    // SignerInfo: replace the sid (the field after version).
+    let set_any = AnyRef::from_der(set_tlv).unwrap();
+    let si_list = set_any.value();
+    let mut set_r = SliceReader::new(si_list).unwrap();
+    let si_any = AnyRef::decode(&mut set_r).unwrap();
+    assert_eq!(si_any.tag(), Tag::Sequence);
+    assert!(set_r.is_finished(), "fixture assumes a single SignerInfo");
+    let si_body = si_any.value();
+    let mut si_r = SliceReader::new(si_body).unwrap();
+    let _version = AnyRef::decode(&mut si_r).unwrap();
+    let sid_start = usize::try_from(si_r.position()).unwrap();
+    let _sid = AnyRef::decode(&mut si_r).unwrap();
+    let sid_end = usize::try_from(si_r.position()).unwrap();
+    let mut new_si_body = Vec::new();
+    new_si_body.extend_from_slice(&si_body[..sid_start]);
+    new_si_body.extend_from_slice(new_sid);
+    new_si_body.extend_from_slice(&si_body[sid_end..]);
+
+    // Rebuild bottom-up: SignerInfo → SET → SignedData → [0] → ContentInfo.
+    let new_si = der_tlv(si_list[0], &new_si_body);
+    let new_set = der_tlv(set_tlv[0], &new_si);
+    let mut sd_body = Vec::new();
+    for f in &fixed {
+        sd_body.extend_from_slice(f);
+    }
+    sd_body.extend_from_slice(&new_set);
+    let new_sd = der_tlv(sd_tlv[0], &sd_body);
+    let new_wrap = der_tlv(wrap_tlv[0], &new_sd);
+    let mut ci2 = Vec::new();
+    ci2.extend_from_slice(&ci_body[..oid_end]);
+    ci2.extend_from_slice(&new_wrap);
+    der_tlv(cms[0], &ci2)
+}
+
+#[test]
+fn ski_signer_resolves_end_to_end() {
+    let (creds, _k) = rsa_credentials();
+    let content: &[u8] = b"the code directory bytes";
+    let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+    let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+    let key_id = ski_of(&creds.certificate);
+    let mut sid = vec![0x80u8, key_id.len() as u8];
+    sid.extend_from_slice(&key_id);
+    let spliced = replace_first_sid(&cms, &sid);
+
+    let report = verify_code_signature_with_anchors(
+        &wrap(&spliced),
+        content,
+        None,
+        &cd_sha256,
+        &anchors_for(&creds),
+    )
+    .unwrap();
+    assert!(report.valid, "SKI signer must resolve: {:?}", report.errors);
+    assert_eq!(report.signer_subject.as_deref(), Some("CN=zsign verify test"));
+}
+
+#[test]
+fn ski_signer_with_unknown_key_id_is_fatal() {
+    let (creds, _k) = rsa_credentials();
+    let content: &[u8] = b"the code directory bytes";
+    let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+    let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+    let real = ski_of(&creds.certificate);
+    let wrong = vec![0x5Au8; real.len()];
+    let mut sid = vec![0x80u8, wrong.len() as u8];
+    sid.extend_from_slice(&wrong);
+    let spliced = replace_first_sid(&cms, &sid);
+
+    let report = verify_code_signature_with_anchors(
+        &wrap(&spliced),
+        content,
+        None,
+        &cd_sha256,
+        &anchors_for(&creds),
+    )
+    .unwrap();
+    assert!(!report.valid);
+    assert!(!report.errors.is_empty());
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.contains("subjectKeyIdentifier")));
+}
+```
+
+Write the two tests first and run them: `ski_signer_resolves_end_to_end` is
+RED on Step 3.1/3.2 state only if the wiring is wrong — on the *base* code the
+splice lands in the unexpected-tag/`warning+continue` path, so it fails there
+(combine Steps 3.1-3.3 in one red/green cycle: tests first, wiring second).
+
+- [ ] **Step 3.4: Run GREEN + acceptance**
 
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS. Acceptance: a sole SKI SignerInfo whose key id matches no
 embedded certificate yields `valid == false` with
 `signer subjectKeyIdentifier does not match any embedded certificate` in
 `errors` (structurally guaranteed — push precedes `continue`, and no path
-returns `valid = false` with an empty `errors`); resolution unit tests green;
-multi-signer best-signer-wins behaviour unchanged.
+returns `valid = false` with an empty `errors`); a conformant **primitive**
+`[0]` sid resolves end-to-end (`valid == true`, `signer_subject` set);
+resolution unit tests green; multi-signer best-signer-wins behaviour
+unchanged.
 Commit (controller): `fix(zsign-core): resolve subjectkeyidentifier signers against embedded certificates`
 
 ---
@@ -1110,7 +1321,7 @@ Commit (controller): `fix(zsign-core): resolve subjectkeyidentifier signers agai
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (OID_CONTENT_TYPE
-  ~:46-48, `SignedAttrs` ~:307-313, `parse_signed_attrs` ~:316-378,
+  ~:46-48, `SignedAttrs` ~:307-313, `parse_signed_attrs` ~:316-367,
   `verify_signed_data` ~:380-697, tests)
 
 - [ ] **Step 4.1: Write failing test (RED)**
@@ -1118,17 +1329,17 @@ Commit (controller): `fix(zsign-core): resolve subjectkeyidentifier signers agai
 ```rust
 #[test]
 fn signed_content_type_must_be_single_id_data() {
-    assert!(content_type_reason(&[])
-        .unwrap_or_default()
-        .contains("missing"));
-    assert_eq!(content_type_reason(&[OID_ID_DATA]), None);
-    assert!(content_type_reason(&[OID_ID_DATA, OID_ID_DATA])
+    assert!(content_type_reason(0, &[]).unwrap_or_default().contains("missing"));
+    assert_eq!(content_type_reason(1, &[OID_ID_DATA]), None);
+    assert!(content_type_reason(2, &[OID_ID_DATA, OID_ID_DATA])
         .unwrap_or_default()
         .contains("duplicate"));
     let other = ObjectIdentifier::new_unwrap("1.2.840.113635.100.9.1");
-    assert!(content_type_reason(&[other])
+    assert!(content_type_reason(1, &[other])
         .unwrap_or_default()
         .contains("expected id-data"));
+    // One occurrence whose value did not decode: malformed, not "missing".
+    assert!(content_type_reason(1, &[]).unwrap_or_default().contains("malformed"));
 }
 ```
 
@@ -1137,34 +1348,49 @@ Run: `cargo test -p zsign-core crypto::cms_verify` — RED (no such function).
 - [ ] **Step 4.2: Implement**
 
 1. Remove `#[allow(dead_code)]` from `OID_CONTENT_TYPE` (~:47).
-2. `SignedAttrs` gains `content_types: Vec<ObjectIdentifier>` (init in
-   `parse_signed_attrs` to `Vec::new()`); dispatch arm inside the attribute
-   loop, beside the `OID_MESSAGE_DIGEST` arm:
+2. `SignedAttrs` gains two fields — `content_type_count: usize` and
+   `content_types: Vec<ObjectIdentifier>` (initialised `0` / empty in
+   `parse_signed_attrs`). In the attribute loop, insert **immediately after
+   the `values.tag() != Tag::Set` check and `let vbytes = values.value();`,
+   before the generic first-value decode** (which skips malformed values with
+   `continue` and only ever reads one value per Attribute):
 
 ```rust
-} else if oid == OID_CONTENT_TYPE && value.tag() == Tag::ObjectIdentifier {
-    if let Ok(ct) = ObjectIdentifier::from_der(&vbytes[vstart..vend]) {
-        content_types.push(ct);
+if oid == OID_CONTENT_TYPE {
+    // RFC 5652 §5.6: exactly one value. Count every value — including
+    // undecodable ones — so an extra or malformed value can never evade
+    // duplicate detection.
+    let mut vr = reader(vbytes, "malformed contentType value")?;
+    while !vr.is_finished() {
+        content_type_count += 1;
+        match ObjectIdentifier::decode(&mut vr) {
+            Ok(ct) => content_types.push(ct),
+            Err(_) => break,
+        }
     }
+    continue;
 }
 ```
 
-   (A malformed OID value is not pushed → the count falls to zero → the
-   missing-attribute error; the CMS is rejected either way.)
+   (The generic decode below keeps handling messageDigest / CDHash unchanged.)
 
 3. The decision function:
 
 ```rust
-/// RFC 5652 §5.6: exactly one signed `contentType`, equal to id-data —
+/// RFC 5652 §5.6: exactly one signed `contentType` value, equal to id-data —
 /// which also pins it to `encapContentInfo`'s eContentType (id-data is
-/// required separately below).
-fn content_type_reason(content_types: &[ObjectIdentifier]) -> Option<String> {
-    match content_types {
-        [] => Some("signed contentType attribute missing".into()),
-        [only] if *only == OID_ID_DATA => None,
-        [only] => Some(format!(
-            "signed contentType attribute is {only} (expected id-data)"
-        )),
+/// required separately below). `count` is every value seen, `decoded` the
+/// subset that decoded as OIDs.
+fn content_type_reason(count: usize, decoded: &[ObjectIdentifier]) -> Option<String> {
+    match count {
+        0 => Some("signed contentType attribute missing".into()),
+        1 => match decoded.first() {
+            Some(only) if *only == OID_ID_DATA => None,
+            Some(only) => Some(format!(
+                "signed contentType attribute is {only} (expected id-data)"
+            )),
+            None => Some("signed contentType attribute is malformed".into()),
+        },
         _ => Some("duplicate signed contentType attribute".into()),
     }
 }
@@ -1192,7 +1418,7 @@ fn content_type_reason(content_types: &[ObjectIdentifier]) -> Option<String> {
      ```
    - In the per-signer error-accumulation block (after the CDHash pushes, ~:661-680):
      ```rust
-     if let Some(reason) = content_type_reason(&attrs.content_types) {
+     if let Some(reason) = content_type_reason(attrs.content_type_count, &attrs.content_types) {
          errors.push(reason);
      }
      ```
@@ -1220,14 +1446,108 @@ fn content_type_reason(content_types: &[ObjectIdentifier]) -> Option<String> {
      Ok(report)
      ```
 
-- [ ] **Step 4.3: Run GREEN + acceptance**
+- [ ] **Step 4.3: Parser-level and report-level fixtures**
+
+The signed `contentType` attribute lives inside `signedAttrs`, so unlike the
+sid it cannot be spliced without breaking the signature — coverage splits
+honestly: the *real parser* gets hand-built DER, and the *global-error gate*
+gets a report-level fixture (its field is unsigned).
+
+```rust
+/// An Attribute SEQUENCE { OID, SET { value } } for parser-level fixtures.
+fn attr_tlv(oid: ObjectIdentifier, value_tlv: &[u8]) -> Vec<u8> {
+    use der::Encode;
+    let mut body = oid.to_der().unwrap();
+    body.extend_from_slice(&der_tlv(0x31, value_tlv)); // SET OF
+    der_tlv(0x30, &body)
+}
+
+#[test]
+fn duplicate_signed_content_type_attributes_are_counted() {
+    use der::Encode;
+    let id_data = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+        .to_der()
+        .unwrap();
+    let mut body = attr_tlv(OID_CONTENT_TYPE, &id_data);
+    body.extend_from_slice(&attr_tlv(OID_CONTENT_TYPE, &id_data));
+    let attrs = parse_signed_attrs(&body).unwrap();
+    assert_eq!(attrs.content_type_count, 2);
+    let reason = content_type_reason(attrs.content_type_count, &attrs.content_types)
+        .unwrap_or_default();
+    assert!(reason.contains("duplicate"), "{reason}");
+}
+
+#[test]
+fn extra_malformed_content_type_value_is_counted() {
+    use der::Encode;
+    let mut value = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
+        .to_der()
+        .unwrap();
+    value.extend_from_slice(&[0x05, 0x00]); // malformed second value (NULL)
+    let body = attr_tlv(OID_CONTENT_TYPE, &value);
+    let attrs = parse_signed_attrs(&body).unwrap();
+    // A valid id-data first value plus a malformed extra must never read as
+    // "exactly one".
+    assert_eq!(attrs.content_type_count, 2);
+    let reason = content_type_reason(attrs.content_type_count, &attrs.content_types)
+        .unwrap_or_default();
+    assert!(reason.contains("duplicate"), "{reason}");
+}
+
+#[test]
+fn global_econtent_type_error_beats_clean_signer() {
+    let (creds, _k) = rsa_credentials();
+    let content: &[u8] = b"the code directory bytes";
+    let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+    let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+    // encapContentInfo.eContentType is the first id-data OID TLV in the CMS
+    // (SignedData's third field precedes signedAttrs, whose copy lives much
+    // later). Patch the trailing arc 1 → 2: id-data becomes id-signedData,
+    // same DER length, and the field is outside signedAttrs, so every
+    // per-signer check stays green.
+    let id_data: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+    let pos = cms
+        .windows(id_data.len())
+        .position(|w| w == id_data)
+        .expect("id-data OID must be present");
+    let mut patched = cms.clone();
+    patched[pos + id_data.len() - 1] = 0x02;
+
+    let report = verify_code_signature_with_anchors(
+        &wrap(&patched),
+        content,
+        None,
+        &cd_sha256,
+        &anchors_for(&creds),
+    )
+    .unwrap();
+    assert!(report.signature_ok, "unsigned field must not break the signature");
+    assert!(!report.valid, "global error must block a clean signer");
+    assert_eq!(
+        report.errors.len(),
+        1,
+        "clean signer must not clear or mask the global error: {:?}",
+        report.errors
+    );
+    assert!(report.errors[0].contains("encapContentInfo eContentType"));
+}
+```
+
+(`der_tlv` comes from Task 3's test module — same `tests` module, Task 3 runs
+first.)
+
+- [ ] **Step 4.4: Run GREEN + acceptance**
 
 Run: `cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS — the migrated round trip proves the signer emits exactly one
 id-data `contentType` (cms 0.2.3 builder evidence, design §2.5). Acceptance:
-missing/duplicate/wrong-OID signed contentType each rejected with its own
-message; `eContentType != id-data` is a global error that a clean SignerInfo
-cannot clear (`report.valid` stays false, `errors` non-empty).
+missing/duplicate/wrong-OID/malformed signed contentType each rejected with
+its own message (parser-level fixtures drive the real `parse_signed_attrs`);
+the extra-malformed-value evasion from the review is closed; `eContentType !=
+id-data` is a global error that a clean SignerInfo cannot clear
+(`global_econtent_type_error_beats_clean_signer`: `valid == false`, exactly
+one error, `signature_ok == true`).
 Commit (controller): `feat(zsign-core): require signed contenttype attribute in cms verification`
 
 ---
@@ -1280,9 +1600,11 @@ verified, immediately before the `verify_cert_signature` call:
 2. the self-signed terminus branch (self-signature of `current`);
 3. the runs-out trust-anchor branch (signature of `current` against the anchor).
 
-Each certificate is verified at most once along the walk, so warnings never
-duplicate; the warning rides out on every `ChainOutcome` return path (the
-`warnings` vec is already threaded through Task 1).
+The warning rides out on every `ChainOutcome` return path (the `warnings`
+vec is threaded through Task 1). Duplicate suppression is solely the report
+append added in Step 1.5 — make no uniqueness guarantee about a single walk
+(no visited-set protects pathological cyclic subject-name chains, and a
+multi-signer CMS repeats the walk once per SignerInfo).
 
 - [ ] **Step 5.3: Run GREEN + acceptance**
 
