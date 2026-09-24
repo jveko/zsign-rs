@@ -132,12 +132,17 @@ Mechanism (repo idiom, not canonicalize — the workspace uses no
    (verbatim `extract.rs:62-71` idiom).
 2. Reject `Component::ParentDir | RootDir | Prefix(_)` in `relative`
    with `"Path {} escapes the bundle root {}"`.
-3. Require plain spelling: reject `Component::CurDir`, and reject any
-   `relative` whose component rebuild differs from its raw `OsStr`
+3. Require plain spelling: split `relative`'s raw text on `/` (on
+   Windows also `\`, where both are accepted separators) and reject any
+   empty segment (redundant or trailing separator) or `.` segment
    (`./Test`, `foo//Test`, `Test/`), with
-   `"Path {} is not a plain relative path under {}"`. CodeResources'
-   main-executable exclusion compares the *raw* `CFBundleExecutable`
-   string against WalkDir-relative paths
+   `"Path {} is not a plain relative path under {}"`. The check is
+   segment-based rather than a `PathBuf`-rebuild comparison because a
+   rebuild joins with the *native* separator and would reject ordinary
+   `/`-spelled values on Windows — including the literal
+   `"_CodeSignature/CodeResources"` passed by Task 3's writers.
+   CodeResources' main-executable exclusion compares the *raw*
+   `CFBundleExecutable` string against WalkDir-relative paths
    (`zsign-core/src/bundle/code_resources.rs:264-267`), so only a plain
    raw value can keep that invariant. Root-prefixed inputs arrive via
    `strip_prefix`, which already returns plain remainders (verified
@@ -176,7 +181,14 @@ root (the path *above* the final component) are trusted operator input
 — equivalent to the operator's choice of working directory — because
 the threat model is hostile bundle content, and rejecting symlinked
 ancestors would break standard layouts (macOS `/var` → `/private/var`,
-tempdir roots).
+tempdir roots). That trust applies to operator-supplied roots only. In
+`sign()`, the components below the extraction TempDir are archive-created
+— extraction permits relative, `..`-free targets like
+`Payload → Payload2` — so `sign()` validates them with
+`resolve_within(temp_dir.path(), app_bundle)` immediately after
+extraction; a symlink among them is a hard error
+(`test_sign_rejects_aliased_payload_root`). Only the TempDir path itself
+and its system-level ancestors remain trusted there.
 
 Wiring — every `fs::write`/`create_dir_all` is preceded by exactly one
 validation: at function entry where the function also reads or dispatches
@@ -236,12 +248,20 @@ tests are `#[cfg(unix)]` + `std::os::unix::fs::symlink` (precedent:
 `ipa/extract.rs:470`, `ipa/archive.rs:426`,
 `bundle/code_resources.rs:441`). Each containment test fails before its
 fix; where an external or target file exists, its bytes must be
-byte-identical afterwards. Platform note: tests 6-12 are
+byte-identical afterwards. Platform note: tests 6-13 are
 `#[cfg(unix)]` (off-Unix only tests 1-5 exist), and test 7's probe
 returns early — passing without asserting — where DAC permission checks
 are bypassed (e.g. running as root). Test 12 is an explicit
 trust-boundary pin: it passes before and after the fix and fails only if
-ancestor-trusting is revoked.
+ancestor-trusting is revoked. Windows: this lane's gates run on Unix;
+the `cfg!(windows)` arm of the separator split is compile-checked but
+not executed here (no Windows runner). Pre-existing, out-of-lane
+limitation: `CodeResourcesBuilder::scan` stores native-separator
+relative paths (`code_resources.rs:171-180`) while `CFBundleExecutable`
+uses `/`, so on Windows *nested* (sub-path) executable values already
+miss the raw-string main-executable exclusion; flat values — the iOS
+norm — are unaffected. This change neither worsens nor repairs that (the
+builder is another lane's file).
 
 1. `test_sign_rejects_executable_path_outside_bundle` — `CFBundleExecutable`
    = `"../outside_macho"` (real Mach-O written beside the `.app` in the
@@ -305,6 +325,13 @@ ancestor-trusting is revoked.
     writes landing at the resolved location (`real/App.app/_CodeSignature`)
     — pinning the documented trust boundary: root *ancestors* are
     operator input, only the root's final component is checked.
+13. `test_sign_rejects_aliased_payload_root` (`#[cfg(unix)]`) — a zip
+    containing a real `Payload2/App.app` plus a `Payload → Payload2`
+    symlink (a target shape `is_safe_symlink_target` permits);
+    `sign()` must fail with `"Pre-existing symlink in signing path"` —
+    the archive-created component above the bundle root is validated
+    against the extraction root. Covers item 3's `sign()` ancestry
+    validation.
 
 Existing `ipa::tests` (4 non-skipped) plus the cross-crate signer tests
 (`builder::tests :562`, `verify::tests :536/:572/:583/:596`, CLI
@@ -396,7 +423,11 @@ failure, ZSN-15).
   was rejected: operator-supplied ancestors are invocation-time input —
   outside the hostile-bundle threat model — and ancestry rejection would
   break standard layouts (macOS `/var` → `/private/var`, tempdir roots).
-  Pinned by `test_sign_trusts_operator_root_ancestors`.
+  Pinned by `test_sign_trusts_operator_root_ancestors`. In `sign()`,
+  archive-created components above the bundle root are validated against
+  the extraction root (`resolve_within(temp_dir.path(), app_bundle)`),
+  closing the `Payload → Payload2` alias — pinned by
+  `test_sign_rejects_aliased_payload_root`.
 - *Decision — plain spelling enforced in `resolve_within`, not
   normalized:* the raw `CFBundleExecutable` string must equal its
   WalkDir-relative form for CodeResources' exclusion invariant, and

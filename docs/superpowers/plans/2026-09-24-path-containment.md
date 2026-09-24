@@ -12,8 +12,11 @@ check). Ancestor path components of an operator-supplied root are
 trusted operator input — equivalent to the operator's choice of working
 directory; the threat model is hostile bundle content, not hostile
 invocation, and rejecting symlinked ancestors would break macOS
-`/var` → `/private/var` and tempdir roots. `sign()`'s ancestors are our
-own fresh TempDir.
+`/var` → `/private/var` and tempdir roots. For `sign()`, the components
+between the extraction TempDir and the bundle root come from the
+archive and are validated — no symlink components — right after
+extraction; only the TempDir path itself and its system-level ancestors
+are trusted there.
 
 **Out of scope for containment** (see the design doc's "What is and is
 not guarded"): read-only paths (`get_bundle_identifier` /
@@ -70,6 +73,23 @@ Add to `mod tests` (near `create_test_ipa`, `:936`), plus the shared
 fixture helper they use:
 
 ```rust
+    /// XML for an Info.plist declaring `cf_bundle_executable_entry`
+    /// (already XML) as CFBundleExecutable.
+    fn info_plist_xml(cf_bundle_executable_entry: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleExecutable</key>
+    {cf_bundle_executable_entry}
+</dict>
+</plist>"#
+        )
+    }
+
     /// Build a minimal `.app` folder whose Info.plist declares
     /// `executable_value` as CFBundleExecutable.
     fn create_folder_bundle(dir: &Path, executable_value: &str, write_executable: bool) -> PathBuf {
@@ -77,18 +97,7 @@ fixture helper they use:
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(
             app.join("Info.plist"),
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.test.app</string>
-    <key>CFBundleExecutable</key>
-    <string>{executable_value}</string>
-</dict>
-</plist>"#
-            ),
+            info_plist_xml(&format!("<string>{executable_value}</string>")),
         )
         .unwrap();
         if write_executable {
@@ -164,20 +173,7 @@ fixture helper they use:
         let temp = TempDir::new().unwrap();
         let app = temp.path().join("App.app");
         std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(
-            app.join("Info.plist"),
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.test.app</string>
-    <key>CFBundleExecutable</key>
-    <integer>42</integer>
-</dict>
-</plist>"#,
-        )
-        .unwrap();
+        std::fs::write(app.join("Info.plist"), info_plist_xml("<integer>42</integer>")).unwrap();
         std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
 
         let error = IpaSigner::new_adhoc()
@@ -274,10 +270,10 @@ fixture helper's value parameter is a `&str`.
 - [ ] **Step 1.2: Run the gate, expect RED**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: **7 failed** on Unix (this machine): five at `expect_err`
-(traversal/absolute/non-string/non-plain/symlinked input currently signs
-successfully) plus `test_sign_rejects_symlinked_main_executable` at its
-`expect_err`, and `test_sign_errors_on_unreadable_path_component` at its
+Expected: **7 failed** on Unix (this machine): six at `expect_err` —
+tests 1-6 (`outside_bundle`, both absolute cases, non-string, non-plain,
+`symlinked_main_executable` all currently sign successfully) — plus
+`test_sign_errors_on_unreadable_path_component` at its
 message assertion (the walk error is swallowed, so `scan` fails first
 with `"Failed to walk directory"` — `code_resources.rs:154-159` — and the
 `"Failed to inspect signing path"` assertion cannot hold). Variants:
@@ -331,16 +327,15 @@ fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
         ))));
     }
 
-    // The raw spelling must equal its component rebuild: CodeResources'
-    // main-executable exclusion compares the raw CFBundleExecutable
-    // string against WalkDir-relative paths, which are always plain.
-    let mut plain = PathBuf::new();
-    for component in relative.components() {
-        plain.push(component.as_os_str());
-    }
-    if relative.components().any(|c| matches!(c, Component::CurDir))
-        || plain.as_os_str() != relative.as_os_str()
-    {
+    // The raw spelling must contain no empty segments (redundant or
+    // trailing separators) and no "." segments — a PathBuf rebuild would
+    // join with the native separator and reject plain '/'-spelled values
+    // on Windows. CodeResources' main-executable exclusion compares the
+    // raw CFBundleExecutable string against WalkDir-relative paths, so
+    // only plain raw values keep that invariant intact.
+    let raw = relative.to_string_lossy();
+    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    if raw.split(separator).any(|s| s.is_empty() || s == ".") {
         return Err(Error::Core(zsign_core::Error::Signing(format!(
             "Path {} is not a plain relative path under {}",
             relative.display(),
@@ -600,11 +595,12 @@ Task 1 is reused):
 - [ ] **Step 2.2: Run the gate, expect RED**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: **2 failed** — `test_symlinked_dylib_is_skipped_and_target_untouched`
+Expected: **2 failed** on Unix — `test_symlinked_dylib_is_skipped_and_target_untouched`
 (fails on `!dylibs.contains(&link)` because `path.is_file()` follows the
 link) and `test_symlinked_framework_is_not_collected_and_target_untouched`
-(fails on `all(...)` because `path.is_dir()` follows the link). All
-other tests pass. Record the output.
+(fails on `all(...)` because `path.is_dir()` follows the link); both are
+`#[cfg(unix)]`, so **0 new failures** on non-Unix. All other tests pass.
+Record the output.
 
 - [ ] **Step 2.3: Swap the four predicates to `entry.file_type()`**
 
@@ -677,7 +673,7 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
   - `generate_code_resources` at `:890-900`
   - `sign_standalone_dylib` at `:476` + its caller at `:370`
   - `sign_binary` at `:770` (signature + entry)
-- Test: inline tests module, 3 new tests
+- Test: inline tests module, 4 new tests
 
 - [ ] **Step 3.1: Write the failing tests**
 
@@ -770,18 +766,52 @@ Add to `mod tests`:
             "writes land at the resolved location of the operator-supplied root"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_aliased_payload_root() {
+        let temp = TempDir::new().unwrap();
+        let ipa = temp.path().join("aliased.ipa");
+
+        let file = std::fs::File::create(&ipa).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload2/", options).unwrap();
+        zip.add_directory("Payload2/App.app/", options).unwrap();
+        zip.start_file("Payload2/App.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(info_plist_xml("<string>Test</string>").as_bytes())
+            .unwrap();
+        zip.start_file("Payload2/App.app/Test", options).unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.add_symlink("Payload", "Payload2", options).unwrap();
+        zip.finish().unwrap();
+
+        let output = temp.path().join("out.ipa");
+        let error = IpaSigner::new_adhoc()
+            .sign(&ipa, &output)
+            .expect_err("an archive-created symlink above the bundle root must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Pre-existing symlink"),
+            "error must name the cause: {message}"
+        );
+    }
 ```
 
 - [ ] **Step 3.2: Run the gate, expect RED**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: **2 failed** (both `#[cfg(unix)]`; non-Unix: no new failures):
+Expected: **3 failed** (all `#[cfg(unix)]`; non-Unix: no new failures):
 `test_sign_rejects_symlinked_info_plist_rewrite` panics at `expect_err`
 — `rewrite_plist_string` currently reads and writes through the symlink,
-so the sign succeeds (and the external plist changes) — and
+so the sign succeeds (and the external plist changes) —
 `test_sign_rejects_symlinked_bundle_root` panics at `expect_err` (the
-symlinked root is accepted and signed through, trailing slash
-included). `test_sign_trusts_operator_root_ancestors` passes already —
+symlinked root is accepted and signed through, trailing slash included),
+and `test_sign_rejects_aliased_payload_root` panics at `expect_err`
+(extraction permits the relative `Payload -> Payload2` alias and signing
+proceeds through it).
+`test_sign_trusts_operator_root_ancestors` passes already —
 it is a trust-boundary pin, not a regression test. All other tests pass.
 Record the output.
 
@@ -889,7 +919,19 @@ and at `:576`:
             )?;
 ```
 
-- [ ] **Step 3.8: Reject a symlinked bundle root**
+- [ ] **Step 3.8: Reject symlinked root zones**
+
+In `sign()` (after `extract_ipa`, `:279`), validate the archive-created
+components between the extraction root and the bundle root — they come
+from the archive, not the operator:
+
+```rust
+        let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
+        // Components between the extraction root and the bundle root come
+        // from the archive: none of them may be a symlink.
+        resolve_within(temp_dir.path(), &app_bundle)?;
+        self.sign_bundle_from_options(&app_bundle)?;
+```
 
 In `sign_bundle_from_options` (`:327-334`), before `load_profile`:
 
@@ -916,8 +958,8 @@ header's Goal).
 - [ ] **Step 3.9: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass — Unix (this machine): 12 new + 4 existing
-(1 filtered out); non-Unix: 5 new + 4 existing (tests 10-12 are
+Expected: all tests pass — Unix (this machine): 13 new + 4 existing
+(1 filtered out); non-Unix: 5 new + 4 existing (tests 10-13 are
 `#[cfg(unix)]`).
 
 - [ ] **Step 3.10: Commit**
@@ -937,10 +979,10 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
 
 - **Spec coverage:** item 1 → Task 1 (helper + hardening + tests 1-7);
   item 2 → Task 2 (four predicates + tests 8-9); item 3 → Task 3 (guard
-  at all seven write/mkdir sites, symlinked-root rejection + trust pin
-  + tests 10-12); design doc's invariants are restated as constraints
-  in each task (lexical returns, no flow restructure, `.exists()`
-  guards kept).
+  at all seven write/mkdir sites, symlinked-root rejection, sign()
+  archive-zone validation, trust pin + tests 10-13); design doc's
+  invariants are restated as constraints in each task (lexical returns,
+  no flow restructure, `.exists()` guards kept).
 - **Placeholders:** none — every step carries complete code, exact
   commands, and expected outcomes.
 - **Type consistency:** `resolve_within(root: &Path, path: &Path) ->
