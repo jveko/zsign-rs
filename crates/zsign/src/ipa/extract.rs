@@ -53,6 +53,35 @@ fn is_safe_symlink_target(target: &str) -> bool {
     target.split('/').all(|component| component != "..")
 }
 
+/// Returns true if an archive entry name is absolute, uses `..` traversal,
+/// or has no substantive component.
+///
+/// Both separator spellings are checked because the zip reader
+/// componentizes names with Windows-path semantics (`Utf8WindowsPath`):
+/// `C:/evil` and `\evil` would otherwise be silently relocated inside the
+/// destination instead of rejected. Empty and dot-only names (``, `.`,
+/// `./`) are rejected too: zip encloses them as an empty path that resolves
+/// to the destination directory itself.
+fn is_unsafe_entry_name(name: &str) -> bool {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    let mut substantive = false;
+    for segment in name.split(['/', '\\']) {
+        if segment == ".." {
+            return true;
+        }
+        if !segment.is_empty() && segment != "." {
+            substantive = true;
+        }
+    }
+    !substantive
+}
+
 /// Validates that no pre-existing symlink exists in the path from root to the target.
 ///
 /// Walks from `root` downward toward `path`, checking each existing component.
@@ -123,6 +152,7 @@ fn validate_output_path(root: &Path, path: &Path) -> Result<()> {
 /// Returns [`Error::Io`] if:
 /// - The IPA file cannot be opened or read
 /// - Extraction fails due to I/O errors
+/// - Returns [`Error::Io`] if an archive entry name is unsafe (traversal or absolute)
 ///
 /// Returns [`Error::Zip`] if:
 /// - The IPA is not a valid ZIP archive
@@ -170,9 +200,22 @@ pub fn extract_ipa(ipa_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Re
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(Error::Zip)?;
 
+        let name = file.name();
+        if is_unsafe_entry_name(name) {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unsafe entry name in IPA: {}", name),
+            )));
+        }
+
         let outpath = match file.enclosed_name() {
-            Some(path) => dest_dir.join(path),
-            None => continue,
+            Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
+            _ => {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unsafe entry name in IPA: {}", name),
+                )))
+            }
         };
 
         #[cfg(unix)]
@@ -400,6 +443,78 @@ mod tests {
         zip.finish().unwrap();
 
         ipa_path
+    }
+    /// Build an otherwise-valid IPA that additionally contains `hostile_name`.
+    fn create_ipa_with_hostile_entry(dir: &Path, hostile_name: &str) -> PathBuf {
+        let ipa_path = dir.join("hostile.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><plist><dict></dict></plist>")
+            .unwrap();
+
+        zip.start_file(hostile_name, options).unwrap();
+        zip.write_all(b"evil content").unwrap();
+
+        zip.finish().unwrap();
+        ipa_path
+    }
+
+    fn assert_rejects_hostile_entry(hostile_name: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_ipa_with_hostile_entry(temp_dir.path(), hostile_name);
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("hostile entry name must fail the extraction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsafe entry name in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains(hostile_name),
+            "error must name the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_parent_traversal_entry() {
+        assert_rejects_hostile_entry("../evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_nested_traversal_entry() {
+        assert_rejects_hostile_entry("Payload/../../evil");
+        // Spelling that enclosed_name() silently normalizes instead of
+        // rejecting — the raw-name check must still fail closed.
+        assert_rejects_hostile_entry("Payload/../evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_absolute_entry_name() {
+        assert_rejects_hostile_entry("/abs/evil");
+        // Names with no real component: zip encloses these as an empty path
+        // resolving to the destination itself.
+        assert_rejects_hostile_entry("");
+        assert_rejects_hostile_entry(".");
+        assert_rejects_hostile_entry("./");
+        // A NUL name is the one form that reaches the `enclosed_name()`
+        // non-`Some` arm (the raw check passes) — this pins that arm.
+        assert_rejects_hostile_entry("Payload/\0evil");
+    }
+
+    #[test]
+    fn test_extract_ipa_rejects_windows_style_absolute_entry_name() {
+        assert_rejects_hostile_entry("C:/abs/evil");
+        assert_rejects_hostile_entry("\\abs\\evil");
+        // Backslash traversal that Windows-path componentization pops
+        // instead of rejecting.
+        assert_rejects_hostile_entry("Payload\\sub\\..\\evil");
     }
 
     #[test]
