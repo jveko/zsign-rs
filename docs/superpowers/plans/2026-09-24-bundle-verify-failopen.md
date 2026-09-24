@@ -40,16 +40,23 @@ inline `#[cfg(test)]` tests using `crate::test_util` fixtures and `crate::ZSign`
 ## Shared test helpers (created by Task 1, reused by all later tasks)
 
 ```rust
-/// Builds the signed `Test.app` fixture, letting the caller add files/symlinks
-/// after the base tree exists but BEFORE signing seals it.
-fn build_signed_bundle_with(dir: &Path, setup: impl FnOnce(&Path)) -> PathBuf { /* move
-    the existing body of build_signed_bundle here; call setup(&app) right before
-    zsign.sign_bundle(&app, None) */ }
-
 fn build_signed_bundle(dir: &Path) -> PathBuf {
     build_signed_bundle_with(dir, |_| {})
 }
+```
 
+`build_signed_bundle_with` is produced by Task 1's refactor — **precise move
+instructions** (no new logic): rename the existing
+`fn build_signed_bundle(dir: &Path) -> PathBuf` (verify.rs:503-528) to
+`fn build_signed_bundle_with(dir: &Path, setup: impl FnOnce(&Path)) -> PathBuf`,
+keep its entire body verbatim (all `fs::create_dir_all`/`fs::write` fixture lines
+including the inline FMWK Info.plist literal), and insert one statement
+`setup(&app);` immediately before `let zsign = ZSign::new()...` so callers can add
+files/symlinks after the base tree exists but before signing seals it. Then add the
+two-line delegating `build_signed_bundle` shown above. Existing tests calling
+`build_signed_bundle(td.path())` are untouched.
+
+```rust
 /// Rewrites `Test.app/_CodeSignature/CodeResources` through a mutation closure.
 /// NOTE: every use breaks the main executable's slot -3 binding, so tests using
 /// this helper assert at the CodeResources / bundle-error layer, not report.valid().
@@ -113,21 +120,34 @@ fn missing_bundle_root_is_hard_error() {
        )));
    }
    ```
-3. Binary-collection walk: replace `filter_map(|e| e.ok())` with
+3. Walk error propagation. `WalkDir`'s iterator yields `Result<DirEntry,
+   walkdir::Error>` **items** — there is no `Iterator::map_err` and the iterator
+   itself is not `Try`, so bind each item inside the loop (the in-repo pattern,
+   `crates/zsign/src/ipa/archive.rs:225-226`):
    ```rust
-   .map_err(|e| {
-       crate::Error::Io(std::io::Error::other(format!("Failed to walk directory: {e}")))
-   })?
+   for entry in WalkDir::new(dir).min_depth(1) {
+       let entry = entry.map_err(|e| {
+           crate::Error::Io(std::io::Error::other(format!("Failed to walk directory: {e}")))
+       })?;
+       let p = entry.path();
+       // ... existing loop body ...
+   }
    ```
-   (same pattern as `crates/zsign/src/bundle/code_resources.rs:154-158`).
+   Apply the identical per-item binding to the disk walk inside
+   `check_code_resources` (its current `filter_map(|e| e.ok())` disappears with the
+   loop rewrite required by Step 4.4). Do NOT put `map_err`/`?` on the iterator
+   chain itself — that does not compile.
 4. `check_code_resources`: add `errors: &mut Vec<String>` parameter, return
-   `Result<CodeResourcesVerification>`; its disk walk propagates the same walk
-   error; caller in `verify_bundle_dir` uses `?`. (Content-error pushes arrive in
-   later tasks; for this task the parameter is threaded and unused by content yet —
-   wire the "no files2 dictionary"/unparseable-plist strings from `unsealed` into
-   `errors` now, they are content errors per C2.)
-5. `is_macho_file(path) -> Result<bool>`: open failure `NotFound → Ok(false)`,
-   other I/O → `Err`; magic mismatch → `Ok(false)`. Caller uses `?`.
+   `Result<CodeResourcesVerification>`; its disk walk uses the per-item binding from
+   Step 4.3 and propagates the error; caller in `verify_bundle_dir` uses `?`.
+   Content-error ownership for this task: move the unparseable-plist and
+   "CodeResources has no files2 dictionary" strings from `unsealed` into `errors`
+   (C2 channel — `files2` is required, its absence is a content error owned here).
+5. `is_macho_file(path) -> Result<bool>`: `File::open` failure `NotFound →
+   Ok(false)`, any other open error → `Err`; `read_exact` of the 4-byte magic
+   failing with `ErrorKind::UnexpectedEof → Ok(false)` (too short to be a Mach-O —
+   not an I/O fault); any other read error → `Err`; magic mismatch → `Ok(false)`.
+   Caller uses `?`.
 6. `verify_macho_file`: `std::fs::read(path)?` already propagates (unchanged).
 
 - [ ] **Step 5: Run test — PASS**, then the scoped gate:
@@ -420,10 +440,15 @@ fn partial_reseal_with_updated_hash2_is_detected() {
 
 1. `use sha1::Sha1;` next to the existing `sha2` import.
 2. Restructure `check_code_resources` to build one **sealed set** =
-   `files2` keys ∪ legacy `files` keys (parse `files` like `files2`; it may be
-   absent — treat absent as empty, both absent is an error handled in Task 6/7
-   territory but keep today's "no files2 dictionary" string moved to `errors`
-   from Task 1).
+   `files2` keys ∪ legacy `files` keys, with explicit dictionary ownership (design
+   C3):
+   - `files2` absent → the content error `CodeResources has no files2 dictionary`
+     (already owned by Task 1) → bundle invalid, no union logic runs;
+     `files2` present but not a dictionary → `CodeResources files2 is not a
+     dictionary`, treated as absent (report already invalid — no silent fallback);
+   - `files` absent → fine, contributes nothing; present but not a dictionary →
+     `CodeResources files is not a dictionary` (same treatment);
+   - no delegation of this error's ownership to Tasks 6/7 — it is fully handled here.
 3. Sealed→disk: iterate `files2` entries first; then iterate `files` entries whose
    key is **not** in `files2` (files2 wins a collision — it carries both algorithms
    already). Per entry:
@@ -515,13 +540,30 @@ fn unsupported_rule_is_reported() {
 
 1. New private items in `verify.rs`:
    ```rust
-   enum RuleAction { Include, Omit, Optional }        // derive(PartialOrd) order used only for tie-break
+   #[derive(Clone, Copy, PartialEq, Eq)]
+   enum RuleAction { Include, Omit, Optional }
    enum RulePattern { Always, Contains(&'static str), Suffix(&'static str),
                       Prefix(&'static str), Exact(&'static str), Dsym, DsStore }
    struct Rule { pattern: RulePattern, action: RuleAction, weight: f64 }
 
    fn compile_rules(dict: &plist::Dictionary, errors: &mut Vec<String>) -> Vec<Rule>
-   fn rule_action(rules: &[Rule], rel: &str) -> Option<RuleAction>   // highest weight wins; tie: Include > Omit > Optional
+   fn rule_action(rules: &[Rule], rel: &str) -> Option<RuleAction>
+   ```
+   **Do NOT derive `PartialOrd` on `RuleAction`** — derived order would make
+   `Optional` outrank `Include` on a tie, inverting the required strictness.
+   Select with an explicit comparator instead:
+   ```rust
+   // Tie-break on equal weight, strictest first: Include beats Omit beats Optional.
+   fn tie_rank(action: RuleAction) -> u8 {
+       match action {
+           RuleAction::Include => 0,
+           RuleAction::Omit => 1,
+           RuleAction::Optional => 2,
+       }
+   }
+   // rule_action: keep the current best rule r when
+   //   r.weight > best.weight
+   //   || (r.weight == best.weight && tie_rank(r.action) < tie_rank(best.action))
    ```
    `compile_rules` recognizes exactly the pattern strings in the design's C4 table
    (both `^version.plist$` spellings map to `Exact("version.plist")`); unknown
@@ -529,10 +571,14 @@ fn unsupported_rule_is_reported() {
    `errors.push(format!("unsupported CodeResources rule: {key}"))` and the rule is
    dropped. `Boolean(true/false)` → Include/Omit at weight 1.0; dict keys limited to
    `omit`/`optional`/`weight` (weight: Real or Integer → f64, default 1.0).
-2. Rule source: `rules2` if present else `rules`; **neither** →
-   `errors.push("CodeResources has no rules dictionary")` and treat lookup as
-   "no rule matches anything" (disk check falls back to structural omissions only,
-   missing entries are never tolerated).
+2. Rule source with fail-closed type handling (design C4): read
+   `dict.get("rules2")` — present but not a dictionary →
+   `errors.push("CodeResources rules2 is not a dictionary")`, treated as absent for
+   evaluation (the report is already invalid — no silent fallback); otherwise use
+   `rules2` when it exists, else `rules` (same wrong-type treatment for `rules`);
+   **neither present** → `errors.push("CodeResources has no rules dictionary")` and
+   treat lookup as "no rule matches anything" (disk check falls back to structural
+   omissions only, missing entries are never tolerated).
 3. `is_rule_omitted` is reduced to the two structural omissions
    (`_CodeSignature` root prefix/exact, frame main executable exact) — delete the
    `Info.plist`/`PkgInfo`/`.DS_Store`/`.lproj` arms (rules2 covers them; the
@@ -610,7 +656,7 @@ fn malformed_entry_is_reported() {
 
 **Files:** `crates/zsign/src/verify.rs` (`check_code_resources`, tests).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -638,27 +684,83 @@ fn path_traversal_keys_are_rejected() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn symlink_parent_traversal_is_rejected() {
+    use std::os::unix::fs::symlink;
+    use sha2::{Digest, Sha256};
+    let td = tempfile::TempDir::new().unwrap();
+    let outside = td.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), b"outside content").unwrap();
+    // A legitimately sealed symlink pointing out of the bundle: the builder
+    // hashes whatever read_link returns, so this signs cleanly.
+    let app = build_signed_bundle_with(td.path(), |app| {
+        symlink(&outside, app.join("Escape")).unwrap();
+    });
+    // Lexical-clean key whose intermediate component is that symlink; the
+    // attacker-chosen hash2 even matches the real outside content.
+    rewrite_code_resources(&app, |dict| {
+        let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+        let mut entry = plist::Dictionary::new();
+        entry.insert(
+            "hash2".to_string(),
+            plist::Value::Data(Sha256::digest(b"outside content").to_vec()),
+        );
+        files2.insert("Escape/secret.txt".to_string(), plist::Value::Dictionary(entry));
+    });
+    let report = verify_bundle(&app).unwrap();
+    assert!(!report.valid());
+    let bundle = report.bundle.as_ref().unwrap();
+    assert!(
+        bundle
+            .errors
+            .iter()
+            .any(|e| e.contains("escapes the bundle") && e.contains("Escape/secret.txt")),
+        "symlink-parent key must be rejected before any read; got {:?}",
+        bundle.errors
+    );
+}
 ```
 
-- [ ] **Step 2: Run and confirm FAIL** — expected: no escape errors (today the keys
-  join out of the bundle and only hash-compare whatever they reach).
+- [ ] **Step 2: Run and confirm FAIL** — expected: no escape errors for either
+  test (today the keys join out of the bundle and are read/hash-compared without
+  complaint; the symlink-parent key even hash-*matches*).
 
-- [ ] **Step 3: Implement** (design C8)
+- [ ] **Step 3: Implement** (design C8, two stages)
 
-1. Helper:
+1. Stage-1 helper:
    ```rust
    /// A sealed key may only address files strictly inside the bundle: every
    /// path component must be a plain name (no `..`, no absolute prefix, no `.`).
    fn is_safe_bundle_key(key: &str) -> bool {
-       let mut components = Path::new(key).components();
-       let all_normal = components.clone().all(|c| matches!(c, std::path::Component::Normal(_)));
-       all_normal && Path::new(key).components().next().is_some()
+       let path = Path::new(key);
+       path.components().next().is_some()
+           && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
    }
    ```
-2. In the sealed→disk loop, validate the key **before** any `join`; violation →
-   `errors.push(format!("CodeResources entry path escapes the bundle: {rel}"))` and
-   `continue`. Applies to `files2` and `files` keys alike. (Disk→sealed keys come
-   from the walk and need no check.)
+2. Stage 1: in the sealed→disk loop, validate the key **before** any `join`;
+   violation → `errors.push(format!("CodeResources entry path escapes the bundle: {rel}"))`
+   and `continue`. Applies to `files2` and `files` keys alike.
+3. Stage 2 (resolved containment — stage 1 alone is bypassable via an in-bundle
+   symlink directory, which `fs::read`/`fs::read_link` follow): at the top of
+   `check_code_resources` compute
+   `let bundle_real = std::fs::canonicalize(bundle).map_err(crate::Error::Io)?;`
+   Then, for **every** entry — before *any* content access, i.e. before both the
+   `symlink` dispatch and the hash read — canonicalize the entry's parent directory
+   (the parent is `bundle` itself for root-level keys):
+   - `Err(NotFound)` → `missing.push(rel)` and `continue` (parent directory absent
+     → the entry cannot exist; **no content is read, so no oracle**);
+   - `Ok(resolved)` where `!resolved.starts_with(&bundle_real)` →
+     `errors.push(format!("CodeResources entry path escapes the bundle: {rel}"))`
+     and `continue`;
+   - other `Err(e)` → `errors.push(format!("cannot resolve CodeResources entry path {rel}: {e}"))`
+     and `continue`;
+   - `Ok(resolved)` inside the bundle → proceed to the dispatch.
+   The residual TOCTOU window between canonicalize and read is documented as out of
+   threat model in design C8 (the verified tree is read-only to us by contract).
+4. The disk→sealed walk needs no stage: its keys come from a non-following WalkDir.
 
 - [ ] **Step 4: Run test — PASS**, then the full scoped gate. Expected: all green.
 
@@ -732,20 +834,25 @@ fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
 
 - **Spec coverage:** queue items 1–9 each map to exactly one task (Task 1…9), in
   brief order; all six mandated regressions are covered (missing root → Task 1;
-  framework symlink → Task 4; tampered sealed file → gate regression throughout;
-  traversal keys → Task 8; missing CodeResources → Task 2; tampered nested binary →
-  Task 3).
+  framework symlink → Task 4; tampered sealed file → guard-test exception, keep-green
+  in every gate — the brief defines it as "existing tests keep passing" and they
+  pass at baseline 7/7; traversal keys + symlink-parent containment → Task 8;
+  missing CodeResources → Task 2; tampered nested binary → Task 3).
 - **Placeholders:** none — every task carries literal test code, literal error
-  strings, and literal commands.
+  strings, and literal commands; the shared helper refactor is specified as
+  verbatim-move instructions outside any code stub.
 - **Type consistency:** `read_opt → Result<Option<Vec<u8>>>` (Task 1) is used
   identically by Tasks 2/9; `check_code_resources(…, errors: &mut Vec<String>) ->
   Result<CodeResourcesVerification>` (Task 1) carries the `errors` channel consumed
   by Tasks 5–8; `build_signed_bundle_with` / `rewrite_code_resources` (Task 1) are
   used verbatim by Tasks 3–8; rule-engine names (`compile_rules`, `rule_action`,
-  `RuleAction`, `RulePattern`) are defined once in Task 6 and referenced only there.
+  `RuleAction`, `RulePattern`, `tie_rank`) are defined once in Task 6 and referenced
+  only there; `bundle_real` containment (Task 8 stage 2) is defined inside
+  `check_code_resources` once.
 - **Deviations recorded:** entry-level `optional` is not honored (rules are the
   single authority — design C4); `base_lproj_deletion_is_not_optional` is a guard
-  test that passes pre-fix by construction.
+  test that passes pre-fix by construction; mandated regression #3 is a keep-green
+  guard per the brief's own wording (see Spec coverage).
 
 ## Execution handoff
 

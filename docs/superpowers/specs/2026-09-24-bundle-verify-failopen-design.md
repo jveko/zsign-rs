@@ -57,8 +57,10 @@ All verified against current source (line numbers as of base `ee42c12`).
 - **Builder emission (the contract to verify against).**
   - files2 file entry: `{hash: SHA-1 20B, hash2: SHA-256 32B, optional?: true}`
     (`optional` iff path contains `.lproj/`); no other keys.
-  - files2 symlink entry: `{symlink: "<target string>"}` only — hashes are computed
-    by the scanner but never emitted.
+  - files2 symlink entry: `{symlink: "<target string>"}` plus `optional: true` when
+    the path contains `.lproj/` (the flag is inserted outside the if/else,
+    zsign-core code_resources.rs:455-457) — but **no** hash fields: hashes are
+    computed by the scanner and discarded.
   - legacy `files`: always emitted; symlinks skipped; `.lproj` entries
     `{hash, optional}`; everything else a bare 20-byte SHA-1 `Data` value; root
     `Info.plist`/`PkgInfo` present here (they are dropped from files2 at build,
@@ -118,16 +120,30 @@ verified (hash match or symlink-target match). `check_code_resources` gains an
 propagates `Err` per C1).
 
 **C3 — sealed set and hash verification.** The sealed set is the union of `files2`
-and legacy `files` keys. Per sealed entry, *every* declared hash field is checked
-with its own algorithm (`hash2` → SHA-256, `hash` → SHA-1); all present fields must
-match. `files2` wins a key collision (its entries carry both algorithms, so SHA-1 is
-covered anyway); `files`-only keys are verified with their declared value type.
-Bare `Data` values are legal in `files` (SHA-1) and malformed in `files2`.
+and legacy `files` keys, with explicit dictionary ownership:
+
+- `files2` is **required** — absent → the content error
+  `CodeResources has no files2 dictionary` (owned by the Task 1 channel rework);
+  a bundle without it is invalid and no union logic runs.
+- `files` is optional — absent simply contributes nothing; present keys not in
+  `files2` are verified from `files`.
+- Either dictionary *present but not a dictionary* (wrong plist type) → content
+  error `CodeResources <key> is not a dictionary`, treated as absent for
+  evaluation (the report is already invalid — never a silent fallback).
+
+Per sealed entry, *every* declared hash field is checked with its own algorithm
+(`hash2` → SHA-256, `hash` → SHA-1); all present fields must match. `files2` wins a
+key collision (its entries carry both algorithms, so SHA-1 is covered anyway);
+`files`-only keys are verified with their declared value type. Bare `Data` values
+are legal in `files` (SHA-1) and malformed in `files2`.
 
 **C4 — rules engine (no regex crate).** Evaluate **the rules our builder emits**;
 anything else is an explicit `unsupported CodeResources rule: <pattern>` report
 error — never a silent ignore. Rule source: `rules2` when present, else `rules`;
-neither present → report error. Semantics per rule value:
+`rules2` *present but not a dictionary* → content error
+`CodeResources rules2 is not a dictionary`, treated as absent for evaluation (the
+report is already invalid — no silent fallback); **neither** present → report error
+`CodeResources has no rules dictionary`. Semantics per rule value:
 `Boolean(true)` → Include, `Boolean(false)` → Omit; dictionary keys restricted to
 `{omit, optional, weight}` (both `omit` and `optional` true, or any other key/type →
 unsupported error); `weight` default 1.0. Among *matching* rules the highest weight
@@ -205,6 +221,26 @@ invalid rather than silently valid. Indices 3/5 (`-4`/`-6`) are never surfaced:
 their content is defined as unavailable at the Mach-O level. Zero-filled slots
 (`Missing`) remain silent — unbound is normal.
 
+**C8 — path containment (two stages).** Stage 1, lexical: before any `join`, every
+`Path::components()` of the plist key must be `Normal` (rejects `ParentDir`,
+`RootDir`, `Prefix`, `CurDir`, and the empty key) → bundle error
+`CodeResources entry path escapes the bundle: <key>`, entry skipped. Stage 2,
+resolved containment: a lexical-clean key can still traverse an in-bundle symlink
+directory (`Escape -> /etc`, key `Escape/passwd`) because `fs::read` and
+`fs::read_link` both resolve intermediate links. Before *reading* anything for an
+entry, canonicalize the entry's parent directory against `canonicalize(bundle)`:
+`NotFound` → the entry is `missing` (no content is read, so no oracle); resolution
+outside the bundle → the same escape error, entry skipped; any other I/O error →
+content error. Stage 2 runs for **both** dispatch branches (hash reads *and*
+symlink target reads — `read_link` resolves intermediate links too). Resolving the
+parent instead of an `openat`-style no-follow traversal is a deliberate trade: the
+residual TOCTOU window (an attacker mutating the tree *during* verification) is out
+of threat model — the tree being verified is read-only to us by contract. Our
+builder never emits symlink-traversing keys (both sealing walks use
+`follow_links(false)`), so stage 2 only ever fires for crafted keys — exactly the
+oracle to close. The disk→sealed direction is inherently safe (keys come from the
+filesystem walk, which does not follow links).
+
 ## Per-item design decisions (brainstorm record)
 
 Each item lists the chosen design and the rejected alternatives. Decisions were
@@ -270,15 +306,18 @@ unknown forms fail closed).
 *Rejected:* (C) `Err` — this is content corruption, not an I/O failure; the partial
 report is useful.
 
-**8. Path traversal — chosen: A.** Before any `join`, every `Path::components()` of
-the plist key must be `Normal` (rejects `ParentDir`, `RootDir`, `Prefix`, `CurDir`,
-and the empty key) → bundle error `CodeResources entry path escapes the bundle:
-<key>`, entry skipped. Applies to `files2` and `files` keys alike. The disk→sealed
-direction is inherently safe (keys come from the filesystem walk).
-*Rejected:* (B) canonicalize + prefix check — TOCTOU-prone, and the builder never
-seals *through* symlinked directories (`follow_links(false)` on both sealing and
-verifying walks), so component rejection is exactly sufficient; (C) sanitize/strip
-the key — verifies the wrong path silently.
+**8. Path traversal — chosen: A (C8, two stages).** Lexical component rejection
+before joining, plus resolved-containment of the entry's parent directory before
+any read — both stages required (stage 1 alone leaves the symlink-directory oracle
+open, which the cold review caught). Applies to `files2` and `files` keys alike.
+*Rejected:* (B) lexical check only — explicitly refuted: `fs::read`/`fs::read_link`
+resolve intermediate in-bundle symlinks, so `Escape -> /etc` + key `Escape/passwd`
+passes a Normal-component check and restores the arbitrary-file oracle (the original
+"builder never seals through symlinked dirs" argument only protects *legitimate*
+keys, not crafted ones); (C) sanitize/strip the key — verifies the wrong path
+silently. A pure `openat`-style no-follow traversal was also considered and
+rejected as disproportionate: parent canonicalization closes every read with a
+documented, out-of-threat-model TOCTOU window.
 
 **9. Unchecked required slots — chosen: A (C7).** Bundle: ungated binary-level
 errors for `NotChecked` at slots -1/-3 (behaviorally the -1 branch exists today via
@@ -297,16 +336,22 @@ Gate for every task (scoped, never project-wide):
 (the filter matches the `verify::tests::*` module path; the skip covers the known
 pre-existing ZSN-15 zip-order flake).
 
-Mandated regressions (must fail before their fix, pass after):
+Mandated regressions. Five are fail-before-fix tests; **#3 is a documented
+guard-test exception** — the brief itself defines it as "existing tests keep
+passing", and those tests (`modified_sealed_resource_fails`,
+`tampered_resource_fails_code_resources`) already pass at baseline (verified: the
+pre-fix gate runs 7/7 green), so they cannot fail before the fix by construction.
+Their mandate is keep-green: every task's gate must keep them passing, which it
+does — they would catch any change that un-detects sealed-file tampering.
 
-| # | test | fails pre-fix because |
+| # | test | pre-fix behavior |
 |---|---|---|
-| 1 | `verify_bundle("…/missing.app")` → `Err` | returns `Ok` + default-valid report |
-| 2 | signed bundle with framework symlink verifies clean end-to-end | symlink entry → "sealed without a hash" → invalid |
-| 3 | existing tampered-sealed-file tests keep passing | guard against items 3–5 regressing detection |
-| 4 | files2 keys `../../../../etc/passwd`, `/etc/passwd` → rejected | no escape error; keys silently read outside |
-| 5 | missing CodeResources at app root → invalid | no *bundle-level* error (a binary-level slot error exists today, so the assertion targets `bundle.errors`) |
-| 6 | tampered nested `Frameworks/Sub.framework/Sub` → detected *by the nested frame's binary report* | nested `binaries` is empty (parent files2 already catches raw content edits; the new signal is the Mach-O verification itself) |
+| 1 | `verify_bundle("…/missing.app")` → `Err` | FAILS pre-fix: returns `Ok` + default-valid report |
+| 2 | signed bundle with framework symlink verifies clean end-to-end | FAILS pre-fix: symlink entry → "sealed without a hash" → invalid |
+| 3 | existing tampered-sealed-file tests keep passing | guard exception (see above): passes before and after every task |
+| 4 | files2 keys `../../../../etc/passwd`, `/etc/passwd` → rejected | FAILS pre-fix: no escape error; keys silently read outside |
+| 5 | missing CodeResources at app root → invalid | FAILS pre-fix: no *bundle-level* error (a binary-level slot error exists today, so the assertion targets `bundle.errors`) |
+| 6 | tampered nested `Frameworks/Sub.framework/Sub` → detected *by the nested frame's binary report* | FAILS pre-fix: nested `binaries` is empty (parent files2 already catches raw content edits; the new signal is the Mach-O verification itself) |
 
 Per-item tests: legacy SHA-1-only entry accepted at the CodeResources layer; both
 hash fields enforced (partial re-seal detected); nested `.DS_Store` (builder
@@ -314,7 +359,10 @@ emission: files2-dropped, `files`-kept, rules2-omitted) verifies clean E2E;
 optional `.lproj` entry deleted after signing stays valid while a deleted
 `Base.lproj` file (weight 1010 > 1000) stays invalid; injected unknown rule →
 explicit unsupported error; non-dict entry → malformed error; bare verify of a
-bundle-bound binary → invalid with a slot error.
+bundle-bound binary → invalid with a slot error; **symlink-parent traversal**
+(fixture seals `Escape -> <dir outside the bundle>`, crafted key
+`Escape/secret.txt` resolving outside → escape error; fails pre-fix because the
+key is read and hash-compared without complaint — the C8 stage-2 regression)**.
 
 Where a test must edit `CodeResources` after signing, that edit also breaks the main
 executable's slot -3 binding — so such tests assert at the CodeResources/bundle-error
