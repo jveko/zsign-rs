@@ -246,13 +246,21 @@ pub fn verify_ipa(path: impl AsRef<Path>) -> Result<VerifyReport> {
 /// `root` is the top bundle directory (for relative paths); `dir` is the
 /// bundle currently being verified; `rel` is `dir` relative to `root`.
 fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerification> {
+    let meta = std::fs::metadata(dir).map_err(crate::Error::Io)?;
+    if !meta.is_dir() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a bundle directory: {}", dir.display()),
+        )));
+    }
+
     let mut out = BundleVerification {
         path: rel.to_string(),
         ..BundleVerification::default()
     };
 
-    let info_plist = read_opt(&dir.join("Info.plist"));
-    let code_resources = read_opt(&dir.join("_CodeSignature").join("CodeResources"));
+    let info_plist = read_opt(&dir.join("Info.plist"))?;
+    let code_resources = read_opt(&dir.join("_CodeSignature").join("CodeResources"))?;
     let main_executable = info_plist
         .as_deref()
         .and_then(|bytes| plist_executable(bytes).ok().flatten());
@@ -261,11 +269,12 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
     // _CodeSignature) and nested bundle directories.
     let mut direct_binaries = Vec::new();
     let mut nested_dirs = Vec::new();
-    for entry in WalkDir::new(dir)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in WalkDir::new(dir).min_depth(1) {
+        let entry = entry.map_err(|e| {
+            crate::Error::Io(std::io::Error::other(format!(
+                "Failed to walk directory: {e}"
+            )))
+        })?;
         let p = entry.path();
         if p.is_dir() {
             if p != dir && is_bundle_dir(p) {
@@ -278,7 +287,7 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         if rel_str.contains("_CodeSignature/") {
             continue;
         }
-        if is_macho_file(p) {
+        if is_macho_file(p)? {
             if inside_nested_bundle(rel_path) {
                 continue; // handled by the nested bundle recursion
             }
@@ -345,7 +354,8 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
             dir,
             cr_bytes,
             main_executable.as_deref(),
-        ));
+            &mut out.errors,
+        )?);
     }
 
     // Recurse into nested bundles (deep verification).
@@ -363,10 +373,13 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
     Ok(out)
 }
 
-/// Reads a file if it exists; `None` otherwise (missing files are treated as
-/// absent, so the signature-slot binding logic can distinguish "missing").
-fn read_opt(path: &Path) -> Option<Vec<u8>> {
-    std::fs::read(path).ok()
+/// Reads a file, returning `None` only when it does not exist.
+fn read_opt(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(crate::Error::Io(e)),
+    }
 }
 
 /// Extracts `CFBundleExecutable` from an Info.plist.
@@ -380,19 +393,24 @@ fn plist_executable(bytes: &[u8]) -> Result<Option<String>> {
 }
 
 /// Detects a Mach-O file by magic bytes (thin + FAT, all byte orders).
-fn is_macho_file(path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
+fn is_macho_file(path: &Path) -> Result<bool> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(crate::Error::Io(e)),
     };
     use std::io::Read;
     let mut magic = [0u8; 4];
-    if f.read_exact(&mut magic).is_err() {
-        return false;
+    if let Err(e) = f.read_exact(&mut magic) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(false);
+        }
+        return Err(crate::Error::Io(e));
     }
-    matches!(
+    Ok(matches!(
         u32::from_le_bytes(magic),
         0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe | 0xbeba_feca
-    )
+    ))
 }
 
 /// Verifies the sealed-file hashes of a CodeResources plist against the
@@ -401,22 +419,21 @@ fn check_code_resources(
     bundle: &Path,
     cr_bytes: &[u8],
     main_executable: Option<&str>,
-) -> CodeResourcesVerification {
+    errors: &mut Vec<String>,
+) -> Result<CodeResourcesVerification> {
     let mut out = CodeResourcesVerification::default();
 
     let Ok(value) = plist::from_bytes::<plist::Value>(cr_bytes) else {
-        out.unsealed
-            .push("CodeResources is not a parseable plist".into());
-        return out;
+        errors.push("CodeResources is not a parseable plist".into());
+        return Ok(out);
     };
     let Some(files2) = value
         .as_dictionary()
         .and_then(|d| d.get("files2"))
         .and_then(|v| v.as_dictionary())
     else {
-        out.unsealed
-            .push("CodeResources has no files2 dictionary".into());
-        return out;
+        errors.push("CodeResources has no files2 dictionary".into());
+        return Ok(out);
     };
 
     // Sealed → disk: every entry must exist and hash to its recorded value.
@@ -450,11 +467,12 @@ fn check_code_resources(
 
     // Disk → sealed: every file in the bundle must be sealed or rule-omitted.
     let mut disk_files = BTreeSet::new();
-    for entry in WalkDir::new(bundle)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in WalkDir::new(bundle).min_depth(1) {
+        let entry = entry.map_err(|e| {
+            crate::Error::Io(std::io::Error::other(format!(
+                "Failed to walk directory: {e}"
+            )))
+        })?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -474,7 +492,7 @@ fn check_code_resources(
         }
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -572,7 +590,7 @@ mod tests {
 
     /// Builds a signed bundle with one nested framework (mirrors the CI
     /// interop fixture shape).
-    fn build_signed_bundle(dir: &Path) -> (PathBuf, crate::SigningCredentials) {
+    fn build_signed_bundle_with(dir: &Path, setup: impl FnOnce(&Path)) -> (PathBuf, crate::SigningCredentials) {
         let app = dir.join("Test.app");
         fs::create_dir_all(app.join("Frameworks").join("Sub.framework")).unwrap();
         fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
@@ -594,6 +612,7 @@ mod tests {
 "#,
         )
         .unwrap();
+        setup(&app);
         let (creds, rsa_key) = local_test_credentials();
         let verify_creds = crate::SigningCredentials {
             certificate: creds.certificate.clone(),
@@ -604,6 +623,23 @@ mod tests {
         let zsign = ZSign::new().credentials(creds);
         zsign.sign_bundle(&app, None).unwrap();
         (app, verify_creds)
+    }
+
+    fn build_signed_bundle(dir: &Path) -> (PathBuf, crate::SigningCredentials) {
+        build_signed_bundle_with(dir, |_| {})
+    }
+
+    /// Rewrites `Test.app/_CodeSignature/CodeResources` through a mutation closure.
+    /// NOTE: every use breaks the main executable's slot -3 binding, so tests using
+    /// this helper assert at the CodeResources / bundle-error layer, not report.valid().
+    fn rewrite_code_resources(app: &Path, mutate: impl FnOnce(&mut plist::Dictionary)) {
+        let cr = app.join("_CodeSignature").join("CodeResources");
+        let bytes = fs::read(&cr).unwrap();
+        let mut value: plist::Value = plist::from_bytes(&bytes).unwrap();
+        mutate(value.as_dictionary_mut().unwrap());
+        let mut out = Vec::new();
+        plist::to_writer_xml(&mut out, &value).unwrap();
+        fs::write(&cr, out).unwrap();
     }
 
     #[test]
@@ -729,5 +765,16 @@ mod tests {
         fs::write(app.join("Test"), minimal_macho()).unwrap();
         let report = verify_bundle(&app).unwrap();
         assert!(!report.valid());
+    }
+
+    #[test]
+    fn missing_bundle_root_is_hard_error() {
+        let td = tempfile::TempDir::new().unwrap();
+        let result = verify_bundle(td.path().join("missing.app"));
+        assert!(
+            result.is_err(),
+            "a nonexistent bundle must not verify: {:?}",
+            result.map(|r| r.valid())
+        );
     }
 }
