@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors = ["jveko"]
 description = "Core iOS code signing library - WASM-compatible computation engine"
 license = "MIT"
+exclude = ["/src/crypto/fixtures"]
 
 [dependencies]
 goblin = "0.10"
