@@ -21,6 +21,8 @@
 //!    end-entity constraints; each climbed issuer must satisfy CA constraints.
 //! 6. **Trust anchoring**: the chain must terminate at a certificate in the
 //!    explicit trust-anchor set ([`TrustAnchors::apple_root`] by default).
+//! 7. **SKI SignerInfo resolution**: a signer identified by its
+//!    `subjectKeyIdentifier` must match a certificate in the embedded set.
 //!
 //! This module proves integrity, Apple-attribute binding, chain structure, and
 //! anchoring to an explicit trust-anchor set — [`TrustAnchors::apple_root`]
@@ -77,6 +79,8 @@ const OID_SHA512_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.
 const OID_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 /// id-ecPublicKey: `1.2.840.10045.2.1`
 const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+/// SubjectKeyIdentifier extension: `2.5.29.14`
+const OID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
 /// keyUsage extension: `2.5.29.15`
 const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
 /// basicConstraints extension: `2.5.29.19`
@@ -603,30 +607,54 @@ fn verify_signed_data(
         let sid = AnyRef::decode(&mut si_r)
             .map_err(|e| Error::Verification(format!("malformed signer id: {e}")))?;
         let sid_body = sid.value();
-        let (issuer_der, serial_der) = match sid.tag() {
+        let mut ski_cert: Option<&x509_cert::Certificate> = None;
+        let mut issuer_der: &[u8] = &[];
+        let mut serial_der: &[u8] = &[];
+        match sid.tag() {
             Tag::Sequence => {
                 let mut sidr = reader(sid_body, "malformed issuerAndSerialNumber")?;
-                let (issuer, serial) = {
-                    let ib = usize::try_from(sidr.position()).unwrap_or(0);
-                    let _issuer_any = AnyRef::decode(&mut sidr)
-                        .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
-                    let ie = usize::try_from(sidr.position()).unwrap_or(0);
-                    let sb = usize::try_from(sidr.position()).unwrap_or(0);
-                    let _serial_any = AnyRef::decode(&mut sidr)
-                        .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
-                    let se = usize::try_from(sidr.position()).unwrap_or(0);
-                    (
-                        sid_body.get(ib..ie).unwrap_or_default(),
-                        sid_body.get(sb..se).unwrap_or_default(),
-                    )
-                };
-                (issuer, serial)
+                let ib = usize::try_from(sidr.position()).unwrap_or(0);
+                let _issuer_any = AnyRef::decode(&mut sidr)
+                    .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
+                let ie = usize::try_from(sidr.position()).unwrap_or(0);
+                let sb = usize::try_from(sidr.position()).unwrap_or(0);
+                let _serial_any = AnyRef::decode(&mut sidr)
+                    .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
+                let se = usize::try_from(sidr.position()).unwrap_or(0);
+                issuer_der = sid_body.get(ib..ie).unwrap_or_default();
+                serial_der = sid_body.get(sb..se).unwrap_or_default();
             }
-            TAG_CTX0 => {
-                report
-                    .warnings
-                    .push("signer identified by subjectKeyIdentifier; skipping".into());
-                continue;
+            // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
+            // STRING (der-derive default); tolerate a constructed wrapper too — its
+            // value is then the inner OCTET STRING TLV rather than the raw key id.
+            Tag::ContextSpecific {
+                number,
+                constructed,
+            } if number == TagNumber::new(0) => {
+                let key_id: Option<Vec<u8>> = if constructed {
+                    der::asn1::OctetString::from_der(sid_body)
+                        .ok()
+                        .map(|o| o.as_bytes().to_vec())
+                } else {
+                    Some(sid_body.to_vec())
+                };
+                let resolved = key_id
+                    .as_deref()
+                    .and_then(|kid| find_cert_by_ski(&certs, kid));
+                match resolved {
+                    Some(c) => ski_cert = Some(c),
+                    None => {
+                        // Never leave the report invalid-with-empty-errors: record why
+                        // this SignerInfo was unusable and move to the next one.
+                        if report.errors.is_empty() {
+                            report.errors.push(
+                                "signer subjectKeyIdentifier does not match any embedded certificate"
+                                    .into(),
+                            );
+                        }
+                        continue;
+                    }
+                }
             }
             other => {
                 return Err(Error::Verification(format!(
@@ -678,19 +706,22 @@ fn verify_signed_data(
         }
         let signature = sig_any.value();
 
-        // Locate the signing certificate by issuer+serial.
-        let signer_cert = certs.iter().find(|c| {
-            c.tbs_certificate
-                .issuer
-                .to_der()
-                .map(|d| d.as_slice() == issuer_der)
-                .unwrap_or(false)
-                && c.tbs_certificate
-                    .serial_number
+        // Locate the signing certificate by resolved SKI or issuer+serial.
+        let signer_cert = match ski_cert {
+            Some(c) => Some(c),
+            None => certs.iter().find(|c| {
+                c.tbs_certificate
+                    .issuer
                     .to_der()
-                    .map(|d| d.as_slice() == serial_der)
+                    .map(|d| d.as_slice() == issuer_der)
                     .unwrap_or(false)
-        });
+                    && c.tbs_certificate
+                        .serial_number
+                        .to_der()
+                        .map(|d| d.as_slice() == serial_der)
+                        .unwrap_or(false)
+            }),
+        };
 
         let Some(cert) = signer_cert else {
             report
@@ -1143,6 +1174,25 @@ fn ext_value<'a>(cert: &'a x509_cert::Certificate, id: ObjectIdentifier) -> Opti
     exts.iter()
         .find(|e| e.extn_id == id)
         .map(|e| e.extn_value.as_bytes())
+}
+
+/// Finds the embedded certificate whose SubjectKeyIdentifier equals `key_id`.
+///
+/// Malformed SKI extensions are skipped; `None` means the SignerInfo cannot
+/// be resolved and must be rejected with a fatal report error.
+fn find_cert_by_ski<'a>(
+    certs: &'a [x509_cert::Certificate],
+    key_id: &[u8],
+) -> Option<&'a x509_cert::Certificate> {
+    use der::Decode;
+    certs.iter().find(|c| {
+        let Some(bytes) = ext_value(c, OID_SUBJECT_KEY_IDENTIFIER) else {
+            return false;
+        };
+        der::asn1::OctetString::from_der(bytes)
+            .map(|ski| ski.as_bytes() == key_id)
+            .unwrap_or(false)
+    })
 }
 
 /// End-entity purpose constraints; applied unconditionally to the leaf.
@@ -2031,5 +2081,204 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("leaf EKU extension is malformed"));
+    }
+    /// The SubjectKeyIdentifier key id of `cert` (Profile::Root fixtures always
+    /// carry the extension).
+    fn ski_of(cert: &x509_cert::Certificate) -> Vec<u8> {
+        use der::Decode;
+        let bytes = ext_value(cert, OID_SUBJECT_KEY_IDENTIFIER).expect("fixture must have SKI");
+        // The extension value is the DER of SubjectKeyIdentifier, itself an
+        // OCTET STRING over the raw key id.
+        der::asn1::OctetString::from_der(bytes)
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// tag byte + minimal DER length (module's own `write_len`) + body.
+    fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        write_len(&mut out, body.len());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Re-encodes the raw CMS with the first SignerInfo's sid swapped for
+    /// `new_sid` (a complete TLV). Assumes the single-SignerInfo output of
+    /// `sign_code_directory` (asserted below).
+    fn replace_first_sid(cms: &[u8], new_sid: &[u8]) -> Vec<u8> {
+        // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap.tag(), TAG_CTX0);
+        let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
+                                            // [0] is EXPLICIT: its value carries the full SignedData TLV (`30 …`),
+                                            // so the SEQUENCE must be decoded before its fields can be iterated.
+        let sd_tlv = wrap.value();
+        let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_body_src = sd_seq.value();
+
+        // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms is
+        // also a SET — select by position, never by tag, or it gets dropped).
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new(); // version, digestAlgs, encap, certs, set
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        let set_tlv = fields.pop().expect("SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(set_tlv).unwrap().tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let fixed: Vec<&[u8]> = fields;
+
+        // SignerInfo: replace the sid (the field after version).
+        let set_any = AnyRef::from_der(set_tlv).unwrap();
+        let si_list = set_any.value();
+        let mut set_r = SliceReader::new(si_list).unwrap();
+        let si_any = AnyRef::decode(&mut set_r).unwrap();
+        assert_eq!(si_any.tag(), Tag::Sequence);
+        assert!(set_r.is_finished(), "fixture assumes a single SignerInfo");
+        let si_body = si_any.value();
+        // RFC 5652 §5.3: a subjectKeyIdentifier sid requires SignerInfo version 3,
+        // and one v3 SignerInfo forces SignedData version 3. Both are `INTEGER 1`
+        // today — bump each with a one-byte patch so lengths never change.
+        assert_eq!(
+            &si_body[..3],
+            &[0x02, 0x01, 0x01],
+            "SignerInfo.version assumed INTEGER 1"
+        );
+        let mut si_body = si_body.to_vec();
+        si_body[2] = 0x03;
+        let mut si_r = SliceReader::new(&si_body).unwrap();
+        let _version = AnyRef::decode(&mut si_r).unwrap();
+        let sid_start = usize::try_from(si_r.position()).unwrap();
+        let _sid = AnyRef::decode(&mut si_r).unwrap();
+        let sid_end = usize::try_from(si_r.position()).unwrap();
+        let mut new_si_body = Vec::new();
+        new_si_body.extend_from_slice(&si_body[..sid_start]);
+        new_si_body.extend_from_slice(new_sid);
+        new_si_body.extend_from_slice(&si_body[sid_end..]);
+
+        // Rebuild bottom-up: SignerInfo → SET → SignedData → [0] → ContentInfo.
+        let new_si = der_tlv(si_list[0], &new_si_body);
+        let new_set = der_tlv(set_tlv[0], &new_si);
+        let mut sd_body = Vec::new();
+        for (i, f) in fixed.iter().enumerate() {
+            if i == 0 {
+                assert_eq!(
+                    *f,
+                    &[0x02, 0x01, 0x01],
+                    "SignedData.version assumed INTEGER 1"
+                );
+                sd_body.extend_from_slice(&[0x02, 0x01, 0x03]);
+            } else {
+                sd_body.extend_from_slice(f);
+            }
+        }
+        sd_body.extend_from_slice(&new_set);
+        let new_sd = der_tlv(sd_tlv[0], &sd_body);
+        let new_wrap = der_tlv(wrap_tlv[0], &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(&ci_body[..oid_end]);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms[0], &ci2)
+    }
+
+    #[test]
+    fn ski_signer_resolves_end_to_end() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+        let key_id = ski_of(&creds.certificate);
+        let mut sid = vec![0x80u8, key_id.len() as u8];
+        sid.extend_from_slice(&key_id);
+        let spliced = replace_first_sid(&cms, &sid);
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&spliced),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(report.valid, "SKI signer must resolve: {:?}", report.errors);
+        assert_eq!(
+            report.signer_subject.as_deref(),
+            Some("CN=zsign verify test")
+        );
+    }
+
+    #[test]
+    fn ski_signer_with_unknown_key_id_is_fatal() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+
+        let real = ski_of(&creds.certificate);
+        let wrong = vec![0x5Au8; real.len()];
+        let mut sid = vec![0x80u8, wrong.len() as u8];
+        sid.extend_from_slice(&wrong);
+        let spliced = replace_first_sid(&cms, &sid);
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&spliced),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(!report.valid);
+        assert!(!report.errors.is_empty());
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("subjectKeyIdentifier")));
+    }
+    #[test]
+    fn ski_resolves_to_matching_certificate() {
+        let (_ka, cert_a, _sa) = build_rsa_root("CN=zsign ski a");
+        let (_kb, cert_b, _sb) = build_rsa_root("CN=zsign ski b");
+        let key_id = ski_of(&cert_a);
+        let certs = [cert_b.clone(), cert_a.clone()];
+        let found =
+            find_cert_by_ski(&certs, &key_id).expect("key id must resolve to its own certificate");
+        assert_eq!(
+            found.tbs_certificate.subject,
+            cert_a.tbs_certificate.subject
+        );
+    }
+
+    #[test]
+    fn ski_unknown_key_id_finds_nothing() {
+        let (_ka, cert_a, _sa) = build_rsa_root("CN=zsign ski solo");
+        let mut wrong = ski_of(&cert_a);
+        let last = wrong.len() - 1;
+        wrong[last] ^= 0xFF;
+        assert!(find_cert_by_ski(&[cert_a.clone()], &wrong).is_none());
+    }
+
+    #[test]
+    fn ski_malformed_extension_is_skipped() {
+        let (_ka, mut cert_a, _sa) = build_rsa_root("CN=zsign ski bad");
+        // Extension value that is not an OCTET STRING: strict decode fails and
+        // the certificate must be skipped, not panic.
+        replace_extension(&mut cert_a, OID_SUBJECT_KEY_IDENTIFIER, &der::asn1::Null);
+        assert!(find_cert_by_ski(&[cert_a.clone()], b"any key id").is_none());
     }
 }
