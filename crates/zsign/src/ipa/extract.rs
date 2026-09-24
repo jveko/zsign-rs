@@ -477,6 +477,19 @@ pub fn extract_ipa_with_limits(
                 let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
                 validate_output_path(dest_dir_ref, &entry.outpath)?;
                 let outfile = File::create(&entry.outpath)?;
+                // Best-effort TOCTOU guard: re-verify that the path just
+                // created is still a regular file before any bytes are
+                // written. A full openat(O_NOFOLLOW) rework is out of scope.
+                let created = fs::symlink_metadata(&entry.outpath)?;
+                if !created.file_type().is_file() {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Extraction path is not a regular file: {}",
+                            entry.outpath.display()
+                        ),
+                    )));
+                }
                 let relative = entry
                     .outpath
                     .strip_prefix(dest_dir_ref)
