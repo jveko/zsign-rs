@@ -275,6 +275,9 @@ impl<'a> IpaSigner<'a> {
         })?;
 
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
+        // Components between the extraction root and the bundle root come
+        // from the archive: none of them may be a symlink.
+        Self::resolve_within(temp_dir.path(), &app_bundle)?;
         self.sign_bundle_from_options(&app_bundle)?;
 
         create_ipa(&app_bundle, output_ipa, self.compression_level)?;
@@ -325,6 +328,16 @@ impl<'a> IpaSigner<'a> {
 
     /// Loads profile options and applies bundle rewrites before signing.
     fn sign_bundle_from_options(&self, bundle_path: &Path) -> Result<()> {
+        // A trailing separator makes lstat follow a final symlink, so check
+        // the component-rebuilt path; ancestors of the root stay trusted.
+        let plain_root: PathBuf = bundle_path.components().collect();
+        let root_metadata = fs::symlink_metadata(&plain_root)?;
+        if root_metadata.file_type().is_symlink() {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Bundle root must not be a symlink: {}",
+                bundle_path.display()
+            ))));
+        }
         let (profile_data, entitlements) = self.load_profile()?;
         self.sign_bundle(
             bundle_path,
@@ -367,7 +380,7 @@ impl<'a> IpaSigner<'a> {
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
         dylibs
             .par_iter()
-            .try_for_each(|dylib_path| self.sign_standalone_dylib(dylib_path))?;
+            .try_for_each(|dylib_path| self.sign_standalone_dylib(bundle_path, dylib_path))?;
 
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
 
@@ -581,7 +594,9 @@ impl<'a> IpaSigner<'a> {
     ///
     /// C++ zsign signs dylibs with: macho.Sign(asset, force, "", "", "", "")
     /// This means: no bundleId, no InfoPlist hash, no CodeResources.
-    fn sign_standalone_dylib(&self, dylib_path: &Path) -> Result<()> {
+    fn sign_standalone_dylib(&self, root: &Path, dylib_path: &Path) -> Result<()> {
+        let validated = Self::resolve_within(root, dylib_path)?;
+        let dylib_path = validated.as_path();
         let macho = MachOFile::open(dylib_path)?;
 
         let identifier = dylib_path
@@ -655,12 +670,19 @@ impl<'a> IpaSigner<'a> {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&identifier);
-            self.sign_binary(binary_path, binary_identifier, None, entitlements)
+            self.sign_binary(
+                bundle_path,
+                binary_path,
+                binary_identifier,
+                None,
+                entitlements,
+            )
         })?;
 
         if copy_provisioning_profile {
             if let Some(data) = profile_data {
-                let embedded_path = bundle_path.join("embedded.mobileprovision");
+                let embedded_path =
+                    Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
                 fs::write(&embedded_path, data).map_err(|e| {
                     Error::Core(zsign_core::Error::Signing(format!(
                         "Failed to write provisioning profile to {}: {}",
@@ -682,6 +704,7 @@ impl<'a> IpaSigner<'a> {
 
         if main_executable.exists() {
             self.sign_binary(
+                bundle_path,
                 &main_executable,
                 &identifier,
                 code_resources_data.as_deref(),
@@ -736,7 +759,7 @@ impl<'a> IpaSigner<'a> {
 
     /// Rewrites a string key in the main app's `Info.plist`.
     fn rewrite_plist_string(&self, bundle_path: &Path, key: &str, value: &str) -> Result<()> {
-        let info_plist_path = bundle_path.join("Info.plist");
+        let info_plist_path = Self::resolve_relative(bundle_path, "Info.plist")?;
 
         if !info_plist_path.exists() {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
@@ -915,11 +938,14 @@ impl<'a> IpaSigner<'a> {
     /// instead of the full entitlements. This matches the behavior of the C++ zsign.
     fn sign_binary(
         &self,
+        root: &Path,
         binary_path: &Path,
         identifier: &str,
         code_resources: Option<&[u8]>,
         entitlements: Option<&[u8]>,
     ) -> Result<()> {
+        let validated = Self::resolve_within(root, binary_path)?;
+        let binary_path = validated.as_path();
         let binary_data = fs::read(binary_path)?;
         let executable_probe = MachOFile::parse(binary_data.clone())?;
         let is_executable = executable_probe
@@ -1036,10 +1062,10 @@ impl<'a> IpaSigner<'a> {
     fn generate_code_resources(&self, bundle_path: &Path) -> Result<()> {
         let code_resources = CodeResourcesBuilder::new(bundle_path)?.scan()?.build()?;
 
-        let codesig_dir = bundle_path.join("_CodeSignature");
+        let codesig_dir = Self::resolve_relative(bundle_path, "_CodeSignature")?;
         fs::create_dir_all(&codesig_dir)?;
 
-        let resources_path = codesig_dir.join("CodeResources");
+        let resources_path = Self::resolve_relative(bundle_path, "_CodeSignature/CodeResources")?;
         fs::write(&resources_path, &code_resources)?;
 
         Ok(())
@@ -1640,6 +1666,123 @@ mod tests {
         assert!(
             !evil.join("_CodeSignature").exists(),
             "no signature may be written outside the bundle"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_symlinked_info_plist_rewrite() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let outside_plist = temp.path().join("outside.plist");
+        std::fs::copy(app.join("Info.plist"), &outside_plist).unwrap();
+        std::fs::remove_file(app.join("Info.plist")).unwrap();
+        symlink(&outside_plist, app.join("Info.plist")).unwrap();
+        let before = std::fs::read(&outside_plist).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .bundle_id("com.test.changed")
+            .sign_folder_in_place(&app)
+            .expect_err("a symlinked Info.plist must be rejected before the rewrite");
+        let message = error.to_string();
+        assert!(
+            message.contains("Pre-existing symlink"),
+            "error must name the cause: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&outside_plist).unwrap(),
+            before,
+            "external plist must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let outside = temp.path().join("Outside.app");
+        std::fs::rename(&app, &outside).unwrap();
+        symlink(&outside, &app).unwrap();
+        let before = std::fs::read(outside.join("Test")).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a symlinked bundle root must be rejected");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "error must name the cause: {error}"
+        );
+
+        let with_slash = format!("{}/", app.display());
+        IpaSigner::new_adhoc()
+            .sign_folder_in_place(&with_slash)
+            .expect_err("a trailing separator must not bypass the root check");
+
+        assert_eq!(
+            std::fs::read(outside.join("Test")).unwrap(),
+            before,
+            "the symlink target must stay untouched"
+        );
+        assert!(
+            !outside.join("_CodeSignature").exists(),
+            "no signature may be written outside the bundle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_trusts_operator_root_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let app = create_folder_bundle(&real, "Test", true);
+        let link = temp.path().join("link");
+        symlink(&real, &link).unwrap();
+        let through_link = link.join("App.app");
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_folder_in_place(&through_link)
+            .unwrap();
+        assert!(
+            app.join("_CodeSignature/CodeResources").exists(),
+            "writes land at the resolved location of the operator-supplied root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_aliased_payload_root() {
+        let temp = TempDir::new().unwrap();
+        let ipa = temp.path().join("aliased.ipa");
+
+        let file = std::fs::File::create(&ipa).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload2/", options).unwrap();
+        zip.add_directory("Payload2/App.app/", options).unwrap();
+        zip.start_file("Payload2/App.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(info_plist_xml("<string>Test</string>").as_bytes())
+            .unwrap();
+        zip.start_file("Payload2/App.app/Test", options).unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.add_symlink("Payload", "Payload2", options).unwrap();
+        zip.finish().unwrap();
+
+        let output = temp.path().join("out.ipa");
+        let error = IpaSigner::new_adhoc()
+            .sign(&ipa, &output)
+            .expect_err("an archive-created symlink above the bundle root must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Pre-existing symlink"),
+            "error must name the cause: {message}"
         );
     }
 }
