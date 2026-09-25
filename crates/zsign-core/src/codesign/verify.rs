@@ -705,8 +705,9 @@ impl<'a> CodeDirectory<'a> {
         }
         let n_special = n_special_slots as usize;
         let n_code = n_code_slots as usize;
-        let expected_tail = hash_offset
-            .checked_add(n_code * hash_size)
+        let expected_tail = n_code
+            .checked_mul(hash_size)
+            .and_then(|bytes| hash_offset.checked_add(bytes))
             .ok_or_else(|| crate::Error::Verification("hash region overflow".into()))?;
         if expected_tail > data.len() {
             return Err(crate::Error::Verification(format!(
@@ -789,15 +790,21 @@ impl<'a> CodeDirectory<'a> {
             return None;
         }
         // Slots are stored most-negative-first, so slot −index is the
-        // `index`-th hash counting back from the code-hash area.
-        let start = self.hash_offset - index * self.hash_size;
-        let end = start + self.hash_size;
-        self.data.get(start..end)
+        // index-th hash counting back from the code-hash area.
+        index
+            .checked_mul(self.hash_size)
+            .and_then(|off| self.hash_offset.checked_sub(off))
+            .and_then(|start| start.checked_add(self.hash_size).map(|end| (start, end)))
+            .and_then(|(start, end)| self.data.get(start..end))
     }
 
     /// All code-page hashes (one `hashSize`-byte digest per page).
     pub fn code_hashes(&self) -> &'a [u8] {
-        &self.data[self.hash_offset..self.hash_offset + self.n_code_slots as usize * self.hash_size]
+        (self.n_code_slots as usize)
+            .checked_mul(self.hash_size)
+            .and_then(|bytes| self.hash_offset.checked_add(bytes))
+            .and_then(|end| self.data.get(self.hash_offset..end))
+            .unwrap_or(&[])
     }
 
     /// True when the directory is SHA-1 hashed.
@@ -1915,5 +1922,93 @@ mod tests {
         .concat();
         ok[20..20 + good.len()].copy_from_slice(&good);
         assert!(parse_superblob(&ok).is_ok(), "0xfade8181 child must parse");
+    }
+
+    #[test]
+    fn code_hashes_is_panic_free_on_inconsistent_header() {
+        let cd_bytes =
+            CodeDirectoryBuilder::new("com.example.bound", &[0x11u8; 8192]).build_sha256();
+        let mut cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert!(!cd.code_hashes().is_empty());
+        // The header field is public; a hostile or buggy consumer can set it to
+        // anything after parse. Slicing must not panic.
+        cd.n_code_slots = u32::MAX;
+        assert!(cd.code_hashes().is_empty());
+        assert!(matches!(
+            check_code_pages(&cd, &[0x11u8; 8192]),
+            PageCheck::CountMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn special_slot_hash_is_panic_free_on_inconsistent_header() {
+        let cd_bytes = CodeDirectoryBuilder::new("com.example.bound", &[0x11u8; 4096])
+            .requirements_hash(vec![0xcd; 32])
+            .build_sha256();
+        let mut cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert!(cd.special_slot_hash(1).is_some());
+        cd.n_special_slots = u32::MAX;
+        assert!(cd.special_slot_hash(u32::MAX as usize).is_none());
+        assert!(cd.special_slot_hash(1).is_some()); // still within bounds
+    }
+
+    #[test]
+    fn parse_rejects_hash_region_product_overflow() {
+        // nCodeSlots * hashSize = 0x0FFFFFFF * 32 = 8.5 GiB worth of slots.
+        // On 64-bit the product fits and the bounds check rejects it; on
+        // 32-bit/wasm32 the unchecked product wraps to ~4 GiB and (pre-fix)
+        // defeats that bounds check entirely — the checked_mul must reject
+        // before any comparison on every width.
+        let mut cd =
+            CodeDirectoryBuilder::new("com.example.overflow", &[0x22u8; 4096]).build_sha256();
+        cd[28..32].copy_from_slice(&0x0FFF_FFFFu32.to_be_bytes());
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("hash region") || m.contains("overruns blob")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn parse_checked_mul_rejects_wrapping_hash_region() {
+        // Same hostile header as above; on a 32-bit target the checked-mul
+        // overflow path is the one that must fire (pre-fix, the wrapped product
+        // passed the bounds check and parse accepted the blob).
+        let mut cd =
+            CodeDirectoryBuilder::new("com.example.overflow", &[0x22u8; 4096]).build_sha256();
+        cd[28..32].copy_from_slice(&0x0FFF_FFFFu32.to_be_bytes());
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m) if m.contains("hash region overflow"))
+        );
+    }
+
+    #[test]
+    fn parse_superblob_rejects_hostile_count() {
+        // count = u32::MAX would make 12 + count*8 wrap on 32-bit; the guard
+        // must reject via the checked product before any bounds comparison.
+        // On 64-bit the same product is representable and the declared-length
+        // bounds check is what rejects it, so accept either diagnostic.
+        let mut b = build_blob(true);
+        b[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = parse_superblob(&b).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("index extent") || m.contains("overruns declared length")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn parse_superblob_hostile_count_hits_overflow_guard() {
+        // The 32-bit sibling pins the *specific* path: on this width
+        // 12 + count*8 wraps, so only the checked-product guard can reject.
+        let mut b = build_blob(true);
+        b[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = parse_superblob(&b).unwrap_err();
+        assert!(matches!(&err, crate::Error::Verification(m) if m.contains("index extent")));
     }
 }
