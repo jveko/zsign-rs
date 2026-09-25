@@ -14,6 +14,7 @@ pub use bundle::CodeResourcesBuilder;
 pub use crypto::SigningCredentials;
 pub use error::Error;
 pub use provisioning::extract_entitlements_from_profile;
+pub use provisioning::{validate_and_extract_profile, ProfileInfo, ProfileRequest};
 
 /// Convenience result type for zsign-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
