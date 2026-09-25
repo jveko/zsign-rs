@@ -2244,6 +2244,296 @@ wasm32 arm of `resolve_now` is compile-checked later by the Task 5 wasm
 
 ---
 
+### Task 4b: Cross-lane fix — ECDSA signature parsing (reported by ZSN-40)
+
+**Files:**
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (two parse sites + one helper)
+- Modify: `crates/zsign-core/src/crypto/cms.rs` (one `#[cfg(test)]` ECDSA fixture signer)
+- Test: inline `mod tests` in both files
+
+**Intent (cross-lane, see design §5.1):** ZSN-40 observed live that ECDSA
+verification is broken: SignerInfo signatures and certificate signatures are
+parsed as fixed 64-byte raw ECDSA via `p256::ecdsa::Signature::from_slice`
+(`cms_verify.rs` ECDSA branches in `verify_signer_signature` ~:986 and
+`verify_cert_signature` ~:1250), while `crypto/cms.rs` signs
+DER-encoded (`build_cms_signed_data::<_, p256::ecdsa::DerSignature>`, cms.rs:302).
+Source-verified encoding (librarian; RFC 5753 §2.1.1: "signature MUST contain
+the DER encoding (as an octet string) of a value of the ASN.1 type
+ECDSA-Sig-Value" §7.2 `SEQUENCE { r INTEGER, s INTEGER }`; X.509 per
+RFC 5280 §4.1.1.3 → RFC 3279 §2.2.3; raw `r‖s` is the JWS convention of
+RFC 7518 §3.4 and does NOT apply to CMS — OpenSSL round-trip-verified): parse
+DER first, keep raw as a lenient fallback (the shape the pre-fix code
+attempted), and leave every RSA branch byte-identical.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `mod tests` in `crates/zsign-core/src/crypto/cms.rs` (fixture — the
+inner generic `build` currently nested in `sign_test_content` must be lifted to
+a module-level `#[cfg(test)] fn build_test_cms<S, Sig>` with the same body and
+`external_message_digest` parameter, so all three signers share it):
+
+```rust
+/// Attached-content signer using an ECDSA P-256 key (DER-encoded SignerInfo
+/// signature per RFC 5753). Test-only; the RSA twin is `sign_attached_content`.
+#[cfg(test)]
+pub(crate) fn sign_attached_content_ecdsa(
+    content: &[u8],
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Result<Vec<u8>> {
+    let encap = EncapsulatedContentInfo {
+        econtent_type: const_oid::db::rfc5911::ID_DATA,
+        econtent: Some(
+            Any::new(Tag::OctetString, content)
+                .map_err(|e| signing_err("Failed to attach content", e))?,
+        ),
+    };
+    build_test_cms(
+        signing_cert,
+        cert_chain,
+        SHA256_OID,
+        &encap,
+        None,
+        signing_key,
+    )
+}
+```
+
+Add to `mod tests` in `crates/zsign-core/src/crypto/cms_verify.rs` (import
+`sign_attached_content_ecdsa` next to the existing fixture import):
+
+```rust
+    // ---- cross-lane: DER ECDSA signatures ----
+
+    fn fixed_time(unix: u64) -> x509_cert::time::Time {
+        x509_cert::time::Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(unix))
+            .unwrap()
+    }
+
+    /// ECDSA root issuing a leaf whose certificate signature is DER-encoded
+    /// ECDSA — exercises the chain's certificate-signature path.
+    fn ecdsa_root_chain() -> (
+        x509_cert::Certificate,
+        x509_cert::Certificate,
+        TrustAnchors,
+    ) {
+        let root_key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let root_name = Name::from_str("CN=zsn3 ecdsa root").unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&root_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(23u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030),
+            },
+            root_name.clone(),
+            root_pub,
+            &root_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
+
+        let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
+            leaf_key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let leaf_cert = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(24u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030),
+            },
+            Name::from_str("CN=zsn3 leaf under ecdsa root").unwrap(),
+            leaf_pub,
+            &root_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
+
+        let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
+        (root_cert, leaf_cert, anchors)
+    }
+
+    /// Fixed-window RSA root issuing an ECDSA-keyed leaf (subject key =
+    /// id-ecPublicKey, certificate signed by the RSA root).
+    fn rsa_root_with_ecdsa_leaf(
+        eku: Option<ExtendedKeyUsage>,
+    ) -> (
+        x509_cert::Certificate,
+        x509_cert::Certificate,
+        p256::ecdsa::SigningKey,
+        TrustAnchors,
+    ) {
+        let root_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let root_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(root_key.clone());
+        let root_name = Name::from_str("CN=zsn3 ecdsa-leaf root").unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(
+            root_key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(26u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030),
+            },
+            root_name.clone(),
+            root_pub,
+            &root_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        let leaf_key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let leaf_name = Name::from_str("CN=zsn3 ecdsa signer leaf").unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&leaf_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut leaf_builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(27u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030),
+            },
+            leaf_name,
+            leaf_pub,
+            &root_signing,
+        )
+        .unwrap();
+        if let Some(eku) = &eku {
+            leaf_builder.add_extension(eku).unwrap();
+        }
+        let leaf_cert = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+
+        let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
+        (root_cert, leaf_cert, leaf_key, anchors)
+    }
+
+    #[test]
+    fn ecdsa_certificate_chain_verifies_der_signatures() {
+        let (root, leaf, anchors) = ecdsa_root_chain();
+        let certs = vec![root, leaf.clone()];
+        let outcome = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2026_APR),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(outcome.ok, "chain outcome: {:?}", outcome);
+        assert!(outcome.anchored);
+    }
+
+    #[test]
+    fn ecdsa_code_signature_round_trips_with_der_signer_info() {
+        let (root, leaf, leaf_key, anchors) =
+            rsa_root_with_ecdsa_leaf(Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])));
+        let creds = SigningCredentials {
+            certificate: leaf,
+            signing_key: SigningKeyType::Ecdsa(leaf_key),
+            cert_chain: vec![root],
+            team_id: None,
+        };
+        let content: &[u8] = b"ecdsa code directory";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let wrapped = wrap(&cms);
+
+        let report =
+            verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors)
+                .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+        assert!(report.chain_ok);
+    }
+
+    #[test]
+    fn attached_profile_envelope_accepts_der_ecdsa_signer() {
+        let (root, leaf, leaf_key, anchors) = rsa_root_with_ecdsa_leaf(None);
+        let envelope =
+            sign_attached_content_ecdsa(sample_plist(), &leaf, &[root], &leaf_key).unwrap();
+
+        let out =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(out.report.valid, "errors: {:?}", out.report.errors);
+        assert_eq!(out.content.as_deref(), Some(sample_plist()));
+        assert!(out.report.signature_ok);
+    }
+```
+
+- [ ] **Step 2: Run to confirm red**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core ecdsa_`
+Expected: all three new tests FAIL assertions (pre-fix `from_slice` rejects
+DER signatures: chain `ok == false`, `signature_ok == false`), not compile
+errors.
+
+- [ ] **Step 3: Implement** in `crates/zsign-core/src/crypto/cms_verify.rs`
+
+Add one helper near `verify_signer_signature` and use it at BOTH ECDSA sites
+(the `ecdsa_sig && alg == OID_EC_PUBLIC_KEY` branch of
+`verify_signer_signature`, and the ECDSA branch of `verify_cert_signature`):
+
+```rust
+/// Parses an ECDSA signature from the encodings real producers emit.
+///
+/// CMS `SignerInfo.signature` (RFC 5753 §2.1.1, §7.2) and X.509
+/// `signatureValue` (RFC 5280 §4.1.1.3 → RFC 3279 §2.2.3) carry the DER
+/// encoding of `SEQUENCE { r INTEGER, s INTEGER }`. A raw fixed-width `r‖s`
+/// (the RFC 7518 JWS form) is accepted as a lenient fallback — the shape the
+/// pre-fix code expected. RSA paths are unaffected.
+fn parse_ecdsa_signature(bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
+    p256::ecdsa::Signature::from_der(bytes)
+        .or_else(|_| p256::ecdsa::Signature::from_slice(bytes))
+        .ok()
+}
+```
+
+Replace the `Signature::from_slice(...) else { return false }` in
+`verify_signer_signature`'s ECDSA branch with
+`let Some(sig) = parse_ecdsa_signature(signature) else { return false; };`
+and the corresponding `from_slice` call in `verify_cert_signature` with the
+same helper over its signature bytes. Touch NOTHING in the RSA branches.
+
+- [ ] **Step 4: Scoped gate (green)**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core provisioning -- --skip test_ipa_signing_is_deterministic`
+Expected: all tests green including the three new ECDSA ones (RSA suites
+byte-identical in behavior).
+
+- [ ] **Step 5: Commit (controller)**
+
+`git add -u crates/zsign-core/src/crypto/cms_verify.rs crates/zsign-core/src/crypto/cms.rs && git commit -m "fix(zsign-core): parse der ecdsa signatures in cms and cert paths (ZSN-3)"`
+
+---
+
 ### Task 5: Full-suite gates and consumer compile proof
 
 **Files:** none changed; verification only.
@@ -2252,7 +2542,7 @@ wasm32 arm of `resolve_now` is compile-checked later by the Task 5 wasm
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
 Expected: green; baseline counts were 182 `zsign-core` / 89 `zsign-rs` tests
-plus this plan's additions (3 Task-1 + 7 Task-2 + 16 Task-3 + 3 Task-4 = 29, exact
+plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b = 34, exact
 numbers recorded in the lane report). Any other pre-existing failure is a
 blocker — stop and diagnose (skill: systematic-debugging).
 
