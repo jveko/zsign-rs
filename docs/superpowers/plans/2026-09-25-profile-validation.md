@@ -1632,10 +1632,10 @@ fn optional_date(dict: &plist::Dictionary, key: &str, name: &str) -> Result<Opti
     }
 }
 
-/// `plist::Date` (a `SystemTime` newtype) in RFC 3339; `None` before 1970 or
-/// outside the `time` crate's range — no real profile predates 1970.
-fn plist_date_to_offset(date: &plist::Date) -> Option<OffsetDateTime> {
-    let system: SystemTime = date.clone().into();
+/// `plist::Date` (a `SystemTime` newtype, `Copy`) in RFC 3339; `None` before
+/// 1970 or outside the `time` crate's range — no real profile predates 1970.
+fn plist_date_to_offset(date: plist::Date) -> Option<OffsetDateTime> {
+    let system: SystemTime = date.into();
     let seconds = system
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()?
