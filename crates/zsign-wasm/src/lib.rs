@@ -141,14 +141,19 @@ fn core_err(e: zsign_core::Error) -> JsValue {
     js_err(code, e)
 }
 
-/// `from_p12` wraps every PKCS#12 failure, including the wrong-password MAC
-/// failure, as `Error::Certificate`. The MAC mismatch display text is the only
-/// surviving wrong-password signal, and wrong passwords fail that check for
-/// every supported variant. All other failures keep their generic core code.
+/// `from_p12` wraps every PKCS#12 failure as `Error::Certificate`. A MAC
+/// mismatch is a password-layer outcome for the standard unencrypted-authSafe
+/// flow, proven across all nine core fixtures; a decryption failure is the
+/// corresponding password-layer outcome for encrypted-authSafe or no-MAC
+/// files. A wrong password that degenerates into a malformed-ASN.1 parse error
+/// carries no password signal and degrades to the generic certificate code.
 fn p12_err(e: zsign_core::Error) -> JsValue {
-    let code = if e
-        .to_string()
-        .contains("invalid PKCS#12 password (MAC mismatch)")
+    let code = if [
+        "invalid PKCS#12 password (MAC mismatch)",
+        "PKCS#12 decryption failed",
+    ]
+    .iter()
+    .any(|marker| e.to_string().contains(marker))
     {
         WasmErrorCode::InvalidPassword
     } else {
@@ -200,6 +205,7 @@ pub struct WasmSigner {
     entitlements_override: Option<Vec<u8>>,
     resource_builder: CodeResourcesBuilder,
     streaming_hashes: HashMap<String, StreamingHashState>,
+    main_executable: Option<String>,
     finalized_paths: HashSet<String>,
 }
 
@@ -238,6 +244,7 @@ impl WasmSigner {
             credentials,
             profile_entitlements: entitlements,
             entitlements_override: None,
+            main_executable: None,
             resource_builder: CodeResourcesBuilder::new(),
             streaming_hashes: HashMap::new(),
             finalized_paths: HashSet::new(),
@@ -302,6 +309,7 @@ impl WasmSigner {
 
     /// Set the main executable name for CodeResources exclusion.
     pub fn set_main_executable(&mut self, name: &str) {
+        self.main_executable = Some(name.to_string());
         self.resource_builder.set_main_executable(name);
     }
 
@@ -430,9 +438,14 @@ impl WasmSigner {
     }
 
     /// Start a new resources round, clearing the builder, active streams, and
-    /// finalized-path seals.
+    /// finalized-path seals. The main-executable exclusion is a bundle-layout
+    /// property and is preserved across resets; call `set_main_executable`
+    /// again to point at a different executable.
     pub fn reset_resources(&mut self) {
         self.resource_builder = CodeResourcesBuilder::new();
+        if let Some(name) = self.main_executable.clone() {
+            self.resource_builder.set_main_executable(name);
+        }
         self.streaming_hashes.clear();
         self.finalized_paths.clear();
     }
@@ -502,7 +515,7 @@ impl WasmSigner {
         }
 
         let macho = zsign_core::macho::MachOFile::parse(data).map_err(core_err)?;
-        if macho.slices().len() > 1 {
+        if macho.is_fat() {
             return Err(js_err(
                 WasmErrorCode::FatUnsupported,
                 "FAT/Universal input is not supported by SHA-256-only signing; call sign_macho_fat() to opt into dual SHA-1+SHA-256 signing explicitly",
@@ -576,7 +589,8 @@ impl WasmSigner {
 
     /// Parse an Info.plist (XML or binary) and return bundle ID and executable name.
     ///
-    /// Returns a JS object with `bundle_id` and `executable` fields (both optional strings).
+    /// Returns a JS object with string fields `bundle_id` and `executable`; each
+    /// defaults to the empty string when the key is absent.
     pub fn parse_info_plist(data: &[u8]) -> Result<JsValue, JsValue> {
         ensure_size(
             data.len(),
@@ -866,6 +880,19 @@ pub mod tests {
         fat
     }
 
+    fn build_fat_macho_one_arch() -> Vec<u8> {
+        let mut fat = vec![0u8; 12_288];
+        fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
+        fat[4..8].copy_from_slice(&1u32.to_be_bytes());
+        fat[8..12].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+        fat[12..16].copy_from_slice(&0u32.to_be_bytes());
+        fat[16..20].copy_from_slice(&4_096u32.to_be_bytes());
+        fat[20..24].copy_from_slice(&8_192u32.to_be_bytes());
+        fat[24..28].copy_from_slice(&12u32.to_be_bytes());
+        fat[4_096..4_096 + MINIMAL_MACHO.len()].copy_from_slice(MINIMAL_MACHO);
+        fat
+    }
+
     #[wasm_bindgen_test(unsupported = test)]
     fn sign_macho_default_emits_sha256_only_for_thin_input() {
         let signed = new_signer()
@@ -906,6 +933,37 @@ pub mod tests {
         assert!(
             msg.contains("sign_macho_fat"),
             "error must name the dual opt-in: {msg}"
+        );
+
+        let err2 = new_signer()
+            .sign_macho(build_fat_macho_one_arch(), "com.zsign.test", None, None)
+            .expect_err("one-slice FAT rejected by default");
+        assert_eq!(error_code(&err2), Some("ZSIGN_FAT_UNSUPPORTED".into()));
+        assert!(err_message(err2).contains("sign_macho_fat"));
+    }
+
+    #[wasm_bindgen_test]
+    fn p12_classifier_maps_password_layer_failures() {
+        let mac = zsign_core::Error::Certificate(
+            "Failed to parse PKCS#12: invalid PKCS#12 password (MAC mismatch)".into(),
+        );
+        assert_eq!(
+            error_code(&p12_err(mac)),
+            Some("ZSIGN_INVALID_PASSWORD".into())
+        );
+        let dec = zsign_core::Error::Certificate(
+            "Failed to parse PKCS#12: PKCS#12 decryption failed: bad padding".into(),
+        );
+        assert_eq!(
+            error_code(&p12_err(dec)),
+            Some("ZSIGN_INVALID_PASSWORD".into())
+        );
+        let other = zsign_core::Error::Certificate(
+            "Failed to parse PKCS#12: malformed PKCS#12: value length exceeds input".into(),
+        );
+        assert_eq!(
+            error_code(&p12_err(other)),
+            Some("ZSIGN_INVALID_CERTIFICATE".into())
         );
     }
 
@@ -1300,6 +1358,10 @@ pub mod tests {
         assert!(!signer
             .hash_file("App", b"binary bytes")
             .expect("second call ok, not sealed"));
+        signer.reset_resources();
+        assert!(!signer
+            .hash_file("App", b"binary bytes")
+            .expect("still excluded after reset"));
     }
 
     fn error_code(err: &JsValue) -> Option<String> {
