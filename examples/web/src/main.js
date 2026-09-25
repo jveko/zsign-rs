@@ -20,6 +20,7 @@ let appPrefix = "";
 let appName = "";
 let p12Bytes = null;
 let profileBytes = null;
+let signingInProgress = false;
 
 // --- DOM refs ---
 const dropZone = $("#drop-zone");
@@ -50,6 +51,11 @@ function log(msg, cls = "") {
   line.append(ts, body);
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function fmtErr(e) {
+  const code = e && e.code ? `[${e.code}] ` : "";
+  return `${code}${(e && e.message) || e}`;
 }
 
 function section(msg) {
@@ -113,6 +119,7 @@ function tryExtractExecutableName(plistData, wasmReady) {
 // --- IPA loading ---
 
 async function loadIpa(file) {
+  if (signingInProgress) return; // a mid-run drop must not start a second run
   startTime = performance.now();
   const logContainer = $("#log");
   logContainer.classList.add("visible");
@@ -189,6 +196,7 @@ async function loadIpa(file) {
 // --- Sign button readiness ---
 
 function updateSignButton() {
+  if (signingInProgress) return; // a run owns the button until finally recomputes state
   const ready =
     ipaFile !== null &&
     p12Bytes !== null &&
@@ -236,6 +244,18 @@ bundleIdInput.addEventListener("input", updateSignButton);
 // --- Signing flow ---
 
 async function signIpa() {
+  // Snapshot inputs so a mid-run DOM mutation cannot change this run; disabling is a belt.
+  const run = {
+    ipaFile,
+    p12Bytes,
+    password: p12Password.value,
+    profileBytes,
+    bundleId: bundleIdInput.value,
+  };
+  signingInProgress = true;
+  for (const el of [p12Input, profileInput, p12Password, bundleIdInput, fileInput]) {
+    el.disabled = true;
+  }
   startTime = performance.now();
   const logContainer = $("#log");
   logContainer.classList.add("visible");
@@ -245,6 +265,8 @@ async function signIpa() {
   downloadBtn.classList.remove("visible");
   signBtn.disabled = true;
 
+  let signer = null;
+  let zipReader = null;
   try {
     // 1. Init WASM
     section("▸ Initializing WASM module");
@@ -255,8 +277,7 @@ async function signIpa() {
 
     // 2. Create signer with credentials
     section("▸ Loading signing credentials");
-    const password = p12Password.value;
-    const signer = new WasmSigner(p12Bytes, password, profileBytes);
+    signer = new WasmSigner(run.p12Bytes, run.password, run.profileBytes);
     const teamId = signer.team_id();
     if (teamId) {
       log(`Team ID: ${teamId}`, "ok");
@@ -264,8 +285,8 @@ async function signIpa() {
     log("Signer initialized with certificate and profile", "ok");
 
     // 3. Extract IPA
-    section(`▸ Extracting ${ipaFile.name} (${formatSize(ipaFile.size)})`);
-    const zipReader = new ZipReader(new BlobReader(ipaFile));
+    section(`▸ Extracting ${run.ipaFile.name} (${formatSize(run.ipaFile.size)})`);
+    zipReader = new ZipReader(new BlobReader(run.ipaFile));
     const entries = await zipReader.getEntries();
     log(`Found ${entries.length} entries in archive`);
 
@@ -276,6 +297,7 @@ async function signIpa() {
     if (!appEntry) {
       log("No .app bundle found in IPA", "err");
       await zipReader.close();
+      zipReader = null;
       return;
     }
     const currentAppPrefix = appEntry.filename;
@@ -327,9 +349,8 @@ async function signIpa() {
     if (mainExecPath) {
       log(`Main executable: ${mainExecPath}`, "ok");
     } else {
-      log(
-        `Warning: main executable "${mainExecName}" not found as Mach-O`,
-        "err",
+      throw new Error(
+        `Main executable "${mainExecName}" not found as Mach-O in the bundle`,
       );
     }
 
@@ -339,6 +360,7 @@ async function signIpa() {
 
     if (dylibsToSign.length > 0) {
       section(`▸ Signing ${dylibsToSign.length} dylibs/frameworks`);
+      const signFailures = [];
       for (const relPath of dylibsToSign) {
         const data = fileMap.get(relPath);
         // Use filename as identifier for dylibs
@@ -348,10 +370,15 @@ async function signIpa() {
           signedFiles.set(relPath, signed);
           log(`  ✓ ${relPath} (${formatSize(data.length)} → ${formatSize(signed.length)})`);
         } catch (e) {
-          log(`  ✗ ${relPath}: ${e.message}`, "err");
-          // Keep original if signing fails
-          signedFiles.set(relPath, data);
+          log(`  ✗ ${relPath}: ${fmtErr(e)}`, "err");
+          signFailures.push(`${relPath}: ${fmtErr(e)}`);
         }
+      }
+      if (signFailures.length > 0) {
+        throw new Error(
+          `Signing failed for ${signFailures.length} binaries — no output produced:\n` +
+            signFailures.join("\n"),
+        );
       }
       log(`Signed ${dylibsToSign.length} dylibs/frameworks`, "ok");
     }
@@ -378,9 +405,9 @@ async function signIpa() {
       }
     }
     // Hash the new provisioning profile
-    signer.hash_file("embedded.mobileprovision", profileBytes);
+    signer.hash_file("embedded.mobileprovision", run.profileBytes);
     filesHashed++;
-    totalBytes += profileBytes.length;
+    totalBytes += run.profileBytes.length;
     log(`Hashed ${filesHashed} files (${formatSize(totalBytes)})`, "ok");
 
     // 7. Build CodeResources
@@ -395,7 +422,7 @@ async function signIpa() {
     if (mainExecPath) {
       section("▸ Signing main executable");
       const mainData = signedFiles.get(mainExecPath) || fileMap.get(mainExecPath);
-      const bundleId = bundleIdInput.value;
+      const bundleId = run.bundleId;
       try {
         const signed = signer.sign_macho_fat(
           mainData,
@@ -409,8 +436,8 @@ async function signIpa() {
           "ok",
         );
       } catch (e) {
-        log(`Main executable signing failed: ${e.message}`, "err");
-        signedFiles.set(mainExecPath, mainData);
+        log(`Main executable signing failed: ${fmtErr(e)}`, "err");
+        throw new Error(`Main executable signing failed: ${fmtErr(e)}`);
       }
     }
 
@@ -508,7 +535,7 @@ async function signIpa() {
     // Add provisioning profile
     await zipWriter.add(
       `${currentAppPrefix}embedded.mobileprovision`,
-      new Uint8ArrayReader(profileBytes),
+      new Uint8ArrayReader(run.profileBytes),
       {
         externalFileAttributes: UNIX_FILE_0644,
         versionMadeBy: VERSION_UNIX_20,
@@ -518,9 +545,6 @@ async function signIpa() {
 
     const blob = await zipWriter.close();
     log(`Wrote ${filesWritten} files (${formatSize(blob.size)})`, "ok");
-
-    await zipReader.close();
-    signer.free();
 
     // 10. Offer download
     const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
@@ -549,15 +573,27 @@ async function signIpa() {
     );
 
     const url = URL.createObjectURL(blob);
-    const outputName = ipaFile.name.replace(/\.ipa$/i, "_signed.ipa");
+    const outputName = run.ipaFile.name.replace(/\.ipa$/i, "_signed.ipa");
     downloadBtn.href = url;
     downloadBtn.download = outputName;
     downloadBtn.textContent = `⬇ Download ${outputName}`;
     downloadBtn.classList.add("visible");
   } catch (e) {
-    log(`Error: ${e.message || e}`, "err");
+    log(`Error: ${fmtErr(e)}`, "err");
     console.error(e);
   } finally {
+    if (signer) {
+      signer.free();
+      signer = null;
+    }
+    if (zipReader) {
+      await zipReader.close();
+      zipReader = null;
+    }
+    signingInProgress = false;
+    for (const el of [p12Input, profileInput, p12Password, bundleIdInput, fileInput]) {
+      el.disabled = false;
+    }
     updateSignButton();
   }
 }
