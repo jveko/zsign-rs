@@ -359,8 +359,9 @@ pub struct CmsEnvelopeReport {
 /// Verifies a provisioning-profile-style CMS envelope against
 /// [`TrustAnchors::apple_root`].
 ///
-/// `now` is the verification instant; `None` falls back to the wall clock
-/// (`time_now`).
+/// `now` is the verification instant. `None` uses the wall clock on native
+/// targets and is an error on wasm32 — browser callers must pass
+/// `Date.now() / 1000`.
 ///
 /// ```ignore
 /// let out = zsign_core::crypto::cms_verify::verify_cms_envelope(&profile_bytes, None)?;
@@ -371,7 +372,9 @@ pub struct CmsEnvelopeReport {
 /// # Errors
 ///
 /// Returns [`Error::Verification`] when the bytes are not a well-formed CMS
-/// structure; integrity failures are report data (`report.valid == false`).
+/// structure. On wasm32, `now: None` also returns [`Error::Verification`];
+/// browser callers must pass `Date.now() / 1000`. Integrity failures are report
+/// data (`report.valid == false`).
 pub fn verify_cms_envelope(
     envelope: &[u8],
     now: Option<time::OffsetDateTime>,
@@ -387,7 +390,7 @@ pub fn verify_cms_envelope_with_anchors(
     now: Option<time::OffsetDateTime>,
     anchors: &TrustAnchors,
 ) -> Result<CmsEnvelopeReport> {
-    let now = now.unwrap_or_else(time_now);
+    let now = resolve_now(now)?;
     let normalized = normalize_ber_lengths(envelope)?;
     let (report, content) = verify_signed_data(
         &normalized,
@@ -1581,10 +1584,35 @@ fn in_validity(cert: &x509_cert::Certificate, now: time::OffsetDateTime) -> bool
     nb <= now && now <= na
 }
 
-/// Returns the wall-clock verification instant used as the default for new
-/// entry points, which take `now: Option<OffsetDateTime>` defaulted with
-/// `now.unwrap_or_else(time_now)`. The wasm32 contract for that default lands
-/// in queue item 4 as `resolve_now`.
+/// Resolves the verification instant for APIs that accept an explicit clock.
+///
+/// `None` falls back to the wall clock on native targets. wasm32 has no
+/// reliable clock (see [`time_now`]), so `None` there is a hard error instead
+/// of a silently wrong fixed timestamp: browser callers must pass
+/// `Date.now() / 1000`.
+pub(crate) fn resolve_now(now: Option<time::OffsetDateTime>) -> Result<time::OffsetDateTime> {
+    match now {
+        Some(t) => Ok(t),
+        None => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Ok(time_now())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(Error::Verification(
+                    "an explicit `now` timestamp is required on wasm32 (no wall \
+                     clock available); pass Date.now() / 1000"
+                        .into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Returns the wall-clock instant used by the legacy `verify_code_signature*`
+/// entry points and by [`resolve_now`] on native targets. Every new API takes
+/// `now: Option<OffsetDateTime>` and resolves it through [`resolve_now`].
 pub(crate) fn time_now() -> time::OffsetDateTime {
     // WASM builds have no reliable wall clock; a fixed reference keeps the
     // module compiling on wasm32 while native builds get real validity checks.
@@ -3186,5 +3214,48 @@ mod tests {
             msg,
             &sig1_bytes,
         ));
+    }
+
+    #[test]
+    fn resolve_now_defaults_on_native_and_honors_explicit_values() {
+        let fallback = resolve_now(None).expect("native builds default to the wall clock");
+        let drift = fallback - time::OffsetDateTime::now_utc();
+        assert!(
+            drift > time::Duration::seconds(-30) && drift < time::Duration::seconds(30),
+            "fallback drift: {drift:?}"
+        );
+        let explicit = at(T_2026_APR);
+        assert_eq!(resolve_now(Some(explicit)).unwrap(), explicit);
+    }
+
+    #[test]
+    fn expired_signer_cert_is_clock_dependent_not_wall_clock_dependent() {
+        let (root, leaf, leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2026_JUL as u64, None);
+        let envelope = sign_attached_content(
+            sample_plist(),
+            &leaf,
+            &[root],
+            &leaf_key,
+            TestDigest::Sha256,
+        )
+        .unwrap();
+
+        let inside =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(inside.report.valid, "errors: {:?}", inside.report.errors);
+
+        let after =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2027)), &anchors).unwrap();
+        assert!(!after.report.valid);
+        assert!(
+            after
+                .report
+                .errors
+                .iter()
+                .any(|e| e.contains("outside validity")),
+            "errors: {:?}",
+            after.report.errors
+        );
     }
 }

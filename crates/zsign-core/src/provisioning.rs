@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 ///
 /// ```ignore
 /// let request = ProfileRequest {
-///     now: None, // wall clock on native targets
+///     now: None, // wall clock on native; error on wasm32 (pass Date.now() / 1000)
 ///     expected_team_id: Some("TESTTEAM".into()),
 ///     target_bundle_id: Some("com.example.app".into()),
 ///     ..Default::default()
@@ -31,9 +31,9 @@ use time::OffsetDateTime;
 pub struct ProfileRequest {
     /// Verification instant consumed by both the CMS chain check and the
     /// profile window check — one instant for both, so a caller cannot
-    /// validate the chain at one time and the window at another. `None` falls
-    /// back to the wall clock; the wasm32 contract for that fallback is
-    /// finalized with queue item 4 in Task 4.
+    /// validate the chain at one time and the window at another. `None` uses
+    /// the wall clock on native targets and is an error on wasm32 (pass
+    /// `Date.now() / 1000` there).
     pub now: Option<OffsetDateTime>,
     /// Trust anchors for the profile's CMS chain. `None` uses Apple's root —
     /// production profiles are Apple-signed.
@@ -84,8 +84,9 @@ pub struct ProfileInfo {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Verification`] for a malformed CMS envelope and
-/// [`Error::ProvisioningProfile`] for every failed check. Window, team,
+/// Returns [`Error::Verification`] for a malformed CMS envelope or, on wasm32,
+/// when `now` is `None`; browser callers must pass `Date.now() / 1000`.
+/// Returns [`Error::ProvisioningProfile`] for every failed check. Window, team,
 /// App-ID-coverage, and device failures name the profile, the offending
 /// value, and the remedy; structural malformations (missing/non-conforming
 /// keys) name the offending key or value.
@@ -93,7 +94,7 @@ pub fn validate_and_extract_profile(
     profile_data: &[u8],
     request: &ProfileRequest,
 ) -> Result<ProfileInfo> {
-    let now = request.now.unwrap_or_else(cms_verify::time_now);
+    let now = cms_verify::resolve_now(request.now)?;
     let envelope = match &request.anchors {
         Some(anchors) => {
             cms_verify::verify_cms_envelope_with_anchors(profile_data, Some(now), anchors)?
@@ -918,5 +919,19 @@ mod tests {
         let err =
             validate_and_extract_profile(&no_exp.data, &request(&no_exp, T_2026_APR)).unwrap_err();
         assert!(err.to_string().contains("has no ExpirationDate"), "{err}");
+    }
+
+    #[test]
+    fn profile_window_is_driven_by_request_now_not_wall_clock() {
+        let sp = signed_profile(&plist_xml(""));
+        // Fixed instant inside the 2026-01-01..2026-07-01 window — passes
+        // whatever today's date is.
+        assert!(validate_and_extract_profile(&sp.data, &request(&sp, T_2026_APR)).is_ok());
+        // One instant after ExpirationDate — rejected.
+        let err = validate_and_extract_profile(&sp.data, &request(&sp, T_2027)).unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        // One instant before CreationDate — rejected as not yet valid.
+        let err = validate_and_extract_profile(&sp.data, &request(&sp, T_2025)).unwrap_err();
+        assert!(err.to_string().contains("not valid until"), "{err}");
     }
 }
