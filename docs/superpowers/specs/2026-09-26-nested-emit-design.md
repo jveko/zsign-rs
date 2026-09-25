@@ -73,9 +73,11 @@ Pass B wins (the root bundle signs last, depth-sorted). Consequences today:
 - without a profile the passes are near-idempotent, so a byte-compare cannot
   prove "signed once" — the observable is the **CD shape** (dual vs single).
 
-There is no processed/visited set anywhere in the walk (grep
-`HashSet<PathBuf>|processed|visited` in `ipa/mod.rs`: zero hits in walk
-logic). Closest in-repo precedent for a path-claim registry:
+There is no processed/visited set in the signing walk: `sign_bundle`,
+`find_standalone_dylibs`, and `find_immediate_macho_binaries` contain none
+(the only `HashSet<PathBuf>` in the ipa module is the unrelated path-claim
+registry in `extract.rs:350-351`). Closest in-repo precedents for such a
+registry:
 `crates/zsign/src/ipa/extract.rs:350-351` (`HashSet<PathBuf>` during a
 walk) and `crates/zsign-wasm/src/lib.rs:209` (`finalized_paths` guard).
 
@@ -220,8 +222,14 @@ constructs its blobs. Effects:
 
 **Doc/comment migration:** `sign_any_macho` doc (`signer.rs:156-160`),
 wrapper doc (`crates/zsign/src/macho/mod.rs:151-152`), the constant's
-doc-comment (deleted with the constant), and the WASM pin-test comment
-(`zsign-wasm/src/lib.rs:1006-1009`, which names `EMPTY_ENTITLEMENTS`).
+doc-comment (deleted with the constant), the WASM pin-test comment
+(`zsign-wasm/src/lib.rs:1006-1009`, which names `EMPTY_ENTITLEMENTS`), and
+in `ipa/mod.rs` the `sign_binary` doc ("empty entitlements are used …
+matches the behavior of the C++ zsign", `:966-969`) plus the adjacent
+Info.plist comment (`:1017-1019`) that repeats the unsourced
+AMFI-rejection quote — both become false or stay unsourced once the
+coercion lands, so they are rewritten in the same change (comment-only
+edits; `builder.rs`/`main.rs` remain untouched).
 Wording follows finding 2.1: no sourced AMFI claim.
 
 **Alternatives considered.**
@@ -264,8 +272,8 @@ Why here and not elsewhere:
   item 2 asks to preserve.
 - Discovery-level filtering is unit-testable in the same style as the
   existing `test_symlinked_dylib_is_skipped_and_target_untouched`
-  (`ipa/mod.rs:1671-1708`), which already calls both discovery functions
-  directly.
+  (`ipa/mod.rs:1671-1707`, `#[cfg(unix)]`), which already calls both
+  discovery functions directly.
 - Paths from `find_standalone_dylibs` and `find_immediate_macho_binaries`
   share lexical shape (both are `WalkDir` from the same bundle root,
   symlinks excluded by `file_type().is_file()` on both sides), so plain
@@ -351,7 +359,7 @@ to prove the whitelist is no longer the sole predicate.
 | Site | Change |
 |---|---|
 | `ipa/mod.rs:431-437` `is_bundle_directory` | deleted; both callers (`:421`, `:765`) call `crate::bundle::is_nested_bundle_dir` |
-| `ipa/mod.rs:578-592` `calculate_bundle_depth` | rewritten to cumulative-prefix evaluation: iterate `strip_prefix(root)` components, accumulate `root.join(prefix…)`, count prefixes satisfying the predicate (also fixes the existing case-sensitivity asymmetry with collect) |
+| `ipa/mod.rs:578-592` `calculate_bundle_depth` | rewritten to cumulative-prefix evaluation: iterate `strip_prefix(root)` components, accumulate `root.join(prefix…)`, count prefixes satisfying the predicate (also fixes the existing case-sensitivity asymmetry with collect; paths not under the root now yield depth 0 instead of counting suffix components — an intended change: the function only ever receives paths collected from that root, and depth feeds only the deepest-first sort) |
 | `verify.rs:143-152` `is_bundle_dir` | deleted; `:456` calls the shared predicate with the full path |
 | `verify.rs:157-165` `has_nested_bundle_component` | gains `root: &Path`; evaluates the predicate on cumulative `root.join(prefix)` components (both call sites `:456`, `:466` sit inside `verify_bundle_dir(root, dir, rel)`, which has `root`) |
 | docs | doc comments naming the old whitelist (`ipa/mod.rs:13-22`, `:406`, `verify.rs:12-14`, `:82`) updated to the new recognition rule |
@@ -495,8 +503,9 @@ Red → green per task: the Tester subagent writes the failing test first.
 `sign_macho_adhoc`, and `sign_any_macho`, each with a non-empty entitlements
 plist. For each output assert, via `parse_superblob` on the
 `code_sig_offset/size` region: no entry with `slot == 0x0005` and none with
-`0x0007` (no entitlements blob), `code_directory.special_slot_hash(5)` is
-`None` or all-zero (slot −5 unbound), and `verify_macho` reports the binary
+`0x0007` (no entitlements blob), the primary CD's
+`special_slot_hash(5)` (via `sb.code_directory.as_ref().expect("primary CD")`)
+is `None` or all-zero (slot −5 unbound), and `verify_macho` reports the binary
 valid (existing verify path). Pre-fix: RED on every entry (empty or real
 dict bound into −5). The strengthened WASM pin
 (`non_executable_input_ignores_profile_entitlements`) additionally asserts
@@ -511,8 +520,8 @@ dict bound into −5). The strengthened WASM pin
 `IpaSigner::new(&test_credentials())` (default `sha256_only = true`), then
 assert on `Frameworks/libfoo.dylib`:
 
-1. `parse_superblob` → `code_directory.identifier() == Some("libfoo")`
-   (pass-A identity stable);
+1. `parse_superblob` → primary CD identifier (same `as_ref().expect`
+   unwrap) `== Some("libfoo")` (pass-A identity stable);
 2. the SuperBlob contains the `0x1000` alternate-code-directory entry
    (pass A's dual CD — pass B would have overwritten it with a single
    SHA-256-only CD: this is the red/green discriminator);

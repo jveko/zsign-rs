@@ -38,6 +38,8 @@ what a change obsoletes; migrate every caller.
 - Modify: `crates/zsign/src/macho/mod.rs:149-170` (doc comment only)
 - Modify: `crates/zsign-wasm/src/lib.rs` (thin path ~:524-533; pin-test
   comment ~:1006-1040)
+- Modify: `crates/zsign/src/ipa/mod.rs` (two comments only — `sign_binary`
+  doc ~:966-969 and the Info.plist comment ~:1017-1019; see Step 1.3(g))
 
 - [ ] **Step 1.1: Write the failing test**
 
@@ -67,15 +69,22 @@ fn test_non_executable_signing_carries_no_entitlements() {
             sb.entries.iter().all(|e| e.slot != 0x0007),
             "{via}: DER entitlements blob must not be emitted for a dylib"
         );
-        match sb.code_directory.special_slot_hash(5) {
+        let cd = sb
+            .code_directory
+            .as_ref()
+            .unwrap_or_else(|| panic!("{via}: primary CodeDirectory must be present"));
+        match cd.special_slot_hash(5) {
             None => {}
             Some(h) => assert!(
                 h.iter().all(|&b| b == 0),
                 "{via}: slot -5 must be unbound, got {h:02x?}"
             ),
         }
-        let report = crate::macho::verify_macho(signed)
-            .unwrap_or_else(|e| panic!("{via}: verify must accept the signed dylib: {e}"));
+        let report = crate::macho::verify_macho(
+            signed,
+            &crate::codesign::verify::SignatureInputs::none(),
+        )
+        .unwrap_or_else(|e| panic!("{via}: verify must accept the signed dylib: {e}"));
         assert!(
             report.is_valid(),
             "{via}: verify errors: {:?}",
@@ -83,7 +92,7 @@ fn test_non_executable_signing_carries_no_entitlements() {
         );
     }
 
-    let macho = MachOFile::parse(make_minimal_dylib()).unwrap();
+    let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_dylib()).unwrap();
     let creds = test_credentials();
 
     let signed = sign_macho(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false).unwrap();
@@ -97,12 +106,18 @@ fn test_non_executable_signing_carries_no_entitlements() {
 }
 ```
 
-Notes for the implementer: `make_minimal_dylib` (`fixtures.rs:102`) is
-already imported in this tests module (used at `signer.rs:1754`).
+Notes for the implementer: call the fixture fully-qualified as
+`crate::macho::fixtures::make_minimal_dylib()` (the tests module's
+`use`-list at `signer.rs:934-936` does NOT import it — `signer.rs:1754`
+uses the fully-qualified path for the same reason). `verify_macho` takes a
+second `&SignatureInputs` argument (`macho/verify.rs:99`); pass
+`&crate::codesign::verify::SignatureInputs::none()` like existing call
+sites (`macho/verify.rs:937`).
 `special_slot_hash(index)` is 1-based: index 5 ↔ slot −5
 (`codesign/verify.rs:788-791`; `None` when `n_special < 5`, i.e. unbound).
-If `sign_macho_sha256_only` is not in scope in the tests module, add it to
-the module's existing `use` list.
+`SuperBlob::code_directory` is `Option<CodeDirectory>` (`codesign/verify.rs:72`)
+— always bind `sb.code_directory.as_ref().expect("primary CD")` first, as
+`crates/zsign/src/verify.rs:1002` does.
 
 - [ ] **Step 1.2: Run the test to verify it fails**
 
@@ -153,9 +168,11 @@ the doc comment (lines ~:1006-1009) so it no longer names
 `EMPTY_ENTITLEMENTS` — new text: `/// Pins the executable/non-executable
 entitlements policy: non-executable input must ignore profile
 entitlements entirely (no entitlements slot either way), executable input
-must not. Passes on the pre-change delegation; goes red if the policy is
-dropped.` And strengthen the non-executable assertion block (~:1022-1027)
-by adding, immediately before the existing `assert_eq!(entitlements_slot(&a),
+must not. The non-executable assertion goes red if any entitlements slot
+is ever emitted for non-executables again (the pre-change state); the
+executable assertions go red if profile entitlements stop being applied.`
+And strengthen the non-executable assertion block (~:1022-1027) by adding,
+immediately before the existing `assert_eq!(entitlements_slot(&a),
 entitlements_slot(&b), …)`:
 
 ```rust
@@ -165,7 +182,36 @@ assert!(
 );
 ```
 
-Keep the existing executable-side `assert_ne!` unchanged.
+Keep the existing executable-side `assert_ne!` unchanged. (Strengthened
+this way the pin is RED before the coercion — today `sign_macho` injects
+the empty dict — and GREEN after Task 1's change; the existing
+`assert_eq!(a, b)` stays green in both states.)
+
+(g) `crates/zsign/src/ipa/mod.rs` — two comments become false/unsourced
+once the coercion lands; update them (comments only, no behavior change):
+
+1. The `sign_binary` doc comment (~:966-969), currently
+   `/// For non-executable binaries (dylibs, frameworks), empty entitlements are used
+   /// instead of the full entitlements. This matches the behavior of the C++ zsign.`
+   →
+
+```rust
+    /// Entitlements are emitted only for executables: non-executables
+    /// (dylibs, frameworks) are signed with no entitlements slot at all
+    /// (enforced in `zsign-core`'s signing context; the C++ upstream
+    /// instead emits an empty-dict slot, which this port deliberately
+    /// does not reproduce).
+```
+
+2. The Info.plist comment inside `sign_binary` (~:1017-1019), currently
+   `// Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
+   // with "has entitlements but is not a main binary".` — keep the
+   truthful first line above it and replace these two lines with:
+
+```rust
+        // The Info.plist hash arrives with the bundle's CodeResources,
+        // which only the main-executable path receives.
+```
 
 - [ ] **Step 1.4: Sweep for leftover references**
 
@@ -245,9 +291,13 @@ fn test_standalone_dylib_signed_exactly_once() {
     let sig_off = sl.code_sig_offset.unwrap() as usize;
     let sig_len = sl.code_sig_size.unwrap() as usize;
     let sb = parse_superblob(&data[sig_off..sig_off + sig_len]).unwrap();
+    let cd = sb
+        .code_directory
+        .as_ref()
+        .expect("primary CodeDirectory must be present");
 
     assert_eq!(
-        sb.code_directory.identifier(),
+        cd.identifier(),
         Some("libfoo"),
         "the standalone pass's file-stem identifier must be the on-disk identifier"
     );
@@ -345,8 +395,9 @@ filtered — the main-executable contract (own CodeResources, bundle
 identifier, entitlements) stays intact.
 
 (d) Migrate the existing direct caller in the tests module
-(`test_symlinked_dylib_is_skipped_and_target_untouched`, `:1671-1708`):
-its `find_immediate_macho_binaries(&app)` call at `:1693` becomes
+(`test_symlinked_dylib_is_skipped_and_target_untouched`, `ipa/mod.rs:1671-1707`,
+`#[cfg(unix)]`): its `find_immediate_macho_binaries(&app)` call at `:1694`
+becomes
 
 ```rust
 let processed: std::collections::HashSet<_> = dylibs.iter().cloned().collect();
@@ -363,6 +414,11 @@ assert!(
     "a standalone-signed dylib must not be re-offered by the immediate walk: {binaries:?}"
 );
 ```
+
+Note: because this test is `#[cfg(unix)]`, it does not compile on
+non-unix targets — that is fine: the production caller in
+`sign_single_bundle` compiles the new signature on every target, so
+`cargo check`/`clippy` still cover it everywhere.
 
 - [ ] **Step 2.5: Run the test to verify it passes**
 
@@ -446,13 +502,16 @@ fn test_xpc_service_is_discovered_and_signed_as_nested_bundle() {
     let sig_off = sl.code_sig_offset.unwrap() as usize;
     let sig_len = sl.code_sig_size.unwrap() as usize;
     let sb = parse_superblob(&foo[sig_off..sig_off + sig_len]).unwrap();
+    let cd = sb
+        .code_directory
+        .as_ref()
+        .expect("primary CodeDirectory must be present");
     assert_eq!(
-        sb.code_directory.identifier(),
+        cd.identifier(),
         Some("com.test.foo.xpc"),
         "the XPC binary must carry its bundle identifier, not its file stem"
     );
-    let info_hash = sb
-        .code_directory
+    let info_hash = cd
         .special_slot_hash(1)
         .expect("nested bundle main executable must bind its Info.plist slot -1");
     assert!(
@@ -621,8 +680,10 @@ pub fn is_nested_bundle_dir(path: &Path) -> bool {
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| {
-            let parent = n.to_string_lossy().to_lowercase();
-            NESTED_CODE_LOCATIONS.contains(&parent.as_str())
+            let parent = n.to_string_lossy();
+            NESTED_CODE_LOCATIONS
+                .iter()
+                .any(|location| location.eq_ignore_ascii_case(parent.as_ref()))
         })
         .unwrap_or(false);
     if parent_is_location {
@@ -700,6 +761,15 @@ fn calculate_bundle_depth(&self, bundle_path: &Path, root_bundle: &Path) -> usiz
     depth
 }
 ```
+
+Intended behavior notes (call these out, do not "fix" them): the previous
+implementation used `strip_prefix(root_bundle).unwrap_or(bundle_path)` and
+still counted suffix components for paths not under the root — the rewrite
+returns 0 instead. That is deliberate: callers only ever pass paths
+collected from `root_bundle`, and depth feeds only the deepest-first sort
+at `sign_bundle`. Re-evaluating `is_nested_bundle_dir` per component may
+re-read an intermediate bundle's Info.plist once per component below it —
+negligible for bundle-shaped trees and the price of one shared predicate.
 
 (c) Doc updates in this file: the tree/module doc at `:13-22` (add an
 `XPCServices/ └── *.xpc/` example under the tree if the doc shows a
