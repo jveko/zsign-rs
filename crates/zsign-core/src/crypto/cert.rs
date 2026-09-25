@@ -99,6 +99,211 @@ pub struct SigningCredentials {
     pub team_id: Option<String>,
 }
 
+/// A PKCS#8 private key decoded to a form that can be SPKI-matched against certificates.
+enum DecodedKey {
+    Rsa(RsaPrivateKey),
+    Ecdsa(EcdsaSigningKey),
+}
+
+impl DecodedKey {
+    fn from_pkcs8_der(der: &[u8]) -> Option<Self> {
+        use pkcs8::DecodePrivateKey;
+        if let Ok(k) = RsaPrivateKey::from_pkcs8_der(der) {
+            return Some(Self::Rsa(k));
+        }
+        EcdsaSigningKey::from_pkcs8_der(der).ok().map(Self::Ecdsa)
+    }
+
+    fn from_pkcs8_pem(pem: &str) -> Option<Self> {
+        use pkcs8::DecodePrivateKey;
+        if let Ok(k) = RsaPrivateKey::from_pkcs8_pem(pem) {
+            return Some(Self::Rsa(k));
+        }
+        EcdsaSigningKey::from_pkcs8_pem(pem).ok().map(Self::Ecdsa)
+    }
+
+    /// DER-encoded SubjectPublicKeyInfo — the pairing identity, byte-compared
+    /// exactly like `verify_key_matches_cert` compares key and certificate.
+    fn spki_der(&self) -> Result<Vec<u8>> {
+        use spki::EncodePublicKey;
+        let der = match self {
+            Self::Rsa(k) => rsa::RsaPublicKey::from(k).to_public_key_der(),
+            Self::Ecdsa(k) => p256::ecdsa::VerifyingKey::from(k).to_public_key_der(),
+        }
+        .map_err(|e| Error::Certificate(format!("Failed to encode public key: {}", e)))?;
+        Ok(der.to_vec())
+    }
+
+    fn into_signing_key(self) -> Result<SigningKeyType> {
+        Ok(match self {
+            Self::Rsa(k) => SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(k)),
+            Self::Ecdsa(k) => SigningKeyType::Ecdsa(k),
+        })
+    }
+}
+
+/// Selects the unique key/certificate pair by matching every decoded key's SPKI
+/// against every parseable certificate.
+///
+/// Returns the selected key, the leaf certificate, and the remaining parsed
+/// certificates for chain assembly. Unparseable keys/certificates are skipped;
+/// zero matches and multiple distinct identities are errors.
+fn select_identity(
+    keys: &[Vec<u8>],
+    certs: &[Vec<u8>],
+) -> Result<(DecodedKey, Certificate, Vec<Certificate>)> {
+    // cert.rs imports der::{Decode, DecodePem} only; to_der() below needs Encode.
+    use der::Encode;
+
+    let decoded: Vec<Option<DecodedKey>> =
+        keys.iter().map(|d| DecodedKey::from_pkcs8_der(d)).collect();
+    let parsed: Vec<Option<Certificate>> = certs
+        .iter()
+        .map(|d| Certificate::from_der(d).ok())
+        .collect();
+    if !certs.is_empty() && parsed.iter().all(Option::is_none) {
+        return Err(Error::Certificate(
+            "No parseable certificate in PKCS#12".into(),
+        ));
+    }
+
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (i, key) in decoded.iter().enumerate() {
+        let Some(key) = key else { continue };
+        let Ok(key_spki) = key.spki_der() else {
+            continue;
+        };
+        for (j, cert) in parsed.iter().enumerate() {
+            let Some(cert) = cert else { continue };
+            let Ok(cert_spki) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+                continue;
+            };
+            if cert_spki == key_spki {
+                pairs.push((i, j));
+            }
+        }
+    }
+
+    // Duplicate bags of the same key+certificate collapse to one identity.
+    let mut distinct: Vec<(usize, usize)> = Vec::new();
+    for &(i, j) in &pairs {
+        let dup = distinct
+            .iter()
+            .any(|&(i2, j2)| keys[i] == keys[i2] && certs[j] == certs[j2]);
+        if !dup {
+            distinct.push((i, j));
+        }
+    }
+
+    match distinct.len() {
+        0 => Err(Error::Certificate(format!(
+            "PKCS#12 contains no certificate matching its {} private key(s); {} certificate(s) present",
+            keys.len(),
+            certs.len()
+        ))),
+        1 => {
+            let (i, j) = distinct[0];
+            let leaf = parsed[j].clone().expect("matched certificate parsed above");
+            let key = decoded
+                .into_iter()
+                .nth(i)
+                .flatten()
+                .expect("matched key decoded above");
+            let rest = parsed
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| if idx != j { c.clone() } else { None })
+                .collect();
+            Ok((key, leaf, rest))
+        }
+        n => {
+            let described: Vec<String> = distinct
+                .iter()
+                .map(|&(_, j)| {
+                    let c = parsed[j].as_ref().expect("parsed");
+                    let serial: String = c
+                        .tbs_certificate
+                        .serial_number
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect();
+                    format!("{} (serial 0x{})", c.tbs_certificate.subject, serial)
+                })
+                .collect();
+            Err(Error::Certificate(format!(
+                "PKCS#12 contains {} identities: {}; expected exactly one key/certificate pair",
+                n,
+                described.join(", ")
+            )))
+        }
+    }
+}
+
+/// Assembles the chain below `leaf` by issuer/subject links over `rest`,
+/// then completes it with the embedded Apple material only where missing.
+///
+/// Unrelated certificates fall out of the walk. The embedded WWDR intermediate
+/// is injected only when no provided certificate links to the leaf's issuer and
+/// the issuer is an Apple WWDR CA; the Apple Root CA is appended only when a
+/// WWDR intermediate is in the chain and the root is not already present.
+fn build_chain_from_leaf(leaf: &Certificate, mut rest: Vec<Certificate>) -> Vec<Certificate> {
+    let mut chain: Vec<Certificate> = Vec::new();
+    let mut current = leaf.clone();
+    loop {
+        if current.tbs_certificate.subject == current.tbs_certificate.issuer {
+            break;
+        }
+        let Some(pos) = rest
+            .iter()
+            .position(|c| c.tbs_certificate.subject == current.tbs_certificate.issuer)
+        else {
+            break;
+        };
+        current = rest.remove(pos);
+        chain.push(current.clone());
+    }
+
+    let links_leaf = chain
+        .iter()
+        .any(|c| c.tbs_certificate.subject == leaf.tbs_certificate.issuer);
+    if !links_leaf {
+        if let Some(wwdr) = embedded_wwdr_for_leaf(leaf) {
+            chain.push(wwdr);
+        }
+    }
+
+    let has_wwdr = chain.iter().any(|c| {
+        extract_subject_cn(c).is_some_and(|cn| cn.contains("Apple Worldwide Developer Relations"))
+    });
+    if has_wwdr && !chain.iter().any(|c| is_apple_root(c)) {
+        if let Ok(root) = Certificate::from_pem(super::assets::APPLE_ROOT_CA_CERT.as_bytes()) {
+            chain.push(root);
+        }
+    }
+    chain
+}
+
+/// The embedded Apple WWDR intermediate matching `leaf`'s issuer, if the
+/// issuer identifies an Apple WWDR CA.
+fn embedded_wwdr_for_leaf(leaf: &Certificate) -> Option<Certificate> {
+    use super::assets::{APPLE_WWDR_CA_CERT, APPLE_WWDR_CA_G3_CERT};
+    let issuer_cn = extract_issuer_cn(leaf).unwrap_or_default();
+    if !issuer_cn.contains("Apple Worldwide Developer Relations") {
+        return None;
+    }
+    let pem = if extract_issuer_ou(leaf).unwrap_or_default() == "G3" {
+        APPLE_WWDR_CA_G3_CERT
+    } else {
+        APPLE_WWDR_CA_CERT
+    };
+    Certificate::from_pem(pem.as_bytes()).ok()
+}
+
+fn is_apple_root(cert: &Certificate) -> bool {
+    extract_subject_cn(cert).is_some_and(|cn| cn == "Apple Root CA")
+}
+
 impl SigningCredentials {
     /// Load credentials from PEM-encoded certificate and private key.
     ///
@@ -130,30 +335,28 @@ impl SigningCredentials {
     /// # Ok::<(), zsign_core::Error>(())
     /// ```
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8], password: Option<&str>) -> Result<Self> {
-        use pkcs8::DecodePrivateKey;
-
         let certificate = Certificate::from_pem(cert_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse certificate PEM: {}", e)))?;
 
         let key_str = std::str::from_utf8(key_pem)
             .map_err(|e| Error::Certificate(format!("Invalid UTF-8 in key PEM: {}", e)))?;
 
-        let signing_key = if let Some(_pass) = password {
+        // The password rejection moves out of the decode expression into a
+        // standalone guard (same message, same position in the flow): the old
+        // `if let ... else if ... else` chain is being replaced wholesale, so the
+        // gate cannot stay embedded in it.
+        if password.is_some() {
             return Err(Error::Certificate(
                 "Encrypted PEM keys are not yet supported. Use unencrypted keys or PKCS#12.".into(),
             ));
-        } else if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_pem(key_str) {
-            SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key))
-        } else if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_pem(key_str) {
-            SigningKeyType::Ecdsa(ecdsa_key)
-        } else {
-            return Err(Error::Certificate(
-                "Failed to parse private key as RSA or ECDSA".into(),
-            ));
-        };
+        }
+        let decoded = DecodedKey::from_pkcs8_pem(key_str).ok_or_else(|| {
+            Error::Certificate("Failed to parse private key as RSA or ECDSA".into())
+        })?;
+        let signing_key = decoded.into_signing_key()?;
 
         let team_id = extract_team_id(&certificate);
-        let cert_chain = build_apple_ca_chain(&certificate);
+        let cert_chain = build_chain_from_leaf(&certificate, Vec::new());
 
         verify_key_matches_cert(&signing_key, &certificate)?;
 
@@ -167,9 +370,10 @@ impl SigningCredentials {
 
     /// Load credentials from a PKCS#12 (.p12) container.
     ///
-    /// Parses a PKCS#12 file containing the signing certificate, private key,
-    /// and optional intermediate CA certificates. This is the recommended format
-    /// for Apple code signing credentials exported from Keychain Access.
+    /// Parses a PKCS#12 file and matches the private key to the certificate by
+    /// public key, independent of bag order. The container may also include
+    /// intermediate CA certificates. This is the recommended format for Apple
+    /// code signing credentials exported from Keychain Access.
     ///
     /// # Arguments
     ///
@@ -184,6 +388,8 @@ impl SigningCredentials {
     /// - No certificate is found in the container
     /// - No private key is found in the container
     /// - The private key is neither RSA nor ECDSA P-256
+    /// - No private key matches a certificate
+    /// - More than one distinct key/certificate identity is present
     ///
     /// # Security
     ///
@@ -212,27 +418,10 @@ impl SigningCredentials {
             return Err(Error::Certificate("No private key in PKCS#12".into()));
         }
 
-        let cert_der = &certs[0];
-        let certificate = Certificate::from_der(cert_der)
-            .map_err(|e| Error::Certificate(format!("Failed to parse certificate DER: {}", e)))?;
-
-        let key_der = &keys[0];
-        let signing_key = Self::parse_private_key_der(key_der)?;
-
-        let mut cert_chain: Vec<Certificate> = certs
-            .iter()
-            .skip(1)
-            .filter_map(|der| Certificate::from_der(der).ok())
-            .collect();
-
-        // If the P12 doesn't include the Apple CA chain, add it automatically
-        if cert_chain.is_empty() {
-            cert_chain = build_apple_ca_chain(&certificate);
-        }
-
+        let (decoded, certificate, rest) = select_identity(&keys, &certs)?;
+        let signing_key = decoded.into_signing_key()?;
+        let cert_chain = build_chain_from_leaf(&certificate, rest);
         let team_id = extract_team_id(&certificate);
-
-        verify_key_matches_cert(&signing_key, &certificate)?;
 
         Ok(Self {
             certificate,
@@ -241,60 +430,6 @@ impl SigningCredentials {
             team_id,
         })
     }
-
-    fn parse_private_key_der(der: &[u8]) -> Result<SigningKeyType> {
-        use pkcs8::DecodePrivateKey;
-
-        if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_der(der) {
-            return Ok(SigningKeyType::Rsa(
-                rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key),
-            ));
-        }
-
-        if let Ok(ecdsa_key) = EcdsaSigningKey::from_pkcs8_der(der) {
-            return Ok(SigningKeyType::Ecdsa(ecdsa_key));
-        }
-
-        Err(Error::Certificate(
-            "Failed to parse private key as RSA or ECDSA".into(),
-        ))
-    }
-}
-
-/// Builds the Apple CA certificate chain for a signing certificate.
-///
-/// Matches the C++ zsign behavior: selects the appropriate Apple WWDR intermediate
-/// CA certificate (legacy or G3) based on the signing certificate's issuer, and
-/// includes the Apple Root CA.
-fn build_apple_ca_chain(signing_cert: &Certificate) -> Vec<Certificate> {
-    use super::assets::{APPLE_ROOT_CA_CERT, APPLE_WWDR_CA_CERT, APPLE_WWDR_CA_G3_CERT};
-
-    let issuer_ou = extract_issuer_ou(signing_cert).unwrap_or_default();
-    let issuer_cn = extract_issuer_cn(signing_cert).unwrap_or_default();
-
-    let is_wwdr = issuer_cn.contains("Apple Worldwide Developer Relations");
-
-    let wwdr_pem = if !is_wwdr {
-        None
-    } else if issuer_ou == "G3" {
-        Some(APPLE_WWDR_CA_G3_CERT)
-    } else {
-        Some(APPLE_WWDR_CA_CERT)
-    };
-
-    let mut chain = Vec::new();
-
-    if let Some(pem) = wwdr_pem {
-        if let Ok(cert) = Certificate::from_pem(pem.as_bytes()) {
-            chain.push(cert);
-        }
-    }
-
-    if let Ok(root) = Certificate::from_pem(APPLE_ROOT_CA_CERT.as_bytes()) {
-        chain.push(root);
-    }
-
-    chain
 }
 
 /// Extracts a string attribute from an X.509 Name by OID.
@@ -386,7 +521,6 @@ fn extract_team_id(cert: &Certificate) -> Option<String> {
 }
 
 /// Extracts the Common Name (CN) from a certificate's subject.
-#[cfg(test)]
 pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
     extract_name_attr(
         &cert.tbs_certificate.subject,
@@ -397,6 +531,112 @@ pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use const_oid::ObjectIdentifier;
+    use der::Decode;
+    use spki::SubjectPublicKeyInfoOwned;
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::{Time, Validity};
+
+    const IDENTITY_SINGLE: &[u8] = include_bytes!("fixtures/identity_single.p12");
+    const IDENTITY_DUP: &[u8] = include_bytes!("fixtures/identity_duplicate_certs.p12");
+
+    fn fresh_2048() -> rsa::RsaPrivateKey {
+        rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap()
+    }
+
+    /// RFC-style validity window from unix seconds.
+    fn window(not_before: i64, not_after: i64) -> Validity {
+        Validity {
+            not_before: Time::UtcTime(
+                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
+                    not_before as u64,
+                ))
+                .unwrap(),
+            ),
+            not_after: Time::UtcTime(
+                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
+                    not_after as u64,
+                ))
+                .unwrap(),
+            ),
+        }
+    }
+
+    /// A window containing today (Nov 2023 → Nov 2039).
+    fn present() -> Validity {
+        window(1_700_000_000, 2_200_000_000)
+    }
+
+    /// Builds a certificate for `subject` signed by `issuer_key` (which may be the
+    /// subject's own key). Signatures are irrelevant to every helper under test —
+    /// pairing compares SPKIs and the chain walk compares names.
+    fn build_cert(
+        subject: &str,
+        issuer: &str,
+        subject_key: &rsa::RsaPrivateKey,
+        issuer_key: &rsa::RsaPrivateKey,
+        validity: Validity,
+        eku: Option<ExtendedKeyUsage>,
+    ) -> Certificate {
+        use spki::EncodePublicKey;
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            subject_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        // The builder borrows the signer, so bind it first — a temporary would be
+        // dropped before `add_extension`/`build` (E0716).
+        let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(issuer_key.clone());
+        let mut b = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: Name::from_str(issuer).unwrap(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(7u32),
+            validity,
+            Name::from_str(subject).unwrap(),
+            spki,
+            &signer,
+        )
+        .unwrap();
+        if let Some(eku) = &eku {
+            b.add_extension(eku).unwrap();
+        }
+        b.build::<rsa::pkcs1v15::Signature>().unwrap()
+    }
+
+    fn der_of(cert: &Certificate) -> Vec<u8> {
+        use der::Encode;
+        cert.to_der().unwrap()
+    }
+
+    fn pkcs8_of(key: &rsa::RsaPrivateKey) -> Vec<u8> {
+        use pkcs8::EncodePrivateKey;
+        key.to_pkcs8_der().unwrap().as_bytes().to_vec()
+    }
+
+    /// PEM-encodes a certificate + private key for `from_pem`.
+    fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>) {
+        use der::{pem::LineEnding, EncodePem};
+        use pkcs8::EncodePrivateKey;
+        (
+            cert.to_pem(LineEnding::LF).unwrap().into_bytes(),
+            key.to_pkcs8_pem(Default::default())
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        )
+    }
 
     #[test]
     fn test_from_pem_invalid_cert() {
@@ -437,5 +677,209 @@ mod tests {
         let cn = extract_issuer_cn(&cert);
         assert!(cn.is_some());
         assert!(cn.unwrap().contains("Apple Root CA"));
+    }
+
+    #[test]
+    fn select_identity_picks_matching_pair_regardless_of_order() {
+        let k1 = fresh_2048();
+        let k2 = fresh_2048();
+        let cert1 = build_cert("CN=zsn k1", "CN=zsn k1", &k1, &k1, present(), None);
+        let cert2 = build_cert("CN=zsn k2", "CN=zsn k2", &k2, &k2, present(), None);
+        // Unrelated certificate FIRST — the ordering openssl cannot produce.
+        let keys = vec![pkcs8_of(&k1)];
+        let certs = vec![der_of(&cert2), der_of(&cert1)];
+        let (_key, leaf, rest) = select_identity(&keys, &certs).expect("pair exists");
+        assert_eq!(leaf.tbs_certificate.subject, cert1.tbs_certificate.subject);
+        assert_eq!(rest.len(), 1, "only the unrelated certificate remains");
+        assert_eq!(
+            rest[0].tbs_certificate.subject,
+            cert2.tbs_certificate.subject
+        );
+    }
+
+    #[test]
+    fn select_identity_reports_no_match() {
+        let k1 = fresh_2048();
+        let k2 = fresh_2048();
+        let cert2 = build_cert("CN=zsn k2", "CN=zsn k2", &k2, &k2, present(), None);
+        let keys = vec![pkcs8_of(&k1)];
+        let certs = vec![der_of(&cert2)];
+        let res = select_identity(&keys, &certs);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("no certificate") && m.contains("1 private key")),
+            "expected no-match rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_rejects_ambiguous_identity() {
+        let res = SigningCredentials::from_p12(IDENTITY_DUP, "testpassword");
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("2 identities") && m.contains("CN=zsign-test-fixture")),
+            "expected ambiguous-identity rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_selects_single_identity_with_empty_chain() {
+        let creds = SigningCredentials::from_p12(IDENTITY_SINGLE, "testpassword")
+            .expect("unique pair must load");
+        assert_eq!(
+            creds.certificate.tbs_certificate.subject.to_string(),
+            "CN=zsign-test-fixture"
+        );
+        assert!(
+            creds.cert_chain.is_empty(),
+            "self-signed non-Apple leaf must not receive the Apple Root CA"
+        );
+    }
+
+    #[test]
+    fn from_pem_self_signed_leaf_yields_empty_chain() {
+        let key = fresh_2048();
+        // codeSigning EKU inline (the production OID constant lands in Task 2): keeps
+        // this loader test policy-compliant so Task 2's gate does not break it.
+        let eku = ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3")]);
+        let cert = build_cert(
+            "CN=zsn pem self",
+            "CN=zsn pem self",
+            &key,
+            &key,
+            present(),
+            Some(eku),
+        );
+        let (cert_pem, key_pem) = leaf_pems(&cert, &key);
+        let creds = SigningCredentials::from_pem(&cert_pem, &key_pem, None)
+            .expect("policy-compliant self-signed leaf must load");
+        assert!(creds.cert_chain.is_empty());
+    }
+
+    #[test]
+    fn chain_walk_orders_by_issuer_and_ignores_unrelated() {
+        let root_key = fresh_2048();
+        let int_key = fresh_2048();
+        let leaf_key = fresh_2048();
+        let unrelated_key = fresh_2048();
+        let root = build_cert(
+            "CN=zsn root",
+            "CN=zsn root",
+            &root_key,
+            &root_key,
+            present(),
+            None,
+        );
+        let int = build_cert(
+            "CN=zsn int",
+            "CN=zsn root",
+            &int_key,
+            &root_key,
+            present(),
+            None,
+        );
+        let leaf = build_cert(
+            "CN=zsn leaf",
+            "CN=zsn int",
+            &leaf_key,
+            &int_key,
+            present(),
+            None,
+        );
+        let unrelated = build_cert(
+            "CN=zsn unrelated",
+            "CN=zsn unrelated",
+            &unrelated_key,
+            &unrelated_key,
+            present(),
+            None,
+        );
+        let chain =
+            build_chain_from_leaf(&leaf, vec![unrelated.clone(), int.clone(), root.clone()]);
+        assert_eq!(chain.len(), 2, "walk stops at the self-signed root");
+        assert_eq!(
+            chain[0].tbs_certificate.subject,
+            int.tbs_certificate.subject
+        );
+        assert_eq!(
+            chain[1].tbs_certificate.subject,
+            root.tbs_certificate.subject
+        );
+    }
+
+    #[test]
+    fn self_signed_leaf_yields_empty_chain() {
+        let k = fresh_2048();
+        let leaf = build_cert("CN=zsn self", "CN=zsn self", &k, &k, present(), None);
+        assert!(build_chain_from_leaf(&leaf, vec![]).is_empty());
+    }
+
+    #[test]
+    fn wwdr_issuer_injects_missing_intermediate_and_root() {
+        let k = fresh_2048();
+        let leaf = build_cert(
+            "CN=zsn wwdr leaf",
+            "OU=G3,CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
+            &k,
+            &k,
+            present(),
+            None,
+        );
+        let chain = build_chain_from_leaf(&leaf, vec![]);
+        assert_eq!(chain.len(), 2, "embedded WWDR intermediate + Apple Root");
+        assert!(chain[0]
+            .tbs_certificate
+            .subject
+            .to_string()
+            .contains("Apple Worldwide Developer Relations"));
+        assert_eq!(
+            extract_subject_cn(&chain[1]).as_deref(),
+            Some("Apple Root CA"),
+            "the embedded Apple Root CA completes the chain"
+        );
+    }
+
+    #[test]
+    fn provided_chain_is_completed_without_duplicates() {
+        let root_key = fresh_2048();
+        let int_key = fresh_2048();
+        let leaf_key = fresh_2048();
+        let root = build_cert(
+            "CN=Apple Root CA",
+            "CN=Apple Root CA",
+            &root_key,
+            &root_key,
+            present(),
+            None,
+        );
+        let int = build_cert(
+            "CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
+            "CN=Apple Root CA",
+            &int_key,
+            &root_key,
+            present(),
+            None,
+        );
+        let leaf = build_cert(
+            "CN=zsn full chain leaf",
+            "CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
+            &leaf_key,
+            &int_key,
+            present(),
+            None,
+        );
+        // Provided chain already has WWDR + Root: nothing injected, nothing duplicated.
+        let chain = build_chain_from_leaf(&leaf, vec![root.clone(), int.clone()]);
+        assert_eq!(chain.len(), 2, "nothing injected or duplicated");
+        assert_eq!(
+            chain[0].tbs_certificate.subject, int.tbs_certificate.subject,
+            "walk starts at the WWDR intermediate"
+        );
+        assert_eq!(
+            chain[1].tbs_certificate.subject, root.tbs_certificate.subject,
+            "walk continues to the provided root"
+        );
     }
 }
