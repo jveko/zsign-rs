@@ -64,8 +64,10 @@ The browser-facing signing surface is unsafe in five ways and untested in one:
   returns `false` only for excluded paths (main executable, `_CodeSignature`,
   exclusions).
 - Credentials/fixtures:
-  - PKCS#12 creation does not exist anywhere in the repo; `from_p12` is
-    decode-only and performs no validity/clock check (cert.rs:202).
+  - PKCS#12 creation has no Rust API anywhere; the only p12 creation in-repo
+    is openssl invocations in `scripts/verify-apple-interop.sh` (CI runtime,
+    never committed). `from_p12` is decode-only and performs no
+    validity/clock check (cert.rs:202).
   - 9 throwaway p12 fixtures are git-**tracked** under
     `crates/zsign-core/src/crypto/fixtures/`, but their cert is
     `CN=zsign-test-fixture`, `CA:TRUE`, **no EKU** — not Leaf-shaped, so they
@@ -76,6 +78,16 @@ The browser-facing signing surface is unsafe in five ways and untested in one:
     sign → `zsign_core::codesign::verify::parse_superblob` (pub) →
     `verify_code_signature_with_anchors(..., TrustAnchors::from_certificates(
     vec![creds.certificate.clone()]))` (cms_verify.rs:295, 330). All pub.
+    Caveat verified against the signer: that helper's `cd_sha1=None` argument
+    is only correct for SHA-256-only output (which zsign's own tests sign —
+    macho/verify.rs:352-355). Dual output has a SHA-1 primary in slot 0
+    (CMS-signed) and a SHA-256 alternate (superblob.rs:37-41, 544-557; the CMS
+    content is the primary — signer.rs:515), and its CDHash-v1 attribute
+    carries `[sha1, truncated-sha256]`, so verification must pass the SHA-1
+    digest of the SHA-1 CD and the SHA-256 digest of the SHA-256 CD
+    (cms_verify.rs:897-900; signer.rs:508-526). The lane's test helper derives
+    both from `is_sha1()` slot classification (§ Fixture strategy), correct for
+    both layouts.
   - All existing in-crate credential builders are `#[cfg(test)]`-private;
     `x509-cert`'s `builder` feature is only enabled in other crates'
     dev-deps. Generating credentials at test runtime would need new dev-deps
@@ -162,8 +174,13 @@ When it lands, step 3 above can be replaced by the per-slice call.
 Candidates:
 
 - **A (picked): `set_entitlements(data: Option<Vec<u8>>) -> Result<()>`.**
-  `Some(bytes)` = validated override (must parse as a plist dictionary, size
-  ≤ plist limit, else `ZSIGN_INVALID_ENTITLEMENTS`); `None` = clear the
+  `Some(bytes)` = validated override: (a) size ≤ plist limit — oversize fails
+  the item-3 guard with `ZSIGN_INPUT_TOO_LARGE` (not this setter's code);
+  (b) parses as a plist dictionary; (c) is DER-encodable by the signer —
+  the setter runs `zsign_core::codesign::der::plist_to_der` (pub, der.rs:230)
+  so types the signer's encoder refuses at signing time (Data/Date/Real,
+  der.rs:176-188) are rejected up front with `ZSIGN_INVALID_ENTITLEMENTS`
+  instead of failing later under a different code. `None` = clear the
   override so the profile-derived value applies again.
 - B: setter replaces a single stored field wholesale. Rejected: clearing loses
   the profile-derived value forever, breaking the documented fallback.
@@ -239,6 +256,10 @@ Candidates:
   - `is_final` as the first and only call → legitimate single-chunk stream,
     finalize and seal (preserved behavior);
   - non-final first chunk → open a stream;
+  - sealing happens only when `add_file` actually stores the entry: excluded
+    paths (main executable, `_CodeSignature`, exclusion rules — the only
+    causes of a `false` return, code_resources.rs:334-345) keep their old
+    always-false, re-callable no-op behavior and are never sealed;
   - `build_code_resources` keeps its unfinished-stream guard
     (`ZSIGN_UNFINISHED_HASHES`, message unchanged);
   - `reset_resources` clears active streams, sealed paths, and the builder —
@@ -298,7 +319,7 @@ core variant fails to compile until categorized:
 | `EncryptedBinary` | `ZSIGN_ENCRYPTED_BINARY` | `Error::EncryptedBinary` |
 | `SigningFailed` | `ZSIGN_SIGNING_FAILED` | `Error::Signing` |
 | `InvalidCertificate` | `ZSIGN_INVALID_CERTIFICATE` | `Error::Certificate` |
-| `InvalidPassword` | `ZSIGN_INVALID_PASSWORD` | `Error::InvalidPassword` |
+| `InvalidPassword` | `ZSIGN_INVALID_PASSWORD` | constructor classifier: `from_p12` failures whose message contains `invalid PKCS#12 password (MAC mismatch)` (see below) |
 | `MissingCredentials` | `ZSIGN_MISSING_CREDENTIALS` | `Error::MissingCredentials` |
 | `Config` | `ZSIGN_CONFIG` | `Error::Config` |
 | `InvalidProfile` | `ZSIGN_INVALID_PROFILE` | `Error::ProvisioningProfile` |
@@ -317,6 +338,20 @@ The full table is documented in the crate-level doc comment of `lib.rs` —
 that doc is the public contract; codes only change across major versions.
 Existing message texts are preserved verbatim (the brief's requirement);
 new guards introduce new messages.
+
+Wrong-password classification (mechanics): `SigningCredentials::from_p12`
+wraps every `extract_p12` failure — including the wrong-password MAC
+failure — as `Error::Certificate` (cert.rs:203-205), and core never
+constructs `Error::InvalidPassword` (error.rs:19-20 has no producer). The
+wasm constructor therefore classifies `from_p12` errors before falling back
+to the generic mapping: a message containing `invalid PKCS#12 password (MAC
+mismatch)` (P12Error::Mac's Display, pkcs12.rs:79) yields
+`ZSIGN_INVALID_PASSWORD`; everything else yields the variant-derived code.
+This is deterministic for all supported p12 variants — core's own tests
+prove wrong passwords fail the MAC check (pkcs12.rs:895-907) — and fails
+safe (a future message change degrades to `ZSIGN_INVALID_CERTIFICATE`, the
+test guarding it goes red). The exhaustive `match` still maps
+`Error::InvalidPassword` for completeness.
 
 ### Item 6 — test suite
 
@@ -366,20 +401,21 @@ Test matrix (what each covers):
 | wrong password | wasm-only | throws, `code == ZSIGN_INVALID_PASSWORD`, message non-empty |
 | bad profile bytes | wasm-only | `code == ZSIGN_INVALID_PROFILE` |
 | entitlements setter: set/clear/fallback | dual (+ wasm-only for invalid) | effective getter before/after; invalid plist → `ZSIGN_INVALID_ENTITLEMENTS` |
-| size guards: `ensure_size` boundaries | dual | limit, limit+1 for each constant, correct code + message contains surface name |
-| size guard wiring (cheap surfaces) | wasm-only | constructor over `MAX_P12_BYTES` → `ZSIGN_INPUT_TOO_LARGE` before p12 parsing |
+| size guards: `ensure_size` boundaries | Ok side dual, Err side wasm-only | every constant at limit (Ok) and limit+1 (`ZSIGN_INPUT_TOO_LARGE`, message contains surface name) — no large allocations, `len` is a plain parameter |
+| size guard wiring (cheap surfaces) | wasm-only | constructor over `MAX_P12_BYTES`, `parse_info_plist` over `MAX_PLIST_BYTES`, `hash_file` over `MAX_HASH_BYTES` (129 MiB — the largest allocation kept in CI) → `ZSIGN_INPUT_TOO_LARGE` before parsing; the 513 MiB Mach-O case is covered by the boundary rows above |
 | chunk: continue/finalize | dual | built CodeResources digest == digest of full content (sha1+sha256) |
 | chunk: single-call finalize | dual | preserved behavior, entry present |
 | chunk: double finalize | wasm-only | `ZSIGN_PATH_ALREADY_FINALIZED` |
 | chunk: post-finalize chunk (interleave) | wasm-only | `ZSIGN_PATH_ALREADY_FINALIZED` (previously silent partial hash) |
 | `hash_file` vs active stream | wasm-only | `ZSIGN_PATH_IN_PROGRESS` |
+| excluded paths stay re-callable | dual | main-executable path: repeated `hash_file` returns `false` both times, never sealed, never throws |
 | build with unfinished stream | wasm-only | `ZSIGN_UNFINISHED_HASHES` (existing guard, now coded) |
-| reset clears seals | dual | after `reset_resources`, the path can be streamed again and builds |
-| sign round-trip thin (default) | dual | `sign_macho` output re-parses thin; superblob has exactly one CodeDirectory, SHA-256 hashType, no SHA-1 alternate; anchored CMS verify via `TrustAnchors::from_certificates` valid; pages/slots consistent via `verify_macho` |
-| sign round-trip dual via `sign_macho_fat` | dual | SHA-1 alternate CD present (dual), anchored verify valid — pins that `sign_macho_fat` behavior did not change |
+| reset clears seals | wasm-only | after `reset_resources()`, a sealed path can be hashed again and builds (the test also asserts the pre-reset throws) |
+| sign round-trip thin (default) | dual | `sign_macho` output re-parses thin; superblob has exactly one CodeDirectory (slot 0, SHA-256 hashType, no alternate); anchored CMS verify via `TrustAnchors::from_certificates` valid |
+| sign round-trip dual via `sign_macho_fat` | dual | dual layout present (SHA-1 primary in slot 0 + SHA-256 alternate, superblob.rs:544-557) and anchored verify valid with both CD digests — pins that `sign_macho_fat` behavior did not change |
 | FAT rejected by default | wasm-only | hand-built FAT → `ZSIGN_FAT_UNSUPPORTED`, message names `sign_macho_fat` |
 | adhoc round-trip | dual | `sign_macho_adhoc` (core, called from the test) + `verify_macho` → signed, adhoc, pages Matched, report valid |
-| dylib-style non-executable entitlements | dual | non-executable input gets `EMPTY_ENTITLEMENTS` special slot, not profile entitlements (pins the replication of `sign_any_macho` selection) |
+| dylib-style non-executable entitlements | dual | a non-executable input signs with the SAME entitlements special slot whether or not a profile is loaded (both use `EMPTY_ENTITLEMENTS`), while executable input's slot differs between profile/no-profile — pins the replication of `sign_any_macho`'s selection without depending on blob internals |
 | `parse_info_plist` XML + binary | wasm-only | bundle_id/executable values; absent keys → `""`; not-a-dictionary → `ZSIGN_INVALID_PLIST` |
 | error object contract | wasm-only | thrown value `instanceof Error`, `.code` string, `.message` unchanged text |
 
@@ -431,13 +467,23 @@ Behavioral changes:
 6. `hash_file_chunk` now throws `ZSIGN_INPUT_TOO_LARGE` per chunk above
    128 MiB and `ZSIGN_PATH_ALREADY_FINALIZED` after finalize (previously
    silently re-seeded a fresh digest). Return stays undefined.
-7. Re-hashing any path in the same round now requires `reset_resources()`.
+7. NEW size guards `ZSIGN_INPUT_TOO_LARGE` on every byte input, checked
+   before any parse: constructor `p12_bytes` (4 MiB) and `profile_bytes`
+   (16 MiB), `extract_entitlements` (16 MiB), `parse_info_plist` (16 MiB),
+   `set_entitlements` (16 MiB), `parse_macho`/`sign_macho`/`sign_macho_fat`
+   data (512 MiB) plus `sign_macho`/`sign_macho_fat` `info_plist` and
+   `code_resources` (16 MiB each). Messages state surface, size, limit, and
+   remedy. String arguments are not length-checked (deliberate, § item 3).
+8. Re-hashing any path in the same round now requires `reset_resources()`.
+   Excluded paths (never stored) keep their old re-callable no-op behavior.
 
 Known consumer impact (from the scout, for the lane-41 brief):
 
 - `examples/web/src/main.js:367` hashes every bundle resource with no
   per-file catch — a >128 MiB resource now aborts the run at :538. Lane 41
   should size-gate that loop or route large files to `hash_file_chunk`.
+  `main.js:375` (`embedded.mobileprovision`) is subject to the same guard
+  (profiles are small — low risk — but it lacks a local catch too).
 - `examples/web` never calls bare `sign_macho`, so change (4) touches it only
   through docs; `sign_macho_fat` at :341/:394 keeps working unchanged.
 - Error `.code` adoption is optional; `e.message` handling stays valid.

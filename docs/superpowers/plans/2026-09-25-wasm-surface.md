@@ -42,11 +42,19 @@ Test fixtures are embedded/`include_bytes!` in the test module — tracked files
 - `LEAF_P12_B64` + `decode_base64()` — self-issued P-256 leaf p12 generated ONCE with the exact openssl commands in Task 1 Step 1 (CA:FALSE, digitalSignature, codeSigning EKU, `OU=ZSN40TEST`, password `test`). Mirrors fixture reality (`Profile::Leaf` + codeSigning EKU) without x509-cert dev-deps and without `Validity::from_now` (panics on wasm32). Validity must cover native now AND the wasm fixed verify epoch 2027-01-15 (cms_verify.rs:1359).
 - `MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin")` — tracked, thin arm64 MH_EXECUTE, 8192 B. If it turns out unsuitable for signing, build a minimal macho in the test module instead and log the deviation in the final report.
 - `PROFILE_XML: &str` — minimal provisioning-profile stand-in: XML plist containing an `Entitlements` dict (`get-task-allow` true + `application-identifier` string). `extract_entitlements_from_profile` (provisioning.rs:12-42) only requires `<?xml`, `</plist`, bounds, and re-serializes the `Entitlements` value.
-- `new_signer()` / `new_signer_with_profile()` helpers wrapping `WasmSigner::new`.
-- `anchored_verify(signed: &[u8], creds) -> CmsVerifyReport` — the fixture-reality recipe (crates/zsign/src/verify.rs:995-1011): locate the slice's code signature via `MachOFile::parse`, `zsign_core::codesign::verify::parse_superblob(&signed[off..off+size])`, then `zsign_core::crypto::cms_verify::verify_code_signature_with_anchors(sb.cms.unwrap(), cd.raw(), None, &cd.cdhash_sha256(), &TrustAnchors::from_certificates(vec![creds.certificate.clone()]))`. All pub.
-- `primary_cd(signed) -> (is_sha1, has_sha1_alternate)` helper inspecting the superblob — mirror the inspection in core's `test_sha256_only_signature_omits_sha1_code_directory` (signer.rs:955-1007): primary via `sb.code_directory`, alternates via `sb.alternate_code_directories`.
-- `error_code(err: &JsValue) -> Option<String>` — `js_sys::Reflect::get(err, &"code".into()).ok().and_then(|v| v.as_string())` (wasm-only use).
-- `build_fat_macho()` — hand-built FAT for the reject test: magic `0xcafebabe`, `nfat_arch = 2`, two big-endian `fat_arch` entries (cputype `0x0100000c` arm64, cpusubtype `0`, offset 4096/8192+... page-aligned past the 8+2×20-byte header, size = 8192, align `12`), payload = two copies of `MINIMAL_MACHO`. Only needs to parse (`MachOFile::parse`) — no FAT fixture exists in the repo.
+- `new_signer()` / `new_signer_with_profile()` helpers wrapping `WasmSigner::new` (profile fixture = `PROFILE_XML`).
+- Test-module imports (beyond `use super::*; use wasm_bindgen_test::*;`): explicit `use sha1::{Digest as _, Sha1}; use sha2::{Digest as _, Sha256};` — `use super::*` does not carry the parent's anonymous `Digest as _` imports, so the trait must be re-imported locally for `Sha1::digest(...)` to resolve.
+- `err_message(err: impl Into<JsValue>) -> String` — `JsValue::from(err).unchecked_into::<js_sys::Error>().message().into()`. `JsError` does not implement `JsCast` (wasm-bindgen lib.rs:1839-1870), so errors must go through `JsValue` first; the same helper keeps compiling after Task 5 (error type becomes `JsValue`, which also satisfies `Into<JsValue>`).
+- `anchored_verify(signed, creds)` = `anchored_verify_slice(signed, 0, creds)`; `anchored_verify_slice(signed, slice_idx, creds) -> CmsVerifyReport` — parse the slice's superblob (`MachOFile::parse` → signature offset = `slice.offset + code_sig_offset` → `zsign_core::codesign::verify::parse_superblob`), then locate BOTH code directories by hash type and call `verify_code_signature_with_anchors`:
+  - content = `primary.raw()` (the CMS signs the primary CD — signer.rs:515; superblob.rs:544-545);
+  - `cd_sha1` = `Some(Sha1::digest(sha1_cd.raw()))` when a SHA-1 CD exists (primary or alternate), else `None`;
+  - `cd_sha256` = `Sha256::digest(sha256_cd.raw())`;
+  - anchors = `TrustAnchors::from_certificates(vec![creds.certificate.clone()])`.
+  This mirrors the signer's CDHash v1/v2 attributes (signer.rs:508-526; cms_verify.rs:897-900) for BOTH layouts: dual = SHA-1 primary + SHA-256 alternate (superblob.rs:37-41, 546-557), sha256-only = single SHA-256 primary. Passing `None`/primary-only — as zsign's own recipe does (crates/zsign/src/verify.rs:1003-1011, correct only for sha256-only output) — fails dual output.
+- `cd_layout(signed) -> (bool, bool)` = `(has_sha1_cd, has_sha256_cd)` over primary + alternates via `is_sha1()` — pins "default output carries no SHA-1 CD" and "dual output carries both" without depending on which slot each occupies.
+- `entitlements_slot(signed) -> Option<Vec<u8>>` — primary CD's special slot −5 (`cd.special_slot_hash(5)`). Fallback if `special_slot_hash` is not visible cross-crate: read it from `cd.raw()` — `hash_offset` u32 at byte 16, `n_special_slots` u32 at byte 24, `hash_size` u8 at byte 36; slot −k spans `raw[hash_offset − k×hash_size ..][..hash_size]`.
+- `error_code(err: &JsValue) -> Option<String>` — `js_sys::Reflect::get(err, &"code".into()).ok().and_then(|v| v.as_string())` (defined with Task 5; wasm-only use).
+- `build_fat_macho()` — hand-built FAT for the reject and dual tests: magic `0xcafebabe`, `nfat_arch = 2`, two big-endian `fat_arch` entries (cputype `0x0100000c`, cpusubtype `0`, `offset0 = 4096`, `offset1 = 12288` (= 4096 + 8192, still 4096-aligned), `size = 8192` each, `align = 12`), payload = two NON-overlapping copies of `MINIMAL_MACHO`, total file size 20480. Overlapping offsets would make the second slice corrupt — `sign_macho_fat` signs both, so both must be intact. No FAT fixture exists in the repo.
 
 ---
 
@@ -82,6 +90,8 @@ Add to lib.rs:
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use sha1::{Digest as _, Sha1};
+    use sha2::{Digest as _, Sha256};
     use wasm_bindgen_test::*;
 
     const LEAF_P12_B64: &str = "<pasted base64>";
@@ -91,20 +101,55 @@ pub mod tests {
     const MINIMAL_MACHO: &[u8] =
         include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
 
+    const PROFILE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key><dict>
+    <key>get-task-allow</key><true/>
+    <key>application-identifier</key><string>ZSN40TEST.com.zsign.test</string>
+  </dict>
+</dict></plist>
+"#;
+
     fn new_signer() -> WasmSigner {
         WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", None).expect("fixture p12 loads")
     }
 
-    /// SHA-1 CodeDirectory presence in the embedded superblob.
-    fn sha1_cd_state(signed: &[u8]) -> (bool, bool) {
+    fn new_signer_with_profile() -> WasmSigner {
+        WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", Some(PROFILE_XML.as_bytes().to_vec()))
+            .expect("fixture p12 + profile load")
+    }
+
+    fn err_message(err: impl Into<JsValue>) -> String {
+        JsValue::from(err).unchecked_into::<js_sys::Error>().message().into()
+    }
+
+    /// (has_sha1_cd, has_sha256_cd) over primary + alternate code directories.
+    fn cd_layout(signed: &[u8]) -> (bool, bool) {
         let m = zsign_core::macho::MachOFile::parse(signed.to_vec()).unwrap();
         let sl = &m.slices()[0];
         let off = sl.offset as usize + sl.code_sig_offset.unwrap() as usize;
         let sb = zsign_core::codesign::verify::parse_superblob(
             &signed[off..off + sl.code_sig_size.unwrap() as usize]).unwrap();
-        let primary_is_sha1 = sb.code_directory.as_ref().unwrap().is_sha1();
-        let has_sha1_alternate = sb.alternate_code_directories.iter().any(|cd| cd.is_sha1());
-        (primary_is_sha1, has_sha1_alternate)
+        let mut sha1 = sb.code_directory.as_ref().unwrap().is_sha1();
+        let mut sha256 = !sha1;
+        for cd in &sb.alternate_code_directories {
+            sha1 |= cd.is_sha1();
+            sha256 |= !cd.is_sha1();
+        }
+        (sha1, sha256)
+    }
+
+    /// Primary CD's entitlements special slot (−5).
+    fn entitlements_slot(signed: &[u8]) -> Option<Vec<u8>> {
+        let m = zsign_core::macho::MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let off = sl.offset as usize + sl.code_sig_offset.unwrap() as usize;
+        let sb = zsign_core::codesign::verify::parse_superblob(
+            &signed[off..off + sl.code_sig_size.unwrap() as usize]).unwrap();
+        sb.code_directory.as_ref().unwrap()
+            .special_slot_hash(5)
+            .map(|h| h.to_vec())
     }
 
     #[wasm_bindgen_test(unsupported = test)]
@@ -114,9 +159,9 @@ pub mod tests {
             .expect("thin sign succeeds");
         let m = zsign_core::macho::MachOFile::parse(signed.clone()).unwrap();
         assert_eq!(m.slices().len(), 1);
-        let (primary_is_sha1, has_sha1_alternate) = sha1_cd_state(&signed);
-        assert!(!primary_is_sha1, "default output must not lead with a SHA-1 CD");
-        assert!(!has_sha1_alternate, "default output must omit the SHA-1 CD entirely");
+        let (has_sha1, has_sha256) = cd_layout(&signed);
+        assert!(!has_sha1, "default output must carry no SHA-1 CodeDirectory");
+        assert!(has_sha256, "default output must carry the SHA-256 CodeDirectory");
         // signature still cryptographically valid under an injected anchor
         let report = anchored_verify(&signed, &new_signer().credentials);
         assert!(report.valid, "sha256-only signature must verify: {:?}", report.errors);
@@ -128,7 +173,7 @@ pub mod tests {
         let err = new_signer()
             .sign_macho(fat, "com.zsign.test", None, None)
             .expect_err("FAT rejected by default");
-        let msg = err.unchecked_into::<js_sys::Error>().message();
+        let msg = err_message(err);
         assert!(msg.contains("sign_macho_fat"), "error must name the dual opt-in: {msg}");
     }
 
@@ -138,8 +183,8 @@ pub mod tests {
         let thin = signer
             .sign_macho_fat(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None)
             .expect("thin dual sign");
-        let (p, a) = sha1_cd_state(&thin);
-        assert!(p || a, "dual output carries a SHA-1 CD");
+        let (has_sha1, has_sha256) = cd_layout(&thin);
+        assert!(has_sha1 && has_sha256, "dual output carries both CodeDirectories");
         assert!(anchored_verify(&thin, &signer.credentials).valid);
 
         let fat = signer
@@ -147,17 +192,39 @@ pub mod tests {
             .expect("FAT dual sign");
         let m = zsign_core::macho::MachOFile::parse(fat.clone()).unwrap();
         assert_eq!(m.slices().len(), 2);
-        assert!(anchored_verify_all_slices(&fat, &signer.credentials),
-            "every FAT slice verifies under the injected anchor");
+        for idx in 0..2 {
+            assert!(anchored_verify_slice(&fat, idx, &signer.credentials).valid,
+                "FAT slice {idx} must verify under the injected anchor");
+        }
+    }
+
+    /// Pins the executable/non-executable entitlements replication in
+    /// `sign_macho`: non-executable input must ignore profile entitlements
+    /// (EMPTY_ENTITLEMENTS both times), executable input must not. Passes on
+    /// the pre-change delegation; goes red if the replication is dropped.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn non_executable_input_ignores_profile_entitlements() {
+        let mut dylib = MINIMAL_MACHO.to_vec();
+        dylib[12..16].copy_from_slice(&6u32.to_le_bytes()); // MH_EXECUTE -> MH_DYLIB
+        let with = new_signer_with_profile();
+        let without = new_signer();
+        let a = with.sign_macho(dylib.clone(), "com.zsign.test", None, None).expect("sign");
+        let b = without.sign_macho(dylib.clone(), "com.zsign.test", None, None).expect("sign");
+        assert_eq!(entitlements_slot(&a), entitlements_slot(&b),
+            "non-executable input must ignore profile entitlements");
+        let c = with.sign_macho(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None).expect("sign");
+        let d = without.sign_macho(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None).expect("sign");
+        assert_ne!(entitlements_slot(&c), entitlements_slot(&d),
+            "executable input must carry the profile entitlements when loaded");
     }
 }
 ```
 
-Also add the scaffolding listed in "Shared test scaffolding" above (base64 decoder, `PROFILE_XML`, `anchored_verify`, `anchored_verify_all_slices` — same recipe per slice with `slice.offset` added to the signature offset, `error_code`, `build_fat_macho`).
+`anchored_verify`, `anchored_verify_slice`, and `build_fat_macho` are implemented per the "Shared test scaffolding" section (all self-contained, wasm-only-safe to call from dual tests since they build no error values). If `special_slot_hash` is not visible cross-crate, use the byte-layout fallback documented in the scaffolding section.
 
 - [ ] **Step 3: Run both gates, confirm red**
 
-`TMPDIR=$PWD/.tmptmp cargo test -p zsign-wasm` → `sign_macho_default_emits_sha256_only_for_thin_input` FAILS (output is dual) and `sign_macho_rejects_fat_input` FAILS (FAT accepted). `wasm-pack test --node crates/zsign-wasm` → same failures under node.
+`TMPDIR=$PWD/.tmptmp cargo test -p zsign-wasm` → `sign_macho_default_emits_sha256_only_for_thin_input` FAILS (output is dual) and `sign_macho_rejects_fat_input` FAILS (FAT accepted). The dual and non-executable tests pass pre-change — they are regression pins for the rewrite (they go red only if the task's implementation drops dual support or the entitlements replication). `wasm-pack test --node crates/zsign-wasm` → same failures under node.
 
 - [ ] **Step 4: Implement**
 
@@ -215,7 +282,7 @@ Update docs:
 
 - [ ] **Step 5: Gates green**
 
-Both gates pass (3 tests × 2 targets; wasm-only FAT test runs in the wasm-pack gate only).
+Both gates pass (4 tests; the wasm-only FAT test runs in the wasm-pack gate only, the other 3 run on both targets).
 
 - [ ] **Step 6: Commit**
 
@@ -232,7 +299,7 @@ Both gates pass (3 tests × 2 targets; wasm-only FAT test runs in the wasm-pack 
 - [ ] **Step 1: Write the failing tests (red)**
 
 ```rust
-    fn parse_dict(xml: &[u8]) -> std::collections::BTreeMap<String, plist::Value> {
+    fn parse_dict(xml: &[u8]) -> plist::Dictionary {
         let v: plist::Value = plist::from_bytes(xml).expect("fixture plist parses");
         v.as_dictionary().expect("top-level dict").clone()
     }
@@ -266,19 +333,29 @@ Both gates pass (3 tests × 2 targets; wasm-only FAT test runs in the wasm-pack 
     }
 
     #[wasm_bindgen_test]
-    fn entitlements_setter_rejects_non_plist_and_non_dictionary() {
+    fn entitlements_setter_rejects_invalid_input() {
         let mut signer = new_signer();
         let e1 = signer
             .set_entitlements(Some(b"not a plist".to_vec()))
             .expect_err("garbage rejected");
-        assert!(e1.unchecked_into::<js_sys::Error>().message().contains("plist dictionary"));
+        assert!(err_message(e1).contains("plist dictionary"));
 
         let arr = br#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><array><string>x</string></array></plist>"#;
         let e2 = signer
             .set_entitlements(Some(arr.to_vec()))
             .expect_err("non-dictionary rejected");
-        assert!(e2.unchecked_into::<js_sys::Error>().message().contains("dictionary"));
+        assert!(err_message(e2).contains("dictionary"));
+
+        // values the signer's DER encoder refuses (Data/Date/Real, der.rs:176-188)
+        // must fail at set time, not at sign time
+        let with_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>k</key><data>AA==</data></dict></plist>"#;
+        let e3 = signer
+            .set_entitlements(Some(with_data.to_vec()))
+            .expect_err("DER-unsupported value rejected");
+        let m3 = err_message(e3);
+        assert!(m3.contains("cannot encode"), "got: {m3}");
     }
 ```
 
@@ -306,11 +383,13 @@ Replace the getter (lib.rs:83-85) and add the setter + effective helper:
 
     /// Override the entitlements used for signing.
     ///
-    /// `Some(bytes)` must be an XML or binary plist dictionary — it replaces
-    /// the profile-derived entitlements until cleared. `None` clears the
-    /// override, falling back to the profile-derived entitlements. To sign
-    /// with no entitlements while holding a profile, construct the signer
-    /// without profile bytes instead.
+    /// `Some(bytes)` must be an XML or binary plist dictionary whose values
+    /// the signer can encode to DER (strings, booleans, integers, arrays,
+    /// dictionaries — Data/Date/Real are rejected here rather than at sign
+    /// time) — it replaces the profile-derived entitlements until cleared.
+    /// `None` clears the override, falling back to the profile-derived
+    /// entitlements. To sign with no entitlements while holding a profile,
+    /// construct the signer without profile bytes instead.
     pub fn set_entitlements(&mut self, data: Option<Vec<u8>>) -> Result<(), JsError> {
         match data {
             Some(bytes) => {
@@ -321,6 +400,9 @@ Replace the getter (lib.rs:83-85) and add the setter + effective helper:
                         "entitlements plist must contain a top-level dictionary",
                     ));
                 }
+                zsign_core::codesign::der::plist_to_der(&bytes).map_err(|e| {
+                    JsError::new(&format!("entitlements contain types the signer cannot encode: {e}"))
+                })?;
                 self.entitlements_override = Some(bytes);
             }
             None => self.entitlements_override = None,
@@ -352,59 +434,66 @@ Commit: `feat(zsign-wasm): add validated entitlements setter (ZSN-40)`
 - [ ] **Step 1: Write the failing tests (red)**
 
 ```rust
-    // Boundary: exactly at the limit passes the guard (fails later at p12
-    // parsing); one byte over fails with the size error. 4 MiB allocations
-    // are cheap; the Mach-O case allocates 513 MiB once per assertion.
+    // ensure_size boundaries: `len` is a plain parameter, so every constant
+    // is pinned without large allocations (the 513 MiB Mach-O case is never
+    // allocated in CI by design — design doc § item 3).
+    #[wasm_bindgen_test(unsupported = test)]
+    fn ensure_size_accepts_exactly_at_limit() {
+        for max in [MAX_P12_BYTES, MAX_HASH_BYTES, MAX_PLIST_BYTES, MAX_PROFILE_BYTES, MAX_MACHO_BYTES] {
+            assert!(ensure_size(max, max, "surface", "remedy").is_ok(), "at limit {max}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn ensure_size_rejects_one_byte_over_every_limit() {
+        for max in [MAX_P12_BYTES, MAX_HASH_BYTES, MAX_PLIST_BYTES, MAX_PROFILE_BYTES, MAX_MACHO_BYTES] {
+            let e = ensure_size(max + 1, max, "surface", "remedy").expect_err("over limit");
+            let msg = err_message(e);
+            assert!(msg.contains("too large") && msg.contains("surface"), "{msg}");
+        }
+    }
+
+    // Wiring: exactly at the limit passes the guard (and fails later at p12
+    // parsing); one byte over fails with the size error. 4 MiB allocations.
     #[wasm_bindgen_test]
     fn p12_size_boundary_is_enforced() {
         let at_limit = vec![0u8; MAX_P12_BYTES];
         let e = WasmSigner::new(&at_limit, "test", None).expect_err("garbage still fails parsing");
-        assert!(!e.unchecked_into::<js_sys::Error>().message().contains("too large"),
-            "exactly-at-limit input must pass the size guard");
+        let m = err_message(e);
+        assert!(!m.contains("too large"), "exactly-at-limit input must pass the size guard: {m}");
 
         let over = vec![0u8; MAX_P12_BYTES + 1];
         let e = WasmSigner::new(&over, "test", None).expect_err("oversize rejected");
-        let msg = e.unchecked_into::<js_sys::Error>().message();
+        let msg = err_message(e);
         assert!(msg.contains("too large") && msg.contains("4194304"), "{msg}");
-    }
-
-    #[wasm_bindgen_test]
-    fn macho_surfaces_reject_oversize_input() {
-        let over = vec![0u8; MAX_MACHO_BYTES + 1];
-        let e = WasmSigner::parse_macho(over.clone()).expect_err("parse guard");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("536870912"));
-        let e = new_signer()
-            .sign_macho(over, "com.zsign.test", None, None)
-            .expect_err("sign guard");
-        let msg = e.unchecked_into::<js_sys::Error>().message();
-        assert!(msg.contains("too large") && msg.contains("sign_macho"), "{msg}");
     }
 
     #[wasm_bindgen_test]
     fn hash_and_plist_surfaces_reject_oversize_input() {
         let mut signer = new_signer();
+        // 129 MiB — the largest allocation kept in CI (one transient chunk)
         let e = signer
             .hash_file("big.bin", &vec![0u8; MAX_HASH_BYTES + 1])
             .expect_err("hash guard");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("hash_file_chunk"),
+        assert!(err_message(e).contains("hash_file_chunk"),
             "remedy must name the streaming API");
 
         let e = signer
             .hash_file_chunk("big.bin", &vec![0u8; MAX_HASH_BYTES + 1], true)
             .expect_err("chunk guard");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("too large"));
+        assert!(err_message(e).contains("too large"));
 
         let e = WasmSigner::parse_info_plist(&vec![0u8; MAX_PLIST_BYTES + 1])
             .expect_err("plist guard");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("16777216"));
+        assert!(err_message(e).contains("16777216"));
 
         let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1])
             .expect_err("profile guard");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("too large"));
+        assert!(err_message(e).contains("too large"));
     }
 ```
 
-(These are the red tests: the constants do not exist yet, and none of the entry points check length.)
+(These are the red tests: the constants and `ensure_size` do not exist yet, and no entry point checks length. The Mach-O `data` surfaces get no >16 MiB integration test — their wiring is the same first-line `ensure_size` call, pinned at three other surfaces and at every constant boundary.)
 
 - [ ] **Step 2: Implement**
 
@@ -449,7 +538,7 @@ Insert guards as the FIRST statement of each entry point (before any parse/copy)
 | `hash_file_chunk` | signature `-> Result<(), JsError>` (state guards come in Task 4); first line `ensure_size(chunk.len(), MAX_HASH_BYTES, "hash_file_chunk", "send smaller chunks")?;` |
 | `extract_entitlements` | `ensure_size(profile_data.len(), MAX_PROFILE_BYTES, "extract_entitlements", "supply a smaller provisioning profile")?;` |
 | `parse_macho` | `ensure_size(data.len(), MAX_MACHO_BYTES, "parse_macho", "use the native zsign CLI for larger binaries")?;` |
-| `sign_macho` / `sign_macho_fat` | `ensure_size(data.len(), MAX_MACHO_BYTES, "sign_macho", "use the native zsign CLI for larger binaries")?;` (use the method's own name) |
+| `sign_macho` / `sign_macho_fat` | `ensure_size(data.len(), MAX_MACHO_BYTES, "<method name>", "use the native zsign CLI for larger binaries")?;` first, then for each optional param: `if let Some(pl) = &info_plist { ensure_size(pl.len(), MAX_PLIST_BYTES, "<method name> (info_plist)", "supply a smaller Info.plist")?; }` and `if let Some(cr) = &code_resources { ensure_size(cr.len(), MAX_PLIST_BYTES, "<method name> (code_resources)", "supply smaller CodeResources")?; }` (design § item 3 covers these two params) |
 | `parse_info_plist` | `ensure_size(data.len(), MAX_PLIST_BYTES, "parse_info_plist", "supply a smaller Info.plist")?;` |
 
 No size check on string inputs (`identifier`, paths, symlink targets, password) — deliberate, recorded in the design doc § item 3.
@@ -474,19 +563,21 @@ Both gates pass. The three oversize tests run wasm-only (they build error values
 - [ ] **Step 1: Write the failing tests (red)**
 
 ```rust
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    /// Parses built CodeResources and returns (files[rel].hash, files2[rel].hash2).
-    fn resource_digests(built: &[u8], rel: &str) -> (String, String) {
+    /// Reads the stored digests for `rel` from built CodeResources:
+    /// legacy `files` maps ordinary paths to raw SHA-1 Data; `files2` maps
+    /// them to a dict with `hash` (SHA-1) and `hash2` (SHA-256) Data
+    /// (code_resources.rs:412-452). Returns (sha1, sha256) bytes.
+    fn resource_digests(built: &[u8], rel: &str) -> (Vec<u8>, Vec<u8>) {
         let root: plist::Value = plist::from_bytes(built).expect("CodeResources is a plist");
         let dict = root.as_dictionary().expect("root dict");
-        let hash = dict["files"].as_dictionary().unwrap()[rel]["hash"]
-            .as_string().unwrap().to_string();
-        let hash2 = dict["files2"].as_dictionary().unwrap()[rel]["hash2"]
-            .as_string().unwrap().to_string();
-        (hash, hash2)
+        let files = dict.get("files").and_then(|v| v.as_dictionary()).expect("files dict");
+        let legacy = files.get(rel).and_then(|v| v.as_data())
+            .expect("legacy files maps ordinary paths to SHA-1 Data").to_vec();
+        let files2 = dict.get("files2").and_then(|v| v.as_dictionary()).expect("files2 dict");
+        let entry = files2.get(rel).and_then(|v| v.as_dictionary()).expect("files2 entry dict");
+        let modern = entry.get("hash2").and_then(|v| v.as_data())
+            .expect("files2 entry carries hash2 Data").to_vec();
+        (legacy, modern)
     }
 
     const CHUNK_A: &[u8] = b"first chunk of a large file ";
@@ -501,8 +592,8 @@ Both gates pass. The three oversize tests run wasm-only (they build error values
         let mut full = CHUNK_A.to_vec();
         full.extend_from_slice(CHUNK_B);
         let (h1, h2) = resource_digests(&built, "stream.bin");
-        assert_eq!(h1, hex(&sha1::Sha1::digest(&full)));
-        assert_eq!(h2, hex(&sha2::Sha256::digest(&full)));
+        assert_eq!(h1, Sha1::digest(&full).to_vec());
+        assert_eq!(h2, Sha256::digest(&full).to_vec());
     }
 
     #[wasm_bindgen_test(unsupported = test)]
@@ -517,11 +608,11 @@ Both gates pass. The three oversize tests run wasm-only (they build error values
         signer.hash_file_chunk("b.bin", b"B2", true).expect("b2 final");
         let built = signer.build_code_resources().expect("build");
         let (a1, a2) = resource_digests(&built, "a.bin");
-        assert_eq!(a1, hex(&sha1::Sha1::digest(b"A1A2")));
-        assert_eq!(a2, hex(&sha2::Sha256::digest(b"A1A2")));
+        assert_eq!(a1, Sha1::digest(b"A1A2").to_vec());
+        assert_eq!(a2, Sha256::digest(b"A1A2").to_vec());
         let (b1, b2) = resource_digests(&built, "b.bin");
-        assert_eq!(b1, hex(&sha1::Sha1::digest(b"B1B2")));
-        assert_eq!(b2, hex(&sha2::Sha256::digest(b"B1B2")));
+        assert_eq!(b1, Sha1::digest(b"B1B2").to_vec());
+        assert_eq!(b2, Sha256::digest(b"B1B2").to_vec());
     }
 
     #[wasm_bindgen_test]
@@ -531,17 +622,17 @@ Both gates pass. The three oversize tests run wasm-only (they build error values
 
         // double finalize (previously silently re-hashed just the 2nd call)
         let e = signer.hash_file_chunk("x.bin", b"more", true).expect_err("double finalize");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("reset_resources"));
+        assert!(err_message(e).contains("reset_resources"));
 
         // post-finalize chunk (previously seeded a fresh digest = silent partial hash)
         let e = signer.hash_file_chunk("x.bin", b"more", false).expect_err("post-finalize chunk");
-        let msg = e.unchecked_into::<js_sys::Error>().message();
+        let msg = err_message(e);
         assert!(msg.contains("already finalized") && msg.contains("reset_resources"), "{msg}");
 
         // build must not contain the corrupted partial content: only "data" was sealed
         let built = signer.build_code_resources().expect("sealed state still builds");
         let (h1, _) = resource_digests(&built, "x.bin");
-        assert_eq!(h1, hex(&sha1::Sha1::digest(b"data")));
+        assert_eq!(h1, Sha1::digest(b"data").to_vec());
     }
 
     #[wasm_bindgen_test]
@@ -549,24 +640,35 @@ Both gates pass. The three oversize tests run wasm-only (they build error values
         let mut signer = new_signer();
         signer.hash_file_chunk("y.bin", b"part", false).expect("stream open");
         let e = signer.hash_file("y.bin", b"direct").expect_err("active stream conflict");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("unfinished streaming hash"));
+        assert!(err_message(e).contains("unfinished streaming hash"));
 
         signer.hash_file_chunk("y.bin", b" rest", true).expect("finalize");
         let e = signer.hash_file("y.bin", b"direct").expect_err("sealed conflict");
-        let msg = e.unchecked_into::<js_sys::Error>().message();
+        let msg = err_message(e);
         assert!(msg.contains("already finalized") && msg.contains("reset_resources"), "{msg}");
 
         // unfinished-stream guard on build stays (stream z.bin never finalized)
         signer.hash_file_chunk("z.bin", b"open", false).expect("open");
         let e = signer.build_code_resources().expect_err("pending streams block build");
-        assert!(e.unchecked_into::<js_sys::Error>().message().contains("unfinished streaming hashes"));
+        assert!(err_message(e).contains("unfinished streaming hashes"));
 
         // reset_resources is the documented round boundary
         signer.reset_resources();
         signer.hash_file("y.bin", b"direct").expect("sealed path reusable after reset");
         let built = signer.build_code_resources().expect("clean build");
         let (h1, _) = resource_digests(&built, "y.bin");
-        assert_eq!(h1, hex(&sha1::Sha1::digest(b"direct")));
+        assert_eq!(h1, Sha1::digest(b"direct").to_vec());
+    }
+
+    /// Excluded paths (the main executable) are never stored and never
+    /// sealed: repeated `hash_file` calls keep returning `false` without
+    /// throwing — the pre-lane no-op behavior is preserved.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn excluded_paths_stay_recallable_noops() {
+        let mut signer = new_signer();
+        signer.set_main_executable("App");
+        assert!(!signer.hash_file("App", b"binary bytes").expect("first call ok"));
+        assert!(!signer.hash_file("App", b"binary bytes").expect("second call ok, not sealed"));
     }
 ```
 
@@ -591,7 +693,9 @@ Red check: `hash_file_chunk`/`hash_file` currently return `()`/`bool`, so `.expe
         }
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(data);
         let added = self.resource_builder.add_file(relative_path, sha1, sha256);
-        self.finalized_paths.insert(relative_path.to_string());
+        if added {
+            self.finalized_paths.insert(relative_path.to_string());
+        }
         Ok(added)
 ```
 
@@ -605,13 +709,14 @@ Red check: `hash_file_chunk`/`hash_file` currently return `()`/`bool`, so `.expe
         }
 ```
 
-  keep the existing `entry/or_insert → update → if is_final { remove, finalize, add_file }` flow, and after `add_file` insert the path into `finalized_paths`.
+  keep the existing `entry/or_insert → update → if is_final { remove, finalize }` flow, and on finalize seal the path **only when `add_file` stored it**:
+  `if self.resource_builder.add_file(relative_path, sha1, sha256) { self.finalized_paths.insert(relative_path.to_string()); }` — excluded paths are never stored, so they are never sealed (same rule as `hash_file`).
 - `build_code_resources`: no logic change (pending-stream guard and message stay verbatim).
-- Doc comments: `hash_file_chunk` documents the state machine — one stream per path per round; finalize seals the path; `is_final` on the first call is a legal single-chunk stream; sealed paths throw until `reset_resources()`; two non-final streams for the same path cannot be distinguished and merge (caller contract: one stream per path). `reset_resources` documents that it starts a new resources round (builder, active streams, and seals cleared). `add_symlink` doc notes it keeps last-wins duplicate semantics and sits outside the sealing machine.
+- Doc comments: `hash_file_chunk` documents the state machine — one stream per path per round; finalize seals the stored path; `is_final` on the first call is a legal single-chunk stream; sealed paths throw until `reset_resources()`; excluded paths (never stored) stay re-callable; two non-final streams for the same path cannot be distinguished and merge (caller contract: one stream per path). `reset_resources` documents that it starts a new resources round (builder, active streams, and seals cleared). `add_symlink` doc notes it keeps last-wins duplicate semantics and sits outside the sealing machine.
 
 - [ ] **Step 3: Gates green, commit**
 
-Both gates pass (3 dual + 2 wasm-only tests added).
+Both gates pass (4 dual + 2 wasm-only tests added).
 Commit: `fix(zsign-wasm): seal code-resources paths against stream interleaving (ZSN-40)`
 
 ---
@@ -641,7 +746,8 @@ Commit: `fix(zsign-wasm): seal code-resources paths against stream interleaving 
             .expect_err("fat input");
         assert_eq!(error_code(&e), Some("ZSIGN_FAT_UNSUPPORTED".into()));
 
-        let e = WasmSigner::parse_macho(vec![0u8; MAX_MACHO_BYTES + 1]).expect_err("oversize");
+        let e = WasmSigner::new(&vec![0u8; MAX_P12_BYTES + 1], "test", None)
+            .expect_err("oversize");
         assert_eq!(error_code(&e), Some("ZSIGN_INPUT_TOO_LARGE".into()));
 
         let mut signer = new_signer();
@@ -659,9 +765,8 @@ Commit: `fix(zsign-wasm): seal code-resources paths against stream interleaving 
         assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PLIST".into()));
 
         // the thrown value is a real Error with a non-empty message
-        let as_error = js_sys::Error::from(e);
-        assert!(as_error.is_instance_of::<js_sys::Error>());
-        assert!(!as_error.message().is_empty());
+        assert!(e.is_instance_of::<js_sys::Error>());
+        assert!(!err_message(e).is_empty());
     }
 ```
 
@@ -753,13 +858,27 @@ fn core_err(e: zsign_core::Error) -> JsValue {
     let code = code_for_core_error(&e);
     js_err(code, e)
 }
+
+/// `from_p12` wraps every PKCS#12 failure — including the wrong-password MAC
+/// failure — as `Error::Certificate` (crypto/cert.rs:203-205); the MAC
+/// mismatch Display text (crypto/pkcs12.rs:79) is the only surviving
+/// wrong-password signal, and core's own tests prove wrong passwords fail
+/// the MAC check (pkcs12.rs:895-907). Anything else keeps the generic code.
+fn p12_err(e: zsign_core::Error) -> JsValue {
+    let code = if e.to_string().contains("invalid PKCS#12 password (MAC mismatch)") {
+        WasmErrorCode::InvalidPassword
+    } else {
+        code_for_core_error(&e)
+    };
+    js_err(code, e)
+}
 ```
 
 - [ ] **Step 3: Migrate every error site (clean cutover, no residue)**
 
 - Change every `Result<T, JsError>` in the file to `Result<T, JsValue>` (`new`, `set_entitlements`, `hash_file`, `hash_file_chunk`, `build_code_resources`, `extract_entitlements`, `parse_macho`, `sign_macho`, `sign_macho_fat`, `parse_info_plist`).
 - `ensure_size` returns `Result<(), JsValue>`; its `Err` becomes `js_err(WasmErrorCode::InputTooLarge, format!(...))` with the same message text.
-- `.map_err(|e| JsError::new(&e.to_string()))` over core results → `.map_err(core_err)` (constructor ×2, build, extract, parse ×2, sign ×2).
+- `.map_err(|e| JsError::new(&e.to_string()))` over core results → `.map_err(core_err)` — EXCEPT the constructor's `from_p12` call, which becomes `.map_err(p12_err)` (wrong-password classification); the constructor's profile-extract call stays `.map_err(core_err)`. Other sites: build, extract, parse ×2, sign ×2.
 - Synthetic errors: unfinished-streams guard → `js_err(WasmErrorCode::UnfinishedHashes, <verbatim existing format!>)`; FAT reject → `js_err(WasmErrorCode::FatUnsupported, <same message>)`; `hash_file` active-stream guard → `PathInProgress`; both "already finalized" guards → `PathAlreadyFinalized`; setter validation branches → `InvalidEntitlements` (keep both message texts); `parse_info_plist` parse/not-dict → `InvalidPlist` (messages verbatim); `Reflect::set` failures → `Internal` (messages verbatim).
 - Grep self-check: after migration, `grep -c JsError crates/zsign-wasm/src/lib.rs` must be 0 (the `prelude::*` import stays).
 - Crate doc: append an "## Error codes" section with the full `ZSIGN_*` table (from the design doc § item 5) and the sentence: match on `error.code`; `error.message` is human-facing and may change.
@@ -822,23 +941,6 @@ Commit: `feat(zsign-wasm): throw errors with stable zsign codes (ZSN-40)`
         assert!(report.is_valid(), "adhoc round-trip must verify: {:?}", slice.errors);
     }
 
-    #[wasm_bindgen_test(unsupported = test)]
-    fn non_executable_input_gets_empty_entitlements_not_profile() {
-        // minimal_macho with the filetype header patched from MH_EXECUTE (2)
-        // to MH_DYLIB (6) — a thin non-executable slice
-        let mut dylib = MINIMAL_MACHO.to_vec();
-        dylib[12..16].copy_from_slice(&6u32.to_le_bytes());
-        let signer = new_signer_with_profile();
-        let signed = signer.sign_macho(dylib, "com.zsign.test", None, None)
-            .expect("dylib signs");
-        let cd = primary_code_directory(&signed);
-        let slot = cd.special_slot_hash(5).expect("entitlements slot present");
-        // special slot must be the EMPTY entitlements digest, not the profile's
-        let empty = zsign_core::macho::EMPTY_ENTITLEMENTS;
-        assert_eq!(slot.as_slice(), sha2::Sha256::digest(empty).as_slice());
-        assert_ne!(slot.as_slice(), sha2::Sha256::digest(&signer.entitlements().unwrap()).as_slice());
-    }
-
     #[wasm_bindgen_test]
     fn parse_info_plist_handles_xml_binary_absent_keys_and_bad_input() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -873,10 +975,8 @@ Commit: `feat(zsign-wasm): throw errors with stable zsign codes (ZSN-40)`
 ```
 
 Notes for the implementer:
-- `PROFILE_XML`'s `application-identifier` value is `ZSN40TEST.com.zsign.test` (team prefix + identifier) — build the fixture exactly so.
-- `special_slot_hash(5)` is the DER/plain entitlements slot (`CSSLOT_ENTITLEMENTS`); if its exact slot number or return type differs, mirror how core's own tests read special slots (signer.rs / verify.rs special-slot assertions) and keep the same two digest assertions.
+- The non-executable/entitlements pin lives in Task 1 (comparison form — it must not depend on blob internals); do not re-add a slot-bytes test here.
 - `plist::to_writer_binary` is the binary serializer in plist 1.x; if the exact name differs (`plist::to_writer` with binary format), use the crate's binary writer — assert `buf.starts_with(b"bplist00")` first if unsure.
-- If patching the filetype byte does not survive `MachOFile::parse`, build the smallest valid `MH_DYLIB` in the test module (same layout, filetype 6) and record the deviation in the final report.
 
 - [ ] **Step 2: Run red, implement any failures, gates green**
 
@@ -901,5 +1001,6 @@ The wasm-pack run is job-equivalent to `.github/workflows/ci.yml:96` and must sh
 ## Self-review record
 
 - Spec coverage: design §2 item 1 → Task 1; item 2 → Task 2; item 3 → Task 3; item 4 → Task 4; item 5 → Task 5; item 6 test matrix → Tasks 1-6 (each row maps to a named test above; rows for wrong-password/bad-profile codes land in Tasks 5-6, parse_info_plist rows in Task 6).
-- Placeholders: the only deferred decisions are explicitly-logged fallbacks (macho fixture suitability, `special_slot_hash` shape, binary-plist writer name) — each has a primary instruction and a fallback, no TBDs.
-- Type consistency: `effective_entitlements()` is the single reader from Task 2 on; `ensure_size` is the only size check; `js_err`/`core_err` are the only error constructors from Task 5 on; `Result<T, JsValue>` is uniform after Task 5.
+- Placeholders: the only deferred decisions are explicitly-logged fallbacks (macho fixture suitability, `special_slot_hash` visibility byte-layout fallback, binary-plist writer name) — each has a primary instruction and a fallback, no TBDs.
+- Type consistency: `effective_entitlements()` is the single reader from Task 2 on; `ensure_size` is the only size check; `js_err`/`core_err`/`p12_err` are the only error constructors from Task 5 on; `Result<T, JsValue>` is uniform after Task 5; test helpers are `err_message`, `cd_layout`, `anchored_verify`/`anchored_verify_slice`, `entitlements_slot`, `resource_digests`, `parse_dict` (→ `plist::Dictionary`), `error_code`, `build_fat_macho` — no other helper names appear.
+- Round-1 cold-review findings B1-B15 are addressed in the design doc (§ evidence, items 2/4/5, matrix, API delta) and in this plan (Task 1-6 edits); round 2 re-review confirms.
