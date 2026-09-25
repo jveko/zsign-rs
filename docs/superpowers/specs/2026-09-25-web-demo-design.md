@@ -589,7 +589,10 @@ Notes:
 - The write pass runs only after every bundle sealed successfully (fail-closed: no
   output exists on error).
 - `loadIpa` uses `findAppRoot` + `assertArchiveWithinLimits` (limits added by Task 9)
-  for early UX errors but performs no signing state; `signIpa` re-derives everything
+  for early UX errors but performs no signing state, and catches wasm-ready
+  root-plist parse failures itself (`ZSIGN_INVALID_PLIST` logged via `fmtErr`, reader
+  closed, replacement IPA left unselected — inside its own try, since its handlers
+  fire-and-forget it); `signIpa` re-derives everything
   from its own reader (no shared mutable discovery state beyond `wasmReady`).
 
 ### 3.3 Error model
