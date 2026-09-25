@@ -460,6 +460,20 @@ working the moment bundle resolution does.
 - **D9 — `ensure_single_app_bundle` keeps its `.app`-only check.** It
   validates `Payload/` root selection (exactly one root `.app`), which is
   not nested-code recognition.
+- **D10 — Verify-leg contract (supervisor AMEND refinement).** For
+  non-executable round-trips: the adhoc entry carries the strict
+  `is_valid()` proof for the no-slot-5 criterion (adhoc output bypasses
+  certificate gating); identity-signed entries copy
+  `verify_signed_binary_round_trip` (`macho/verify.rs:948-980`) verbatim —
+  signed/`!adhoc`/identifier/pages Matched/exactly one anchor error/cms
+  signature+message_digest+cdhash+chain ok — using Leaf+codeSigning-EKU
+  fixtures (`macho/fixtures.rs:360-399`; `test_util::test_credentials`
+  upgraded to the same shape for ipa-level tests); item 2 applies the same
+  pins one level up per binary with structural-only bundle pins and **no
+  report-level `valid()` assertion**. `cms_report_with_test_anchor`
+  (`crates/zsign/src/verify.rs:991`, private to that test module) remains
+  the available full valid+anchored proof but is not needed by these
+  tests.
 
 ## 5. Invariants
 
@@ -505,20 +519,26 @@ plist. For each output assert, via `parse_superblob` on the
 `code_sig_offset/size` region: no entry with `slot == 0x0005` and none with
 `0x0007` (no entitlements blob), the primary CD's
 `special_slot_hash(5)` (via `sb.code_directory.as_ref().expect("primary CD")`)
-is `None` or all-zero (slot −5 unbound). Verify leg (choice recorded per
-supervisor): the **adhoc entry carries the strict `is_valid()` proof** —
+is `None` or all-zero (slot −5 unbound). Verify legs (supervisor AMEND
+refinement): the **adhoc entry carries the strict `is_valid()` proof** —
 adhoc output carries no certificate and bypasses certificate gating
 (`macho/verify.rs:405-406`), so `verify_macho` must report zero errors
 (the item-1 "still verifies via the existing verify path" criterion;
 empirically confirmed for a non-executable with no entitlements slot); the
-three identity-signed entries are **dual-pinned** per the
-`macho/verify.rs:952-965` pattern: `report` not valid, and the credential
-gate is the *only* failure (`slice.errors.len() == 1`, the fixture leaf's
-missing codeSigning EKU — a string already pinned in-tree by
-`codesign/cms_verify.rs` tests). Rejected alternative: plumbing the
-private `cms_report_with_test_anchor` helper out of the verify tests to
-force full validity on credentialed entries — cross-module churn, no extra
-proof. Pre-fix: RED on every entry (empty or real dict bound into −5).
+three identity-signed entries copy **`verify_signed_binary_round_trip`
+(`macho/verify.rs:948-980`, verified — body at `:951-981`)** verbatim:
+`signed`, `!adhoc`, identifier, `pages == Matched`, exactly one error equal
+to the anchor message, and `cms.signature_ok && message_digest_ok &&
+cdhash_v1_ok && cdhash_v2_ok && chain_ok` with `!anchored`. That pattern
+requires a Leaf+codeSigning-EKU leaf, so the test uses the shared
+`macho/fixtures.rs:360-399 test_signing_credentials` rather than the signer
+tests' local `Profile::Root` helper (an EKU-less leaf trips
+`cms_verify.rs:1601-1607` before the anchor gate). The companion full
+valid+anchored helper `cms_report_with_test_anchor` sits at
+`crates/zsign/src/verify.rs:991` (supervisor cite `:909` drifted) and is
+private to that test module — not used; the adhoc leg is the recorded
+choice for the no-slot-5 criterion. Pre-fix: RED on every entry (empty or
+real dict bound into −5).
 The strengthened WASM pin
 (`non_executable_input_ignores_profile_entitlements`) additionally asserts
 `entitlements_slot(&a) == None` instead of only `a == b`.
@@ -541,12 +561,20 @@ assert on `Frameworks/libfoo.dylib`:
 4. discovery seam: `find_immediate_macho_binaries(&app, &set)` where `set`
    is built from `find_standalone_dylibs` excludes the dylib (mirrors the
    `:1671` precedent);
-5. `verify_bundle(&app)` **dual-pin** (the `verify.rs:1105-1127`
-   `signed_bundle_verifies` contract): identity-signed output is
-   credential-gated, so "ipa sign→verify passes" = bundle-level errors
-   empty + `code_resources.valid()` + every binary's only failure is the
-   single fixture credential-gate error — any structural defect (pages,
-   slots, sealing) would add a second error or flip these assertions.
+5. `verify_bundle(&app)` **per-binary pins, one level up from
+   `verify_signed_binary_round_trip` (`macho/verify.rs:948-980`)**: each
+   binary's only failure is the anchor message, with `signed`,
+   `pages == Matched`, and `cms.signature_ok && message_digest_ok &&
+   cdhash_v1_ok && cdhash_v2_ok && chain_ok` — any structural defect
+   (pages, slots, sealing) would add a second error or flip these pins.
+   Bundle-level pins stay structural only (errors empty,
+   `code_resources.valid()`); **no report-level `valid()` assertion**
+   (supervisor AMEND refinement). Enabled by Step 2.1's fixture upgrade:
+   `test_util::test_credentials` becomes self-issued `Profile::Leaf` +
+   codeSigning EKU (the standing fixture-credential convention; no
+   existing test pins the old `Profile::Root`/no-EKU shape — verified by
+   grep: every anchor/EKU pin lives in `verify.rs` tests using their own
+   `local_test_credentials`).
 
 Pre-fix RED comes from assertion 2 (single CD — empirically confirmed:
 the dylib's SuperBlob has no `0x1000` today) — assertion 4's parameter

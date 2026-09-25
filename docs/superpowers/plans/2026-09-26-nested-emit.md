@@ -44,8 +44,10 @@ what a change obsoletes; migrate every caller.
 - [ ] **Step 1.1: Write the failing test**
 
 Add to the `#[cfg(test)]` tests module of
-`crates/zsign-core/src/macho/signer.rs` (reuses that module's existing
-`test_credentials()` helper, as at `signer.rs:1158`):
+`crates/zsign-core/src/macho/signer.rs` (the shared Leaf+EKU fixture
+`crate::macho::fixtures::test_signing_credentials()` — NOT that module's
+local `test_credentials()` helper, which is `Profile::Root` without the
+codeSigning EKU and would trip the EKU gate instead of the anchor gate):
 
 ```rust
 #[test]
@@ -88,11 +90,14 @@ fn test_non_executable_signing_carries_no_entitlements() {
     }
 
     let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_dylib()).unwrap();
-    let creds = test_credentials();
+    // Leaf + codeSigning EKU fixture (macho/fixtures.rs:360-399) — the
+    // shared macho-test credentials. EKU is required for the identity
+    // entries to reach the anchor gate the dual-pin pattern below pins.
+    let creds = crate::macho::fixtures::test_signing_credentials();
 
     // Adhoc entry: strict verify leg — adhoc output carries no certificate,
     // so "still verifies via the existing verify path" means report.is_valid()
-    // with zero errors (empirically true for this fixture shape).
+    // with zero errors (empirically confirmed for this fixture shape).
     let signed = sign_macho_adhoc(&macho, "com.zsign.dylib", Some(ENT), None, None, false).unwrap();
     assert_no_entitlements(&signed, "sign_macho_adhoc");
     let report = verify(&signed);
@@ -102,13 +107,10 @@ fn test_non_executable_signing_carries_no_entitlements() {
         report.slices[0].errors
     );
 
-    // Credential-signed entries: dual-pin contract (the macho/verify.rs
-    // verify_signed_binary_round_trip pattern) — identity output can never
-    // pass strict verify, so pin that the credential gate is the ONLY
-    // problem: exactly one error, the fixture leaf's missing codeSigning
-    // EKU (Profile::Root test cert; the string itself is in-tree-pinned at
-    // codesign/cms_verify.rs). Re-litigating the fixture cert shape is out
-    // of scope here — the structural claim is errors.len() == 1.
+    // Identity-signed entries: copy verify_signed_binary_round_trip
+    // (macho/verify.rs:948-980) verbatim — signed + !adhoc + identifier +
+    // pages Matched + cms signature/message_digest/cdhash/chain each ok,
+    // with the ONLY allowed error being the anchor message.
     let gated: [(&str, Vec<u8>); 3] = [
         (
             "sign_macho",
@@ -128,20 +130,34 @@ fn test_non_executable_signing_carries_no_entitlements() {
     for (via, signed) in gated {
         assert_no_entitlements(&signed, via);
         let report = verify(&signed);
-        assert!(!report.is_valid(), "{via}: fixture must stay credential-gated");
+        assert!(!report.is_valid(), "{via}: fixture must stay anchor-gated");
         let slice = &report.slices[0];
         assert!(slice.signed, "{via}: output must carry a signature");
+        assert!(!slice.adhoc, "{via}: credential-signed output must not be ad-hoc");
+        assert_eq!(slice.identifier.as_deref(), Some("com.zsign.dylib"), "{via}");
+        assert_eq!(
+            slice.pages,
+            crate::codesign::verify::PageCheck::Matched,
+            "{via}: page hashes must match"
+        );
         assert_eq!(
             slice.errors.len(),
             1,
-            "{via}: only the credential gate may fail, got {:?}",
+            "{via}: only the anchor gate may fail, got {:?}",
             slice.errors
         );
         assert!(
-            slice.errors[0].contains("leaf lacks codeSigning EKU extension"),
+            slice.errors[0].contains("not anchored to a trusted root"),
             "{via}: unexpected gate: {}",
             slice.errors[0]
         );
+        let cms = slice.cms.as_ref().expect("CMS report");
+        assert!(
+            cms.signature_ok && cms.message_digest_ok && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok && cms.chain_ok,
+            "{via}: cms: {cms:?}"
+        );
+        assert!(!cms.anchored, "{via}: not anchored without an injected root");
     }
 }
 ```
@@ -159,18 +175,29 @@ sites (`macho/verify.rs:937`).
 — always bind `sb.code_directory.as_ref().expect("primary CD")` first, as
 `crates/zsign/src/verify.rs:1002` does.
 
-Verify-leg design (recorded per supervisor ruling): the **adhoc entry
-carries the strict `is_valid()` proof** for item 1's "still verifies via
-the existing verify path" criterion — adhoc slices bypass certificate
-gating entirely (`macho/verify.rs:405-406` substitutes the adhoc CMS
-report), so strict validity is achievable and was empirically confirmed
-for a non-executable signed with no entitlements slot. Identity-signed
-output is structurally verified via the repo's dual-pin contract instead
-(`macho/verify.rs:952-965`: all problems must collapse to the single
-credential gate). Rejected alternative: reusing the verify.rs test-module
-helper `cms_report_with_test_anchor` to force full validity on
-credentialed entries — it is private to that test module and plumbing it
-across modules is churn with no extra proof value.
+Verify-leg design (supervisor AMEND refinement): the **adhoc entry carries
+the strict `is_valid()` proof** for item 1's "still verifies via the
+existing verify path" criterion — adhoc slices bypass certificate gating
+entirely (`macho/verify.rs:405-406` substitutes the adhoc CMS report), so
+strict validity is achievable and was empirically confirmed for a
+non-executable signed with no entitlements slot. The identity-signed
+entries copy **`verify_signed_binary_round_trip`
+(`crates/zsign-core/src/macho/verify.rs:948-980`, citation verified — the
+test body sits at `:951-981` in current source)** verbatim: `signed`,
+`!adhoc`, identifier, `pages == Matched`, exactly one error equal to the
+anchor message, and `cms.signature_ok && message_digest_ok && cdhash_v1_ok
+&& cdhash_v2_ok && chain_ok` with `!anchored` — which is why the test
+uses the Leaf+codeSigning-EKU fixture
+(`macho/fixtures.rs:360-399`, `test_signing_credentials`) instead of the
+signer tests' local `Profile::Root` helper (an EKU-gated leaf trips a
+different error before the anchor gate; verified at
+`codesign/cms_verify.rs:1601-1607`). The companion full valid+anchored
+proof helper `cms_report_with_test_anchor` was located at
+`crates/zsign/src/verify.rs:991` (the supervisor's `:909` cite has
+drifted) and is **private to that test module** — not used here: the
+adhoc leg already carries the strict proof for this criterion, and
+plumbing a verify-tests private across modules is churn with no extra
+proof value (the recorded rejected alternative).
 
 - [ ] **Step 1.2: Run the test to verify it fails**
 
@@ -299,15 +326,17 @@ reports a fmt fix, let it restage and complete the commit).
 ### Task 2: IPA — standalone dylibs signed exactly once
 
 **Files:**
-- Modify: `crates/zsign/src/test_util.rs` (new fixture helper)
+- Modify: `crates/zsign/src/test_util.rs` (MH_DYLIB fixture helper +
+  credential fixture upgrade — Step 2.1)
 - Modify: `crates/zsign/src/ipa/mod.rs`
   (`sign_bundle` ~:368-404, `sign_single_bundle` ~:684-747,
   `find_immediate_macho_binaries` ~:752-789, tests from ~:1106)
 - Test: same file, `#[cfg(test)]` module in `ipa/mod.rs`
 
-- [ ] **Step 2.1: Add the MH_DYLIB fixture helper**
+- [ ] **Step 2.1: Add the MH_DYLIB fixture helper and upgrade the
+  credential fixture**
 
-Append to `crates/zsign/src/test_util.rs` (modeled on
+Append the dylib helper to `crates/zsign/src/test_util.rs` (modeled on
 `minimal_macho_encrypted` at `:14-27`):
 
 ```rust
@@ -318,6 +347,46 @@ pub(crate) fn minimal_dylib() -> Vec<u8> {
     data
 }
 ```
+
+Then upgrade `test_credentials()` (`test_util.rs:29-`): replace
+`Profile::Root` (`:49`) with a self-issued `Profile::Leaf` and add the
+codeSigning EKU — this is the standing fixture-credential convention
+(leaf must carry `1.3.6.1.5.5.7.3.3` so verification reaches the anchor
+gate, the gate every dual-pin test in this repo pins), and it is what the
+verify tests' `local_test_credentials` (`verify.rs:963-980`) already do:
+
+```rust
+    let mut builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: subject.clone(),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        serial,
+        validity,
+        subject,
+        pub_key,
+        &signing_key,
+    )
+    .unwrap();
+    builder
+        .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
+            x509_cert::oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+        ]))
+        .unwrap();
+    let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+```
+
+Keep subject (`CN=zsign test,OU=TESTTEAM`), serial `7`, and
+`team_id: Some("TESTTEAM")` unchanged; add
+`use x509_cert::ext::pkix::ExtendedKeyUsage;` (and the OID import path
+the crate already uses — check `verify.rs:977-979` for the exact form and
+mirror it). Blast-radius check (verified by grep before writing this
+plan): no existing test pins the `Profile::Root`/no-EKU shape — every
+anchor/EKU pin in `crates/zsign` lives in `verify.rs` tests that build
+their own `local_test_credentials`, and all other consumers
+(ipa/builder tests) only sign and assert sign success. The scoped gates
+in Step 2.6 re-run those suites anyway.
 
 - [ ] **Step 2.2: Write the failing end-to-end test (old API)**
 
@@ -368,19 +437,15 @@ fn test_standalone_dylib_signed_exactly_once() {
         "no entitlements blob may be applied to a dylib"
     );
 
-    // Dual-pin contract (the verify.rs signed_bundle_verifies pattern): the
-    // bundle is identity-signed with the shared Profile::Root test cert, so
-    // report.valid() is credential-gated by construction. "sign→verify
-    // passes" therefore means: bundle-level errors empty, CodeResources
-    // sealed and re-hashed correctly, and every binary's ONLY failure is the
-    // fixture credential gate (exactly one error). Any structural defect —
-    // broken pages, unbound slots, bad sealing — would add a second error or
-    // flip these assertions.
+    // Per-binary pins, one level up from verify_signed_binary_round_trip
+    // (macho/verify.rs:948-980): identity-signed output is anchor-gated, so
+    // "sign→verify passes" = each binary's ONLY failure is the anchor
+    // message, with signed + pages Matched + cms signature/message_digest/
+    // cdhash/chain each ok — any structural defect (pages, slots, sealing)
+    // would add a second error or flip these pins. No report-level
+    // valid() assertion (supervisor AMEND refinement); bundle-level pins
+    // stay structural: no bundle errors and a sealed CodeResources.
     let report = crate::verify::verify_bundle(&app).expect("verify must run");
-    assert!(
-        !report.valid(),
-        "identity-signed bundle must be credential-gated, not silently invalid"
-    );
     let bundle = report.bundle.as_ref().expect("bundle verification");
     assert!(
         bundle.errors.is_empty(),
@@ -404,18 +469,46 @@ fn test_standalone_dylib_signed_exactly_once() {
             .as_ref()
             .unwrap_or_else(|| panic!("Mach-O report for {}", binary.path))
             .slices[0];
+        assert!(
+            slice.signed,
+            "{}: output must carry a signature",
+            binary.path
+        );
+        assert!(
+            !slice.adhoc,
+            "{}: credential-signed output must not be ad-hoc",
+            binary.path
+        );
+        assert_eq!(
+            slice.pages,
+            zsign_core::codesign::verify::PageCheck::Matched,
+            "{}: page hashes must match",
+            binary.path
+        );
         assert_eq!(
             slice.errors.len(),
             1,
-            "{}: only the credential gate may fail, got {:?}",
+            "{}: only the anchor gate may fail, got {:?}",
             binary.path,
             slice.errors
         );
         assert!(
-            slice.errors[0].contains("leaf lacks codeSigning EKU extension"),
+            slice.errors[0].contains("not anchored to a trusted root"),
             "{}: unexpected gate: {}",
             binary.path,
             slice.errors[0]
+        );
+        let cms = slice.cms.as_ref().expect("CMS report");
+        assert!(
+            cms.signature_ok && cms.message_digest_ok && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok && cms.chain_ok,
+            "{}: cms: {cms:?}",
+            binary.path
+        );
+        assert!(
+            !cms.anchored,
+            "{}: not anchored without an injected root",
+            binary.path
         );
     }
 }
@@ -429,10 +522,13 @@ SHA-1+SHA-256 entries (`sign_standalone_dylib` → `sign_macho`,
 single-CD path (`sign_binary` → `sign_macho_sha256_only`, `:1039`). Any
 second pass destroys the `0x1000` alternate CD. (Pre-change state
 empirically confirmed: a `Frameworks/libfoo.dylib` under this exact fixture
-signs with `has_alt_cd=false` today, so Step 2.3's red is real.) The EKU
-gate string is the in-tree-pinned credential-gate message for Profile::Root
-fixtures (`codesign/cms_verify.rs` pins `leaf lacks codeSigning EKU` in
-its own tests).
+signs with `has_alt_cd=false` today, so Step 2.3's red is real.) After the
+Step 2.1 credential upgrade (Leaf + codeSigning EKU) the per-binary gate
+is the anchor message — the same string pinned by
+`verify_signed_binary_round_trip` and, for the sha256-only path this
+signer uses by default, by the single-binary round trip at
+`crates/zsign/src/verify.rs:1232-1245` (`errors.len() == 1` +
+`contains("not anchored to a trusted root")`).
 
 - [ ] **Step 2.3: Run the test to verify it fails**
 
@@ -1001,8 +1097,8 @@ orchestrator lands the branch with `wt merge --no-squash`.
 
 | Ticket acceptance | Proof |
 |---|---|
-| 1. MH_DYLIB asserts neither slot −5 nor an entitlements blob; still verifies via the existing verify path; new MH_DYLIB round-trip | `test_non_executable_signing_carries_no_entitlements` — four entries × (no `0x0005`/`0x0007` child, unbound −5); strict `verify_macho().is_valid()` on the adhoc entry (adhoc output is not certificate-gated); the three identity-signed entries dual-pinned to exactly one credential-gate error (`macho/verify.rs:952-965` pattern) |
-| 2. `Frameworks/*.dylib` under a root `.app` signed once, identifier stable, main-app entitlements never applied, ipa sign→verify passes | `test_standalone_dylib_signed_exactly_once` — identifier `libfoo`, surviving dual CD (`0x1000`) as the signed-once discriminator, no `0x0005`, `verify_bundle` dual-pin (bundle errors empty + CodeResources valid + every binary's only failure the fixture credential gate — the `verify.rs:1105-1127` pattern); discovery seam locked by the migrated `test_symlinked_dylib_is_skipped_and_target_untouched` |
+| 1. MH_DYLIB asserts neither slot −5 nor an entitlements blob; still verifies via the existing verify path; new MH_DYLIB round-trip | `test_non_executable_signing_carries_no_entitlements` — four entries × (no `0x0005`/`0x0007` child, unbound −5); strict `verify_macho().is_valid()` on the adhoc entry (adhoc output is not certificate-gated); the three identity-signed entries pin `verify_signed_binary_round_trip` verbatim (`macho/verify.rs:948-980`: signed, `!adhoc`, identifier, pages Matched, exactly one anchor error, cms signature/message_digest/cdhash/chain ok) using the Leaf+EKU fixture |
+| 2. `Frameworks/*.dylib` under a root `.app` signed once, identifier stable, main-app entitlements never applied, ipa sign→verify passes | `test_standalone_dylib_signed_exactly_once` — identifier `libfoo`, surviving dual CD (`0x1000`) as the signed-once discriminator, no `0x0005`; per-binary anchor pins one level up from `macho/verify.rs:948-980` (signed, pages Matched, exactly one anchor error, cms ok) plus structural bundle pins (errors empty, CodeResources valid) with **no report-level `valid()` assert**; discovery seam locked by the migrated `test_symlinked_dylib_is_skipped_and_target_untouched` |
 | 3. XPC-service-shaped fixture discovered and signed with bundle relationship intact; extension whitelist no longer the sole predicate | `test_xpc_service_is_discovered_and_signed_as_nested_bundle` — `.xpc` ∉ whitelist yet collected at depth 1, own `_CodeSignature/CodeResources`, bundle-id identifier, Info.plist slot −1 bound, no entitlements, verifier recognizes the same bundle (`nested[0].path`), adhoc strict `verify_bundle().valid()` |
 
 Empirical pre-verification (throwaway probe, run during the amend cycle and
@@ -1011,11 +1107,14 @@ nested `.framework` reaches `verify_bundle().valid() == true`; (b) an
 adhoc-signed dylib with no entitlements slot reaches
 `verify_macho().is_valid() == true` with zero errors; (c) a
 credentialed-signer dylib today has no `0x1000` alternate CD (the Task 2
-red is real) and its verify errors collapse to exactly
-`["leaf lacks codeSigning EKU extension"]`; (d) a credentialed folder
-bundle yields empty bundle errors, `cr.valid()`, and one credential-gate
-error per binary (CMS signature/digest/cdhash checks true, chain/anchoring
-false).
+red is real); (d) a credentialed folder bundle yields empty bundle errors,
+`cr.valid()`, and exactly one credential-gate error per binary with CMS
+signature/digest/cdhash checks true. Caveat recorded for honesty: (d)'s
+gate string was the EKU message because the probe ran against the
+pre-upgrade `Profile::Root` fixture — after Step 2.1's Leaf+EKU upgrade
+the gate becomes the anchor message with `chain_ok = true`, which is the
+shape every dual-pin test in this repo pins; probe items (a), (b), (c)
+are unaffected by the upgrade.
 
 Known coverage limit (recorded): no provisioning-profile fixture exists in
 this workspace, so the item-2 test runs with `entitlements = None` on both
