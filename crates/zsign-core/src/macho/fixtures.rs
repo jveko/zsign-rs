@@ -96,6 +96,15 @@ pub(crate) fn make_minimal_macho_text_vmsize_pad() -> Vec<u8> {
     b[64..72].copy_from_slice(&0x2000u64.to_le_bytes());
     b
 }
+
+/// `make_minimal_macho` shape with `filetype = MH_DYLIB` (offset 12..16 of
+/// `mach_header_64`), for non-executable flag-lock tests.
+pub fn make_minimal_dylib() -> Vec<u8> {
+    let mut data = make_minimal_macho();
+    data[12..16].copy_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
+    data
+}
+
 /// `make_minimal_macho` extended with an existing LC_CODE_SIGNATURE whose
 /// `slot_len`-byte slot begins at 0x2000 (inside `__LINKEDIT`, whose filesize
 /// covers the slot), filled with 0xAA. Builds a parseable already-signed image.

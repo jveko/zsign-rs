@@ -127,11 +127,15 @@ pub struct ArchSlice {
     /// Size of the existing code signature, if present.
     pub code_sig_size: Option<u32>,
     /// File-backed size of the `__TEXT` segment (`filesize`, excluding
-    /// zero-fill — used for `execSegLimit` in code signing).
+    /// zero-fill) — the `execSegLimit` value and the `text_segment_filesize`
+    /// member of the fileoff/filesize rider pair.
     pub text_segment_size: u64,
-    /// Base virtual address of the `__TEXT` segment (used for
-    /// `execSegBase` in code signing).
+    /// Base virtual address of `__TEXT` (vmaddr — consumed by the verifier's
+    /// exact-match arm; NOT emitted as execSegBase).
     pub text_segment_base: u64,
+    /// File offset of the `__TEXT` segment (slice-relative). Emitted as
+    /// `execSegBase` per Apple convention (`machorep.cpp`: `__TEXT.fileoff`).
+    pub text_segment_fileoff: u64,
     /// Length of code to be signed: the existing signature start
     /// (`LC_CODE_SIGNATURE.dataoff`), or the full declared size for unsigned
     /// slices (thin: whole file).
@@ -236,6 +240,7 @@ impl MachOFile {
         let mut code_sig_size = None;
         let mut text_segment_size = 0u64;
         let mut text_segment_base = 0u64;
+        let mut text_segment_fileoff = 0u64;
         let mut encryption = None;
 
         let mut meta_code_sig_cmd = None;
@@ -272,6 +277,7 @@ impl MachOFile {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.filesize;
                         text_segment_base = seg.vmaddr;
+                        text_segment_fileoff = seg.fileoff;
                     }
                     if seg.segname.starts_with(b"__LINKEDIT") {
                         meta_linkedit_cmd =
@@ -285,6 +291,7 @@ impl MachOFile {
                     if seg.segname.starts_with(b"__TEXT") {
                         text_segment_size = seg.filesize as u64;
                         text_segment_base = seg.vmaddr as u64;
+                        text_segment_fileoff = seg.fileoff as u64;
                     }
                     if seg.fileoff > 0
                         && seg.filesize > 0
@@ -356,6 +363,7 @@ impl MachOFile {
             code_sig_size,
             text_segment_size,
             text_segment_base,
+            text_segment_fileoff,
             code_length,
             metadata: MachOMetadata {
                 code_sig_cmd: meta_code_sig_cmd,
@@ -800,6 +808,24 @@ mod tests {
         assert_eq!(
             slice.size, declared,
             "declared arch size must include the tail"
+        );
+    }
+
+    #[test]
+    fn test_text_segment_fileoff_is_exposed() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho()).unwrap();
+        let slice = &macho.slices()[0];
+        assert_eq!(
+            slice.text_segment_fileoff, 0x1000,
+            "__TEXT fileoff of the fixture"
+        );
+        assert_eq!(
+            slice.text_segment_base, 0x1_0000_0000,
+            "vmaddr arm stays for the verifier"
+        );
+        assert_eq!(
+            slice.text_segment_size, 0x1000,
+            "file-backed size (the filesize rider field)"
         );
     }
 }

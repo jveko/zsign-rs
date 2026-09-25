@@ -485,6 +485,7 @@ fn sign_slice_complete(
                 )?),
                 text_segment_size: slice.text_segment_size,
                 text_segment_base: slice.text_segment_base,
+                text_segment_fileoff: slice.text_segment_fileoff,
                 code_length: slice.code_length,
                 metadata: updated_metadata.clone(),
                 encryption: slice.encryption,
@@ -617,6 +618,7 @@ fn sign_slice_complete(
                     )?),
                     text_segment_size: slice.text_segment_size,
                     text_segment_base: slice.text_segment_base,
+                    text_segment_fileoff: slice.text_segment_fileoff,
                     code_length: slice.code_length,
                     metadata: updated_metadata.clone(),
                     encryption: slice.encryption,
@@ -869,7 +871,7 @@ fn build_code_directory_from_hashes(
     let mut builder = CodeDirectoryBuilder::new(identifier, code)
         .requirements_hash(requirements_hash.to_vec())
         .flags(if ctx.adhoc { CS_ADHOC } else { 0 })
-        .exec_seg_base(slice.text_segment_base)
+        .exec_seg_base(slice.text_segment_fileoff)
         .exec_seg_limit(slice.text_segment_size)
         .exec_seg_flags(exec_seg_flags);
 
@@ -1608,7 +1610,8 @@ mod tests {
         // Executable segment fields (v0x20400).
         let exec_seg_base = u64::from_be_bytes(cd[64..72].try_into().unwrap());
         let exec_seg_limit = u64::from_be_bytes(cd[72..80].try_into().unwrap());
-        assert_eq!(exec_seg_base, 0x1_0000_0000, "exec segment base");
+        // Apple emits __TEXT.fileoff, not vmaddr
+        assert_eq!(exec_seg_base, 0x1000, "exec segment base");
         assert_eq!(exec_seg_limit, 0x1000, "exec segment limit");
 
         // Team identifier (v0x20200+).
@@ -1641,5 +1644,70 @@ mod tests {
         }
         assert_eq!(hashes, manual, "code-page hashes must verify");
         seen
+    }
+
+    /// Returns the raw bytes of the primary (first) CodeDirectory in an
+    /// embedded superblob: `CSSLOT_CODEDIRECTORY` is type 0 in the entry table.
+    fn primary_code_directory(blob: &[u8]) -> Vec<u8> {
+        let count = read_u32(blob, 8) as usize;
+        for e in 0..count {
+            let typ = read_u32(blob, 12 + e * 8);
+            let off = read_u32(blob, 12 + e * 8 + 4) as usize;
+            if typ == crate::codesign::constants::CSSLOT_CODEDIRECTORY {
+                return blob[off..].to_vec();
+            }
+        }
+        panic!("primary CodeDirectory present");
+    }
+
+    #[test]
+    fn test_exec_seg_main_binary_and_fileoff_base_on_every_fat_slice() {
+        let mut b = make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        let fat = make_fat_macho(&[make_minimal_macho(), b], &[12, 12]);
+        let macho = MachOFile::parse(fat).unwrap();
+        let creds = test_credentials();
+        let signed =
+            sign_any_macho(&macho, "com.zsign.execseg", None, &creds, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        assert_eq!(m.slices().len(), 2);
+        for (i, slice) in m.slices().iter().enumerate() {
+            let sig = slice.code_sig_offset.expect("signed") as usize;
+            let size = slice.code_sig_size.expect("signed size") as usize;
+            let blob = &signed[slice.offset + sig..slice.offset + sig + size];
+            let cd = primary_code_directory(blob);
+            let base = u64::from_be_bytes(cd[64..72].try_into().unwrap());
+            let limit = u64::from_be_bytes(cd[72..80].try_into().unwrap());
+            let flags = u64::from_be_bytes(cd[80..88].try_into().unwrap());
+            assert_eq!(
+                base, slice.text_segment_fileoff,
+                "slice {i}: execSegBase must be __TEXT fileoff (Apple convention), got {base:#x}"
+            );
+            assert_eq!(
+                limit, slice.text_segment_size,
+                "slice {i}: execSegLimit stays __TEXT.filesize"
+            );
+            assert_ne!(
+                flags & 0x1,
+                0,
+                "slice {i}: CS_EXECSEG_MAIN_BINARY must be set on every MH_EXECUTE slice"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exec_seg_flags_zero_for_non_executable() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_dylib()).unwrap();
+        let signed = sign_macho_adhoc(&macho, "com.zsign.dylib", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig = sl.code_sig_offset.expect("signed") as usize;
+        let blob = &signed[sig..sig + sl.code_sig_size.expect("size") as usize];
+        let cd = primary_code_directory(blob);
+        let flags = u64::from_be_bytes(cd[80..88].try_into().unwrap());
+        assert_eq!(
+            flags, 0,
+            "non-executables must not claim CS_EXECSEG_MAIN_BINARY"
+        ); // contract lock
     }
 }
