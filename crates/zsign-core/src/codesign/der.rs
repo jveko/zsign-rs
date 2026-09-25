@@ -209,7 +209,15 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
             output.push(if *b { 0xff } else { 0x00 });
         }
         Value::Integer(i) => {
-            let val = i.as_signed().unwrap_or(0) as u64;
+            let val = match i.as_signed() {
+                Some(v) => v as u64,
+                None => {
+                    return Err(Error::DerEncoding(format!(
+                        "integer value {} is outside the i64 range",
+                        i
+                    )));
+                }
+            };
             output.push(DER_TAG_INTEGER);
 
             if val == 0 {
@@ -300,6 +308,7 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
 /// - The XML plist cannot be parsed
 /// - The resulting DER encoding is empty
 /// - An unsupported plist type is encountered (Real)
+/// - An integer value lies outside the i64 range
 ///
 /// # Examples
 ///
@@ -578,5 +587,24 @@ mod tests {
 </dict>
 </plist>"#;
         assert_eq!(plist_to_der(flipped).unwrap(), der);
+    }
+
+    #[test]
+    fn test_plist_to_der_rejects_out_of_i64_integer() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>huge</key>
+    <integer>18446744073709551615</integer>
+</dict>
+</plist>"#;
+        let err = plist_to_der(xml).unwrap_err();
+        match err {
+            Error::DerEncoding(msg) => {
+                assert!(msg.contains("18446744073709551615"), "message: {msg}")
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 }
