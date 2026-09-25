@@ -9,8 +9,9 @@
 
 use crate::codesign::constants::*;
 use crate::codesign::verify::{
-    check_code_pages, check_special_slots, der_entitlements_to_plist, parse_superblob,
-    CodeDirectory, PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
+    check_code_pages, check_special_slots, der_entitlements_to_plist, parse_requirements,
+    parse_superblob, CodeDirectory, PageCheck, RequirementContext, RequirementVerdict,
+    SignatureInputs, SpecialSlotCheck, SuperBlob,
 };
 use crate::Result;
 use sha1::Sha1;
@@ -377,28 +378,28 @@ fn verify_slice(
                     .errors
                     .push("empty CMS wrapper but not ad-hoc flagged".into());
             }
-            return Ok(report);
-        }
-
-        let (cd_sha1, cd_sha256_opt) = cdhash_pair(&cds);
-        match cd_sha256_opt {
-            None => report.errors.push(
-                "CMS signature present but no SHA-256 CodeDirectory to bind CDHash v2".to_string(),
-            ),
-            Some(cd_sha256) => {
-                match crate::crypto::cms_verify::verify_code_signature(
-                    cms_blob,
-                    primary.raw(),
-                    cd_sha1.as_ref(),
-                    &cd_sha256,
-                ) {
-                    Ok(cms_report) => {
-                        if !cms_report.valid {
-                            report.errors.extend(cms_report.errors.clone());
+        } else {
+            let (cd_sha1, cd_sha256_opt) = cdhash_pair(&cds);
+            match cd_sha256_opt {
+                None => report.errors.push(
+                    "CMS signature present but no SHA-256 CodeDirectory to bind CDHash v2"
+                        .to_string(),
+                ),
+                Some(cd_sha256) => {
+                    match crate::crypto::cms_verify::verify_code_signature(
+                        cms_blob,
+                        primary.raw(),
+                        cd_sha1.as_ref(),
+                        &cd_sha256,
+                    ) {
+                        Ok(cms_report) => {
+                            if !cms_report.valid {
+                                report.errors.extend(cms_report.errors.clone());
+                            }
+                            report.cms = Some(cms_report);
                         }
-                        report.cms = Some(cms_report);
+                        Err(e) => report.errors.push(format!("CMS verification error: {e}")),
                     }
-                    Err(e) => report.errors.push(format!("CMS verification error: {e}")),
                 }
             }
         }
@@ -408,6 +409,52 @@ fn verify_slice(
         report
             .errors
             .push("no CMS signature slot but not ad-hoc flagged".into());
+    }
+
+    if let Some(req) = superblob
+        .entries
+        .iter()
+        .find(|entry| entry.slot == CSSLOT_REQUIREMENTS)
+    {
+        match parse_requirements(req.blob) {
+            Err(e) => report
+                .errors
+                .push(format!("malformed requirements blob: {e}")),
+            Ok(set) => {
+                if let Some(dr) = set.designated() {
+                    let cdhashes: Vec<Vec<u8>> = cds
+                        .iter()
+                        .map(|cd| {
+                            let digest: Vec<u8> = match cd.hash_type {
+                                1 => Sha1::digest(cd.raw()).to_vec(),
+                                _ => Sha256::digest(cd.raw()).to_vec(),
+                            };
+                            digest[..digest.len().min(20)].to_vec()
+                        })
+                        .collect();
+                    let refs: Vec<&[u8]> = cdhashes.iter().map(Vec::as_slice).collect();
+                    let anchored = report
+                        .cms
+                        .as_ref()
+                        .filter(|cms| !cms.no_signature)
+                        .map(|cms| cms.anchored);
+                    let context = RequirementContext {
+                        identifier: primary.identifier(),
+                        cdhashes: &refs,
+                        anchored,
+                    };
+                    match dr.evaluate(&context) {
+                        RequirementVerdict::Violated => report
+                            .errors
+                            .push("designated requirement not satisfied".to_string()),
+                        RequirementVerdict::Unsupported(why) => report
+                            .warnings
+                            .push(format!("designated requirement not fully evaluated: {why}")),
+                        RequirementVerdict::Satisfied => {}
+                    }
+                }
+            }
+        }
     }
 
     Ok(report)
@@ -503,8 +550,9 @@ mod tests {
 
     use super::*;
     use crate::codesign::constants::{
-        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY,
-        CSSLOT_DER_ENTITLEMENTS, CSSLOT_SIGNATURESLOT,
+        CSMAGIC_EMBEDDED_SIGNATURE, CSMAGIC_REQUIREMENT, CSMAGIC_REQUIREMENTS,
+        CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_DER_ENTITLEMENTS,
+        CSSLOT_REQUIREMENTS, CSSLOT_SIGNATURESLOT,
     };
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
@@ -637,6 +685,111 @@ mod tests {
             assert_eq!(bytes.len(), hash_size);
             signed[start..start + hash_size].copy_from_slice(&bytes);
         }
+    }
+
+    fn ident_dr_blob(name: &str) -> Vec<u8> {
+        let mut expr = 2u32.to_be_bytes().to_vec(); // opIdent
+        expr.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        expr.extend_from_slice(name.as_bytes());
+        while expr.len() % 4 != 0 {
+            expr.push(0);
+        }
+        let child_len = 12 + expr.len();
+        let total = 0x14 + child_len;
+        let mut b = Vec::with_capacity(total);
+        b.extend_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&3u32.to_be_bytes()); // CSREQ_DESIGNATED
+        b.extend_from_slice(&0x14u32.to_be_bytes());
+        b.extend_from_slice(&CSMAGIC_REQUIREMENT.to_be_bytes());
+        b.extend_from_slice(&(child_len as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // exprForm
+        b.extend_from_slice(&expr);
+        b
+    }
+
+    /// Replace the requirements child of `signed`'s SuperBlob with `new_child`
+    /// (shifting later children, fixing declared length + index offsets), then
+    /// rebind stored special slot -2 in BOTH CDs to the new child.
+    fn replace_requirements_child(signed: &mut [u8], new_child: &[u8]) {
+        use std::collections::HashMap;
+        let m = MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let sb = &signed[sig_off..sig_off + sig_len];
+        let declared = u32::from_be_bytes(sb[4..8].try_into().unwrap()) as usize;
+        let count = u32::from_be_bytes(sb[8..12].try_into().unwrap()) as usize;
+        let index_end = 12 + count * 8;
+        let mut entries: Vec<(u32, usize, usize)> = Vec::with_capacity(count);
+        for i in 0..count {
+            let e = 12 + i * 8;
+            let slot = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
+            let off = u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(sb[off + 4..off + 8].try_into().unwrap()) as usize;
+            entries.push((slot, off, len));
+        }
+        let (req_off, req_len) = entries
+            .iter()
+            .find(|(s, _, _)| *s == CSSLOT_REQUIREMENTS)
+            .map(|(_, o, l)| (*o, *l))
+            .expect("requirements child");
+        let delta = new_child.len() as isize - req_len as isize;
+        assert!(
+            declared as isize + delta <= sig_len as isize,
+            "LC window slack too small for the DR blob"
+        );
+        entries.sort_by_key(|(_, off, _)| *off);
+        let mut out: Vec<u8> = Vec::with_capacity((declared as isize + delta) as usize);
+        out.extend_from_slice(&sb[0..index_end]); // header (length fixed below) + index
+        let mut new_off = HashMap::new();
+        for (slot, off, len) in &entries {
+            new_off.insert(*slot, out.len());
+            if *off == req_off {
+                out.extend_from_slice(new_child);
+            } else {
+                out.extend_from_slice(&sb[*off..*off + *len]);
+            }
+        }
+        let new_declared = out.len() as u32;
+        out[4..8].copy_from_slice(&new_declared.to_be_bytes());
+        for i in 0..count {
+            let e = 12 + i * 8;
+            let slot = u32::from_be_bytes(out[e..e + 4].try_into().unwrap());
+            let off = new_off[&slot] as u32;
+            out[e + 4..e + 8].copy_from_slice(&off.to_be_bytes());
+        }
+        signed[sig_off..sig_off + out.len()].copy_from_slice(&out);
+        bind_special_slot(signed, 2, Some(new_child)); // task 5 helper
+    }
+
+    #[test]
+    fn designated_requirement_is_enforced_end_to_end() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        // Satisfied: DR demanding this fixture's own identifier -> no DR finding.
+        let mut ok_signed =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut ok_signed, &ident_dr_blob("com.example.dr"));
+        let ok_report = verify_macho(&ok_signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            ok_report.is_valid(),
+            "satisfied DR must verify: {:?}",
+            ok_report.slices[0].errors
+        );
+        // Violated: DR demanding a different identifier -> hard error.
+        let mut bad_signed =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut bad_signed, &ident_dr_blob("com.evil"));
+        let report = verify_macho(&bad_signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("designated requirement not satisfied")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
     }
 
     fn build_two_slice_fat() -> Vec<u8> {

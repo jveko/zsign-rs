@@ -217,6 +217,268 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     })
 }
 
+#[derive(Debug, Clone)]
+enum Expr {
+    True,
+    False,
+    Ident(Vec<u8>),
+    AppleAnchor,
+    AppleGenericAnchor,
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    CdHash(Vec<u8>),
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Requirement<'a> {
+    expr: Expr,
+    #[allow(dead_code)]
+    raw: &'a [u8],
+}
+
+/// All requirement entries stored in a requirements SuperBlob.
+#[derive(Debug, Clone)]
+pub struct RequirementsSet<'a> {
+    entries: Vec<(u32, Requirement<'a>)>,
+}
+
+impl RequirementsSet<'_> {
+    pub fn designated(&self) -> Option<&Requirement<'_>> {
+        self.entries
+            .iter()
+            .find(|(kind, _)| *kind == CSREQ_DESIGNATED)
+            .map(|(_, requirement)| requirement)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequirementVerdict {
+    Satisfied,
+    Violated,
+    Unsupported(String),
+}
+
+pub struct RequirementContext<'a> {
+    pub identifier: Option<&'a str>,
+    pub cdhashes: &'a [&'a [u8]],
+    pub anchored: Option<bool>,
+}
+
+impl Requirement<'_> {
+    pub fn evaluate(&self, ctx: &RequirementContext<'_>) -> RequirementVerdict {
+        match evaluate_expr(&self.expr, ctx) {
+            Tri::True => RequirementVerdict::Satisfied,
+            Tri::False => RequirementVerdict::Violated,
+            Tri::Unknown => {
+                RequirementVerdict::Unsupported("boolean context unevaluable".to_string())
+            }
+            Tri::Unsupported(reason) => RequirementVerdict::Unsupported(reason),
+        }
+    }
+}
+
+enum Tri {
+    True,
+    False,
+    Unknown,
+    Unsupported(String),
+}
+
+fn evaluate_expr(expr: &Expr, ctx: &RequirementContext<'_>) -> Tri {
+    match expr {
+        Expr::True => Tri::True,
+        Expr::False => Tri::False,
+        Expr::Ident(bytes) => match ctx.identifier {
+            Some(identifier) if identifier.as_bytes() == bytes => Tri::True,
+            Some(_) => Tri::False,
+            None => Tri::Unknown,
+        },
+        Expr::AppleAnchor | Expr::AppleGenericAnchor => match ctx.anchored {
+            Some(true) => Tri::True,
+            Some(false) => Tri::False,
+            None => Tri::Unknown,
+        },
+        Expr::Not(inner) => match evaluate_expr(inner, ctx) {
+            Tri::True => Tri::False,
+            Tri::False => Tri::True,
+            Tri::Unknown => Tri::Unknown,
+            Tri::Unsupported(reason) => Tri::Unsupported(reason),
+        },
+        Expr::And(left, right) => match (evaluate_expr(left, ctx), evaluate_expr(right, ctx)) {
+            (Tri::False, _) | (_, Tri::False) => Tri::False,
+            (Tri::True, Tri::True) => Tri::True,
+            (Tri::Unsupported(reason), _) | (_, Tri::Unsupported(reason)) => {
+                Tri::Unsupported(reason)
+            }
+            _ => Tri::Unknown,
+        },
+        Expr::Or(left, right) => match (evaluate_expr(left, ctx), evaluate_expr(right, ctx)) {
+            (Tri::True, _) | (_, Tri::True) => Tri::True,
+            (Tri::False, Tri::False) => Tri::False,
+            (Tri::Unsupported(reason), _) | (_, Tri::Unsupported(reason)) => {
+                Tri::Unsupported(reason)
+            }
+            _ => Tri::Unknown,
+        },
+        Expr::CdHash(data) => {
+            if ctx.cdhashes.iter().any(|digest| *digest == data) {
+                Tri::True
+            } else {
+                Tri::False
+            }
+        }
+        Expr::Unsupported(reason) => Tri::Unsupported(reason.clone()),
+    }
+}
+
+fn requirement_error(message: impl Into<String>) -> crate::Error {
+    crate::Error::Verification(message.into())
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    let raw = bytes
+        .get(*offset..offset.wrapping_add(4))
+        .ok_or_else(|| requirement_error("requirement expression is truncated"))?;
+    *offset += 4;
+    Ok(u32::from_be_bytes(raw.try_into().unwrap()))
+}
+
+fn read_aligned_data(bytes: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
+    let len = read_u32(bytes, offset)? as usize;
+    let data_end = offset
+        .checked_add(len)
+        .ok_or_else(|| requirement_error("requirement expression data length overflows"))?;
+    let padded_end = data_end
+        .checked_add(3)
+        .map(|end| end & !3)
+        .ok_or_else(|| requirement_error("requirement expression alignment overflows"))?;
+    let data = bytes
+        .get(*offset..data_end)
+        .ok_or_else(|| requirement_error("requirement expression data overruns child"))?;
+    if padded_end > bytes.len() {
+        return Err(requirement_error(
+            "requirement expression aligned data overruns child",
+        ));
+    }
+    *offset = padded_end;
+    Ok(data.to_vec())
+}
+
+fn parse_requirement_expr(bytes: &[u8], offset: &mut usize, depth: u32) -> Result<Expr> {
+    if depth >= 64 {
+        return Err(requirement_error(
+            "requirement expression nesting exceeds 64 levels",
+        ));
+    }
+    let op = read_u32(bytes, offset)?;
+    match op {
+        0 => Ok(Expr::False),
+        1 => Ok(Expr::True),
+        2 => Ok(Expr::Ident(read_aligned_data(bytes, offset)?)),
+        3 => Ok(Expr::AppleAnchor),
+        6 => {
+            let left = parse_requirement_expr(bytes, offset, depth + 1)?;
+            if matches!(left, Expr::Unsupported(_)) {
+                return Ok(left);
+            }
+            let right = parse_requirement_expr(bytes, offset, depth + 1)?;
+            if matches!(right, Expr::Unsupported(_)) {
+                return Ok(right);
+            }
+            Ok(Expr::And(Box::new(left), Box::new(right)))
+        }
+        7 => {
+            let left = parse_requirement_expr(bytes, offset, depth + 1)?;
+            if matches!(left, Expr::Unsupported(_)) {
+                return Ok(left);
+            }
+            let right = parse_requirement_expr(bytes, offset, depth + 1)?;
+            if matches!(right, Expr::Unsupported(_)) {
+                return Ok(right);
+            }
+            Ok(Expr::Or(Box::new(left), Box::new(right)))
+        }
+        8 => Ok(Expr::CdHash(read_aligned_data(bytes, offset)?)),
+        9 => {
+            let inner = parse_requirement_expr(bytes, offset, depth + 1)?;
+            match inner {
+                unsupported @ Expr::Unsupported(_) => Ok(unsupported),
+                inner => Ok(Expr::Not(Box::new(inner))),
+            }
+        }
+        15 => Ok(Expr::AppleGenericAnchor),
+        _ => Ok(Expr::Unsupported(format!("opcode 0x{op:08x}"))),
+    }
+}
+
+/// Parses the requirements SuperBlob stored in `CSSLOT_REQUIREMENTS`.
+pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>> {
+    if blob.len() < 12 {
+        return Err(requirement_error(
+            "requirements blob too short for SuperBlob header",
+        ));
+    }
+    if read_u32(blob, &mut 0)? != CSMAGIC_REQUIREMENTS {
+        return Err(requirement_error("requirements blob magic mismatch"));
+    }
+    let declared = read_u32(blob, &mut 4)? as usize;
+    if declared < 12 || declared > blob.len() {
+        return Err(requirement_error(
+            "requirements blob declared length is invalid",
+        ));
+    }
+    let count = read_u32(blob, &mut 8)? as usize;
+    let index_end = count
+        .checked_mul(8)
+        .and_then(|end| end.checked_add(12))
+        .ok_or_else(|| requirement_error("requirements index extent overflows"))?;
+    if index_end > declared {
+        return Err(requirement_error(
+            "requirements index overruns declared length",
+        ));
+    }
+    let bytes = &blob[..declared];
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut entry_offset = 12 + index * 8;
+        let kind = read_u32(bytes, &mut entry_offset)?;
+        let child_offset = read_u32(bytes, &mut entry_offset)? as usize;
+        if child_offset < index_end {
+            return Err(requirement_error(
+                "requirements entry points inside the header/index",
+            ));
+        }
+        let child = bytes
+            .get(child_offset..)
+            .ok_or_else(|| requirement_error("requirements entry points outside declared blob"))?;
+        if child.len() < 12 {
+            return Err(requirement_error("requirement child is truncated"));
+        }
+        if u32::from_be_bytes(child[0..4].try_into().unwrap()) != CSMAGIC_REQUIREMENT {
+            return Err(requirement_error("requirement child magic mismatch"));
+        }
+        let child_len = u32::from_be_bytes(child[4..8].try_into().unwrap()) as usize;
+        if child_len < 12 || child_len > child.len() {
+            return Err(requirement_error(
+                "requirement child declared length is invalid",
+            ));
+        }
+        let child = &child[..child_len];
+        let form = u32::from_be_bytes(child[8..12].try_into().unwrap());
+        if form != 1 {
+            return Err(requirement_error(
+                "only expression-form requirements are supported",
+            ));
+        }
+        let mut expression_offset = 12;
+        let expr = parse_requirement_expr(child, &mut expression_offset, 0)?;
+        entries.push((kind, Requirement { expr, raw: child }));
+    }
+    Ok(RequirementsSet { entries })
+}
+
 /// A parsed CodeDirectory (`CSMAGIC_CODEDIRECTORY`).
 ///
 /// All multi-byte header fields are big-endian per the Apple format.
@@ -888,6 +1150,129 @@ mod tests {
         }
         b.resize(total as usize, 0);
         b
+    }
+
+    fn req_blob_with_dr(expr: &[u8]) -> Vec<u8> {
+        // Requirements SuperBlob: magic/length/count=1, index {type=designated,
+        // offset=0x14}, child: CSMAGIC_REQUIREMENT / length / kind=exprForm(1) / expr.
+        let child_len = 12 + expr.len();
+        let total = 0x14 + child_len;
+        let mut b = Vec::with_capacity(total);
+        b.extend_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // count
+        b.extend_from_slice(&CSREQ_DESIGNATED.to_be_bytes()); // type = designated
+        b.extend_from_slice(&0x14u32.to_be_bytes()); // child offset
+        b.extend_from_slice(&CSMAGIC_REQUIREMENT.to_be_bytes());
+        b.extend_from_slice(&(child_len as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // kind = exprForm
+        b.extend_from_slice(expr);
+        b
+    }
+
+    fn ident_expr(name: &str) -> Vec<u8> {
+        let mut e = 2u32.to_be_bytes().to_vec(); // opIdent
+        e.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        e.extend_from_slice(name.as_bytes());
+        while e.len() % 4 != 0 {
+            e.push(0);
+        } // string operand 4-aligned
+        e
+    }
+
+    fn kind_lwcr_blob() -> Vec<u8> {
+        let expr = ident_expr("x");
+        let child_len = 12 + expr.len();
+        let total = 0x14 + child_len;
+        let mut b = Vec::with_capacity(total);
+        b.extend_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&CSREQ_DESIGNATED.to_be_bytes());
+        b.extend_from_slice(&0x14u32.to_be_bytes());
+        b.extend_from_slice(&CSMAGIC_REQUIREMENT.to_be_bytes());
+        b.extend_from_slice(&(child_len as u32).to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes()); // kind = lwcrForm -> must Err
+        b.extend_from_slice(&expr);
+        b
+    }
+
+    fn truncated_expr_blob() -> Vec<u8> {
+        let mut expr = 2u32.to_be_bytes().to_vec(); // opIdent ...
+        expr.extend_from_slice(&16u32.to_be_bytes()); // ... declares 16 bytes ...
+        expr.extend_from_slice(b"abc"); // ... provides 3 -> operand overrun
+        req_blob_with_dr(&expr)
+    }
+
+    #[test]
+    fn designated_requirement_evaluates_identifier() {
+        let blob = req_blob_with_dr(&ident_expr("com.example"));
+        let set = parse_requirements(&blob).unwrap();
+        let dr = set.designated().expect("dr present");
+        assert_eq!(
+            dr.evaluate(&RequirementContext {
+                identifier: Some("com.example"),
+                cdhashes: &[],
+                anchored: None
+            }),
+            RequirementVerdict::Satisfied
+        );
+        assert_eq!(
+            dr.evaluate(&RequirementContext {
+                identifier: Some("com.evil"),
+                cdhashes: &[],
+                anchored: None
+            }),
+            RequirementVerdict::Violated
+        );
+        // Binary AND (opAnd = 6) over left/right subtrees:
+        let mut and_true = 6u32.to_be_bytes().to_vec();
+        and_true.extend_from_slice(&ident_expr("com.example"));
+        and_true.extend_from_slice(&1u32.to_be_bytes()); // opTrue
+        let and_blob = req_blob_with_dr(&and_true);
+        let set2 = parse_requirements(&and_blob).unwrap();
+        assert_eq!(
+            set2.designated().unwrap().evaluate(&RequirementContext {
+                identifier: Some("com.example"),
+                cdhashes: &[],
+                anchored: None
+            }),
+            RequirementVerdict::Satisfied
+        );
+    }
+
+    #[test]
+    fn empty_requirements_has_no_designated() {
+        let blob = crate::codesign::superblob::build_requirements_blob();
+        assert!(parse_requirements(&blob).unwrap().designated().is_none());
+    }
+
+    #[test]
+    fn unsupported_opcode_is_not_a_hard_error() {
+        // opCertField(11): a zero-flag opcode OUTSIDE the supported set. The whole DR
+        // becomes Unsupported (operands never inspected) - never a hard error, because
+        // Apple's DRs carry cert-chain ops whose chain DER crypto/cms_verify.rs does
+        // not expose (out of scope).
+        let mut expr = 11u32.to_be_bytes().to_vec();
+        expr.extend_from_slice(&[0u8; 16]); // junk operands - must NOT be parsed
+        let blob = req_blob_with_dr(&expr);
+        let set = parse_requirements(&blob).unwrap();
+        let v = set
+            .designated()
+            .expect("dr present")
+            .evaluate(&RequirementContext {
+                identifier: Some("com.example"),
+                cdhashes: &[],
+                anchored: None,
+            });
+        assert!(matches!(v, RequirementVerdict::Unsupported(_)), "{v:?}");
+    }
+
+    #[test]
+    fn malformed_requirements_are_errors() {
+        assert!(parse_requirements(&[0; 8]).is_err()); // too short
+        assert!(parse_requirements(&kind_lwcr_blob()).is_err()); // kind = lwcrForm(2)
+        assert!(parse_requirements(&truncated_expr_blob()).is_err()); // operand overrun
     }
 
     #[test]
