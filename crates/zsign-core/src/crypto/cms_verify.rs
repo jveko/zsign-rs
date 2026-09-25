@@ -117,18 +117,23 @@ const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29
 /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`
 const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
 
+/// Maximum accepted nesting depth for BER constructed TLVs. Matches the
+/// DER parser's depth cap; real CMS structures nest well under this.
+const MAX_BER_NEST_DEPTH: usize = 32;
+
 /// Normalizes BER indefinite-length encodings to definite-length DER.
 ///
 /// Apple's own toolchains occasionally emit CMS structures with BER
 /// indefinite lengths (observed in `/bin/ls` on Intel macOS runners), which
 /// strict DER parsers reject. This rewrites every indefinite-length constructed
 /// TLV into its definite-length form, leaving already-definite bytes untouched.
-/// `EOC` (0x00 0x00) closes the innermost indefinite frame.
+/// `EOC` (0x00 0x00) closes the innermost indefinite frame. Nesting deeper
+/// than 32 constructed levels is rejected.
 pub fn normalize_ber_lengths(input: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0usize;
     while i < input.len() {
-        let (bytes, consumed) = write_norm(input, i)?;
+        let (bytes, consumed) = write_norm(input, i, 0)?;
         out.extend_from_slice(&bytes);
         i += consumed;
     }
@@ -137,7 +142,12 @@ pub fn normalize_ber_lengths(input: &[u8]) -> Result<Vec<u8>> {
 
 /// Serializes one TLV (and its children) starting at `i`, returning the
 /// normalized bytes and the number of input bytes consumed.
-fn write_norm(input: &[u8], mut i: usize) -> Result<(std::vec::Vec<u8>, usize)> {
+fn write_norm(input: &[u8], mut i: usize, depth: usize) -> Result<(std::vec::Vec<u8>, usize)> {
+    if depth >= MAX_BER_NEST_DEPTH {
+        return Err(Error::Verification(
+            "BER nesting depth exceeds limit".into(),
+        ));
+    }
     let start = i;
     let tag = *input
         .get(i)
@@ -164,7 +174,7 @@ fn write_norm(input: &[u8], mut i: usize) -> Result<(std::vec::Vec<u8>, usize)> 
                 if rest.len() >= 2 && rest[0] == 0 && rest[1] == 0 {
                     break; // EOC
                 }
-                write_norm(input, i)?
+                write_norm(input, i, depth + 1)?
             };
             content.extend_from_slice(&b);
             i += n;
@@ -211,7 +221,7 @@ fn write_norm(input: &[u8], mut i: usize) -> Result<(std::vec::Vec<u8>, usize)> 
     if constructed {
         let mut j = 0usize;
         while j < content.len() {
-            let (child, n) = write_norm(content, j)?;
+            let (child, n) = write_norm(content, j, depth + 1)?;
             out.extend_from_slice(&child);
             j += n;
         }
@@ -1924,6 +1934,35 @@ mod tests {
     fn normalize_is_noop_on_definite_input() {
         let der = b"\x30\x03\x02\x01\x01\x04\x02\xaa\xbb".to_vec();
         assert_eq!(normalize_ber_lengths(&der).unwrap(), der);
+    }
+
+    /// n levels of indefinite-length constructed TLVs: `30 80 … 00 00`.
+    fn nested_indefinite(depth: usize) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00];
+        for _ in 0..depth {
+            let mut next = vec![0x30, 0x80];
+            next.append(&mut v);
+            next.extend_from_slice(&[0x00, 0x00]);
+            v = next;
+        }
+        v
+    }
+
+    #[test]
+    fn normalize_ber_rejects_overdeep_nesting() {
+        let err = normalize_ber_lengths(&nested_indefinite(50_000)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Verification(m) if m.contains("nesting depth")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_ber_boundary_depth() {
+        // Depth 32 is the accepted ceiling (matches the DER cap precedent);
+        // 33 levels must be rejected, not overflow the stack.
+        assert!(normalize_ber_lengths(&nested_indefinite(32)).is_ok());
+        assert!(normalize_ber_lengths(&nested_indefinite(33)).is_err());
     }
 
     #[test]
