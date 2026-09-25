@@ -13,10 +13,12 @@
 //! Entitlement ::= SEQUENCE { UTF8String key, value }
 //! ```
 //!
-//! Keys are sorted lexicographically and `BOOLEAN true` is encoded as `0xFF`
-//! (DER canonical). This is the format Apple's `codesign --generate-entitlement-der`
-//! emits; non-canonical variants (bare SETs, `BOOLEAN true = 0x01`) are rejected
-//! by modern macOS verification and iOS 15+ installs.
+//! Dictionary entries are ordered by their complete member encodings compared
+//! as octet strings (DER SET OF rule, X.690 clause 11.6) and `BOOLEAN true` is
+//! encoded as `0xFF` (DER canonical). This is the format Apple's
+//! `codesign --generate-entitlement-der` emits; non-canonical variants
+//! (unordered entries, bare SETs, `BOOLEAN true = 0x01`) are rejected by modern
+//! macOS verification and iOS 15+ installs.
 //!
 //! # Examples
 //!
@@ -159,6 +161,43 @@ fn civil_from_days(z: i64) -> (i64, i32, i32) {
         d as i32,
     )
 }
+/// Encode a dictionary as its canonical entries container:
+/// [16] (0xb0) IMPLICIT SET OF `SEQUENCE { UTF8String key, value }`.
+///
+/// Members are sorted by their complete encoded bytes before the container
+/// length is computed — the DER SET OF ordering rule of X.690 clause 11.6
+/// (encodings compared as octet strings; the standard's virtual trailing-zero
+/// padding is equivalent to plain byte order for complete DER encodings).
+fn encode_dictionary(dict: &plist::Dictionary) -> Result<Vec<u8>> {
+    let mut members = Vec::with_capacity(dict.len());
+    for (key, val) in dict {
+        let encoded_val = encode_value(val)?;
+
+        let mut key_encoded = Vec::new();
+        key_encoded.push(DER_TAG_UTF8STRING);
+        encode_length(&mut key_encoded, key.len());
+        key_encoded.extend(key.as_bytes());
+
+        let pair_len = key_encoded.len() + encoded_val.len();
+        let mut pair = Vec::with_capacity(pair_len + 4);
+        pair.push(DER_TAG_SEQUENCE);
+        encode_length(&mut pair, pair_len);
+        pair.extend_from_slice(&key_encoded);
+        pair.extend_from_slice(&encoded_val);
+        members.push(pair);
+    }
+    members.sort();
+
+    let content_len: usize = members.iter().map(|m| m.len()).sum();
+    let mut output = Vec::with_capacity(content_len + 4);
+    output.push(0xb0); // [16] IMPLICIT SET (constructed)
+    encode_length(&mut output, content_len);
+    for member in &members {
+        output.extend_from_slice(member);
+    }
+    Ok(output)
+}
+
 fn encode_value(value: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
@@ -220,34 +259,7 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
             encode_length(&mut output, array_content.len());
             output.extend(array_content);
         }
-        Value::Dictionary(dict) => {
-            // Build SET content from key-value pairs
-            let mut set_content = Vec::new();
-
-            for (key, val) in dict {
-                let encoded_val = encode_value(val)?;
-
-                // Each key-value pair is a SEQUENCE: { key_as_UTF8String, encoded_value }
-                // Encode the key as UTF8String
-                let mut key_encoded = Vec::new();
-                key_encoded.push(DER_TAG_UTF8STRING);
-                encode_length(&mut key_encoded, key.len());
-                key_encoded.extend(key.as_bytes());
-
-                // Build the pair content
-                let pair_len = key_encoded.len() + encoded_val.len();
-
-                // Pair header: SEQUENCE tag + length
-                set_content.push(DER_TAG_SEQUENCE);
-                encode_length(&mut set_content, pair_len);
-                set_content.extend(key_encoded);
-                set_content.extend(encoded_val);
-            }
-
-            output.push(0xb0); // [16] IMPLICIT SET (constructed)
-            encode_length(&mut output, set_content.len());
-            output.extend(set_content);
-        }
+        Value::Dictionary(dict) => return encode_dictionary(dict),
         Value::Data(bytes) => {
             output.push(DER_TAG_OCTETSTRING);
             encode_length(&mut output, bytes.len());
@@ -312,38 +324,18 @@ pub fn plist_to_der(plist_xml: &[u8]) -> Result<Vec<u8>> {
     let value: Value = plist::from_bytes(plist_xml)
         .map_err(|e| Error::DerEncoding(format!("Failed to parse plist: {}", e)))?;
 
-    // Entitlements root must be a dictionary; encode its sorted key/value
-    // pairs as the entries SET content (each pair is a SEQUENCE).
+    // Entitlements root must be a dictionary; encode it as the canonical
+    // [16] entries container (members sorted by encoded bytes).
     let dict = value
         .as_dictionary()
         .ok_or_else(|| Error::DerEncoding("Entitlements plist root must be a dictionary".into()))?;
-    let mut pairs = Vec::new();
-    for (key, val) in dict {
-        let encoded_val = encode_value(val)?;
-
-        let mut key_encoded = Vec::new();
-        key_encoded.push(DER_TAG_UTF8STRING);
-        encode_length(&mut key_encoded, key.len());
-        key_encoded.extend(key.as_bytes());
-
-        let pair_len = key_encoded.len() + encoded_val.len();
-        let mut pair = Vec::with_capacity(pair_len + 4);
-        pair.push(DER_TAG_SEQUENCE);
-        encode_length(&mut pair, pair_len);
-        pair.extend_from_slice(&key_encoded);
-        pair.extend_from_slice(&encoded_val);
-        pairs.extend_from_slice(&pair);
-    }
+    let entries = encode_dictionary(dict)?;
 
     // Apple canonical envelope (matches `codesign --generate-entitlement-der`):
     //   [APPLICATION 16] (0x70) IMPLICIT SEQUENCE {
     //       version  INTEGER (1),
     //       entries  [16] (0xB0) IMPLICIT SET OF Entitlement
     //   }
-    let mut entries = Vec::with_capacity(pairs.len() + 4);
-    entries.push(0xb0); // [16] IMPLICIT SET (constructed)
-    encode_length(&mut entries, pairs.len());
-    entries.extend_from_slice(&pairs);
 
     let mut seq_content = Vec::with_capacity(entries.len() + 4);
     seq_content.push(DER_TAG_INTEGER);
@@ -549,5 +541,43 @@ mod tests {
                 b'0', b'0', b'.', b'3', b'Z',
             ]
         );
+    }
+    #[test]
+    fn test_plist_to_der_sorts_set_members() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>aa</key>
+    <true/>
+    <key>b</key>
+    <true/>
+</dict>
+</plist>"#;
+
+        let der = plist_to_der(xml).unwrap();
+        // Members are ordered by their complete encodings compared as octet
+        // strings (X.690 11.6): pair "b" is 30 06 ..., pair "aa" is 30 07 ...,
+        // so "b" sorts first even though the document/key order says otherwise.
+        assert_eq!(
+            der,
+            vec![
+                0x70, 0x16, 0x02, 0x01, 0x01, 0xb0, 0x11, 0x30, 0x06, 0x0c, 0x01, b'b', 0x01, 0x01,
+                0xff, 0x30, 0x07, 0x0c, 0x02, b'a', b'a', 0x01, 0x01, 0xff,
+            ]
+        );
+
+        // Encoding is independent of the document order of the same dict.
+        let flipped = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>b</key>
+    <true/>
+    <key>aa</key>
+    <true/>
+</dict>
+</plist>"#;
+        assert_eq!(plist_to_der(flipped).unwrap(), der);
     }
 }
