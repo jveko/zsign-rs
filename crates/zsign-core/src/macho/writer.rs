@@ -137,10 +137,7 @@ fn realloc_code_sign_space_single(
 
     let mut output = data[..code_length].to_vec();
 
-    let is_big_endian = data.len() >= 4
-        && (data[0..4] == [0xfe, 0xed, 0xfa, 0xce]
-            || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
-            || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
     if let Some((offset, seg)) = linkedit_cmd {
         let linkedit_fileoff = seg.fileoff as usize;
@@ -468,10 +465,7 @@ fn update_linkedit_data_command(
     let dataoff_offset = offset + 8;
     let datasize_offset = offset + 12;
 
-    let is_big_endian = data.len() >= 4
-        && (data[0..4] == [0xfe, 0xed, 0xfa, 0xce]
-            || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
-            || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
     write_u32(data, dataoff_offset, dataoff, is_big_endian)?;
     write_u32(data, datasize_offset, datasize, is_big_endian)?;
@@ -498,10 +492,7 @@ fn add_code_signature_command(
         ));
     }
 
-    let is_big_endian = data.len() >= 4
-        && (data[0..4] == [0xfe, 0xed, 0xfa, 0xce]
-            || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
-            || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
     write_u32(data, load_commands_end, LC_CODE_SIGNATURE, is_big_endian)?;
     write_u32(
@@ -550,10 +541,10 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
     }
 
     let magic = read_u32(input, 0, false)?;
-    let is_big_endian = magic == MH_CIGAM_64;
     if magic != MH_MAGIC_64 && magic != MH_CIGAM_64 {
         return Err(Error::MachO("not a 64-bit Mach-O binary".into()));
     }
+    let is_big_endian = super::parser::is_big_endian_macho(input, 0);
 
     let ncmds = read_u32(input, 16, is_big_endian)? as usize;
 
@@ -763,10 +754,7 @@ fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) ->
     let filesize_offset = offset + 48;
     let vmsize_offset = offset + 32;
 
-    let is_big_endian = data.len() >= 4
-        && (data[0..4] == [0xfe, 0xed, 0xfa, 0xce]
-            || data[0..4] == [0xfe, 0xed, 0xfa, 0xcf]
-            || data[0..4] == [0xca, 0xfe, 0xba, 0xbe]);
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
     write_u64(data, filesize_offset, new_filesize, is_big_endian)?;
 
@@ -1578,6 +1566,92 @@ mod tests {
             crate::macho::sign_macho_adhoc(&macho, "com.example.tight", None, None, None, false)
                 .is_err(),
             "signing must not overwrite __text by appending LC_CODE_SIGNATURE"
+        );
+    }
+
+    #[test]
+    fn test_big_endian_sign_parse_roundtrip() {
+        let data = crate::macho::fixtures::make_minimal_macho_be();
+        assert_eq!(
+            &data[0..4],
+            &[0xfe, 0xed, 0xfa, 0xcf],
+            "fixture must be a real big-endian image"
+        );
+        let macho = crate::macho::MachOFile::parse(data).expect("big-endian Mach-O must parse");
+        let slice = &macho.slices()[0];
+        assert!(
+            slice.metadata.is_big_endian,
+            "parser must classify the slice as big-endian"
+        );
+
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.be", None, None, None, false)
+                .expect("big-endian signing must succeed");
+        let reparsed = crate::macho::MachOFile::parse(signed.clone())
+            .expect("signed big-endian output must reparse");
+        let out = &reparsed.slices()[0];
+        assert!(
+            out.metadata.is_big_endian,
+            "signed output must still be big-endian"
+        );
+
+        // __LINKEDIT.filesize must have been rewritten big-endian: decode raw bytes both ways.
+        let (lc_off, _, _, _) = out
+            .metadata
+            .linkedit_cmd
+            .expect("signed output keeps __LINKEDIT");
+        let raw = u64::from_be_bytes(signed[lc_off + 48..lc_off + 56].try_into().unwrap());
+        assert_eq!(
+            raw,
+            out.metadata.linkedit_cmd.unwrap().3,
+            "__LINKEDIT filesize must be encoded big-endian"
+        );
+        assert_ne!(
+            raw,
+            u64::from_le_bytes(signed[lc_off + 48..lc_off + 56].try_into().unwrap()),
+            "little-endian decoding must not yield the filesize value"
+        );
+        assert!(
+            raw > 0,
+            "signing must have given __LINKEDIT a nonzero filesize"
+        );
+
+        // LC_CODE_SIGNATURE.dataoff must also be big-endian on the wire.
+        let (cmd_off, _, _) = out
+            .metadata
+            .code_sig_cmd
+            .expect("signed output carries LC_CODE_SIGNATURE");
+        let dataoff_be = u32::from_be_bytes(signed[cmd_off + 8..cmd_off + 12].try_into().unwrap());
+        let dataoff_le = u32::from_le_bytes(signed[cmd_off + 8..cmd_off + 12].try_into().unwrap());
+        assert_eq!(
+            dataoff_be,
+            out.code_sig_offset.expect("parsed dataoff"),
+            "LC_CODE_SIGNATURE.dataoff must be encoded big-endian"
+        );
+        assert_ne!(
+            dataoff_be, dataoff_le,
+            "little-endian decoding must not yield the dataoff"
+        );
+
+        // Verify leg: the embedded superblob and its CodeDirectory must round-trip.
+        let sig_off = out
+            .code_sig_offset
+            .expect("signed output carries LC_CODE_SIGNATURE") as usize;
+        let sig_size = out
+            .code_sig_size
+            .expect("signed output carries LC_CODE_SIGNATURE") as usize;
+        let superblob =
+            crate::codesign::verify::parse_superblob(&signed[sig_off..sig_off + sig_size])
+                .expect("big-endian signed output must carry a parseable superblob");
+        let cd = superblob
+            .code_directory
+            .as_ref()
+            .expect("superblob carries a code directory");
+        let cd_raw = cd.raw();
+        assert_eq!(
+            u64::from_be_bytes(cd_raw[72..80].try_into().unwrap()),
+            0x1000,
+            "CodeDirectory execSegLimit must round-trip for a big-endian image"
         );
     }
 }

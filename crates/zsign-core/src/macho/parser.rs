@@ -66,6 +66,25 @@ pub struct MachOMetadata {
     pub is_64: bool,
 }
 
+/// True when the Mach-O image starting at byte `base` is big-endian. Detection
+/// keys on the byte-swapped magic constants (CIGAM == on-disk big-endian),
+/// which is exactly equivalent to comparing the raw prefix against the
+/// big-endian magic byte patterns.
+pub(crate) fn is_big_endian_macho(data: &[u8], base: usize) -> bool {
+    base.checked_add(4)
+        .and_then(|end| data.get(base..end))
+        .map(|raw| {
+            let magic = u32::from_le_bytes(raw.try_into().expect("4-byte slice"));
+            matches!(
+                magic,
+                goblin::mach::header::MH_CIGAM
+                    | goblin::mach::header::MH_CIGAM_64
+                    | goblin::mach::fat::FAT_CIGAM
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// A parsed Mach-O binary.
 ///
 /// Handles both single-architecture and FAT/Universal binaries. For FAT binaries,
@@ -313,10 +332,7 @@ impl MachOFile {
             first_segment_offset as usize
         };
 
-        let is_big_endian = data.len() >= 4
-            && (data[base_offset..base_offset + 4] == [0xfe, 0xed, 0xfa, 0xce]
-                || data[base_offset..base_offset + 4] == [0xfe, 0xed, 0xfa, 0xcf]
-                || data[base_offset..base_offset + 4] == [0xca, 0xfe, 0xba, 0xbe]);
+        let is_big_endian = is_big_endian_macho(data, base_offset);
 
         let slice_data = if base_offset == 0 {
             data
