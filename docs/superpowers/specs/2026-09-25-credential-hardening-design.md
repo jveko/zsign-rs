@@ -103,14 +103,17 @@ yields an empty `cert_chain`.
   public shape and breaks every struct-literal construction in out-of-scope files; there is
   no logging facility in `zsign-core` and adding one is out of scope.
 
-**Leaf policy (mirrors `cms_verify.rs` verify-side shape rules exactly):**
+**Leaf policy (mirrors `cms_verify.rs` verify-side shape rules exactly, including check
+order: `leaf_purpose_reason` runs before `in_validity` in `verify_chain`, so the load side
+checks purpose first and validity last — both sides name the same violation for a
+certificate that breaks several rules):**
 
-| Check | Rule | Violation message names |
-|---|---|---|
-| Validity window | `notBefore ≤ now ≤ notAfter` (mirrored `time_now()`) | subject, both timestamps, current time |
-| Extended key usage | extension **present** and contains `codeSigning` (`1.3.6.1.5.5.7.3.3`) | subject, EKU contents / absence |
-| Key usage | if present, must include `digitalSignature` | subject, KU bits |
-| Basic constraints | if present, must assert `CA=false` | subject, CA flag |
+| # | Check | Rule | Violation message names |
+|---|---|---|---|
+| 1 | Extended key usage | extension **present** and contains `codeSigning` (`1.3.6.1.5.5.7.3.3`) | subject, EKU contents / absence |
+| 2 | Key usage | if present, must include `digitalSignature` | subject, KU bits |
+| 3 | Basic constraints | if present, must assert `CA=false` | subject, CA flag |
+| 4 | Validity window | `notBefore ≤ now ≤ notAfter` (mirrored `time_now()`) | subject, both timestamps, current time |
 
 Consistency note: the verify side *requires* the EKU extension, tolerates a *missing* KU and
 a *missing* BC (checking them only when present). The load side mirrors that exactly —
@@ -134,11 +137,12 @@ Using `SystemTime::now()` directly would *panic* on `wasm32-unknown-unknown` (wh
 verify disagree; no clock injection — determinism comes from fixtures sitting far outside
 any plausible window (expired ≪ today, not-yet-valid ≫ today).
 
-**Known duplication:** `ext_value`, the OIDs, `in_validity`, and `time_now` are
+**Known duplication:** `ext_value`, the four extension OIDs, and `time_now` are
 module-private in `cms_verify.rs`; sharing them would require editing that file, which the
 brief forbids (deferred to ZSN-23's owners — "if your policy work seems to need a
-`cms_verify.rs` edit — STOP and report"). `cert.rs` therefore mirrors the four helpers and
-the four OID constants verbatim; the mirror is pinned by quoting both rule sets
+`cms_verify.rs` edit — STOP and report"). `cert.rs` therefore re-implements `ext_value`,
+the OIDs and `time_now` verbatim, and inlines the `in_validity` comparison inside the
+policy function (no separate helper). The mirror is pinned by quoting both rule sets
 side-by-side in this document and by asserting *the same violation wording shapes* in
 `cert.rs` tests.
 
@@ -190,7 +194,8 @@ fail.
 
 **Candidates considered:**
 
-- **A. Three-way dispatch in `collect_bags` with depth-capped recursion.**
+- **A. Four-way bag-type dispatch in `collect_bags` (raw key / shrouded key / cert /
+  nested safe-contents) with depth-capped recursion.**
   `…10.1.1` (keyBag) → the bag value *is* an unencrypted PKCS#8 `PrivateKeyInfo`, push its
   DER bytes; `…10.1.2` (pkcs8ShroudedKeyBag) → keep `decrypt_key_bag` (and rename the
   mislabeled `KEY_BAG` constant to `SHROUDED_KEY_BAG`); `…10.1.6` (safeContentsBag) →
@@ -216,7 +221,7 @@ All load failures stay on `Error::Certificate(String)` via the existing
 `Error::Certificate(format!(...))` convention. Messages must name the exact violation and
 the offending subject, for example:
 
-- `signing certificate "CN=…, OU=…": expired (notAfter=2026-01-01T00:00:00Z, now=2026-09-25T…)`
+- `signing certificate "CN=…, OU=…": expired (notAfter=2026-01-01 00:00:00.000000000, now=2026-09-25 …)`
 - `signing certificate "CN=…": extended key usage missing codeSigning (1.3.6.1.5.5.7.3.3)`
 - `signing certificate "CN=…": keyUsage present but lacks digitalSignature`
 - `signing certificate "CN=…": basicConstraints asserts CA=true (leaf must be end-entity)`
@@ -230,17 +235,20 @@ PKCS#12 parse-stage failures keep their `P12Error` variants (`Der`/`Mac`/`Decryp
 
 ### New/changed internal functions
 
+(Signatures below match the plan's delivered code — the plan is the executable form of
+these decisions.)
+
 | Location | Function | Role |
 |---|---|---|
-| cert.rs | `select_identity(keys, certs) -> Result<(SigningKeyType, Certificate)>` | SPKI pairing, ambiguity/no-match errors |
-| cert.rs | `build_chain_from_leaf(leaf, remaining_certs) -> Vec<Certificate>` | issuer/subject walk + conditional Apple WWDR/Root injection |
-| cert.rs | `check_code_signing_policy(cert, now) -> std::result::Result<(), String>` | leaf policy, returns violation text naming subject+property |
-| cert.rs | `rsa_signing_key(key: RsaPrivateKey) -> Result<SigningKeyType>` | shared ≥2048 floor + wrap (both loaders) |
-| cert.rs | `build_apple_ca_chain` | narrowed: only called for the WWDR-injection path; appends Root only with WWDR |
+| cert.rs | `DecodedKey::{from_pkcs8_der, from_pkcs8_pem, spki_der, into_signing_key}` | single decode path for both loaders; `spki_der` feeds pairing; `into_signing_key` carries the ≥2048 floor and wraps into `SigningKeyType` |
+| cert.rs | `select_identity(keys, certs) -> Result<(DecodedKey, Certificate, Vec<Certificate>)>` | SPKI pairing, ambiguity/no-match errors; returns selected key, leaf, and remaining parsed certs for the chain walk |
+| cert.rs | `build_chain_from_leaf(leaf, rest: Vec<Certificate>) -> Vec<Certificate>` | issuer/subject walk + conditional Apple WWDR/Root injection |
+| cert.rs | `code_signing_policy_violation(cert, now) -> Option<String>` | leaf policy in verify-side order (EKU → KU → BC → validity); `Some` = violation text naming subject+property |
+| cert.rs | `embedded_wwdr_for_leaf` / `is_apple_root` / un-gated `extract_subject_cn` | Apple-material lookup used by `build_chain_from_leaf`; `build_apple_ca_chain` and `parse_private_key_der` are **deleted** as obsolete |
 | pkcs12.rs | `Pbkdf2Parameter { salt, iterations, key_length, prf }` | retained fields |
-| pkcs12.rs | `pbes2_decrypt` | keyLength validation + PRF dispatch |
-| pkcs12.rs | `collect_bags(..., depth: usize)` | three-way bag dispatch + recursion |
-| pkcs12.rs | oid `SHROUDED_KEY_BAG` (rename), `PRIVATE_KEY_BAG`, `SAFE_CONTENTS_BAG` | RFC 7292 registry names |
+| pkcs12.rs | `pbes2_decrypt` | keyLength validation + PRF dispatch (complete code in the plan) |
+| pkcs12.rs | `collect_bags(bytes, password, depth, keys, certs)` | four bag-type branches (raw key / shrouded key / cert / nested safe-contents) with depth-capped recursion |
+| pkcs12.rs | oid `SHROUDED_KEY_BAG` (rename of the mislabeled `KEY_BAG`), `PRIVATE_KEY_BAG`, `SAFE_CONTENTS_BAG` | RFC 7292 registry names |
 
 Callers: `from_p12` and `from_pem` are the only entry points; both are inside scope files.
 No other file in the repo calls `extract_p12`, `collect_bags`, `parse_private_key_der`,
@@ -286,8 +294,9 @@ Tests live inline in `cert.rs` and `pkcs12.rs` (repo convention). Layers:
    `pbes2_decrypt` directly with hand-built DER (the test module already imports
    `der::Encode`); raw keyBag additionally has the end-to-end `raw_keybag.p12` fixture.
 4. **Regression guard:** the existing 9-fixture `pkcs12` suite runs at
-   `extract_p12` level and must stay green unchanged; ZSN-23's `crypto` tests (59+) must
-   stay green.
+   `extract_p12` level and must stay green unchanged; the gate command's full 59-test
+   `crypto` set (including ZSN-23's 33-test `cms_verify` module) must stay green —
+   measured 59 passed / 0 failed at base `c9ff0fb`.
 
 New `.p12` fixtures are generated with **policy-compliant leaf certificates** (codeSigning
 EKU, digitalSignature KU, `basicConstraints CA:FALSE`, ~10-year validity) so that landing
@@ -304,8 +313,9 @@ determinism test fails pre-existing and is skipped in full runs.
 
 ### Consumer map (scout)
 
-- **Public shape is load-bearing.** `SigningCredentials` (cert.rs) has *no* derives; 12
-  struct-literal sites exist, all in `#[cfg(test)]` helpers or the criterion bench
+- **Public shape is load-bearing.** `SigningCredentials` (cert.rs) has *no* derives; 13
+  struct-literal sites exist (12 helpers/locations — `zsign/verify.rs` has two), all in
+  `#[cfg(test)]` helpers or the criterion bench
   (`cms.rs:531/647/751/828/884`, `cms_verify.rs:1415/1897`, `macho/signer.rs:947`,
   `macho/verify.rs:344`, `zsign/test_util.rs:60`, `zsign/verify.rs:982/1056`,
   `benches/signing.rs:133`). Adding any field would break all of them — outside this
