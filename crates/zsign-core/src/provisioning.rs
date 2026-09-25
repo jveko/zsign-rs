@@ -542,7 +542,7 @@ mod tests {
         let data = sign_attached_content(
             plist_xml.as_bytes(),
             &leaf_cert,
-            &[root_cert.clone()],
+            std::slice::from_ref(&root_cert),
             &leaf_key,
             TestDigest::Sha256,
         )
