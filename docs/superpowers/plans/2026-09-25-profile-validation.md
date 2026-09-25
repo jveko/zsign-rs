@@ -875,8 +875,18 @@ fn verify_signed_data(
                     "attached eContent is not an OCTET STRING".into(),
                 ));
             }
+            if !ecr.is_finished() {
+                return Err(Error::Verification(
+                    "eContent wrapper has trailing data after the OCTET STRING".into(),
+                ));
+            }
             econtent = Some(inner.value().to_vec());
         }
+    }
+    if !encap_r.is_finished() {
+        return Err(Error::Verification(
+            "encapContentInfo has trailing fields after eContent".into(),
+        ));
     }
 ```
 
