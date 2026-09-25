@@ -20,6 +20,7 @@ let p12Bytes = null;
 let profileBytes = null;
 let signingInProgress = false;
 let wasmReady = false;
+let downloadUrl = null;
 
 // --- DOM refs ---
 const dropZone = $("#drop-zone");
@@ -183,6 +184,47 @@ const HASH_CHUNK = 64 * 1024 * 1024;
 
 const MAX_P12_BYTES = 4 * 1024 * 1024; // landed wasm credential limits, checked here for a friendlier error
 const MAX_PROFILE_BYTES = 16 * 1024 * 1024;
+
+// The demo holds the whole archive in browser memory, so the input is capped
+// at the wasm Mach-O ceiling and the unpacked total is capped independently:
+// a small archive may still expand enormously.
+const MAX_IPA_BYTES = 512 * 1024 * 1024;
+const MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
+
+function assertArchiveWithinLimits(entries, file) {
+  if (file.size > MAX_IPA_BYTES) {
+    throw new Error(
+      `IPA is ${formatSize(file.size)}; this demo accepts at most ${formatSize(MAX_IPA_BYTES)} (browser memory limits)`,
+    );
+  }
+  let declared = 0;
+  for (const entry of entries) {
+    if (!entry.directory) declared += entry.uncompressedSize;
+  }
+  if (declared > MAX_UNCOMPRESSED_BYTES) {
+    throw new Error(
+      `Archive expands to about ${formatSize(declared)}; this demo accepts at most ${formatSize(MAX_UNCOMPRESSED_BYTES)} unpacked`,
+    );
+  }
+}
+
+// zip.js already refuses an entry whose bytes disagree with the size the
+// central directory declared, so that check runs — and in practice throws —
+// inside getData before the bytes ever reach us. This is a defence-in-depth
+// backstop, not the enforcement point: it stays live, with its own message, if
+// that dependency behaviour ever changes, and it is checked after a read that
+// is already in memory rather than before the expansion it is watching.
+// Both layers fail closed on a lying central directory; this one names the
+// offending entry and states the rule, so a failure stays diagnosable.
+async function readEntry(entry) {
+  const data = await entry.getData(new Uint8ArrayWriter());
+  if (data.length > entry.uncompressedSize) {
+    throw new Error(
+      `${entry.filename} expands beyond its declared size — refusing (zip-bomb guard)`,
+    );
+  }
+  return data;
+}
 
 function hashEntry(signer, relPath, bytes) {
   if (bytes.length <= HASH_FILE_MAX) {
@@ -501,6 +543,10 @@ function rewriteBinaryBundleId(bytes, newId) {
 
 async function loadIpa(file) {
   if (signingInProgress) return; // a mid-run drop must not start a second run
+  if (downloadUrl !== null) {
+    URL.revokeObjectURL(downloadUrl);
+    downloadUrl = null;
+  }
   // A rejected replacement must not leave the previous IPA signable.
   ipaFile = null;
   updateSignButton();
@@ -535,6 +581,8 @@ async function loadIpa(file) {
     const entries = await zipReader.getEntries();
     log(`Found ${entries.length} entries in archive`);
 
+    assertArchiveWithinLimits(entries, file);
+
     let app;
     try {
       app = findAppRoot(entries);
@@ -549,7 +597,7 @@ async function loadIpa(file) {
       (e) => e.filename === `${app.prefix}Info.plist`,
     );
     if (infoPlistEntry) {
-      const plistData = await infoPlistEntry.getData(new Uint8ArrayWriter());
+      const plistData = await readEntry(infoPlistEntry);
       const bundleId = tryExtractBundleId(plistData, wasmReady);
       if (bundleId) {
         bundleIdInput.value = bundleId;
@@ -645,6 +693,12 @@ bundleIdInput.addEventListener("input", updateSignButton);
 // --- Signing flow ---
 
 async function signIpa() {
+  // The previous run's blob is dead weight the moment a new run starts; the
+  // button is hidden below, so nothing can be holding it open.
+  if (downloadUrl !== null) {
+    URL.revokeObjectURL(downloadUrl);
+    downloadUrl = null;
+  }
   // Snapshot inputs so a mid-run DOM mutation cannot change this run; disabling is a belt.
   const run = {
     ipaFile,
@@ -699,6 +753,8 @@ async function signIpa() {
     zipReader = new ZipReader(new BlobReader(run.ipaFile));
     const entries = await zipReader.getEntries();
     log(`Found ${entries.length} entries in archive`);
+
+    assertArchiveWithinLimits(entries, run.ipaFile);
 
     const { prefix: currentAppPrefix, name: currentAppName } =
       findAppRoot(entries);
@@ -783,7 +839,7 @@ async function signIpa() {
       if (!plistEntry) {
         throw new Error(`bundle ${prefix} has no Info.plist`);
       }
-      const plistData = await plistEntry.getData(new Uint8ArrayWriter());
+      const plistData = await readEntry(plistEntry);
       const execName = tryExtractExecutableName(plistData, wasmReady);
       if (!execName) {
         throw new Error(
@@ -797,7 +853,7 @@ async function signIpa() {
       let found = false;
       for (const entry of entries) {
         if (entry.directory || entry.filename !== execFull || isSymlinkEntry(entry)) continue;
-        if (isMachO(await entry.getData(new Uint8ArrayWriter()))) {
+        if (isMachO(await readEntry(entry))) {
           found = true;
           break;
         }
@@ -848,7 +904,7 @@ async function signIpa() {
         const name = entry.filename.slice(prefix.length);
         if (name.startsWith("_CodeSignature/")) continue;
         // One decompression serves both the Mach-O test and the sign call.
-        const data = await entry.getData(new Uint8ArrayWriter());
+        const data = await readEntry(entry);
         if (!isMachO(data)) continue;
         try {
           const signed = signer.sign_macho_fat(data, fileStem(name), null, null);
@@ -915,11 +971,11 @@ async function signIpa() {
           if (isRoot) {
             hashOne(relPath, run.profileBytes);
           } else {
-            hashOne(relPath, signedFiles.get(entry.filename) || (await entry.getData(new Uint8ArrayWriter())));
+            hashOne(relPath, signedFiles.get(entry.filename) || (await readEntry(entry)));
           }
           continue;
         }
-        hashOne(relPath, signedFiles.get(entry.filename) || (await entry.getData(new Uint8ArrayWriter())));
+        hashOne(relPath, signedFiles.get(entry.filename) || (await readEntry(entry)));
       }
       for (const [fullPath, bytes] of signedFiles) {
         if (!fullPath.startsWith(prefix) || fullPath === execFull) continue;
@@ -934,7 +990,7 @@ async function signIpa() {
       log(`CodeResources for ${prefix}: ${formatSize(codeResourcesBytes.length)}`, "ok");
 
       // e. Sign this bundle's main executable last: it embeds the signature.
-      const mainData = signedFiles.get(execFull) || (await entries.find((e) => e.filename === execFull).getData(new Uint8ArrayWriter()));
+      const mainData = signedFiles.get(execFull) || (await readEntry(entries.find((e) => e.filename === execFull)));
       try {
         const signed = signer.sign_macho_fat(
           mainData,
@@ -1044,7 +1100,7 @@ async function signIpa() {
         continue;
       }
 
-      const data = await entry.getData(new Uint8ArrayWriter());
+      const data = await readEntry(entry);
       await zipWriter.add(entry.filename, new Uint8ArrayReader(data), {
         externalFileAttributes: entry.externalFileAttributes || UNIX_FILE_0644,
         lastModDate: entry.lastModDate,
@@ -1103,9 +1159,9 @@ async function signIpa() {
       }),
     );
 
-    const url = URL.createObjectURL(blob);
+    downloadUrl = URL.createObjectURL(blob);
     const outputName = run.ipaFile.name.replace(/\.ipa$/i, "_signed.ipa");
-    downloadBtn.href = url;
+    downloadBtn.href = downloadUrl;
     downloadBtn.download = outputName;
     downloadBtn.textContent = `⬇ Download ${outputName}`;
     downloadBtn.classList.add("visible");
