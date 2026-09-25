@@ -310,3 +310,89 @@ pub(crate) fn make_text_fileoff0_macho(tight_gap: bool) -> Vec<u8> {
     b.resize(0x2000, 0);
     b
 }
+
+/// Assembles a big-endian FAT/Universal container around the given thin
+/// slices. Offsets follow the per-entry align exponent (lipo's rule:
+/// round each slice up to a multiple of 2^align), so fixtures obey the
+/// same invariant the writer must emit.
+pub fn make_fat_macho(slices: &[Vec<u8>], aligns: &[u32]) -> Vec<u8> {
+    assert_eq!(slices.len(), aligns.len());
+    assert!(!slices.is_empty());
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xcafebabeu32.to_be_bytes());
+    out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+    let header_size = 8 + slices.len() * 20;
+    let mut offsets = Vec::with_capacity(slices.len());
+    let mut cursor = header_size;
+    for (slice, align) in slices.iter().zip(aligns) {
+        let step = 1usize << *align;
+        cursor = cursor.checked_add(step - 1).unwrap() & !(step - 1);
+        offsets.push(cursor);
+        cursor += slice.len();
+    }
+    // Entries are appended directly after the 8-byte fat_header (magic +
+    // nfat_arch), so the table lands at offset 8 where goblin reads it.
+    for ((slice, align), offset) in slices.iter().zip(aligns).zip(&offsets) {
+        let cpu = u32::from_le_bytes(slice[4..8].try_into().expect("cputype"));
+        let sub = u32::from_le_bytes(slice[8..12].try_into().expect("cpusubtype"));
+        out.extend_from_slice(&cpu.to_be_bytes());
+        out.extend_from_slice(&sub.to_be_bytes());
+        out.extend_from_slice(&(*offset as u32).to_be_bytes());
+        out.extend_from_slice(&(slice.len() as u32).to_be_bytes());
+        out.extend_from_slice(&align.to_be_bytes());
+    }
+    for (slice, offset) in slices.iter().zip(&offsets) {
+        out.resize(*offset, 0);
+        out.extend_from_slice(slice);
+    }
+    out
+}
+
+/// Shared self-signed RSA-2048 code-signing credentials for macho tests:
+/// `Profile::Leaf` (issuer == subject), the code-signing EKU
+/// `1.3.6.1.5.5.7.3.3`, `CA=false`, `team_id = Some("TESTTEAM")`.
+pub(crate) fn test_signing_credentials() -> crate::crypto::SigningCredentials {
+    use crate::crypto::cert::SigningKeyType;
+    use der::Decode;
+    use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+    use std::str::FromStr;
+    use std::time::Duration;
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::Validity;
+
+    let mut rng = rand::thread_rng();
+    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone());
+    let subject = Name::from_str("CN=zsign verify test").unwrap();
+    let serial = SerialNumber::from(7u32);
+    let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+    let pub_der = key.to_public_key().to_public_key_der().unwrap();
+    let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_der.as_ref()).unwrap();
+    let mut builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: subject.clone(),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        serial,
+        validity,
+        subject,
+        pub_key,
+        &signing_key,
+    )
+    .unwrap();
+    builder
+        .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
+            const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+        ]))
+        .unwrap();
+    let certificate = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+    crate::crypto::SigningCredentials {
+        certificate,
+        signing_key: SigningKeyType::Rsa(signing_key),
+        cert_chain: vec![],
+        team_id: Some("TESTTEAM".to_string()),
+    }
+}

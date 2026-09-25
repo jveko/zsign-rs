@@ -315,8 +315,12 @@ pub fn sign_macho_adhoc(
     Ok(signed.signed_data)
 }
 
-/// Signs a single-architecture Mach-O emitting only the SHA-256 code
-/// directory (no SHA-1 code directory slot).
+/// Signs a Mach-O emitting only the SHA-256 code directory (no SHA-1 code
+/// directory slot).
+///
+/// Every slice of a FAT/Universal binary is signed with SHA-256-only code
+/// directories and the container is reassembled; a thin binary is signed in
+/// place.
 pub fn sign_macho_sha256_only(
     macho: &MachOFile,
     identifier: &str,
@@ -326,10 +330,19 @@ pub fn sign_macho_sha256_only(
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
-    if macho.slices().len() != 1 {
-        return Err(crate::Error::MachO(
-            "sign_macho_sha256_only only supports single-arch Mach-O".into(),
-        ));
+    if macho.is_fat() {
+        reject_encrypted(macho, identifier, allow_encrypted)?;
+        let signed = sign_all_slices_impl(
+            macho,
+            identifier,
+            entitlements,
+            credentials,
+            info_plist,
+            code_resources,
+            allow_encrypted,
+            true,
+        )?;
+        return super::writer::embed_signature_fat(macho.data(), &signed);
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
@@ -366,6 +379,33 @@ pub fn sign_macho_all_slices(
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
 ) -> Result<Vec<SignedSlice>> {
+    sign_all_slices_impl(
+        macho,
+        identifier,
+        entitlements,
+        credentials,
+        info_plist,
+        code_resources,
+        allow_encrypted,
+        false,
+    )
+}
+
+/// Shared per-slice signing engine behind [`sign_macho_all_slices`] and
+/// [`sign_macho_sha256_only`].
+///
+/// `sha256_only` selects whether each slice gets a SHA-256-only code
+/// directory (no SHA-1 slot) or the default SHA-1 + SHA-256 set.
+fn sign_all_slices_impl(
+    macho: &MachOFile,
+    identifier: &str,
+    entitlements: Option<&[u8]>,
+    credentials: &SigningCredentials,
+    info_plist: Option<&[u8]>,
+    code_resources: Option<&[u8]>,
+    allow_encrypted: bool,
+    sha256_only: bool,
+) -> Result<Vec<SignedSlice>> {
     let is_executable = macho
         .slices()
         .first()
@@ -396,7 +436,7 @@ pub fn sign_macho_all_slices(
                 identifier,
                 &ctx,
                 Some(credentials),
-                false,
+                sha256_only,
             )?;
 
             signed.slice_index = index;
@@ -876,7 +916,9 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::fixtures::{make_minimal_macho, make_minimal_macho_encrypted};
+    use crate::macho::fixtures::{
+        make_fat_macho, make_minimal_macho, make_minimal_macho_encrypted,
+    };
 
     #[test]
     fn test_sha1_hash() {
@@ -1004,6 +1046,93 @@ mod tests {
         );
         assert!(!saw_sha1, "sha1 code directory must be omitted");
         assert!(saw_cms, "cms signature must be present");
+    }
+
+    #[test]
+    fn test_sha256_only_signs_two_arch_fat_container() {
+        use crate::codesign::constants::{
+            CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            CSSLOT_CODEDIRECTORY, CS_HASHTYPE_SHA1, CS_HASHTYPE_SHA256,
+        };
+
+        let mut second = make_minimal_macho();
+        second[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed
+        let fat = make_fat_macho(&[make_minimal_macho(), second], &[12, 12]);
+        let macho = MachOFile::parse(fat).unwrap();
+        assert!(macho.is_fat(), "fixture must parse as a FAT container");
+        assert_eq!(macho.slices().len(), 2, "fixture must hold two slices");
+
+        let creds = test_credentials();
+        // This is exactly the call the default IpaSigner (sha256_only=true) makes.
+        let signed =
+            sign_macho_sha256_only(&macho, "com.zsign.fatsha", None, &creds, None, None, false)
+                .expect("default sha256-only path must sign a two-arch FAT executable");
+
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        assert!(m.is_fat(), "FAT container must survive sha256-only signing");
+        assert_eq!(m.slices().len(), 2, "both architectures must be preserved");
+        let cpus: Vec<u32> = m.slices().iter().map(|s| s.cpu_type).collect();
+        assert_eq!(
+            cpus,
+            vec![0x0100_000c, 0x0100_0007],
+            "architecture order must be preserved"
+        );
+        for slice in m.slices() {
+            let sig = slice
+                .code_sig_offset
+                .expect("each slice must carry a signature");
+            let sig_len = slice
+                .code_sig_size
+                .expect("each slice must size its signature") as usize;
+            let start = slice.offset + sig as usize;
+            let blob = &signed[start..start + sig_len];
+            assert_eq!(
+                read_u32(blob, 0),
+                CSMAGIC_EMBEDDED_SIGNATURE,
+                "slice cpu_type {:#x}: signature must be a superblob",
+                slice.cpu_type
+            );
+            // SuperBlob layout: magic(4) + count(4, BE) + count * 8-byte
+            // (type, offset) BE entries starting at offset 8.
+            let count = read_u32(blob, 8) as usize;
+            let mut saw_cd = false;
+            for i in 0..count {
+                let typ = read_u32(blob, 12 + i * 8);
+                let eoff = read_u32(blob, 16 + i * 8) as usize;
+                let is_cd_slot = typ == CSSLOT_CODEDIRECTORY
+                    || (typ >= CSSLOT_ALTERNATE_CODEDIRECTORIES
+                        && typ < CSSLOT_ALTERNATE_CODEDIRECTORIES + 5);
+                if !is_cd_slot {
+                    continue;
+                }
+                assert_eq!(
+                    read_u32(blob, eoff),
+                    CSMAGIC_CODEDIRECTORY,
+                    "slot {typ:#x} must point at a CodeDirectory blob"
+                );
+                // CodeDirectory header: magic 4 + version 4 + flags 4 +
+                // hashOffset 2 + identOffset 2 + nSpecialSlots 4 +
+                // nCodeSlots 4 + codeLimit 4 + hashSize 1 => hashType is
+                // the single byte at offset 37 (CS_HASHTYPE_SHA256 == 2).
+                let hash_type = blob[eoff + 37];
+                saw_cd = true;
+                assert_ne!(
+                    hash_type, CS_HASHTYPE_SHA1,
+                    "slice cpu_type {:#x}: no SHA-1 CodeDirectory may exist",
+                    slice.cpu_type
+                );
+                assert_eq!(
+                    hash_type, CS_HASHTYPE_SHA256,
+                    "slice cpu_type {:#x}: every CodeDirectory must be SHA-256",
+                    slice.cpu_type
+                );
+            }
+            assert!(
+                saw_cd,
+                "slice cpu_type {:#x}: at least one CodeDirectory must be emitted",
+                slice.cpu_type
+            );
+        }
     }
 
     #[test]
