@@ -52,9 +52,6 @@ const DER_TAG_UTF8STRING: u8 = 0x0c;
 /// DER tag for SEQUENCE (used for arrays).
 const DER_TAG_SEQUENCE: u8 = 0x30;
 
-/// DER tag for SET (used for dictionaries).
-const DER_TAG_SET: u8 = 0x31;
-
 /// Encode a length value in DER format.
 ///
 /// For lengths < 128, uses short form (1 byte).
@@ -83,7 +80,7 @@ fn encode_length(output: &mut Vec<u8>, length: usize) {
 /// - Integer -> INTEGER
 /// - String -> UTF8String
 /// - Array -> SEQUENCE
-/// - Dictionary -> SET of key-value pairs
+/// - Dictionary -> [16] (0xb0) IMPLICIT SET OF key-value pairs
 fn encode_value(value: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
@@ -169,7 +166,7 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
                 set_content.extend(encoded_val);
             }
 
-            output.push(DER_TAG_SET);
+            output.push(0xb0); // [16] IMPLICIT SET (constructed)
             encode_length(&mut output, set_content.len());
             output.extend(set_content);
         }
@@ -408,5 +405,31 @@ mod tests {
         let der = encode_value(&value).unwrap();
         // Should be: 0x02 (INTEGER), 0x02 (length=2), 0x00, 0xFF
         assert_eq!(der, vec![0x02, 0x02, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn test_plist_to_der_nested_dictionary() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>outer</key>
+    <dict>
+        <key>k</key>
+        <true/>
+    </dict>
+</dict>
+</plist>"#;
+
+        let der = plist_to_der(xml).unwrap();
+        // 70 18 | 02 01 01 | b0 13 | 30 11 0c 05 "outer" b0 08 30 06 0c 01 "k" 01 01 ff
+        // nested dictionary must be [16] 0xb0, never universal SET 0x31.
+        assert_eq!(
+            der,
+            vec![
+                0x70, 0x18, 0x02, 0x01, 0x01, 0xb0, 0x13, 0x30, 0x11, 0x0c, 0x05, b'o', b'u', b't',
+                b'e', b'r', 0xb0, 0x08, 0x30, 0x06, 0x0c, 0x01, b'k', 0x01, 0x01, 0xff,
+            ]
+        );
     }
 }
