@@ -502,12 +502,13 @@ For each of the six targets:
 ```sh
 mkdir -p fuzz/target/smoke-corpus/<target>
 TMPDIR=$PWD/.tmptmp cargo +nightly-2026-04-30 fuzz run <target> --features fuzzing \
-  fuzz/target/smoke-corpus/<target> fuzz/corpus/<target> -- -runs=2000 -timeout=25
+  fuzz/target/smoke-corpus/<target> fuzz/corpus/<target> -- -runs=2000 -timeout=25 -print_final_stats=1
 ```
 Both corpus dirs are passed explicitly — cargo-fuzz adds the automatic `fuzz/corpus/<target>`
 only when *no* user dir is given (`project.rs` `if !run.corpus.is_empty()`), so a scratch-only
 command would load zero seeds. Scratch goes first (libFuzzer's writeback dir), committed
-seeds second (read-only). Record verbatim per target: the `#N INITED cov: … corp: M …` line
+seeds second (read-only). `-print_final_stats=1` is required for the
+`stat::number_of_executed_units:` line to print (verified against cargo-fuzz 0.13.2). Record verbatim per target: the `#N INITED cov: … corp: M …` line
 (M ≥ committed seed count proves ingestion) and the closing `stat::number_of_executed_units:`
 summary (a nonzero count proves mutation ran). All six
 must exit 0 (a crash here is a REPORT under the design-doc §8 classification — record it,
@@ -625,7 +626,7 @@ For each of the six targets:
 ```sh
 mkdir -p fuzz/target/smoke-corpus/<target>
 TMPDIR=$PWD/.tmptmp cargo +nightly-2026-04-30 fuzz run <target> --features fuzzing \
-  fuzz/target/smoke-corpus/<target> fuzz/corpus/<target> -- -max_total_time=60 -timeout=25 -rss_limit_mb=2048
+  fuzz/target/smoke-corpus/<target> fuzz/corpus/<target> -- -max_total_time=60 -timeout=25 -rss_limit_mb=2048 -print_final_stats=1
 ```
 (Both dirs mandatory — see Task 2 Step 7: scratch first for writeback, committed corpus
 second so the seeds actually load.)
@@ -639,6 +640,11 @@ yields a REPORT with panic site `file:line`, owning lane (ZSN-29 codesign/*+cms_
 ZSN-33 macho signer/writer/parser/builder · ZSN-39 ipa/* · ZSN-5 main.rs · otherwise
 supervisor-routed candidate), and a one-line repro
 `cargo fuzz run <target> --features fuzzing fuzz/artifacts/<target>/<file> -- -runs=0`.
+**Stale-finding rule (ZSN-29 landed on main as `2e06a17` after this branch's base):** a crash
+in the shift / multiply / special-slot / BER classes is expected on this pre-fix branch —
+record it verbatim but classify `STALE (fixed on main 2e06a17; no routing)`; only classes
+still open on main (design §8: plist_to_der encode recursion, PBKDF2 TIMEOUT) route to an
+owner, and any of the fixed classes crashing AFTER `2e06a17` merges would be a NEW finding.
 Artifacts land in
 `fuzz/artifacts/` (gitignored). `ENV` failures: retry once with `TMPDIR=$PWD/.tmptmp`, then
 record honestly.

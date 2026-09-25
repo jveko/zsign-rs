@@ -208,26 +208,34 @@ panic in a file owned by **no** active lane (`macho/verify.rs`, `crypto/pkcs12.r
 `crypto/cert.rs`, `provisioning.rs`) → note as candidate with a one-line fix suggestion and
 route to the supervisor; `codesign/der.rs` and all of `codesign/*` route to ZSN-29.
 
-**Known candidates the scouts + quality reviews flagged** (may surface during smoke; findings,
-not fixes — all route to their owning lanes):
-- `check_code_pages`: `1usize << cd.page_size_log2` (`codesign/verify.rs:859`) —
-  `page_size_log2` is read unvalidated at `verify.rs:613`; cargo-fuzz injects
-  `-Cdebug-assertions` (overflow checks on) → shift-overflow panic is reachable from target
-  `code_directory` with a 44-byte blob (`page_size_log2 >= 64`). Quality review additionally
-  established **CLI reachability**: `zsign verify` → `verify_macho` → `check_code_pages_in_file`
-  → `check_code_pages` (`macho/verify.rs:417-420,505`) — a crafted binary panics the verify
-  CLI. Owner: ZSN-29 (`codesign/*`).
-- `check_code_pages`: unchecked `expected_slots * cd.hash_size` multiply before indexing
-  `stored` (`codesign/verify.rs:883`, slice at `:900`) — a wrapped product could let the
-  guard pass and the per-page index run past `stored` (theoretical: needs ~2^32 slots).
-  Owner: ZSN-29 (`codesign/*`).
-- `special_slot_hash` bare subtraction (`verify.rs:780`) is safe only via two parse-time
-  guards 70 lines away (`verify.rs:705`) — doc-line candidate for the owner, no behavior
-  change. Owner: ZSN-29 (`codesign/*`).
-- `normalize_ber_lengths` → `write_norm` recursion per nested constructed TLV with no depth
-  counter (`crypto/cms_verify.rs:152+`) → stack-overflow candidate. Owner: ZSN-29 (BER).
+**Known candidates — status after ZSN-29 landing (supervisor update, verified against
+`git show 2e06a17:…`):** this branch's base (0f07c30) **predates** main commit `2e06a17`,
+which landed `page_size_log2` validation + checked shift (`verify.rs:613-618,884`),
+hash-region `checked_mul` including `special_slot_hash`/`code_hashes` (`verify.rs:709,795,804,906`),
+the `write_norm` BER depth cap, and superblob u32 narrowing guards. Consequences for this lane:
+- Crashes on **this branch** in the shift / multiply / special-slot / BER classes are
+  **STALE findings** — record them citing `2e06a17` as already-fixed; no owner routing.
+- The same classes crashing **after** the orchestrator merges `2e06a17` would be NEW findings.
+- `plist_to_der` encode recursion remains **OPEN on main** (verified: `2e06a17`'s `der.rs`
+  has no depth guard) → still routes to ZSN-29.
+
+Bullet status (all route-targets below were evaluated against the branch base):
+- ~~`check_code_pages`: `1usize << cd.page_size_log2` (`codesign/verify.rs:859`) — `page_size_log2`
+  read unvalidated at `verify.rs:613`; `-Cdebug-assertions` → shift-overflow from a 44-byte
+  blob (`page_size_log2 >= 64`), also CLI-reachable (`zsign verify` → `verify_macho` →
+  `check_code_pages_in_file`, `macho/verify.rs:417-420,505`)~~ **FIXED on main `2e06a17`**
+  (parse-time rejection + checked shift; test `parse_rejects_page_size_log2_above_16`);
+  stale on this branch base.
+- ~~Unchecked `expected_slots * cd.hash_size` before indexing `stored`
+  (`codesign/verify.rs:883`, slice `:900`)~~ **FIXED on main `2e06a17`** (`verify.rs:906`
+  `checked_mul` → `CountMismatch`); stale on this branch base.
+- ~~`special_slot_hash` bare subtraction (`verify.rs:780`) safe only via parse-time guards~~
+  **FIXED on main `2e06a17`** (full checked chain); stale on this branch base.
+- ~~`normalize_ber_lengths` → `write_norm` uncapped recursion (`crypto/cms_verify.rs:152+`)~~
+  **FIXED on main `2e06a17`** (BER depth cap landed); stale on this branch base.
 - `plist_to_der` encode side has no recursion-depth cap (`codesign/der.rs:346+`; decode side
-  *is* capped at 32/64 in `verify.rs:1115,1143,1154,373`). Owner: ZSN-29 (`codesign/*`).
+  *is* capped at 32/64 in `verify.rs:1115,1143,1154,373`) — **OPEN on main** (verified
+  against `2e06a17`). Owner: ZSN-29 (`codesign/*`).
 - PKCS#12 PBKDF2 work factor: `validate_iterations` accepts up to `MAX_ITERATIONS = 10_000_000`
   (`crypto/pkcs12.rs:149,383`) — attacker-controlled per-input cost; classified `TIMEOUT`
   under §8 rules, `-timeout=25` on every run. No active lane owns `crypto/pkcs12.rs` →
