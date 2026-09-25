@@ -1026,7 +1026,10 @@ mod tests {
 
     /// Builds a signed bundle with one nested framework (mirrors the CI
     /// interop fixture shape).
-    fn build_signed_bundle_with(dir: &Path, setup: impl FnOnce(&Path)) -> (PathBuf, crate::SigningCredentials) {
+    fn build_signed_bundle_with(
+        dir: &Path,
+        setup: impl FnOnce(&Path),
+    ) -> (PathBuf, crate::SigningCredentials) {
         let app = dir.join("Test.app");
         fs::create_dir_all(app.join("Frameworks").join("Sub.framework")).unwrap();
         fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
@@ -1081,7 +1084,7 @@ mod tests {
     #[test]
     fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         let extracted = td.path().join("extracted-bin");
         fs::write(&extracted, fs::read(app.join("Test")).unwrap()).unwrap();
         let report = verify_macho_file(&extracted).unwrap();
@@ -1154,16 +1157,33 @@ mod tests {
         // Target a plain resource, never a Mach-O: the signer's binary walk follows
         // links (ipa/mod.rs:598-620) and would re-sign a linked executable through
         // the symlink, which is out of this test's scope.
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, creds) = build_signed_bundle_with(td.path(), |app| {
             let framework = app.join("Frameworks").join("Sub.framework");
             fs::write(framework.join("resource.bin"), b"framework resource").unwrap();
             symlink("resource.bin", framework.join("reslink")).unwrap();
         });
         let report = verify_bundle(&app).unwrap();
+        // Dual-pin contract: without injected anchors report.valid() is false,
+        // so "verifies clean end-to-end" = every problem is the anchoring gate
+        // and the CMS verifies anchored against the test root.
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(bundle.errors.is_empty(), "errors: {:?}", bundle.errors);
+        assert_eq!(bundle.nested.len(), 1);
+        for binary in bundle.binaries.iter().chain(&bundle.nested[0].binaries) {
+            let slice = &binary.report.as_ref().expect("Mach-O report").slices[0];
+            assert_eq!(slice.errors.len(), 1, "binaries: {:?}", binary.errors);
+            assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        }
+        let injected = cms_report_with_test_anchor(&fs::read(app.join("Test")).unwrap(), &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
+        let cr = bundle.code_resources.as_ref().expect("CodeResources check");
         assert!(
-            report.valid(),
-            "a bundle whose framework contains a sealed symlink must verify: {:?}",
-            report.bundle
+            cr.valid(),
+            "sealed symlink verified: mismatched={:?} missing={:?} unsealed={:?}",
+            cr.mismatched,
+            cr.missing,
+            cr.unsealed
         );
     }
 
@@ -1247,7 +1267,7 @@ mod tests {
     #[test]
     fn missing_code_resources_is_reported_invalid() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         fs::remove_dir_all(app.join("_CodeSignature")).unwrap();
         let report = verify_bundle(&app).unwrap();
         assert!(
@@ -1268,7 +1288,7 @@ mod tests {
     #[test]
     fn tampered_nested_binary_is_detected_by_nested_frame() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         let sub = app.join("Frameworks").join("Sub.framework").join("Sub");
         let mut data = fs::read(&sub).unwrap();
         data[0x1000] ^= 0x04;
@@ -1306,21 +1326,29 @@ mod tests {
         // Builder emission: any *.DS_Store is dropped from files2 at build, kept in
         // the legacy files dict, and omitted by rules2 (weight 2000).
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, creds) = build_signed_bundle_with(td.path(), |app| {
             fs::write(app.join("Frameworks").join(".DS_Store"), b"junk").unwrap();
         });
         let report = verify_bundle(&app).unwrap();
-        assert!(
-            report.valid(),
-            "files-only keys are sealed; bundle: {:?}",
-            report.bundle
-        );
+        // Dual-pin: report.valid() is anchor-gated; this rule defends
+        // files-only sealing, asserted at the CodeResources layer.
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        assert!(cr.valid(), "files-only keys are sealed: {:?}", cr);
+        let cms = cms_report_with_test_anchor(&fs::read(app.join("Test")).unwrap(), &creds);
+        assert!(cms.valid, "cms errors: {:?}", cms.errors);
+        assert!(cms.anchored);
     }
 
     #[test]
     fn legacy_sha1_only_entry_verifies() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         let key = "Frameworks/Sub.framework/Info.plist";
         rewrite_code_resources(&app, |dict| {
             let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
@@ -1346,7 +1374,7 @@ mod tests {
     #[test]
     fn partial_reseal_with_updated_hash2_is_detected() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         let target = app
             .join("Frameworks")
             .join("Sub.framework")
@@ -1385,17 +1413,25 @@ mod tests {
     #[test]
     fn optional_lproj_deletion_after_signing_stays_valid() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, creds) = build_signed_bundle_with(td.path(), |app| {
             fs::create_dir_all(app.join("en.lproj")).unwrap();
             fs::write(app.join("en.lproj").join("Localizable.strings"), b"hi").unwrap();
         });
         fs::remove_dir_all(app.join("en.lproj")).unwrap();
         let report = verify_bundle(&app).unwrap();
-        assert!(
-            report.valid(),
-            "rules2 marks .lproj optional (weight 1000): {:?}",
-            report.bundle
-        );
+        // Dual-pin: report.valid() is anchor-gated; this rule defends the
+        // optional tolerance, asserted at the CodeResources layer.
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        assert!(cr.valid(), "rules2 marks .lproj optional: {:?}", cr);
+        let cms = cms_report_with_test_anchor(&fs::read(app.join("Test")).unwrap(), &creds);
+        assert!(cms.valid, "cms errors: {:?}", cms.errors);
+        assert!(cms.anchored);
     }
 
     #[test]
@@ -1403,7 +1439,7 @@ mod tests {
         // Guard for weight precedence: ^Base\.lproj/ (1010, include) must beat
         // ^.*\.lproj/ (1000, optional), so a sealed Base.lproj file may not vanish.
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, _) = build_signed_bundle_with(td.path(), |app| {
             fs::create_dir_all(app.join("Base.lproj")).unwrap();
             fs::write(app.join("Base.lproj").join("Notes.strings"), b"x").unwrap();
         });
@@ -1429,23 +1465,35 @@ mod tests {
         // (its files2 drop list is only Info.plist/PkgInfo/*.DS_Store) while the
         // rules declare it omit at weight 1100.
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, creds) = build_signed_bundle_with(td.path(), |app| {
             fs::create_dir_all(app.join("en.lproj")).unwrap();
             fs::write(app.join("en.lproj").join("locversion.plist"), b"x").unwrap();
         });
         fs::remove_file(app.join("en.lproj").join("locversion.plist")).unwrap();
         let report = verify_bundle(&app).unwrap();
+        // Dual-pin: report.valid() is anchor-gated; this rule defends Omit
+        // tolerance, asserted at the CodeResources layer.
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
         assert!(
-            report.valid(),
+            cr.valid(),
             "an omitted-but-sealed entry may vanish: {:?}",
-            report.bundle
+            cr
         );
+        let cms = cms_report_with_test_anchor(&fs::read(app.join("Test")).unwrap(), &creds);
+        assert!(cms.valid, "cms errors: {:?}", cms.errors);
+        assert!(cms.anchored);
     }
 
     #[test]
     fn unsupported_rule_is_reported() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         rewrite_code_resources(&app, |dict| {
             let rules2 = dict.get_mut("rules2").unwrap().as_dictionary_mut().unwrap();
             rules2.insert("^secret\\.bin$".into(), plist::Value::Boolean(true));
@@ -1468,7 +1516,7 @@ mod tests {
     #[test]
     fn malformed_entry_is_reported() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         rewrite_code_resources(&app, |dict| {
             let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
             files2.insert(
@@ -1491,7 +1539,7 @@ mod tests {
     #[test]
     fn path_traversal_keys_are_rejected() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         rewrite_code_resources(&app, |dict| {
             let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
             for key in ["../../../../etc/passwd", "/etc/passwd"] {
@@ -1526,7 +1574,7 @@ mod tests {
         fs::write(outside.join("secret.txt"), b"outside content").unwrap();
         // A legitimately sealed symlink pointing out of the bundle: the builder
         // hashes whatever read_link returns, so this signs cleanly.
-        let app = build_signed_bundle_with(td.path(), |app| {
+        let (app, _) = build_signed_bundle_with(td.path(), |app| {
             symlink(&outside, app.join("Escape")).unwrap();
         });
         // Lexical-clean key whose intermediate component is that symlink; the
