@@ -258,7 +258,7 @@ Bullet status (all route-targets below were evaluated against the branch base):
   `cargo fuzz build` compilation warnings plus review.
 - `ci.yml` integration (fuzz as a required PR gate instead of weekly) and `hk.pkl` test-step
   integration are follow-ups for their owners (both files are out of this lane's scope).
-- **cargo-deny conflict (needs owner action — supervisor question raised):** making `fuzz` a
+- **cargo-deny conflict — RESOLVED (landed by orchestrator; option A):** making `fuzz` a
   workspace member puts `libfuzzer-sys 0.4.13` — license `(MIT OR Apache-2.0) AND NCSA`
   (`libfuzzer-sys-0.4.13/Cargo.toml:36`) — into the root `Cargo.lock`, while `deny.toml`'s
   `[licenses].allow` (`deny.toml:15-27`) has no `NCSA`; the required `cargo-deny` CI job
@@ -267,10 +267,13 @@ Bullet status (all route-targets below were evaluated against the branch base):
   one line, the standard LLVM license, recommended; **(B)** land the branch with the deny job
   red until that line lands; **(C)** drop workspace membership (`fuzz` keeps its own
   `[workspace]` table — cargo-fuzz-supported and CI-green, but deviates from the brief's
-  `members += "fuzz"` mandate). **Resolution: supervisor selected option A** — keep
-  membership; the one-line `"NCSA"` allowlist addition to `deny.toml` is routed outside this
-  lane (still out of this lane's scope; must land before the required cargo-deny job is green
-  again). Lock delta measured on this worktree: three added entries (`libfuzzer-sys`,
+  `members += "fuzz"` mandate). **Resolution: supervisor selected option A — and the
+  one-line `"NCSA"` allowlist addition to `deny.toml` has since LANDED on main
+  (committed by the orchestrator on the primary checkout; this lane never touched
+  `deny.toml`).** The cargo-deny job stays green before and after this branch merges:
+  `libfuzzer-sys` only enters the root lock via this lane's fuzz crate, and its NCSA
+  license is now allowlisted. Lock delta measured on this worktree: three added entries
+  (`libfuzzer-sys`,
   `arbitrary`, the path member `zsign-fuzz`), 25 insertions / 0 deletions, **no version
   changes** — `cc` stays 1.4.7 (a fresh-project lock would pull newer transitives; this
   repo's existing pins already satisfy the new graph, see §6).
