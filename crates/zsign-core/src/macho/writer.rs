@@ -691,14 +691,15 @@ fn add_code_signature_command(
 }
 
 /// Injects an `LC_LOAD_DYLIB` (or `LC_LOAD_WEAK_DYLIB` when `weak`) command into
-/// a 64-bit Mach-O, returning a new binary with the command appended to the
-/// load-command region.
+/// a single 64-bit Mach-O slice, returning a new binary of identical length with
+/// the command written into the slack between the last load command and the
+/// first segment.
 ///
 /// # Errors
 ///
 /// Returns [`Error::MachO`] if the input is not a 64-bit Mach-O or there is no
 /// room for the command between the last load command and the first segment.
-pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
+fn inject_dylib_thin(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
     const HEADER_SIZE: usize = 32;
     const DYLIB_FIXED_SIZE: usize = 24;
     const DEFAULT_FIRST_SEGMENT_OFFSET: usize = 4096;
@@ -887,6 +888,57 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
     )?;
 
     Ok(output)
+}
+
+/// Injects an `LC_LOAD_DYLIB` (or `LC_LOAD_WEAK_DYLIB` when `weak`) command into
+/// every architecture slice of a FAT/Universal binary and reassembles the
+/// container, returning a new binary. Thin (single-architecture) binaries take
+/// the same path as before: the command is written into the load-command slack,
+/// so the returned binary has the same length as the input.
+///
+/// # Errors
+///
+/// For a FAT binary, returns [`Error::MachO`] if the arch table is unreadable or
+/// inconsistent with the container, or if any slice cannot take the new command
+/// (the failing slice's error is propagated). For a thin binary, returns
+/// [`Error::MachO`] if the input is not a 64-bit Mach-O or there is no room for
+/// the command between the last load command and the first segment.
+pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
+    if let Ok(Mach::Fat(fat)) = Mach::parse(input) {
+        let arches: Vec<FatArch> = fat
+            .iter_arches()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::MachO(format!("Failed to read FAT arches: {e}")))?;
+        if arches.is_empty() {
+            return Err(Error::MachO("Empty FAT binary".into()));
+        }
+        validate_fat_arches(&arches, input)?;
+
+        let mut signed_slices: Vec<SignedSlice> = Vec::with_capacity(arches.len());
+        for (i, arch) in arches.iter().enumerate() {
+            let start = arch.offset as usize;
+            let end = start + arch.size as usize; // validated by validate_fat_arches
+            let injected = inject_dylib_thin(&input[start..end], dylib_name, weak)
+                .map_err(|e| Error::MachO(format!("FAT slice {i} ({}): {e}", arch.cputype)))?;
+            if injected.len() != arch.size as usize {
+                return Err(Error::MachO(format!(
+                    "FAT slice {i}: injection changed slice length from {} to {}",
+                    arch.size,
+                    injected.len()
+                )));
+            }
+            signed_slices.push(SignedSlice {
+                slice_index: i,
+                offset: start,
+                original_size: arch.size as usize,
+                cpu_type: arch.cputype,
+                signed_data: injected,
+            });
+        }
+        return embed_fat_from_signed_slices(&fat, &signed_slices);
+    }
+
+    inject_dylib_thin(input, dylib_name, weak)
 }
 
 fn find_first_segment_offset(macho: &MachO) -> usize {
@@ -2442,5 +2494,64 @@ mod tests {
                 panic!("prepare must not panic on hostile __LINKEDIT.fileoff (u64 underflow)")
             }
         }
+    }
+
+    #[test]
+    fn test_inject_dylib_command_injects_every_fat_slice_then_signs() {
+        let mut b = make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed second slice
+        let fat = make_fat_macho(&[make_minimal_macho(), b], &[12, 12]);
+        let m0 = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let ncmds_before: Vec<u32> = m0
+            .slices()
+            .iter()
+            .map(|s| {
+                let hdr = &fat[s.offset..];
+                u32::from_le_bytes(hdr[16..20].try_into().unwrap()) // mach_header_64.ncmds
+            })
+            .collect();
+
+        let out = inject_dylib_command(&fat, "/usr/lib/libzsigntest.dylib", false)
+            .expect("FAT injection must succeed");
+        let m = crate::macho::MachOFile::parse(out.clone()).unwrap();
+        assert_eq!(m.slices().len(), 2, "injection must keep the container");
+        for (i, slice) in m.slices().iter().enumerate() {
+            let hdr = &out[slice.offset..];
+            let ncmds = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
+            assert_eq!(
+                ncmds,
+                ncmds_before[i] + 1,
+                "slice {i} must gain one LC_LOAD_DYLIB"
+            );
+        }
+
+        // injected container must still be signable end-to-end:
+        let creds = test_signing_credentials();
+        let signed = crate::macho::sign_any_macho(
+            &m,
+            "com.zsign.injectfat",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .expect("signing after FAT injection must succeed");
+        let ms = crate::macho::MachOFile::parse(signed).unwrap();
+        assert!(ms.is_fat() && ms.slices().len() == 2);
+        assert!(
+            ms.slices().iter().all(|s| s.code_sig_offset.is_some()),
+            "every slice must be signed after injection"
+        );
+
+        // a slice without load-command slack fails closed, with a non-misleading error:
+        let tight = crate::macho::fixtures::make_text_fileoff0_macho(true);
+        let fat_tight = make_fat_macho(&[tight, make_minimal_macho()], &[12, 12]);
+        let err = inject_dylib_command(&fat_tight, "/usr/lib/libzsigntest.dylib", false)
+            .expect_err("tight slice must refuse injection");
+        assert!(
+            !err.to_string().contains("not a 64-bit"),
+            "FAT must not fall into the thin magic guard: {err}"
+        );
     }
 }
