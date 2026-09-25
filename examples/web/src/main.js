@@ -149,6 +149,279 @@ function tryExtractExecutableName(plistData, wasmReady) {
   return match ? match[1] : null;
 }
 
+function rewriteBundleIdentifier(plistBytes, newId) {
+  if (!/^[A-Za-z0-9._-]+$/.test(newId) || newId.length > 255) {
+    throw new Error(
+      `Bundle ID "${newId}" is invalid — letters, digits, dot, dash and underscore only (max 255)`,
+    );
+  }
+  if (plistBytes.length < 8) {
+    throw new Error("Info.plist is too short to be a plist");
+  }
+  const head = String.fromCharCode(
+    plistBytes[0], plistBytes[1], plistBytes[2], plistBytes[3],
+    plistBytes[4], plistBytes[5], plistBytes[6], plistBytes[7],
+  );
+  if (head === "bplist00") return rewriteBinaryBundleId(plistBytes, newId);
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(plistBytes);
+  if (text.startsWith("<?xml") || text.startsWith("<plist")) {
+    return rewriteXmlBundleId(plistBytes, newId);
+  }
+  throw new Error("Unsupported Info.plist format — expected XML or binary plist");
+}
+
+function rewriteXmlBundleId(bytes, newId) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (_) {
+    throw new Error("Info.plist XML is not valid UTF-8");
+  }
+  if (text.indexOf("<plist") === -1) {
+    throw new Error("Unsupported Info.plist format — expected XML or binary plist");
+  }
+  // Depth-aware scan: only ROOT-dict direct entries count, and the value element
+  // immediately following the key must be a bounded <string>. Matches are COUNTED
+  // during the scan (no early return — plist parsers are last-wins, so rewriting
+  // only the first of two root keys would desynchronize the emitted plist from the
+  // signed identifier) and rejected unless exactly one exists.
+  const tagRe = /<[^>]*>/g;
+  tagRe.lastIndex = text.indexOf("<");
+  let depth = 0;
+  let pendingRootKey = false;
+  let matches = 0;
+  let valueStart = -1;
+  let innerLen = -1;
+  let m;
+  while ((m = tagRe.exec(text)) !== null) {
+    const tag = m[0];
+    if (pendingRootKey) {
+      // Consumed by the very next tag — BEFORE any close-tag handling, so a stray
+      // close between the key and its value fails closed instead of deferring the
+      // pending key onto a later, unrelated <string>.
+      if (!tag.startsWith("<string>")) {
+        throw new Error("CFBundleIdentifier value is not a string");
+      }
+      const start = m.index + "<string>".length;
+      // Element-bounded match: stop at THIS element's close; a '<' before it means
+      // malformed content — never search onward through the document.
+      const sm = /^([^<]*)<\/string>/.exec(text.slice(start));
+      if (!sm) throw new Error("CFBundleIdentifier string value is unterminated");
+      matches += 1;
+      if (matches === 1) {
+        valueStart = start;
+        innerLen = sm[1].length;
+      }
+      pendingRootKey = false;
+      tagRe.lastIndex = start + sm[0].length;
+      continue;
+    }
+    if (tag.startsWith("</")) {
+      if (tag.startsWith("</dict") || tag.startsWith("</array")) depth -= 1;
+      continue;
+    }
+    if (tag.startsWith("<dict") || tag.startsWith("<array")) {
+      if (!tag.endsWith("/>")) depth += 1;
+      continue;
+    }
+    if (depth !== 1) continue;
+    if (tag.startsWith("<key>")) {
+      const keyStart = m.index + tag.length;
+      const keyEnd = text.indexOf("</key>", keyStart);
+      if (keyEnd === -1) throw new Error("Info.plist has an unterminated key");
+      const km = /^([^<]*)<\/key>/.exec(text.slice(keyStart));
+      if (!km) throw new Error("Info.plist has a malformed key element");
+      if (km[1] === "CFBundleIdentifier") pendingRootKey = true;
+      tagRe.lastIndex = keyStart + km[0].length;
+    }
+  }
+  if (pendingRootKey) throw new Error("CFBundleIdentifier has no value element");
+  if (matches === 0) {
+    throw new Error("Info.plist root dictionary has no CFBundleIdentifier key");
+  }
+  if (matches > 1) {
+    throw new Error(
+      `Info.plist has ${matches} root CFBundleIdentifier keys — refusing to rewrite (ambiguous)`,
+    );
+  }
+  const current = text.slice(valueStart, valueStart + innerLen);
+  if (current === newId) return bytes;
+  const updated = text.slice(0, valueStart) + newId + text.slice(valueStart + innerLen);
+  return new TextEncoder().encode(updated);
+}
+
+function readPlistU64(view, offset) {
+  return view.getUint32(offset) * 0x100000000 + view.getUint32(offset + 4);
+}
+
+function rewriteBinaryBundleId(bytes, newId) {
+  const len = bytes.length;
+  if (len < 40) throw new Error("Malformed binary plist (too short)");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const offsetIntSize = bytes[len - 26];
+  const objectRefSize = bytes[len - 25];
+  const numObjects = readPlistU64(view, len - 24);
+  const topObject = readPlistU64(view, len - 16);
+  const offsetTableOffset = readPlistU64(view, len - 8);
+  if (offsetIntSize < 1 || offsetIntSize > 8 || objectRefSize < 1 || objectRefSize > 8 ||
+      numObjects < 1 || topObject >= numObjects ||
+      offsetTableOffset + numObjects * offsetIntSize !== len - 32) {
+    throw new Error("Unsupported binary plist layout (trailer not adjacent to offset table)");
+  }
+  const readOffset = (i) => {
+    let o = 0;
+    for (let k = 0; k < offsetIntSize; k++) o = o * 256 + bytes[offsetTableOffset + i * offsetIntSize + k];
+    if (o >= offsetTableOffset) {
+      throw new Error("Malformed binary plist: object offset outside object table");
+    }
+    return o;
+  };
+  const readRef = (p) => {
+    let r = 0;
+    for (let k = 0; k < objectRefSize; k++) r = r * 256 + bytes[p + k];
+    if (r >= numObjects) {
+      throw new Error("Malformed binary plist: object reference out of range");
+    }
+    return r;
+  };
+  const parseHeader = (off) => {
+    if (off < 8 || off >= offsetTableOffset) {
+      throw new Error("Malformed binary plist: object starts outside object table");
+    }
+    const marker = bytes[off];
+    if (marker === 0x0f) {
+      // One-byte fill object (Apple CFBinaryPList.c): never a length prefix and
+      // never a container — object censuses must skip it, not reject the file.
+      return { type: 0, count: 0, headerEnd: off + 1 };
+    }
+    let count = marker & 0x0f;
+    let p = off + 1;
+    if (count === 0x0f) {
+      const intMarker = bytes[p];
+      if (intMarker >> 4 !== 1) throw new Error("Malformed binary plist length");
+      const n = 1 << (intMarker & 0x0f);
+      count = 0;
+      for (let k = 0; k < n; k++) count = count * 256 + bytes[p + 1 + k];
+      p += 1 + n;
+    }
+    if (p > offsetTableOffset) {
+      throw new Error("Malformed binary plist: header past object table");
+    }
+    return { type: marker >> 4, count, headerEnd: p };
+  };
+  const decodeString = (off) => {
+    const h = parseHeader(off);
+    const unit = h.type === 5 ? 1 : h.type === 6 ? 2 : 0;
+    if (unit === 0) return null;
+    if (h.headerEnd + h.count * unit > offsetTableOffset) {
+      throw new Error("Malformed binary plist: string payload past object table");
+    }
+    if (h.type === 5) {
+      return { text: new TextDecoder("utf-8", { fatal: false })
+          .decode(bytes.subarray(h.headerEnd, h.headerEnd + h.count)),
+        end: h.headerEnd + h.count };
+    }
+    if (h.type === 6) {
+      let s = "";
+      for (let i = 0; i < h.count; i++) {
+        s += String.fromCharCode((bytes[h.headerEnd + 2 * i] << 8) | bytes[h.headerEnd + 2 * i + 1]);
+      }
+      return { text: s, end: h.headerEnd + 2 * h.count };
+    }
+    return null;
+  };
+  const top = parseHeader(readOffset(topObject));
+  if (top.type !== 13) throw new Error("Binary plist root is not a dictionary");
+  if (top.headerEnd + top.count * 2 * objectRefSize > offsetTableOffset) {
+    throw new Error("Malformed binary plist: dictionary payload past object table");
+  }
+  const keyCount = top.count;
+  const keysAt = top.headerEnd;
+  const valsAt = keysAt + keyCount * objectRefSize;
+  // Binary plists may deduplicate equal strings: a value object referenced from
+  // more than just this dict slot must not be spliced (it would corrupt the other
+  // reference) — count every container ref pointing at it and reject if shared.
+  // Comparison currency is the OBJECT-TABLE INDEX (what readRef returns), never a
+  // byte offset.
+  const countRefsTo = (targetIndex) => {
+    let refs = 0;
+    for (let i = 0; i < numObjects; i++) {
+      const h = parseHeader(readOffset(i));
+      if (h.type !== 10 && h.type !== 12 && h.type !== 13) continue;
+      const refCount = h.type === 13 ? h.count * 2 : h.count;
+      if (h.headerEnd + refCount * objectRefSize > offsetTableOffset) {
+        throw new Error("Malformed binary plist: container payload past object table");
+      }
+      for (let j = 0; j < refCount; j++) {
+        if (readRef(h.headerEnd + j * objectRefSize) === targetIndex) refs++;
+      }
+    }
+    return refs;
+  };
+  // Count FIRST: binary plists may contain the root key more than once and the
+  // plist parser is last-wins — rewriting only the first would desynchronize the
+  // emitted plist from the signed identifier.
+  let matchIdx = -1;
+  let matches = 0;
+  for (let i = 0; i < keyCount; i++) {
+    const key = decodeString(readOffset(readRef(keysAt + i * objectRefSize)));
+    if (key && key.text === "CFBundleIdentifier") {
+      matches += 1;
+      if (matchIdx === -1) matchIdx = i;
+    }
+  }
+  if (matches === 0) throw new Error("Info.plist has no CFBundleIdentifier key");
+  if (matches > 1) {
+    throw new Error(
+      `Info.plist has ${matches} root CFBundleIdentifier keys — refusing to rewrite (ambiguous)`,
+    );
+  }
+  const i = matchIdx;
+  const valIdx = readRef(valsAt + i * objectRefSize);
+  const valOff = readOffset(valIdx);
+  const val = decodeString(valOff);
+  if (!val) throw new Error("CFBundleIdentifier is not a string in the binary plist");
+  if (val.text === newId) return bytes;
+  if (countRefsTo(valIdx) > 1) {
+    throw new Error(
+      "CFBundleIdentifier value is shared with other plist entries — refusing to rewrite",
+    );
+  }
+  // Re-encode the value object as an ASCII string (type 5) with an extended count.
+  const payload = new Uint8Array(3 + newId.length);
+  payload[0] = 0x5f;
+  payload[1] = 0x10;
+  payload[2] = newId.length;
+  for (let j = 0; j < newId.length; j++) payload[3 + j] = newId.charCodeAt(j);
+  const delta = payload.length - (val.end - valOff);
+  const out = new Uint8Array(bytes.length + delta);
+  out.set(bytes.subarray(0, valOff), 0);
+  out.set(payload, valOff);
+  const tableShifted = offsetTableOffset + delta;
+  out.set(bytes.subarray(val.end, offsetTableOffset), valOff + payload.length);
+  const maxShifted =
+    offsetIntSize >= 6 ? Number.MAX_SAFE_INTEGER : 2 ** (8 * offsetIntSize) - 1;
+  for (let k = 0; k < numObjects; k++) {
+    const old = readOffset(k);
+    const shifted = old > valOff ? old + delta : old;
+    if (shifted > maxShifted || shifted < 0) {
+      throw new Error(
+        "Unsupported binary plist layout: shifted offsets are out of range for the offset table width",
+      );
+    }
+    for (let w = offsetIntSize - 1, v = shifted; w >= 0; w--, v = Math.floor(v / 256)) {
+      out[tableShifted + k * offsetIntSize + w] = v & 0xff;
+    }
+  }
+  const newTrailerOffset = tableShifted + numObjects * offsetIntSize;
+  out.set(bytes.subarray(len - 32), newTrailerOffset);
+  const t = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  const newOffsetTable = offsetTableOffset + delta;
+  t.setUint32(newTrailerOffset + 24, Math.floor(newOffsetTable / 0x100000000));
+  t.setUint32(newTrailerOffset + 28, newOffsetTable >>> 0);
+  return out;
+}
+
 // --- IPA loading ---
 
 async function loadIpa(file) {
@@ -448,6 +721,15 @@ async function signIpa() {
       // executable's signature, and the emitted bytes all read from here.
       signedFiles.set(`${prefix}Info.plist`, plistData);
     }
+
+    const rootInfoPlistPath = `${currentAppPrefix}Info.plist`;
+    const infoPlistData = signedFiles.get(rootInfoPlistPath);
+    const previousId = tryExtractBundleId(infoPlistData, wasmReady) ?? "(none)";
+    const rewritten = rewriteBundleIdentifier(infoPlistData, run.bundleId);
+    if (rewritten !== infoPlistData) {
+      log(`Bundle ID rewritten: ${previousId} → ${run.bundleId}`, "ok");
+    }
+    signedFiles.set(rootInfoPlistPath, rewritten);
     log(
       `Sealing ${bundles.length} bundles innermost-first: ${bundles.map((b) => b.prefix).join(", ")}`,
       "ok",
