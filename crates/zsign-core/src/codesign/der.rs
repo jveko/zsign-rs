@@ -607,4 +607,81 @@ mod tests {
             other => panic!("unexpected error variant: {other}"),
         }
     }
+
+    #[test]
+    fn test_plist_to_der_array_values() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>application-groups</key>
+    <array>
+        <string>g1</string>
+        <string>g2</string>
+    </array>
+</dict>
+</plist>"#;
+        let der = plist_to_der(xml).unwrap();
+        // 70 25 | 02 01 01 | b0 20 | 30 1e 0c 12 "application-groups"
+        //       30 08 0c 02 "g1" 0c 02 "g2"
+        assert_eq!(
+            der,
+            vec![
+                0x70, 0x25, 0x02, 0x01, 0x01, 0xb0, 0x20, 0x30, 0x1e, 0x0c, 0x12, b'a', b'p', b'p',
+                b'l', b'i', b'c', b'a', b't', b'i', b'o', b'n', b'-', b'g', b'r', b'o', b'u', b'p',
+                b's', 0x30, 0x08, 0x0c, 0x02, b'g', b'1', 0x0c, 0x02, b'g', b'2',
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plist_to_der_long_form_lengths() {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>k</key>
+    <string>{}</string>
+</dict>
+</plist>"#,
+            "x".repeat(130)
+        );
+        let der = plist_to_der(xml.as_bytes()).unwrap();
+        // Long-form (0x81 nn) lengths at every level once the entries SET
+        // exceeds 127 bytes: value 0c 81 82, pair 30 81 88, entries b0 81 8b,
+        // envelope 70 81 91.
+        let mut expected = vec![
+            0x70, 0x81, 0x91, 0x02, 0x01, 0x01, 0xb0, 0x81, 0x8b, 0x30, 0x81, 0x88, 0x0c, 0x01,
+            b'k', 0x0c, 0x81, 0x82,
+        ];
+        expected.extend(std::iter::repeat_n(b'x', 130));
+        assert_eq!(der, expected);
+    }
+
+    #[test]
+    fn test_plist_to_der_data_and_date_in_envelope() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ts</key>
+    <date>1981-05-16T11:32:06Z</date>
+    <key>bin</key>
+    <data>AQID</data>
+</dict>
+</plist>"#;
+        let der = plist_to_der(xml).unwrap();
+        // Sorted member order puts "bin" (30 0a ...) before "ts" (30 15 ...)
+        // despite the document order; date renders as GeneralizedTime
+        // 18 0f "19810516113206Z".
+        assert_eq!(
+            der,
+            vec![
+                0x70, 0x28, 0x02, 0x01, 0x01, 0xb0, 0x23, 0x30, 0x0a, 0x0c, 0x03, b'b', b'i', b'n',
+                0x04, 0x03, 0x01, 0x02, 0x03, 0x30, 0x15, 0x0c, 0x02, b't', b's', 0x18, 0x0f, b'1',
+                b'9', b'8', b'1', b'0', b'5', b'1', b'6', b'1', b'1', b'3', b'2', b'0', b'6', b'Z',
+            ]
+        );
+    }
 }
