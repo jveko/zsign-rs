@@ -213,14 +213,16 @@ fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>)
 ```
 
 (Imports at the top of `mod tests` — exact paths at x509-cert 0.2.5 / der 0.7.10:
-`der::{Encode, EncodePem}`, `der::pem::LineEnding`, `pkcs8::{DecodePrivateKey,
+`der::{Decode, Encode, EncodePem}`, `der::pem::LineEnding`, `pkcs8::{DecodePrivateKey,
 EncodePrivateKey}`, `spki::{EncodePublicKey, SubjectPublicKeyInfoOwned}` (the `spki`
 crate re-export, as `cms_verify.rs` tests use — `x509_cert::spki` does not exist),
 `x509_cert::builder::{Builder, CertificateBuilder, Profile}`,
 `x509_cert::name::Name`,
 `x509_cert::{serial_number::SerialNumber, time::{Time, Validity}}`,
 `x509_cert::ext::pkix::ExtendedKeyUsage`, `std::str::FromStr`,
-`rand::thread_rng`.)
+`rand::thread_rng`. `Decode` is also reachable via the parent module's
+`use der::{Decode, DecodePem}` through `use super::*`, but importing it explicitly keeps
+the test module self-contained.)
 
 Tests:
 
