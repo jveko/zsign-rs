@@ -87,6 +87,15 @@ pub(crate) fn make_minimal_macho() -> Vec<u8> {
     b.resize(0x2000, 0);
     b
 }
+
+/// `make_minimal_macho` with zero-fill in `__TEXT`: `vmsize` 0x2000 over a
+/// file-backed `filesize` of 0x1000 (file length unchanged at 0x2000).
+pub(crate) fn make_minimal_macho_text_vmsize_pad() -> Vec<u8> {
+    let mut b = make_minimal_macho();
+    // LC_SEGMENT_64 __TEXT starts at 32: vmsize at +32 (fileoff 0x1000, filesize 0x1000).
+    b[64..72].copy_from_slice(&0x2000u64.to_le_bytes());
+    b
+}
 /// `make_minimal_macho` extended with an existing LC_CODE_SIGNATURE whose
 /// `slot_len`-byte slot begins at 0x2000 (inside `__LINKEDIT`, whose filesize
 /// covers the slot), filled with 0xAA. Builds a parseable already-signed image.

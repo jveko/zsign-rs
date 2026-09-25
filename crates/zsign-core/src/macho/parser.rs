@@ -126,7 +126,8 @@ pub struct ArchSlice {
     pub code_sig_offset: Option<u32>,
     /// Size of the existing code signature, if present.
     pub code_sig_size: Option<u32>,
-    /// Size of the `__TEXT` segment (used for `execSegLimit` in code signing).
+    /// File-backed size of the `__TEXT` segment (`filesize`, excluding
+    /// zero-fill — used for `execSegLimit` in code signing).
     pub text_segment_size: u64,
     /// Base virtual address of the `__TEXT` segment (used for
     /// `execSegBase` in code signing).
@@ -267,7 +268,7 @@ impl MachOFile {
                 }
                 CommandVariant::Segment64(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
-                        text_segment_size = seg.vmsize;
+                        text_segment_size = seg.filesize;
                         text_segment_base = seg.vmaddr;
                     }
                     if seg.segname.starts_with(b"__LINKEDIT") {
@@ -280,7 +281,7 @@ impl MachOFile {
                 }
                 CommandVariant::Segment32(ref seg) => {
                     if seg.segname.starts_with(b"__TEXT") {
-                        text_segment_size = seg.vmsize as u64;
+                        text_segment_size = seg.filesize as u64;
                         text_segment_base = seg.vmaddr as u64;
                     }
                     if seg.fileoff > 0
@@ -776,5 +777,42 @@ mod tests {
             meta.first_segment_offset, 0x400,
             "metadata insertion bound must come from the first file-backed section"
         );
+    }
+
+    #[test]
+    fn test_text_segment_size_is_file_backed_extent() {
+        let data = crate::macho::fixtures::make_minimal_macho_text_vmsize_pad();
+        let macho = super::MachOFile::parse(data).expect("fixture must parse");
+        let slice = &macho.slices()[0];
+        assert_eq!(
+            slice.text_segment_size, 0x1000,
+            "execSegLimit input must be __TEXT.filesize, not vmsize (zero-fill excluded)"
+        );
+        assert_eq!(
+            slice.text_segment_base, 0x1_0000_0000,
+            "execSegBase input stays the segment base"
+        );
+    }
+
+    #[test]
+    fn test_exec_seg_limit_written_from_filesize() {
+        let data = crate::macho::fixtures::make_minimal_macho_text_vmsize_pad();
+        let macho = super::MachOFile::parse(data).expect("fixture must parse");
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.textpad", None, None, None, false)
+                .expect("sign must succeed");
+        let reparsed = super::MachOFile::parse(signed.clone()).expect("signed output parses");
+        let slice = &reparsed.slices()[0];
+        let off = slice.code_sig_offset.expect("signed") as usize;
+        let size = slice.code_sig_size.expect("signed") as usize;
+        let superblob = crate::codesign::verify::parse_superblob(&signed[off..off + size])
+            .expect("embedded superblob parses");
+        let cd = superblob
+            .code_directory
+            .as_ref()
+            .expect("code directory present");
+        let exec_seg_limit = u64::from_be_bytes(cd.raw()[72..80].try_into().unwrap());
+        assert_eq!(exec_seg_limit, 0x1000,
+            "CodeDirectory execSegLimit must equal __TEXT.filesize (byte offsets as in signer.rs:1400-1403)");
     }
 }
