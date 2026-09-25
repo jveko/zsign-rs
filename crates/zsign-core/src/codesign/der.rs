@@ -36,6 +36,8 @@
 //! assert!(!der.is_empty());
 //! ```
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use plist::Value;
 
 use crate::{Error, Result};
@@ -48,6 +50,12 @@ const DER_TAG_INTEGER: u8 = 0x02;
 
 /// DER tag for UTF8String.
 const DER_TAG_UTF8STRING: u8 = 0x0c;
+
+/// DER tag for OCTET STRING (used for Data).
+const DER_TAG_OCTETSTRING: u8 = 0x04;
+
+/// DER tag for GeneralizedTime (used for Date).
+const DER_TAG_GENERALIZEDTIME: u8 = 0x18;
 
 /// DER tag for SEQUENCE (used for arrays).
 const DER_TAG_SEQUENCE: u8 = 0x30;
@@ -81,6 +89,76 @@ fn encode_length(output: &mut Vec<u8>, length: usize) {
 /// - String -> UTF8String
 /// - Array -> SEQUENCE
 /// - Dictionary -> [16] (0xb0) IMPLICIT SET OF key-value pairs
+/// - Data -> OCTET STRING
+/// - Date -> GeneralizedTime
+
+/// Convert a plist date to a DER GeneralizedTime value (X.690 clause 11.7).
+///
+/// Output is `YYYYMMDDHHMMSSZ` in UTC; a fractional part is appended only when
+/// the value carries subsecond precision, with trailing zeros stripped so the
+/// encoding stays canonical. Years outside 0..=9999 are rejected.
+fn generalized_time(date: plist::Date) -> Result<String> {
+    let (secs, nanos) = match SystemTime::from(date).duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            let secs = d.as_secs() as i64;
+            if d.subsec_nanos() == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
+    };
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9999).contains(&year) {
+        return Err(Error::DerEncoding(format!(
+            "date value {}s from the Unix epoch is outside the GeneralizedTime year range",
+            secs
+        )));
+    }
+    let mut out = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        year,
+        month,
+        day,
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    );
+    if nanos != 0 {
+        let mut frac = format!("{:09}", nanos);
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        out.insert_str(out.len() - 1, &format!(".{}", frac));
+    }
+    Ok(out)
+}
+
+/// Convert days since the Unix epoch to a (year, month, day) civil date —
+/// the inverse of Howard Hinnant's days-from-civil algorithm.
+fn civil_from_days(z: i64) -> (i64, i32, i32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if m <= 2 {
+            yoe + era * 400 + 1
+        } else {
+            yoe + era * 400
+        },
+        m as i32,
+        d as i32,
+    )
+}
 fn encode_value(value: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
@@ -170,11 +248,16 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
             encode_length(&mut output, set_content.len());
             output.extend(set_content);
         }
-        Value::Data(_) => {
-            return Err(Error::DerEncoding("Unsupported plist type: Data".into()));
+        Value::Data(bytes) => {
+            output.push(DER_TAG_OCTETSTRING);
+            encode_length(&mut output, bytes.len());
+            output.extend(bytes);
         }
-        Value::Date(_) => {
-            return Err(Error::DerEncoding("Unsupported plist type: Date".into()));
+        Value::Date(date) => {
+            let text = generalized_time(*date)?;
+            output.push(DER_TAG_GENERALIZEDTIME);
+            encode_length(&mut output, text.len());
+            output.extend(text.as_bytes());
         }
         Value::Real(_) => {
             return Err(Error::DerEncoding("Unsupported plist type: Real".into()));
@@ -205,7 +288,7 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
 /// Returns an error if:
 /// - The XML plist cannot be parsed
 /// - The resulting DER encoding is empty
-/// - An unsupported plist type is encountered (Data, Date, Real)
+/// - An unsupported plist type is encountered (Real)
 ///
 /// # Examples
 ///
@@ -367,13 +450,13 @@ mod tests {
     }
 
     #[test]
-    fn test_plist_to_der_unsupported_data_type() {
+    fn test_plist_to_der_unsupported_real_type() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>test-data</key>
-    <data>AQID</data>
+    <key>test-real</key>
+    <real>1.5</real>
 </dict>
 </plist>"#;
         let result = plist_to_der(xml);
@@ -429,6 +512,41 @@ mod tests {
             vec![
                 0x70, 0x18, 0x02, 0x01, 0x01, 0xb0, 0x13, 0x30, 0x11, 0x0c, 0x05, b'o', b'u', b't',
                 b'e', b'r', 0xb0, 0x08, 0x30, 0x06, 0x0c, 0x01, b'k', 0x01, 0x01, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encode_data() {
+        let value = Value::Data(vec![0x01, 0x02, 0x03]);
+        let der = encode_value(&value).unwrap();
+        assert_eq!(der, vec![0x04, 0x03, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_encode_date() {
+        let date = plist::Date::from_xml_format("1981-05-16T11:32:06Z").unwrap();
+        let der = encode_value(&Value::Date(date)).unwrap();
+        // GeneralizedTime (X.690 11.7): YYYYMMDDHHMMSSZ, seconds precision, UTC.
+        assert_eq!(
+            der,
+            vec![
+                0x18, 0x0f, b'1', b'9', b'8', b'1', b'0', b'5', b'1', b'6', b'1', b'1', b'3', b'2',
+                b'0', b'6', b'Z',
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encode_date_fraction() {
+        let date = plist::Date::from_xml_format("1992-07-22T13:21:00.3Z").unwrap();
+        let der = encode_value(&Value::Date(date)).unwrap();
+        // Nonzero fraction kept, trailing zeros stripped (X.690 11.7.3).
+        assert_eq!(
+            der,
+            vec![
+                0x18, 0x11, b'1', b'9', b'9', b'2', b'0', b'7', b'2', b'2', b'1', b'3', b'2', b'1',
+                b'0', b'0', b'.', b'3', b'Z',
             ]
         );
     }
