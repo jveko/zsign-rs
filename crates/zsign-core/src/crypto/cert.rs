@@ -44,7 +44,7 @@ const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1
 ///
 /// # Variants
 ///
-/// * [`Rsa`](SigningKeyType::Rsa) - RSA private key (commonly 2048 or 4096 bits)
+/// * [`Rsa`](SigningKeyType::Rsa) - RSA private key (minimum 2048 bits)
 /// * [`Ecdsa`](SigningKeyType::Ecdsa) - ECDSA P-256 private key (secp256r1)
 #[allow(clippy::large_enum_variant)]
 pub enum SigningKeyType {
@@ -141,10 +141,22 @@ impl DecodedKey {
     }
 
     fn into_signing_key(self) -> Result<SigningKeyType> {
-        Ok(match self {
-            Self::Rsa(k) => SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(k)),
-            Self::Ecdsa(k) => SigningKeyType::Ecdsa(k),
-        })
+        match self {
+            Self::Rsa(k) => {
+                use rsa::traits::PublicKeyParts;
+                let bits = k.n().bits();
+                if bits < 2048 {
+                    return Err(Error::Certificate(format!(
+                        "RSA key too small: {} bits (minimum 2048)",
+                        bits
+                    )));
+                }
+                Ok(SigningKeyType::Rsa(
+                    rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(k),
+                ))
+            }
+            Self::Ecdsa(k) => Ok(SigningKeyType::Ecdsa(k)),
+        }
     }
 }
 
@@ -430,6 +442,7 @@ impl SigningCredentials {
     /// - The certificate PEM is malformed or invalid
     /// - The private key PEM is malformed or not valid PKCS#8
     /// - The private key is neither RSA nor ECDSA P-256
+    /// - The RSA private key is smaller than 2048 bits
     /// - A password is provided (encrypted keys not yet supported)
     /// - The certificate is expired or not yet valid
     /// - The certificate is missing the codeSigning extended key usage
@@ -504,6 +517,7 @@ impl SigningCredentials {
     /// - No certificate is found in the container
     /// - No private key is found in the container
     /// - The private key is neither RSA nor ECDSA P-256
+    /// - The RSA private key is smaller than 2048 bits
     /// - No private key matches a certificate
     /// - More than one distinct key/certificate identity is present
     /// - The certificate is expired or not yet valid
@@ -666,6 +680,7 @@ mod tests {
 
     const IDENTITY_SINGLE: &[u8] = include_bytes!("fixtures/identity_single.p12");
     const IDENTITY_DUP: &[u8] = include_bytes!("fixtures/identity_duplicate_certs.p12");
+    const WEAK_RSA1024: &[u8] = include_bytes!("fixtures/weak_rsa1024.p12");
 
     fn fresh_2048() -> rsa::RsaPrivateKey {
         rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap()
@@ -1205,6 +1220,39 @@ mod tests {
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning") && m.contains("CN=zsign-test-fixture")),
             "expected non-compliant fixture rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_rejects_weak_rsa_key() {
+        let res = SigningCredentials::from_p12(WEAK_RSA1024, "testpassword");
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
+            "expected weak-RSA rejection naming both bit counts, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_weak_rsa_key() {
+        // rsa 0.9.10 enforces no minimum at generation or decode (verified in its
+        // vendored source), so a 1024-bit key builds in-memory.
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024)
+            .expect("rsa crate accepts 1024-bit generation");
+        let cert = build_cert(
+            "CN=zsign-test-fixture",
+            "CN=zsign-test-fixture",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let (cert_pem, key_pem) = leaf_pems(&cert, &key);
+        let res = SigningCredentials::from_pem(&cert_pem, &key_pem, None);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
+            "expected weak-RSA rejection naming both bit counts, got {:?}",
             res.as_ref().err()
         );
     }
