@@ -1279,7 +1279,7 @@ mod tests {
         assert!(r.stdout.is_empty(), "stdout must stay empty: {}", r.stdout);
         let doc = parse_json(&r.stderr);
         assert_eq!(doc["status"], "error");
-        assert!(doc["error"].as_str().unwrap().len() > 0);
+        assert!(!doc["error"].as_str().unwrap().is_empty());
     }
 
     #[test]
