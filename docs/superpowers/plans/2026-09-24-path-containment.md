@@ -210,6 +210,8 @@ fixture helper they use:
         let app = create_folder_bundle(temp.path(), "Test", false);
         let real = app.join("RealTest");
         std::fs::write(&real, crate::test_util::minimal_macho()).unwrap();
+        // Flattened versioned-framework layout: the declared executable
+        // is the root link, RealTest the real binary.
         symlink(&real, app.join("Test")).unwrap();
         let before = std::fs::read(&real).unwrap();
 

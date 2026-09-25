@@ -144,10 +144,13 @@ Mechanism (repo idiom, not canonicalize — the workspace uses no
    CodeResources' main-executable exclusion compares the *raw*
    `CFBundleExecutable` string against WalkDir-relative paths
    (`zsign-core/src/bundle/code_resources.rs:264-267`), so only a plain
-   raw value can keep that invariant. Root-prefixed inputs arrive via
-   `strip_prefix`, which already returns plain remainders (verified
-   against Rust std behavior), so the check only ever fires on
-   literal/relative inputs — i.e. the raw plist value.
+   raw value can keep that invariant. The check applies to BOTH input
+   shapes: `strip_prefix` trims only the separators leading/trailing
+   the remainder — walkdir-produced remainders are plain because file
+   names cannot contain separators, while a manually constructed
+   `root/foo//bar` keeps its interior `//` and is (correctly) rejected
+   here as well; relative inputs (the raw plist value, the literals)
+   are checked in full.
 4. Downward walk: push each component onto a `current` buffer starting at
    root; if `fs::symlink_metadata(&current)` says symlink →
    `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:79-86`).
@@ -289,6 +292,10 @@ builder is another lane's file).
    in-bundle file; sign must fail (`"Pre-existing symlink"`) and the real
    target's bytes must stay unchanged — documents that layouts whose
    plist names the root link are rejected (Item 1 × Item 2 composition).
+   The fixture flattens the versioned-framework layout
+   (`Foo` → `Versions/Current/Foo` of `code_resources.rs:456-468`): the
+   declared executable being *any* in-root symlink is the same rejected
+   branch, so this test is the regression for that layout.
 7. `test_sign_errors_on_unreadable_path_component` (`#[cfg(unix)]`) — a
    bundle subdirectory is chmod'd unreadable and `CFBundleExecutable`
    points through it; sign must fail with
