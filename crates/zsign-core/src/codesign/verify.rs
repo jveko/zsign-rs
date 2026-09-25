@@ -229,6 +229,12 @@ pub struct CodeDirectory<'a> {
     pub version: u32,
     /// `flags` header field ([`CS_ADHOC`] etc.).
     pub flags: u32,
+    /// `execSegBase` header field (version >= 0x20400); 0 when unset/older.
+    pub exec_seg_base: u64,
+    /// `execSegLimit` header field (version >= 0x20400); 0 when unset/older.
+    pub exec_seg_limit: u64,
+    /// `execSegFlags` header field (version >= 0x20400); 0 when unset/older.
+    pub exec_seg_flags: u64,
     /// `hashOffset`: start of the code-page hash slots.
     hash_offset: usize,
     /// `identOffset` into `data` for the null-terminated identifier.
@@ -262,13 +268,21 @@ impl<'a> CodeDirectory<'a> {
                 "CodeDirectory blob too short".into(),
             ));
         }
-        if blob[0..4] != CSMAGIC_CODEDIRECTORY.to_be_bytes() {
+        let declared = u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize;
+        if declared < 12 || declared > blob.len() {
+            return Err(crate::Error::Verification(format!(
+                "CodeDirectory declared length ({declared}) is invalid for blob of {} bytes",
+                blob.len()
+            )));
+        }
+        let data = &blob[..declared];
+        if data[0..4] != CSMAGIC_CODEDIRECTORY.to_be_bytes() {
             return Err(crate::Error::Verification(
                 "not a CodeDirectory blob (magic mismatch)".into(),
             ));
         }
 
-        let version = u32::from_be_bytes(blob[8..12].try_into().unwrap());
+        let version = u32::from_be_bytes(data[8..12].try_into().unwrap());
         if version < CODEDIRECTORY_VERSION_EARLIEST {
             return Err(crate::Error::Verification(format!(
                 "unsupported CodeDirectory version 0x{version:08x}"
@@ -284,13 +298,14 @@ impl<'a> CodeDirectory<'a> {
         } else {
             52
         };
-        if blob.len() < header_size {
+        if data.len() < header_size {
             return Err(crate::Error::Verification(format!(
                 "CodeDirectory header ({header_size} bytes for version 0x{version:08x}) overruns blob"
             )));
         }
 
-        let rd_u32 = |off: usize| u32::from_be_bytes(blob[off..off + 4].try_into().unwrap());
+        let rd_u32 = |off: usize| u32::from_be_bytes(data[off..off + 4].try_into().unwrap());
+        let rd_u64 = |off: usize| u64::from_be_bytes(data[off..off + 8].try_into().unwrap());
 
         let flags = rd_u32(12);
         let hash_offset = rd_u32(16) as usize;
@@ -298,14 +313,20 @@ impl<'a> CodeDirectory<'a> {
         let n_special_slots = rd_u32(24);
         let n_code_slots = rd_u32(28);
         let code_limit = rd_u32(32);
-        let hash_size = blob[36] as usize;
-        let hash_type = blob[37];
-        let page_size_log2 = blob[39];
+        let hash_size = data[36] as usize;
+        let hash_type = data[37];
+        let page_size_log2 = data[39];
         let team_offset_raw = if version >= CODEDIRECTORY_VERSION_TEAMID {
             rd_u32(48)
         } else {
             0
         };
+        let (exec_seg_base, exec_seg_limit, exec_seg_flags) =
+            if version >= CODEDIRECTORY_VERSION_EXECSEG {
+                (rd_u64(64), rd_u64(72), rd_u64(80))
+            } else {
+                (0, 0, 0)
+            };
 
         if hash_type != CS_HASHTYPE_SHA1 && hash_type != CS_HASHTYPE_SHA256 {
             return Err(crate::Error::Verification(format!(
@@ -319,14 +340,14 @@ impl<'a> CodeDirectory<'a> {
         }
 
         // Bounds: identifier/team strings, then special slots, then code slots.
-        if ident_offset >= blob.len() {
+        if ident_offset >= data.len() {
             return Err(crate::Error::Verification(
                 "CodeDirectory identifier offset out of bounds".into(),
             ));
         }
         let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
         if let Some(off) = team_offset {
-            if off >= blob.len() {
+            if off >= data.len() {
                 return Err(crate::Error::Verification(
                     "CodeDirectory team offset out of bounds".into(),
                 ));
@@ -337,7 +358,7 @@ impl<'a> CodeDirectory<'a> {
         let expected_tail = hash_offset
             .checked_add(n_code * hash_size)
             .ok_or_else(|| crate::Error::Verification("hash region overflow".into()))?;
-        if expected_tail > blob.len() {
+        if expected_tail > data.len() {
             return Err(crate::Error::Verification(format!(
                 "CodeDirectory hash region ({n_special} special + {n_code} code slots) overruns blob"
             )));
@@ -349,9 +370,12 @@ impl<'a> CodeDirectory<'a> {
         }
 
         Ok(CodeDirectory {
-            data: blob,
+            data,
             version,
             flags,
+            exec_seg_base,
+            exec_seg_limit,
+            exec_seg_flags,
             hash_offset,
             ident_offset,
             n_special_slots,
@@ -1038,6 +1062,19 @@ mod tests {
         assert_eq!(cd.n_special_slots, 2);
         assert_eq!(cd.special_slot_hash(1), Some(&[0xAB; 32][..]));
         assert_eq!(cd.special_slot_hash(2), Some(&[0xCD; 32][..]));
+    }
+
+    #[test]
+    fn parse_reads_exec_segment_fields() {
+        let cd_bytes = CodeDirectoryBuilder::new("com.example.exec", TEST_CODE)
+            .exec_seg_base(0x1_0000_0000)
+            .exec_seg_limit(0x1000)
+            .exec_seg_flags(CS_EXECSEG_MAIN_BINARY)
+            .build_sha256();
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(cd.exec_seg_base, 0x1_0000_0000);
+        assert_eq!(cd.exec_seg_limit, 0x1000);
+        assert_eq!(cd.exec_seg_flags, CS_EXECSEG_MAIN_BINARY);
     }
 
     #[test]

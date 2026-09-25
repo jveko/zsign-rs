@@ -285,6 +285,85 @@ fn verify_slice(
         );
     }
 
+    if primary.version >= CODEDIRECTORY_VERSION_EXECSEG {
+        let (base, limit, flags) = (
+            primary.exec_seg_base,
+            primary.exec_seg_limit,
+            primary.exec_seg_flags,
+        );
+        if base != 0 || limit != 0 {
+            // Our signer uses exact virtual-address base/limit pairs.
+            let vm_matches = base == slice.text_segment_base && limit == slice.text_segment_size;
+            // Apple's file-convention range remains a plausibility fallback
+            // because __TEXT fileoff/filesize is not exposed by this parser.
+            let file_space_ok = base <= slice.size as u64
+                && limit >= 0x1000
+                && limit <= slice.text_segment_size
+                && base.saturating_add(limit) <= slice.size as u64;
+            if !vm_matches && !file_space_ok {
+                report.errors.push(format!(
+                    "executable segment range 0x{base:x}+0x{limit:x} does not match __TEXT"
+                ));
+            }
+        }
+        const KNOWN_EXECSEG_FLAGS: u64 = 0x1 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200;
+        if flags & !KNOWN_EXECSEG_FLAGS != 0 {
+            report.errors.push(format!(
+                "unknown exec segment flags bits {:#x}",
+                flags & !KNOWN_EXECSEG_FLAGS
+            ));
+        }
+        if (flags & CS_EXECSEG_MAIN_BINARY != 0) != slice.is_executable {
+            report.errors.push(if slice.is_executable {
+                "exec segment flags missing CS_EXECSEG_MAIN_BINARY".to_string()
+            } else {
+                "CS_EXECSEG_MAIN_BINARY set on a non-executable slice".to_string()
+            });
+        }
+        const CROSS_CHECK_FLAGS: u64 =
+            CS_EXECSEG_ALLOW_UNSIGNED | CS_EXECSEG_JIT | CS_EXECSEG_DEBUGGER | CS_EXECSEG_SKIP_LV;
+        if flags & CROSS_CHECK_FLAGS != 0 {
+            let ent_dict = child(CSSLOT_ENTITLEMENTS)
+                .and_then(|e| plist::from_bytes::<plist::Dictionary>(e.payload()).ok());
+            match ent_dict {
+                Some(dict) => {
+                    let has = |k: &str| dict.get(k).is_some();
+                    if flags & CS_EXECSEG_ALLOW_UNSIGNED != 0
+                        && !(has("get-task-allow") || has("run-unsigned-code"))
+                    {
+                        report.errors.push(
+                            "CS_EXECSEG_ALLOW_UNSIGNED requires get-task-allow or run-unsigned-code"
+                                .to_string(),
+                        );
+                    }
+                    if flags & CS_EXECSEG_JIT != 0 && !has("dynamic-codesigning") {
+                        report
+                            .errors
+                            .push("CS_EXECSEG_JIT requires dynamic-codesigning".to_string());
+                    }
+                    if flags & CS_EXECSEG_DEBUGGER != 0 && !has("com.apple.private.cs.debugger") {
+                        report.errors.push(
+                            "CS_EXECSEG_DEBUGGER requires com.apple.private.cs.debugger"
+                                .to_string(),
+                        );
+                    }
+                    if flags & CS_EXECSEG_SKIP_LV != 0
+                        && !has("com.apple.private.skip-library-validation")
+                    {
+                        report.errors.push(
+                            "CS_EXECSEG_SKIP_LV requires com.apple.private.skip-library-validation"
+                                .to_string(),
+                        );
+                    }
+                }
+                None => report.warnings.push(format!(
+                    "exec segment flags {:#x} cannot be cross-checked without entitlements",
+                    flags
+                )),
+            }
+        }
+    }
+
     // CMS signature. An exact 8-byte CSMAGIC_BLOBWRAPPER header is what
     // codesign emits for ad-hoc output; the shortcut also requires CS_ADHOC.
     if let Some(cms_blob) = superblob.cms {
@@ -1145,6 +1224,84 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("special slot -8 is bound but its content was not supplied")),
             "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    /// Ad-hoc dual fixture with `__TEXT` vm exec-seg values; returns bytes with the
+    /// PRIMARY CD's exec-seg header already patched by `f(base, limit, flags)`.
+    fn adhoc_with_patched_execseg(f: impl FnOnce(u64, u64, u64) -> (u64, u64, u64)) -> Vec<u8> {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.xseg", None, None, None, false).unwrap();
+        let cd = child_off_in_signed(&signed, CSSLOT_CODEDIRECTORY);
+        let base = u64::from_be_bytes(signed[cd + 64..cd + 72].try_into().unwrap());
+        let limit = u64::from_be_bytes(signed[cd + 72..cd + 80].try_into().unwrap());
+        let flags = u64::from_be_bytes(signed[cd + 80..cd + 88].try_into().unwrap());
+        let (b, l, g) = f(base, limit, flags);
+        signed[cd + 64..cd + 72].copy_from_slice(&b.to_be_bytes());
+        signed[cd + 72..cd + 80].copy_from_slice(&l.to_be_bytes());
+        signed[cd + 80..cd + 88].copy_from_slice(&g.to_be_bytes());
+        signed
+    }
+
+    #[test]
+    fn exec_segment_range_mismatch_is_rejected() {
+        let signed = adhoc_with_patched_execseg(|_, _, g| (0xDEAD_0000_0000_0000u64, 0x1000, g));
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("does not match __TEXT")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn unknown_exec_segment_flag_bits_are_rejected() {
+        let signed = adhoc_with_patched_execseg(|b, l, g| (b, l, g | 0x800));
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("unknown exec segment flags bits 0x800")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn main_binary_flag_is_required_for_executables() {
+        let signed = adhoc_with_patched_execseg(|b, l, _| (b, l, 0));
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("exec segment flags missing CS_EXECSEG_MAIN_BINARY")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn jit_flag_without_entitlements_warns() {
+        let signed = adhoc_with_patched_execseg(|b, l, g| (b, l, g | 0x40)); // CS_EXECSEG_JIT
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .warnings
+                .iter()
+                .any(|w| w.contains("cannot be cross-checked without entitlements")),
+            "warnings: {:?}",
+            report.slices[0].warnings
+        );
+        assert!(
+            report.is_valid(),
+            "a warning must not invalidate: {:?}",
             report.slices[0].errors
         );
     }
