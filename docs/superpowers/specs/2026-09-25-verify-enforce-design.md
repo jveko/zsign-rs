@@ -26,9 +26,14 @@ Queue corrections accepted from research (brief vs evidence):
 - "valid pre-0x20400 directories are rejected" is imprecise: the oversized header check
   only bites trivially-short blobs; the real defects are the wrong table, the missing
   upper gate, and the unread fields. The fix (correct table) still applies.
-- "bare signing can leave the vector length 2": real builder minimum is `n_special = 3`
-  (`code_directory.rs:501-535`, test `:772-779`); n=2 exists only in hand-synthesized
-  test blobs. Unaffected: the rule keys on nonzero stored hashes, not on vector length.
+- "bare signing can leave the vector length 2": both the brief and an intermediate
+  correction were imprecise. The *raw builder* all-empty fallback floors at
+  `n_special = 3` (`code_directory.rs:501-535`, test `:772-779`), but *actual bare
+  signer output* is `n_special = 2`: the signer always binds a nonzero requirements
+  hash (`signer.rs:798-801, 823-824`), `count_special_slots` trims unbound high
+  slots (−3..−7 absent → window stops at −2), and −1 stays inside the window
+  zero-filled. Unaffected either way: the elevation rule keys on nonzero stored
+  hashes, not on vector length.
 - `execSeg*` fields are *unparsed* today, not "parsed then discarded".
 - The 0x20600 header size is **108 bytes, not 112** (librarian: `sizeof` 112 is compiler
   trailing padding; Apple's ld64 uses `offsetof(end_withLinkage)`). The design uses ≥108.
@@ -41,9 +46,16 @@ Queue corrections accepted from research (brief vs evidence):
 2. Dual-signed binaries verify: CDHash v1/v2 are bound by emitted CD *type*.
 3. All findings ride the existing `report.errors` / `report.warnings` channels;
    `verify_macho` keeps its `Ok(report)` channel for parseable Mach-O.
-4. Existing tests and the macOS interop gate (`scripts/verify-apple-interop.sh`
-   `agree_valid` on our cert bundle, our ad-hoc bundle, `/bin/ls`, and codesign ad-hoc
-   output) stay green.
+4. No NEW failures against the macOS interop gate
+   (`scripts/verify-apple-interop.sh` `agree_valid` on our ad-hoc bundle, `/bin/ls`,
+   codesign ad-hoc output, and the tampered negative control). The `agree_valid
+   "cert-signed bundle"` line (`:190`) is **already red at c9ff0fb, pre-existing and
+   out of scope**: the script self-signs its certificate (`:58-64`) while production
+   CMS verification hard-defaults to Apple roots (`crypto/cms_verify.rs:281-288`) and
+   the facade report is error-sensitive (`zsign/src/verify.rs:135-138`), so
+   `zsign -V` reports the anchoring failure that the dual-pin design intentionally
+   produces. This lane neither fixes nor worsens it; it is escalated as a supervisor
+   decision (see Findings for the supervisor).
 
 ## Frozen contracts (must not break — compiled from the consumer map)
 
@@ -61,12 +73,26 @@ Queue corrections accepted from research (brief vs evidence):
 - **C-5** `SignatureInputs` keeps exactly the fields `{info_plist, code_resources}`
   (full literal at `crates/zsign/src/verify.rs:483-486`); `verify_macho` signature frozen;
   `parse_superblob` keeps `Result<SuperBlob>` (doctest `codesign/verify.rs:20-26`).
-- **C-6** `verify_macho`, `SpecialSlotCheck`, `PageCheck`, report structs, `SuperBlob`,
-  `SlotEntry`, `CodeDirectory` pub members are published through the `zsign` facade
-  (`zsign/src/lib.rs:49`) — changes are allowed only with in-workspace migration;
+- **C-6** The report structs are re-exported through the facade at
+  `crates/zsign/src/verify.rs:33`, and `codesign`/`crypto` modules are re-exported by
+  `crates/zsign/src/lib.rs:49` — changes are allowed only with in-workspace migration;
   downstream semver impact is out of lane scope and noted in the report.
-- **C-7** Constants in the "USED" set (see plan) keep name and value; the whole constants
-  module is published via the facade.
+- **C-7** The following constants keep name and value (current in-workspace consumers,
+  from the constants-usage sweep): `CSMAGIC_EMBEDDED_SIGNATURE`,
+  `CSMAGIC_CODEDIRECTORY`, `CSMAGIC_REQUIREMENTS`, `CSMAGIC_REQUIREMENT`,
+  `CSMAGIC_EMBEDDED_ENTITLEMENTS`, `CSMAGIC_EMBEDDED_DER_ENTITLEMENTS`,
+  `CSMAGIC_BLOBWRAPPER`, `CSSLOT_CODEDIRECTORY`, `CSSLOT_REQUIREMENTS`,
+  `CSSLOT_ENTITLEMENTS`, `CSSLOT_DER_ENTITLEMENTS`,
+  `CSSLOT_ALTERNATE_CODEDIRECTORIES`/`_MAX`/`_LIMIT`, `CSSLOT_SIGNATURESLOT`,
+  `CS_HASHTYPE_SHA1`, `CS_HASHTYPE_SHA256`, `CS_SHA1_LEN`, `CS_SHA256_LEN`, `CS_ADHOC`,
+  `CS_EXECSEG_MAIN_BINARY`, `CS_EXECSEG_ALLOW_UNSIGNED`, `CODEDIRECTORY_VERSION`,
+  `CODEDIRECTORY_VERSION_EARLIEST`, `CODEDIRECTORY_VERSION_TEAMID`,
+  `CODEDIRECTORY_VERSION_CODELIMIT64`, `CODEDIRECTORY_VERSION_EXECSEG`,
+  `CSREQ_DESIGNATED`. `CS_EXECSEG_DEBUGGER`/`JIT`/`SKIP_LV` and
+  `CODEDIRECTORY_VERSION_SCATTER` are currently unconsumed and become first-used by
+  tasks 7/9; `CSSLOT_TICKETSLOT`, `CODEDIRECTORY_VERSION_RUNTIME`,
+  `CODEDIRECTORY_VERSION_LINKAGE`, `CSSLOT_SPECIAL_*`, `CSMAGIC_*_OLD`, and the
+  launch-constraint magic are the revalued/added set owned by queue items 9/10.
 
 ## Architecture
 
@@ -83,7 +109,9 @@ Cross-cutting decisions (brainstorm picks, refined by research):
   `report.errors.push(...)`; unverifiable-but-not-false conditions are
   `report.warnings.push(...)`.
 - **All CDs verified, primary reports.** `parse_superblob` errors on any CodeDirectory
-  slot child that fails to parse (primary and alternates). `verify_slice` runs
+  slot child that fails to parse (primary and alternates). `verify_slice` collects the
+  emitted-CD list ONCE, immediately after `primary` is established (so the CMS branch
+  and the post-CMS designated-requirement step both see it), and runs
   page-check + special-slot-check for *every* emitted CD; `report.pages`,
   `report.special_slots`, `report.identifier`, `report.adhoc` keep reflecting the
   primary CD (C-3; existing tests pin primary-patched fixtures). Alternate-CD findings
@@ -100,13 +128,30 @@ Cross-cutting decisions (brainstorm picks, refined by research):
     together with `CSMAGIC_LAUNCH_CONSTRAINT`).
   - `k = 4, 6`: no content source; stay non-fatal `NotChecked` (never in the brief's
     required list; blanketing them risks the interop gate on Apple output).
+  Hashing always uses the FULL child blob (magic+length header included — that is what
+  the signer hashes); semantic parsing (XML plist, DER entitlements) uses a new
+  additive `SlotEntry::payload()` accessor returning the child *after* its 8-byte
+  header, bounded by the child's declared length — `SlotEntry::blob` carries the
+  header, so passing it straight to `plist::from_bytes`/
+  `der_entitlements_to_plist` would parse `fade7171/fade7172 + length` as data.
 - **Elevation rule (item 3)** lives in `macho/verify.rs` where errors are owned (C-4):
-  after `check_special_slots`, `NotChecked` at `k ∈ {1,2,3,5,7} ∪ {8,9,10,11}` pushes
-  `special slot -{k} is bound but its content was not supplied`. `Mismatch` at any `k`
-  keeps pushing `special slot -{k} hash mismatch` (existing string, pinned at
-  `macho/verify.rs:690`). `Missing` (stored hash all-zero = not bound) stays silent —
-  this is how the rule self-scopes to "what the signer actually binds" (dylibs never
-  bind −1/−3; bare signing zero-fills them).
+  after `check_special_slots`, ONE loop walks `(label, checks)` pairs — the primary
+  (label `""`) plus every alternate (label `alternate {SHA-1|SHA-256} `) — pushing
+  `{label}special slot -{k} hash mismatch` on `Mismatch` (primary text byte-identical
+  to the pinned string) and, when `NotChecked` and `k` is in the required set,
+  `{label}special slot -{k} is bound but its content was not supplied`. Alternate
+  `NotChecked` IS elevated (a tampered alternate can diverge from the primary). The
+  required set is the single constant list
+  `[CSSLOT_SPECIAL_INFOSLOT, CSSLOT_SPECIAL_REQUIREMENTS, CSSLOT_SPECIAL_RESOURCEDIR,
+  CSSLOT_SPECIAL_ENTITLEMENTS, CSSLOT_SPECIAL_DER_ENTITLEMENTS,
+  CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF..RESPONSIBLE,
+  CSSLOT_SPECIAL_LIBRARY_CONSTRAINT]` (= −1,−2,−3,−5,−7,−8,−9,−10,−11), matched as
+  `-k` — this gives the new negative constants their consumer and excludes −4/−6
+  (task 3 writes the −8..−11 membership numerically; task 10 replaces the literals
+  with the new constants).
+  `Missing` (stored hash all-zero = not bound) stays silent — how the rule self-scopes
+  to "what the signer actually binds" (dylibs never bind −1/−3; bare signing
+  zero-fills −1).
 - **CDHash pair by emitted type (item 1)**, private helper in `macho/verify.rs`:
   `cd_sha1 = SHA1(bytes of the SHA-1 CD among {primary} ∪ alternates)`,
   `cd_sha256 = SHA256(bytes of the SHA-256 CD)`, CMS `content` stays `primary.raw()`.
@@ -118,10 +163,14 @@ Cross-cutting decisions (brainstorm picks, refined by research):
 - **Requirements evaluation (item 8)**: bounded parser in `codesign/verify.rs`
   (Requirements SuperBlob `0xfade0c01` → typed index → requirement blob `0xfade0c00`
   with `kind == exprForm(1)`; `lwcrForm(2)` rejected), expression tree with bounded
-  recursion, Kleene three-valued evaluator. `macho/verify.rs` wires it after the CMS
-  branch (restructured so the ad-hoc path no longer early-returns before it):
-  `Violated` → error, `Unsupported` → warning `designated requirement not fully
-  evaluated: <reason>`, empty/absent designated requirement → pass.
+  recursion, Kleene three-valued evaluator. `macho/verify.rs` wires it AFTER the whole
+  CMS/ad-hoc chain: the 8-byte empty-wrapper branch keeps its exact current semantics
+  (sets `adhoc_report()` and skips `verify_code_signature` — the guard is preserved by
+  branching, not by early-returning) and control then falls through to the
+  designated-requirement step, so ad-hoc output is evaluated too without ever feeding
+  the empty wrapper to the CMS parser. `Violated` → error, `Unsupported` → warning
+  `designated requirement not fully evaluated: <reason>`, empty/absent designated
+  requirement → pass.
 - **Version-gated header reads (item 9)** in `CodeDirectory::parse`, with `data`
   sliced to the blob's own declared length so `cdhash()` binds declared length by
   construction for every caller (production paths already bounded; direct callers
@@ -138,7 +187,12 @@ values once passed correctly. Rejected alternatives: trying candidates until att
 match (nondeterministic, masks mismatches); pushing selection into `crypto/cms_verify.rs`
 (out of scope — ZSN-3). Centerpiece regression: first dual-mode sign→verify round trip
 in the repo (`sign_macho` + credentials): production path must yield exactly the
-anchoring error, `cdhash_v1_ok && cdhash_v2_ok`; injected anchors → `valid`.
+anchoring error, `cdhash_v1_ok && cdhash_v2_ok`; injected anchors → `valid`. The
+existing test helper `cms_report_with_test_anchor` hardcodes `cd_sha1 = None` and the
+primary's `cdhash_sha256()`, which is wrong for dual output — it is generalized to use
+the same emitted-type pair selector as production (a small private `cdhash_pair(&SuperBlob)`
+function in `macho/verify.rs`, shared by `verify_slice` and the helper; sha256-only
+behavior is unchanged).
 
 ### 2. Alternate CodeDirectory parsing and verification
 `parse_superblob` returns `Err` (with detail) when any CodeDirectory slot child fails
@@ -188,29 +242,39 @@ Known compatibility pin: the truncated-CMS fixture (`macho/verify.rs:603`) keeps
 ### 5. XML vs DER entitlements
 - **Comparison:** private `der_entitlements_to_plist(&[u8]) -> Result<plist::Value>`
   in `codesign/verify.rs`, reversed from the in-repo encoder `codesign/der.rs::plist_to_der`
-  and extended for Apple's shapes: v1 envelope `[APPLICATION 16]{INTEGER version, dict}`
-  (macOS 12+) and v0 bare `SET OF KeyValuePair` (Big Sur … macOS 14); dictionary
-  container handled tag-agnostically (0x30/0x31/0x60/0xA0 walked as pairs) because
-  sources disagree on the inner tag; values map `NULL|BOOLEAN|OCTET STRING|GeneralizedTime|
-  SEQUENCE|array|UTF8String|INTEGER|nested dict` onto `plist::Value` (`Data`/`Date`
-  supported — Apple v1 uses them). Unmappable or malformed DER → `Err` → error
-  (fail-closed; our own encoder can only emit values the decoder handles).
-  XML parsed with `plist::from_bytes`; parse failure → error. Dictionaries compared
-  with `Value` equality (order-insensitive: `plist::Dictionary` is IndexMap-backed and
-  `sort_keys` is never called by the encoder — key order is document order, NOT
-  normative, so the comparison must not depend on it). Rejected: re-encoding XML via
-  `plist_to_der` and byte-comparing (byte order equals *our* XML order only; third-party
-  encoders would false-mismatch).
-- **DER requirement:** error when slot −5 is bound, −7 is absent/unbound, the slice is
-  an executable (`slice.is_executable`), and the primary CD version ≥
-  `CODEDIRECTORY_VERSION_EXECSEG` (`0x20400`):
-  `XML entitlements bound (slot -5) without DER entitlements (slot -7)`.
-  Scoped exactly this way because the signer emits DER only for executables
-  (`signer.rs:85-93`) and dylibs legitimately bind −5 without −7
-  (`EMPTY_ENTITLEMENTS`, `signer.rs:166-176`) — a blanket rule breaks
-  `zsign`'s `signed_bundle_verifies` (`errors.len()==1` pins on the framework binary).
-  Apple TN3126 backs the main-executable rule ("re-sign your app to include the new
-  DER entitlements").
+  and extended for Apple's shapes. The repository encoder emits the canonical **v1**
+  envelope — `0x70` [APPLICATION 16] constructed, `INTEGER version`, `0xb0`
+  [16]-constructed entries SET of `SEQUENCE { UTF8String key, value }`
+  (`der.rs:258-276`, pinned by its tests `:348-369`) — with nested dicts as `SET 0x31`
+  and arrays as `SEQUENCE 0x30`; values `BOOLEAN 0x01 | INTEGER 0x02 | UTF8String 0x0C`
+  (the encoder refuses Data/Date/Real). The decoder therefore: accepts the `0x70`
+  envelope (require leading `INTEGER` version, value ignored) OR no envelope (v0 —
+  older Apple blobs start directly at the entries container); walks the entries
+  container tag-agnostically (`0xb0 | 0x31 | 0x30 | 0x60 | 0xA0` — sources disagree on
+  the inner tag, so only the pair structure is required); maps
+  `BOOLEAN|INTEGER|UTF8String/IA5String|OCTET STRING→Data|GeneralizedTime/UTCTime→Date|
+  SEQUENCE→Array|nested container→Dictionary`; `NULL` and unknown tags → `Err`
+  (plist has no null — fail closed; our own encoder cannot produce them).
+  Bounds-checked lengths, recursion depth capped (32). Semantic parsing reads the
+  child payload AFTER the 8-byte blob header via `SlotEntry::payload()`; the XML side
+  parses `payload()` with `plist::from_bytes` (parse failure → error). Dictionaries
+  compared with `Value` equality (order-insensitive: `plist::Dictionary` is
+  IndexMap-backed and `sort_keys` is never called — key order is document order, NOT
+  normative). Rejected: re-encoding XML via `plist_to_der` and byte-comparing (byte
+  order equals *our* XML order only; third-party encoders would false-mismatch).
+- **DER requirement:** gated on BINDING, not just child presence: compute
+  `xml_bound` = stored −5 hash nonzero and `der_bound` = stored −7 hash nonzero.
+  For `slice.is_executable`, primary CD version ≥ `CODEDIRECTORY_VERSION_EXECSEG`,
+  and `xml_bound`: require `der_bound` AND the `0x0007` child present, else error
+  `XML entitlements bound (slot -5) without bound DER entitlements (slot -7)` — a
+  present-but-unbound DER child (attacker zeroes the −7 hash while supplying a
+  matching blob) is rejected too. When both children are present they are compared
+  regardless of binding (the binding rule above covers the bound cases). Scoped to
+  executables because the signer emits DER only for executables (`signer.rs:85-93`)
+  and dylibs legitimately bind −5 without −7 (`EMPTY_ENTITLEMENTS`,
+  `signer.rs:166-176`) — a blanket rule breaks `zsign`'s `signed_bundle_verifies`
+  (`errors.len()==1` pins on the framework binary). Apple TN3126 backs the
+  main-executable rule ("re-sign your app to include the new DER entitlements").
 
 ### 6. Launch-constraint slots −8..−11
 Content lookup extends to superblob children `0x0008..0x000b` (contiguous with the
@@ -229,18 +293,22 @@ Enforcement in `macho/verify.rs` against the slice, primary CD only (honest outp
 identical across CDs; keeps messages single):
 - **Range** (`0/0` = unset → accepted):
   1. `(base, limit) == (text_segment_base, text_segment_size)` → OK — our signer's
-     convention (`signer.rs:825-826` passes `__TEXT` **vmaddr/vmsize**);
-  2. file-space form `base <= slice.size && limit <= text_segment_size &&
-     base + limit <= slice.size` → OK — Apple writes `__TEXT` **fileoff/filesize**
-     (librarian: Security source + `/bin/ps` sample `Base 0x0 Limit 0x8000`; ld64
-     `textSeg.Offset/Filesz`). The in-scope parser does not expose `__TEXT`
-     fileoff/filesize (`parser.rs` keeps vmaddr/vmsize only and `first_segment_offset`
-     skips `fileoff == 0`), so exact file-convention equality is not computable without
-     touching `parser.rs` (out of scope) — the file-space form is the strongest sound
-     check available and still rejects any vm-space tampering;
+     convention (`signer.rs:825-826` passes `__TEXT` **vmaddr/vmsize**); exact match,
+     fully sound.
+  2. Otherwise, a **plausibility fallback** for file-convention signatures (Apple
+     writes `__TEXT` **fileoff/filesize** — librarian: Security source + `/bin/ps`
+     sample `Base 0x0 Limit 0x8000`; ld64 `textSeg.Offset/Filesz`):
+     `base <= slice.size && limit >= 0x1000 && limit <= text_segment_size &&
+     base + limit <= slice.size`. The `≥ 0x1000` floor rejects degenerate ranges
+     like `(0, 1)`; still, with `base == 0` a small-but-plausible tampered `limit`
+     is NOT detectable — this branch is explicitly NOT sound enforcement.
   3. otherwise → error `executable segment range 0x…+0x… does not match __TEXT`.
-  Known limitation (documented): with `base == 0` a tampered-but-small `limit` below
-  `vmsize` is not detectable; parser-level fileoff/filesize exposure is the follow-up.
+  **Exact file-convention enforcement is BLOCKED**: it needs `__TEXT` fileoff/filesize
+  exposed by `macho/parser.rs` (`ArchSlice` carries only vmaddr/vmsize at
+  `parser.rs:110-114, 237-252`, and `first_segment_offset` skips `fileoff == 0`), and
+  `parser.rs` is outside this lane's three-file scope. Recorded as a scope question
+  for the supervisor (Findings); the fallback above is the strongest sound-adjacent
+  check available in scope.
 - **Flags**: known mask `0x3F1` = MAIN_BINARY|ALLOW_UNSIGNED|DEBUGGER|JIT|SKIP_LV|
   CAN_LOAD_CDHASH|CAN_EXEC_CDHASH (librarian enumerated Apple's set; it ends at
   `0x200`). Unknown bits → error `unknown exec segment flags bits 0x…`.
@@ -269,26 +337,29 @@ Opcodes are `u32` big-endian; high byte = flag mask (`opFlagMask 0xFF000000`,
 `opFalse(0), opTrue(1), opIdent(2), opAppleAnchor(3), opAnd(6), opOr(7), opCDHash(8),
 opNot(9), opAppleGenericAnchor(15)`; `opAnd/opOr` are **binary** (nested; n-ary chains
 are the emitter's sugar). Strings = `u32 len` + raw bytes, next operand 4-aligned, no
-NUL (librarian, from Apple's requirement reader). Bounded recursion; structural
-malformation (truncation, unknown count extent, `kind != 1`) → `Err` (hard error),
-matching Apple's `errSecCSReqUnsupported`/`errSecCSReqInvalid` posture. Any other
-opcode (including flagged generic forms) parses to `Unknown` — it does not abort
-structure parsing but makes evaluation unsupported.
-Evaluator (Kleene `{T,F,U}`): `Violated` (result F) → error
+NUL (librarian, from Apple's requirement reader). **One grammar rule, no
+contradictions:** the parser fully parses only the supported set with correct operand
+layouts; **ANY other opcode — known-but-unsupported (`opCertField(11)`,
+`opCertGeneric`, …), unknown, or flag-bearing — terminates parsing of that requirement
+and marks the whole designated requirement `Unsupported`** without inspecting
+operands (bounded by the child's declared length). Structural malformation *inside the
+supported grammar* (truncated operand, bad header/magic/count/`kind != 1`, recursion
+depth > 64) → `Err` (hard error), matching Apple's `errSecCSReqInvalid` posture.
+Bounded recursion likewise.
+Evaluator (Kleene `{T,F,U}` over fully-supported trees): `Violated` (result F) → error
 `designated requirement not satisfied`; `Unsupported` (result U) → warning
-`designated requirement not fully evaluated: opcode <n>` (must stay a warning — the
+`designated requirement not fully evaluated: <reason>` (must stay a warning — the
 interop gate's `/bin/ls` DR uses `anchor apple generic` + certificate-policy ops whose
 cert chain DER is not exposed by `crypto/cms_verify.rs`, which is out of scope);
 no designated entry in the set → pass (our signer always emits the count=0 empty set —
 `signer.rs:76-82` — so no self-output regression; Apple synthesizes a default DR that
 cannot be re-derived here). Context: `identifier` from the primary CD; `cdhashes` =
 truncated (`min(len,20)`) digest of *each* emitted CD (its own hashType) for `opCDHash`;
-anchors map to `CmsVerifyReport.anchored` when a CMS report exists, `U` for ad-hoc.
-Cert-dependent opcodes (`opCertField`, `opCertGeneric`, `opTrustedCert(s)`,
-`opCertPolicy`, `opAnchorHash`, `opInfo*`, `opEntitlementField`, `opNotarized`,
-…) → `U` (warning). Rejected: strict unsupported→error (would fail every real Apple DR
-and the interop gate); full cert-aware evaluation (needs `crypto/cms_verify.rs` edits —
-explicitly deferred to ZSN-3).
+anchors map to `CmsVerifyReport.anchored` when a real (non-ad-hoc) CMS report exists,
+`U` when there is no CMS. The `U` source is always the single whole-requirement
+`Unsupported` marker produced by the parser. Rejected: strict unsupported→error
+(would fail every real Apple DR and the interop gate); full cert-aware evaluation
+(needs `crypto/cms_verify.rs` edits — explicitly deferred to ZSN-3).
 
 ### 9. CD version handling
 Header-size table in `CodeDirectory::parse` (verified against Apple's struct via
@@ -346,8 +417,9 @@ Version-gated reads and policies:
 - Add `CSMAGIC_LAUNCH_CONSTRAINT = 0xfade8181` (one magic for all four constraint
   types) → adopted by the item-4 magic table for slots `0x0008..0x000b`.
 - Add `CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF/PARENT/RESPONSIBLE = -8/-9/-10` and
-  `CSSLOT_SPECIAL_LIBRARY_CONSTRAINT = -11` → adopted in `check_special_slots`'s
-  whitelist and content map (replacing the numeric literals introduced by tasks 3/6).
+  `CSSLOT_SPECIAL_LIBRARY_CONSTRAINT = -11` → adopted in the elevation whitelist
+  (`macho/verify.rs`) and the content map (`codesign/verify.rs`), replacing the
+  numeric literals introduced by tasks 3/6.
 
 ## Invariants
 
@@ -376,30 +448,40 @@ Scoped gate (every task, before its commit):
 `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
 (`/tmp` is tmpfs and SIGBUS-flakes under parallel-lane load; `test_ipa_signing_is_deterministic`
 is the pre-existing ZSN-15 failure and is skipped in every run, baseline verified:
-54 passed / 0 failed at c9ff0fb.)
+54 passed / 0 failed at c9ff0fb.) Task 10 additionally requires
+`TMPDIR=$PWD/.tmptmp cargo test -p zsign-core constants` — the `verify` substring
+filter does not select `codesign::constants::tests::*` (baseline there: 5 tests).
 
 Every queue item gets a failing-first regression (Tester writes, implementer greens),
 inline in the scope files per repo convention:
 
 1. dual sign→verify round trip (`sign_macho` + credentials): production errors == 1
-   (`not anchored`), `cdhash_v1_ok && cdhash_v2_ok`, injected anchors → `valid`.
-2. corrupt alternate CD magic → error carries parse detail; tampered alternate page
-   hash → `alternate SHA-256 code page …` error; primary messages unchanged.
+   (`not anchored`), `cdhash_v1_ok && cdhash_v2_ok`, injected anchors → `valid`
+   (helper generalized to the emitted-type `cdhash_pair` selector).
+2. corrupt alternate CD *hashType byte* (magic left intact so task 4's magic table
+   stays out of the way — the assertion must remain stable after task 4 lands) →
+   error carries the parse detail (`unsupported CodeDirectory hash type`); tampered
+   alternate page hash → `alternate SHA-256 code page …` error; primary messages
+   unchanged.
 3. ad-hoc fixture signed with `info_plist`, verified with `SignatureInputs::none()` →
    `special slot -1 is bound but its content was not supplied`; zero-hash (unbound)
-   slots stay silent (existing bare fixtures).
+   slots stay silent (existing bare fixtures); alternate `NotChecked` elevation
+   asserted via the same fixture (dual output carries an alternate).
 4. requirements child magic patched → `parse_superblob` `Err`; distinct-content
    duplicate `0x0002` → `Err`; truncated-CMS fixture still reaches the
    `empty CMS wrapper` rule.
-5. decoder unit: `xml → plist_to_der → decode == xml` round trip, synthetic Apple-v1
-   envelope, order-insensitive dict equality; e2e: DER value byte flipped + `-7` hash
-   recomputed → `XML and DER entitlements dictionaries differ`; slot type `0x0007`
-   rewritten + `-7` hash zeroed → missing-DER error on an executable; dylib-shape
-   fixture (no DER) unaffected.
-6. content-map unit: superblob slot `0x0008` present → `Some(blob)`; e2e: `n_special`
+5. decoder units: `xml → plist_to_der → decode == xml` round trip (exercises the real
+   `0x70`/`0xb0` v1 envelope), a hand-built v0 (no-envelope) blob, order-insensitive
+   dict equality, malformed DER → `Err`; e2e: DER value byte flipped + `-7` hash
+   recomputed in both CDs → `XML and DER entitlements dictionaries differ`; slot type
+   `0x0007` rewritten + `-7` hash zeroed → missing-DER error on an executable;
+   dylib-shape fixture (no DER) unaffected.
+6. content-map unit: a synthetic CD whose stored −8 hash equals
+   `SHA256(child)` over a `0xfade8181` child → `Matched`; e2e: `n_special`
    patched `7 → 8` (deterministic nonzero stored hash from the header/ident bytes that
    enter the grown window; no panic — `hash_offset/hash_size` stays ≥ 8) with no
-   constraint child → `special slot -8 is bound but its content was not supplied`.
+   constraint child → `special slot -8 is bound but its content was not supplied`
+   (this fixture has no `0x0008` child, so task 10's magic check cannot affect it).
 7. ad-hoc fixture, primary CD bytes patched: `execSegBase` → vm-space junk → range
    error; `execSegFlags |= 0x800` → unknown-bits error; `MAIN_BINARY` cleared on an
    executable → error; JIT bit without entitlements → warning; unchanged fixture →
@@ -447,22 +529,27 @@ the final tree containing every constant the brief's item 10 lists.
 `scripts/verify-apple-interop.sh` (macOS CI, not part of the scoped cargo gate) runs
 `zsign -V` and requires `verified: yes` for our cert bundle, our ad-hoc bundle,
 `/bin/ls`, and codesign ad-hoc output; and requires *no* `verified: yes` for a tampered
-control. Per-rule analysis:
+control. **Pre-existing status: the cert-signed-bundle line (`:190`) is already red at
+c9ff0fb** — the script's self-signed certificate (`:58-64`) can never satisfy the
+production Apple-root anchoring (`crypto/cms_verify.rs:281-288`) that the dual-pin
+design intentionally enforces (`zsign/src/verify.rs:135-138` makes the facade
+error-sensitive). Out of scope; escalated below. The lane's acceptance bar is therefore
+*no new failures* on the other four lines. Per-rule analysis:
 
 | Rule | Our output | `/bin/ls` / codesign ad-hoc |
 |---|---|---|
 | slot elevation (whitelist) | bound slots always have content in fixtures | −2 self-consistent; −1/−3 unbound for CLI tools (and if bound, `zsign`'s own standalone check already fails today — no delta); −4/−6 excluded from whitelist |
-| execSeg range | exact vm-pair match | Apple file-space form accepted (base 0, limit ≤ vmsize, within slice) |
+| execSeg range | exact vm-pair match (branch 1) | file-space plausibility fallback (branch 2, ≥0x1000 floor) — NOT sound enforcement; see BLOCKED note §7 |
 | unknown execSeg bits | `0x1`/`0x11` ⊂ mask | `/bin/ps` sample: `0x1` ⊂ mask |
 | MAIN_BINARY ⇔ executable | signer sets iff `MH_EXECUTE` | same per Apple source |
 | entitlement subset checks | ALLOW_UNSIGNED only ever with get-task-allow | no such flags on `/bin/ls` |
-| DER compare / DER-required | fixtures carry no entitlements; entitlement fixtures emit both | `/bin/ls` has both, semantically equal — decoder must parse Apple v0/v1 (accepted risk, fail-closed on decode error) |
-| DR evaluation | empty set → pass | ad-hoc: identifier/opCDHash evaluable; anchor/cert ops → warning, never error |
+| DER compare / DER-required | fixtures carry no entitlements; entitlement fixtures emit both (bound) | `/bin/ls` has both, semantically equal — decoder accepts the repo's `0x70`/`0xb0` v1 form plus no-envelope v0 (accepted risk, fail-closed on decode error) |
+| DR evaluation | empty set → pass | ad-hoc: identifier/`opCDHash` evaluable; any other opcode → whole-DR `Unsupported` → warning, never error |
 | version reject `>0x20600` | `0x20400` | `/bin/ls` ≤ `0x20600` (hardened `0x20500`-class; a hypothetical `>0x20600` Apple CD would be rejected — accepted strictness, flagged) |
 
-Residual risks accepted and reported: DER decoder fidelity against Apple v1 on the
-macOS runner; execSeg range file-space form is plausibility-only (parser does not
-expose `__TEXT` fileoff/filesize).
+Residual risks accepted and reported: DER decoder fidelity against Apple's real-world
+DER on the macOS runner; execSeg file-space branch is plausibility-only (exact
+enforcement BLOCKED on parser exposure — §7).
 
 ## Design-decisions record (with source citations)
 
@@ -491,19 +578,23 @@ computed by compiling Apple's own struct and printing `offsetof`):
   per CD — our single-value verifier (crypto layer, out of scope) is a deliberate
   simplification; the fix must not demand a SHA-1 AgileHash entry.
 - Requirements: `kind == exprForm(1)`; opcodes `u32 BE` with high-byte flags; `opAnd/
-  opOr` binary; strings `u32 len` + bytes, 4-aligned, no NUL; unknown zero-flag opcode
-  fails evaluation categorically; bounded recursion via stack limit. DR may be absent →
+  opOr` binary; strings `u32 len` + bytes, 4-aligned, no NUL; Apple's own evaluator
+  fails unknown zero-flag opcodes categorically; bounded recursion via stack limit. We
+  deliberately deviate for unknown/unsupported opcodes (whole-DR `Unsupported` →
+  warning, §8) because cert-chain operands are unreachable in-scope. DR may be absent →
   Apple synthesizes a default we cannot rederive → absence passes.
 - execSegBase/Limit = `__TEXT` **fileoff/filesize** (both 0 when `platform()==0`);
   entitlement derivations ALLOW_UNSIGNED ⇐ get-task-allow OR run-unsigned-code, JIT ⇐
   dynamic-codesigning, DEBUGGER ⇐ com.apple.private.cs.debugger, SKIP_LV ⇐
   com.apple.private.skip-library-validation; enforcement of execSeg bits lives in
   closed AMFI/PPL (zero callers in OSS) → self-consistency + subset rules only.
-- DER entitlements: v1 `[APPLICATION 16]{INTEGER version, dict}`, v0 bare
-  `SET OF {UTF8String key, value}`; inner dictionary tag disputed across sources →
-  tag-agnostic walk; key order non-normative → order-insensitive compare; repo encoder
-  emits v0 (its "sorted keys" doc claim is false — `plist::Dictionary` is
-  IndexMap-backed, `sort_keys` never called).
+- DER entitlements: v1 `[APPLICATION 16]{INTEGER version, entries}` where entries is a
+  set of `SEQUENCE {UTF8String key, value}`; v0 = the entries set without the envelope;
+  inner dictionary tag disputed across sources (`0x30/0x31/0x60/0xA0`, and the repo
+  encoder emits `0xb0`) → tag-agnostic walk; key order non-normative →
+  order-insensitive compare; the repo encoder (`codesign/der.rs:258-276`, tests
+  `:348-369`) emits the **v1 `0x70`/`0xb0` form** (its "sorted keys" doc claim is
+  false — `plist::Dictionary` is IndexMap-backed, `sort_keys` never called).
 - Apple's own verifier rejects `version > compatibilityLimit (0x2F000)` or `< 0x20001`
   and only *logs* newer-than-current versions → our `> 0x20600` reject is documented
   stricter-than-Apple policy.
@@ -513,16 +604,36 @@ computed by compiling Apple's own struct and printing `offsetof`):
 1. **Signer execSeg convention divergence**: `signer.rs:825-826` writes `__TEXT`
    vmaddr/vmsize into `execSegBase/execSegLimit`; Apple writes fileoff/filesize
    (librarian). `codesign --verify` does not enforce either (zero OSS callers), which
-   is why the interop gate passes today. Verifier accepts both forms (design §7);
-   fixing the signer belongs to ZSN-32/33/34.
+   is why the interop gate's codesign steps pass today. The verifier accepts both
+   forms (design §7); fixing the signer belongs to ZSN-32/33/34.
 2. `codesign/der.rs::plist_to_der` doc claims sorted keys; the encoder preserves XML
    document order (IndexMap, no `sort_keys`) and errors on Data/Date/Real values that
    Apple v1 DER uses. Cosmetic/docs; `codesign/der.rs` is out of scope.
 3. `zsign/src/verify.rs` will show duplicate messaging for slots −1/−3 (core error +
    ZSN-26's message) once task 3 lands; harmless (`.any()` assertions), removable only
    by editing a file this lane may not touch.
+4. **QUESTION 1 (interop cert line).** `scripts/verify-apple-interop.sh:190`
+   `agree_valid "cert-signed bundle"` requires `zsign -V` → `verified: yes` on a bundle
+   signed with the script's self-signed certificate, but production verification is
+   hard-anchored to Apple's root, so this line is red at c9ff0fb and will stay red
+   regardless of this lane. Options: (a) leave it red and let the script/crypto owner
+   reconcile it (e.g. script injects a test anchor or asserts the dual-pin form) —
+   default, what this lane assumes; (b) authorize a follow-up lane to edit the script;
+   (c) authorize `crypto/cms_verify.rs` to expose an anchor-injection flag for the CLI.
+   The lane proceeds under (a) and reports the line honestly.
+5. **QUESTION 2 (execSeg exact range).** Sound `execSegBase/execSegLimit` enforcement
+   against `__TEXT` requires `macho/parser.rs` to expose `__TEXT` fileoff/filesize
+   (outside this lane's three-file scope; `ArchSlice` carries only vmaddr/vmsize).
+   Options: (a) accept the in-scope plausibility fallback (exact vm-pair match +
+   bounded file-space check with a 4 KiB floor) — default; (b) authorize a follow-up
+   to add `text_segment_fileoff`/`text_segment_filesize` to `parser.rs` and tighten
+   the check to exact equality; (c) reject every non-vm-pair range now (breaks the
+   `/bin/ls` interop line). The lane proceeds under (a); design §7 labels the fallback
+   explicitly as not-sound.
 
 ## Known items
 
-(Reserved for the cold-review adjudication rule: findings from a NOT-READY re-review
-that are doc/nit-level and were authorized to proceed verbatim. Empty at round 1.)
+(Reserved for the cold-review adjudication rule: findings from a NOT-READY *re-review*
+that are doc/nit-level and were authorized to proceed verbatim. Round 1 was NOT-READY
+and all 16 findings were applied before the round-2 re-review; empty unless round 2
+fails.)
