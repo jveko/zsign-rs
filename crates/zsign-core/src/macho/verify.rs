@@ -322,17 +322,25 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_der = key.to_public_key().to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &signing_key,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        builder
+            .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
+                const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+            ]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
         SigningCredentials {
             certificate: cert,
             signing_key: SigningKeyType::Rsa(signing_key),
@@ -478,6 +486,30 @@ mod tests {
         assert!(!report.is_valid());
     }
 
+    fn cms_report_with_test_anchor(
+        bin: &[u8],
+        creds: &SigningCredentials,
+    ) -> crate::crypto::cms_verify::CmsVerifyReport {
+        let macho = MachOFile::parse(bin.to_vec()).unwrap();
+        let slice = &macho.slices()[0];
+        let (off, size) = (
+            slice.code_sig_offset.unwrap() as usize,
+            slice.code_sig_size.unwrap() as usize,
+        );
+        let sb = parse_superblob(&bin[off..off + size]).unwrap();
+        let cd = sb.code_directory.as_ref().unwrap();
+        crate::crypto::cms_verify::verify_code_signature_with_anchors(
+            sb.cms.expect("signed superblob carries a CMS slot"),
+            cd.raw(),
+            None,
+            &cd.cdhash_sha256(),
+            &crate::crypto::cms_verify::TrustAnchors::from_certificates(vec![creds
+                .certificate
+                .clone()]),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn verify_unsigned_binary_fails() {
         let report = verify_macho(&make_minimal_macho(), &SignatureInputs::none()).unwrap();
@@ -493,8 +525,11 @@ mod tests {
         let creds = rsa_credentials();
         let signed = sign_round_trip(&creds, "com.example");
         let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        // Production anchors to Apple's roots, so the self-signed fixture is
+        // rejected for anchoring and nothing else; the injected root proves
+        // full round-trip validity.
         assert!(
-            report.is_valid(),
+            !report.is_valid(),
             "errors: {:?}",
             report.slices.iter().map(|s| &s.errors).collect::<Vec<_>>()
         );
@@ -504,7 +539,19 @@ mod tests {
         assert_eq!(slice.identifier.as_deref(), Some("com.example"));
         assert_eq!(slice.pages, PageCheck::Matched);
         let cms = slice.cms.as_ref().unwrap();
-        assert!(cms.valid, "cms errors: {:?}", cms.errors);
+        assert_eq!(slice.errors.len(), 1);
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        assert!(
+            cms.signature_ok
+                && cms.message_digest_ok
+                && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok
+                && cms.chain_ok
+        );
+        assert!(!cms.anchored);
+        let injected = cms_report_with_test_anchor(&signed, &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
     }
 
     #[test]
@@ -607,10 +654,25 @@ mod tests {
         };
         let report = verify_macho(&signed, &inputs).unwrap();
         assert!(
-            report.is_valid(),
+            !report.is_valid(),
             "errors: {:?}",
             report.slices.iter().map(|s| &s.errors).collect::<Vec<_>>()
         );
+        let slice = &report.slices[0];
+        assert_eq!(slice.errors.len(), 1);
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        let cms = slice.cms.as_ref().unwrap();
+        assert!(
+            cms.signature_ok
+                && cms.message_digest_ok
+                && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok
+                && cms.chain_ok
+        );
+        assert!(!cms.anchored);
+        let injected = cms_report_with_test_anchor(&signed, &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
         assert!(report.slices[0]
             .special_slots
             .iter()

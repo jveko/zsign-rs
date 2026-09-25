@@ -481,10 +481,82 @@ fn check_code_resources(
 mod tests {
     use super::*;
     use crate::macho::{sign_macho_sha256_only, MachOFile};
-    use crate::test_util::{minimal_macho, test_credentials};
+    use crate::test_util::minimal_macho;
     use crate::ZSign;
+    use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+    use sha2::Sha256;
+    use spki::der::Decode;
+    use spki::{EncodePublicKey, ObjectIdentifier, SubjectPublicKeyInfoOwned};
     use std::fs;
     use std::path::PathBuf;
+    use std::str::FromStr;
+    use std::time::Duration;
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::Validity;
+
+    fn local_test_credentials() -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
+        let mut rng = rand::thread_rng();
+        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let signing_key = RsaSigningKey::<Sha256>::new(rsa_key.clone());
+        let subject = Name::from_str("CN=zsign test,OU=TESTTEAM").unwrap();
+        let serial = SerialNumber::from(7u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap(
+                "1.3.6.1.5.5.7.3.3",
+            )]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+        let creds = crate::SigningCredentials {
+            certificate: cert,
+            signing_key: zsign_core::crypto::SigningKeyType::Rsa(signing_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        };
+        (creds, rsa_key)
+    }
+
+    fn cms_report_with_test_anchor(
+        bin: &[u8],
+        creds: &crate::SigningCredentials,
+    ) -> zsign_core::crypto::cms_verify::CmsVerifyReport {
+        let macho = MachOFile::parse(bin.to_vec()).unwrap();
+        let slice = &macho.slices()[0];
+        let (off, size) = (
+            slice.code_sig_offset.unwrap() as usize,
+            slice.code_sig_size.unwrap() as usize,
+        );
+        let sb = zsign_core::codesign::verify::parse_superblob(&bin[off..off + size]).unwrap();
+        let cd = sb.code_directory.as_ref().unwrap();
+        zsign_core::crypto::cms_verify::verify_code_signature_with_anchors(
+            sb.cms.expect("signed superblob carries a CMS slot"),
+            cd.raw(),
+            None,
+            &cd.cdhash_sha256(),
+            &zsign_core::crypto::cms_verify::TrustAnchors::from_certificates(vec![creds
+                .certificate
+                .clone()]),
+        )
+        .unwrap()
+    }
 
     fn app_info_plist() -> Vec<u8> {
         br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -500,7 +572,7 @@ mod tests {
 
     /// Builds a signed bundle with one nested framework (mirrors the CI
     /// interop fixture shape).
-    fn build_signed_bundle(dir: &Path) -> PathBuf {
+    fn build_signed_bundle(dir: &Path) -> (PathBuf, crate::SigningCredentials) {
         let app = dir.join("Test.app");
         fs::create_dir_all(app.join("Frameworks").join("Sub.framework")).unwrap();
         fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
@@ -522,22 +594,25 @@ mod tests {
 "#,
         )
         .unwrap();
-        let zsign = ZSign::new().credentials(test_credentials());
+        let (creds, rsa_key) = local_test_credentials();
+        let verify_creds = crate::SigningCredentials {
+            certificate: creds.certificate.clone(),
+            signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::new(rsa_key)),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        };
+        let zsign = ZSign::new().credentials(creds);
         zsign.sign_bundle(&app, None).unwrap();
-        app
-    }
-
-    fn verify_app(dir: &Path) -> VerifyReport {
-        let app = build_signed_bundle(dir);
-        verify_bundle(&app).unwrap()
+        (app, verify_creds)
     }
 
     #[test]
     fn signed_bundle_verifies() {
         let td = tempfile::TempDir::new().unwrap();
-        let report = verify_app(td.path());
+        let (app, creds) = build_signed_bundle(td.path());
+        let report = verify_bundle(&app).unwrap();
         assert!(
-            report.valid(),
+            !report.valid(),
             "problems: {} — {:#?}",
             report
                 .bundle
@@ -547,16 +622,27 @@ mod tests {
             report.bundle
         );
         let bundle = report.bundle.unwrap();
+        assert!(bundle.errors.is_empty());
         assert_eq!(bundle.nested.len(), 1); // Sub.framework
-        assert!(
-            bundle.binaries.iter().all(|b| b.valid()),
-            "binaries: {:?}",
-            bundle
-                .binaries
-                .iter()
-                .map(|b| (&b.path, &b.errors))
-                .collect::<Vec<_>>()
-        );
+        for binary in bundle.binaries.iter().chain(&bundle.nested[0].binaries) {
+            assert!(!binary.valid());
+            let slice = &binary.report.as_ref().expect("Mach-O report").slices[0];
+            assert_eq!(slice.errors.len(), 1, "binaries: {:?}", binary.errors);
+            assert!(slice.errors[0].contains("not anchored to a trusted root"));
+            let cms = slice.cms.as_ref().unwrap();
+            assert!(
+                cms.signature_ok
+                    && cms.message_digest_ok
+                    && cms.cdhash_v1_ok
+                    && cms.cdhash_v2_ok
+                    && cms.chain_ok,
+                "cms: {:?}",
+                cms
+            );
+        }
+        let injected = cms_report_with_test_anchor(&fs::read(app.join("Test")).unwrap(), &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
         let cr = bundle.code_resources.as_ref().expect("CodeResources check");
         assert!(
             cr.valid(),
@@ -571,7 +657,7 @@ mod tests {
     #[test]
     fn tampered_resource_fails_code_resources() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         fs::write(app.join("data.bin"), b"tampered payload").unwrap();
         let report = verify_bundle(&app).unwrap();
         assert!(!report.valid());
@@ -582,7 +668,7 @@ mod tests {
     #[test]
     fn tampered_binary_fails_pages() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         // Flip a byte inside the __text code region of the main binary.
         let bin = app.join("Test");
         let mut data = fs::read(&bin).unwrap();
@@ -595,7 +681,7 @@ mod tests {
     #[test]
     fn modified_sealed_resource_fails() {
         let td = tempfile::TempDir::new().unwrap();
-        let app = build_signed_bundle(td.path());
+        let (app, _) = build_signed_bundle(td.path());
         // Modify a sealed resource AFTER signing: the framework binary is
         // sealed as a file in the parent's CodeResources; re-writing it
         // changes its hash without re-signing.
@@ -611,15 +697,19 @@ mod tests {
     fn bare_macho_verifies() {
         let td = tempfile::TempDir::new().unwrap();
         let out = td.path().join("signed.bin");
-        let creds = test_credentials();
+        let (creds, _) = local_test_credentials();
         let macho = MachOFile::parse(minimal_macho()).unwrap();
         let signed =
             sign_macho_sha256_only(&macho, "com.zsign.test", None, &creds, None, None, false)
                 .unwrap();
-        fs::write(&out, signed).unwrap();
+        fs::write(&out, &signed).unwrap();
         let report = verify_macho_file(&out).unwrap();
-        assert!(report.valid(), "{:#?}", report.macho);
-        assert!(report.macho.as_ref().unwrap().is_valid());
+        let slice = &report.macho.as_ref().expect("Mach-O report").slices[0];
+        assert_eq!(slice.errors.len(), 1, "{:#?}", report.macho);
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        let injected = cms_report_with_test_anchor(&fs::read(&out).unwrap(), &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
     }
 
     #[test]
