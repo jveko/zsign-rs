@@ -74,21 +74,29 @@ formatters, linters, and project-wide tests.
 | `scripts/verify-apple-interop.sh` | T3 only: `-p "$WORK/cs.p12"` → `--pkcs12 "$WORK/cs.p12"` (sign_and_verify invocations) |
 
 **Test-harness contract (every task's subprocess tests use these helpers, introduced
-in Task 1 and reused verbatim):**
+in Task 1 and reused verbatim):** Task 1 adds them to `mod tests` and extends that
+module's imports with `use std::ffi::OsStr;` (the existing `use super::*; use
+std::path::Path; use tempfile::TempDir;` at main.rs:395-397 do not bring `OsStr`
+into scope, and the tests below call bare `OsStr::new`).
 
 ```rust
 /// Path to the freshly built zsign-cli binary, building it once per test process.
 /// Cargo does not build the bin target for unit tests (no tests/ dir), so the child
-/// `cargo build` is what makes the executable exist and be current.
+/// `cargo build` is what makes the executable exist and be current. The child
+/// mirrors this test binary's profile: CI also runs `cargo test --workspace
+/// --release` (ci.yml:62), and a release test run resolves target/release/zsign-cli
+/// — a debug-only build would leave that path missing at merge.
 fn zsign_bin() -> std::path::PathBuf {
     static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
         let exe = std::env::current_exe().expect("test executable path");
         let profile_dir = exe.parent().expect("deps dir").parent().expect("profile dir");
-        let out = std::process::Command::new("cargo")
-            .args(["build", "-p", "zsign-cli", "-q"])
-            .output()
-            .expect("spawn cargo build for zsign-cli");
+        let mut build = std::process::Command::new("cargo");
+        build.args(["build", "-p", "zsign-cli", "-q"]);
+        if !cfg!(debug_assertions) {
+            build.arg("--release");
+        }
+        let out = build.output().expect("spawn cargo build for zsign-cli");
         assert!(
             out.status.success(),
             "cargo build -p zsign-cli failed:\n{}",
@@ -569,9 +577,8 @@ Note: neither test uses `-a` — adhoc bypasses `load_credentials` entirely
 
 ```rust
     /// Password for the PKCS#12 or key material (empty password is valid).
-    /// Precedence: this flag beats the ZSIGN_PASSWORD environment variable.
-    /// Values passed on the command line are visible to other users in
-    /// process listings; prefer ZSIGN_PASSWORD where possible.
+    /// (Task 4 rewrites this help: precedence over ZSIGN_PASSWORD, argv
+    /// exposure warning, and the env attribute itself.)
     #[arg(short = 'p', long)]
     password: Option<String>,
 
@@ -1084,8 +1091,11 @@ fn read_credential_file(path: &std::path::Path, label: &str) -> Result<Vec<u8>, 
 ## Verification checklist (controller, end of lane)
 
 - [ ] Both scoped gates green (verbatim output captured for the final report)
-- [ ] `git log --oneline` shows exactly the 5 feature commits + 1 docs commit on
-  `zsn5-cli-surface`; tree clean; no fmt/clippy/hk invoked manually
+- [ ] `git log --oneline` shows exactly the 5 feature commits plus this lane's docs
+  commits (4 at lane end: `4fb8b12`, `0125b9e`, `0560874`, and the round-3
+  amendment) on `zsn5-cli-surface`; `rm -rf .tmptmp` first (the scratch dir is not
+  gitignored — `.gitignore` is fenced — and untracked leftovers would fail the
+  cleanliness check); tree clean; no fmt/clippy/hk invoked manually
 - [ ] `grep`-audit: no `process::exit` left in `run_verify`; no `report.warnings`
   printer; no `-p "$WORK/cs.p12"` path usage left in `scripts/verify-apple-interop.sh`
   (narrow pattern — `-p "` false-matches `mkdir -p`); no ticket IDs

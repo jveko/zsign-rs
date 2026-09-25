@@ -52,7 +52,10 @@ rule "migrate every caller" governs).
   `--json` must therefore be
   byte-stable; the `-p <path>` callsites must migrate to `--pkcs12` with item 3.
 - CI (`.github/workflows/ci.yml`): fmt check, `clippy -D warnings --all-targets`,
-  `cargo test --workspace` (no `--locked`), cargo-deny (license allow-list
+  `cargo test --workspace` (no `--locked`), **`cargo test --workspace --release --
+  --skip test_ipa_signing_is_deterministic` (ci.yml:62 — release profile; the
+  subprocess test harness mirrors the running profile when ensure-building the
+  bin)**, cargo-deny (license allow-list
   MIT/Apache-2.0/BSD-2/3/ISC/Unicode-3.0/CC0/Unlicense/Zlib; `multiple-versions = "warn"`),
   MSRV 1.88, macOS interop job. Every new dependency below is checked against this.
 
@@ -225,10 +228,12 @@ PEM → DER → PKCS#12 (src/openssl.cpp:876-907, no extension sniffing).
 
 **Flag migration:**
 
-- `password`: gains `short = 'p'`, `env = "ZSIGN_PASSWORD"`, `hide_env_values = true`
-  (mandatory — clap prints `[env: ZSIGN_PASSWORD=<value>]` into `--help` otherwise,
-  L2: help_template.rs:770-787); help text documents argv exposure
-  (`ps`-visible) and recommends the env var.
+- `password`: gains `short = 'p'` (item 3). The `env = "ZSIGN_PASSWORD"`
+  attribute, `hide_env_values = true` (mandatory — clap prints
+  `[env: ZSIGN_PASSWORD=<value>]` into `--help` otherwise,
+  L2: help_template.rs:770-787) and the argv-exposure help sentences land with
+  **item 4's** channel work, so each commit's `--help` only advertises channels that
+  actually work.
 - `pkcs12`: **loses its short flag** (`#[arg(long)]` only).
 - `private_key`: keeps `-k/--private-key`; help text becomes
   "Private key or PKCS#12 file (PEM, DER, or PKCS#12 auto-detected by content)".
