@@ -58,6 +58,7 @@
 //! assert!(!superblob.is_empty());
 //! ```
 
+use super::code_directory::u32_len;
 use super::constants::*;
 
 /// Size of the SuperBlob header in bytes (magic + length + count).
@@ -136,11 +137,17 @@ impl BlobEntry {
 /// assert!(!superblob.is_empty());
 /// ```
 pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
-    let count = entries.len() as u32;
+    let count = u32_len(entries.len(), "entry count");
 
     // Header: magic(4) + length(4) + count(4) = 12 bytes
     // Index: count * (type(4) + offset(4)) = count * 8 bytes
-    let header_size = SUPERBLOB_HEADER_SIZE + (count * INDEX_ENTRY_SIZE);
+    let header_size = u32_len(
+        (count as usize)
+            .checked_mul(INDEX_ENTRY_SIZE as usize)
+            .and_then(|bytes| bytes.checked_add(SUPERBLOB_HEADER_SIZE as usize))
+            .expect("SuperBlob index extent overflows u32"),
+        "index extent",
+    );
 
     // Calculate offsets for each blob with 4-byte alignment
     let mut offsets = Vec::with_capacity(entries.len());
@@ -148,12 +155,16 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
 
     for entry in &entries {
         offsets.push(current_offset);
-        current_offset += entry.data.len() as u32;
+        current_offset = current_offset
+            .checked_add(u32_len(entry.data.len(), "entry"))
+            .expect("SuperBlob entry offset overflows u32");
 
         // Pad to 4-byte alignment for next blob
         let remainder = current_offset % 4;
         if remainder != 0 {
-            current_offset += 4 - remainder;
+            current_offset = current_offset
+                .checked_add(4 - remainder)
+                .expect("SuperBlob alignment overflows u32");
         }
     }
 
@@ -184,7 +195,7 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
             total_length
         };
 
-        let current_pos = buf.len() as u32;
+        let current_pos = u32_len(buf.len(), "buffer position");
         if next_offset > current_pos {
             let padding = (next_offset - current_pos) as usize;
             buf.extend(std::iter::repeat_n(0u8, padding));
@@ -217,7 +228,7 @@ pub fn build_superblob(entries: Vec<BlobEntry>) -> Vec<u8> {
 /// assert!(blob.len() > plist.len());
 /// ```
 pub fn build_entitlements_blob(plist_data: &[u8]) -> Vec<u8> {
-    let total_len = 8 + plist_data.len() as u32;
+    let total_len = u32_len(8 + plist_data.len(), "entitlements blob");
     let mut buf = Vec::with_capacity(total_len as usize);
 
     buf.extend(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
@@ -250,7 +261,7 @@ pub fn build_entitlements_blob(plist_data: &[u8]) -> Vec<u8> {
 /// assert_eq!(blob.len(), 8 + der_data.len());
 /// ```
 pub fn build_der_entitlements_blob(der_data: &[u8]) -> Vec<u8> {
-    let total_len = 8 + der_data.len() as u32;
+    let total_len = u32_len(8 + der_data.len(), "der entitlements blob");
     let mut buf = Vec::with_capacity(total_len as usize);
 
     buf.extend(&CSMAGIC_EMBEDDED_DER_ENTITLEMENTS.to_be_bytes());
@@ -387,21 +398,32 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
     ];
 
     // Calculate inner requirement length (magic2 + length2 + pack2 + bundle_id + pack3 + subject_cn + pack4)
-    let inner_length: u32 = 4 // magic
-        + 4 // length
-        + pack2.len() as u32
-        + 4 // bundle ID length field
-        + padded_bundle_id.len() as u32
-        + pack3.len() as u32
-        + 4 // subject CN length field
-        + padded_subject_cn.len() as u32
-        + pack4.len() as u32;
+    let inner_length = u32_len(
+        [
+            4usize,
+            4,
+            pack2.len(),
+            4,
+            padded_bundle_id.len(),
+            pack3.len(),
+            4,
+            padded_subject_cn.len(),
+            pack4.len(),
+        ]
+        .iter()
+        .try_fold(0usize, |acc, &part| acc.checked_add(part))
+        .expect("requirement inner length overflows usize"),
+        "requirement inner",
+    );
 
     // Calculate outer requirements length (magic1 + length1 + pack1 + inner_length)
-    let outer_length: u32 = 4 // magic
-        + 4 // length
-        + pack1.len() as u32
-        + inner_length;
+    let outer_length = u32_len(
+        [4usize, 4, pack1.len(), inner_length as usize]
+            .iter()
+            .try_fold(0usize, |acc, &part| acc.checked_add(part))
+            .expect("requirement outer length overflows usize"),
+        "requirement outer",
+    );
 
     // Build the blob
     let mut buf = Vec::with_capacity(outer_length as usize);
@@ -417,14 +439,14 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
     buf.extend(&pack2);
 
     // Bundle ID (length + padded string)
-    buf.extend(&(bundle_id.len() as u32).to_be_bytes());
+    buf.extend(&u32_len(bundle_id.len(), "bundle id").to_be_bytes());
     buf.extend(&padded_bundle_id);
 
     // Certificate field check
     buf.extend(&pack3);
 
     // Subject CN (length + padded string)
-    buf.extend(&(subject_cn.len() as u32).to_be_bytes());
+    buf.extend(&u32_len(subject_cn.len(), "subject cn").to_be_bytes());
     buf.extend(&padded_subject_cn);
 
     // Apple anchor OID check
@@ -456,7 +478,7 @@ pub fn build_requirements_blob_full(bundle_id: &str, subject_cn: &str) -> Vec<u8
 /// assert_eq!(blob.len(), 8 + cms_data.len());
 /// ```
 pub fn build_signature_blob(cms_data: &[u8]) -> Vec<u8> {
-    let total_len = 8 + cms_data.len() as u32;
+    let total_len = u32_len(8 + cms_data.len(), "signature blob");
     let mut buf = Vec::with_capacity(total_len as usize);
 
     buf.extend(&CSMAGIC_BLOBWRAPPER.to_be_bytes());
