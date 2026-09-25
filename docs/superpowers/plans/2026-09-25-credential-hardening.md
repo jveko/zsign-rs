@@ -231,7 +231,7 @@ fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>)
 here and inside a helper would leave the module-scope copy unused and fail the merge
 gate's `-D warnings`. The helper bodies above therefore carry their own local imports
 for every trait they use (`der::Encode` in `der_of`, `der::{EncodePem, pem::LineEnding}`
-in `leaf_pems`, `pkcs8::EncodePrivateKey` in `der_of`/`pkcs8_of`/`leaf_pems`,
+in `leaf_pems`, `pkcs8::EncodePrivateKey` in `pkcs8_of`/`leaf_pems`,
 `spki::EncodePublicKey` + `x509_cert::builder::*` + `x509_cert::name::Name` +
 `std::str::FromStr` in `build_cert`), and none of those are repeated at module scope.
 The module-scope list is exactly the names the *test bodies* use bare:
@@ -1006,7 +1006,9 @@ fn code_signing_policy_violation(cert: &Certificate, now: time::OffsetDateTime) 
 }
 ```
 
-Wire into both loaders, after key handling and before chain build:
+Wire into both loaders after key handling and the key↔cert match, before each loader
+returns (this is the single binding rule — note `from_pem` builds its chain *before* the
+key match, so "before chain build" does not apply to it):
 
 ```rust
         if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
@@ -1014,8 +1016,8 @@ Wire into both loaders, after key handling and before chain build:
         }
 ```
 
-`from_pem`: insert after `verify_key_matches_cert` (158); `from_p12`: insert after
-`into_signing_key`. Doc migration: both `# Errors` lists gain the policy bullets (expired /
+`from_p12`: insert after `into_signing_key`, before `build_chain_from_leaf`;
+`from_pem`: insert after `verify_key_matches_cert` (158). Doc migration: both `# Errors` lists gain the policy bullets (expired /
 not-yet-valid / missing-or-wrong EKU / KU / CA-true).
 
 - [ ] **Step 2.4: Run green + gate + commit**

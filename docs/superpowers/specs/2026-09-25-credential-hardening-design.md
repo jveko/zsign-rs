@@ -6,7 +6,9 @@ was replayed cleanly and the crypto files stayed byte-identical throughout, so a
 `cert.rs`/`pkcs12.rs`/`cms_verify.rs` line citations hold at every base; commit hashes
 cited below without the "pre-rebase" label are current-branch hashes)
 **Scope (authoritative):** lane brief `/tmp/zsn-37.txt`, queue items 1–5, files
-`crates/zsign-core/src/crypto/{cert.rs,pkcs12.rs}` + their inline `#[cfg(test)]` tests ONLY.
+`crates/zsign-core/src/crypto/{cert.rs,pkcs12.rs}` + their inline `#[cfg(test)]` tests
+ONLY, plus NEW files under `crates/zsign-core/src/crypto/fixtures/` (the brief's fixture
+exception; package-excluded since ZSN-31).
 
 ## Problem statement
 
@@ -39,9 +41,10 @@ Signing credentials are loaded with almost no validation:
 
 ## Hard constraints (derived from brief + repo reality)
 
-- **Edit surface:** only `cert.rs`, `pkcs12.rs`, and their inline tests. `error.rs`,
-  `cms_verify.rs`, `assets.rs`, `provisioning.rs`, `cli/main.rs`, `wasm/lib.rs`, `ipa/**` are
-  out of scope (deferred to other lanes; editing them is a lane collision).
+- **Edit surface:** only `cert.rs`, `pkcs12.rs`, their inline tests, and NEW files under
+  `crypto/fixtures/` (fixture exception per brief). `error.rs`, `cms_verify.rs`,
+  `assets.rs`, `provisioning.rs`, `cli/main.rs`, `wasm/lib.rs`, `ipa/**` are out of scope
+  (deferred to other lanes; editing them is a lane collision).
 - **`SigningCredentials` must keep its exact public shape.** It is struct-literal-constructed
   in out-of-scope files (cms.rs tests, macho/signer.rs tests, verify.rs tests,
   zsign/test_util.rs, benches/signing.rs). Adding a field (e.g. a `warnings` channel) would
@@ -342,9 +345,9 @@ determinism test fails pre-existing and is skipped in full runs.
   this lane never edits the script.)
 - **Error surfacing:** CLI propagates `?` raw to `main`'s `Result` (rendered via
   `Debug`, exit 1); wasm routes the loader through `p12_err` (`lib.rs:236`; `p12_err`
-  at `:144-160`) and flattens `Display` into a JS `Error` with a mapped code; the
+  at `:144-163`) and flattens `Display` into a JS `Error` with a mapped code; the
   zsign facade forwards core errors `#[error(transparent)]`
-  (`zsign/src/error.rs:56-67`). **No consumer string-matches `Error::Certificate` text** —
+  (`zsign/src/error.rs:54-55`). **No consumer string-matches `Error::Certificate` text** —
   policy-message wording is free to change (the closest coupling there is ZSN-23's
   `cms_verify.rs:2077/2128`, which asserts *verify-report* strings). **However —
   cross-crate contract (round-4 finding):** `p12_err` string-matches the wrapped
@@ -353,10 +356,14 @@ determinism test fails pre-existing and is skipped in full runs.
   `zsign-wasm/src/lib.rs:947-960`. Those two parse-stage strings must be preserved
   verbatim by any future wording change in `pkcs12.rs`; this lane does not touch them.
 - **Existing loader tests cannot newly fail:** `cert.rs:401` and `cert.rs:407` assert
-  `is_err()` on garbage input, failing at parse before any policy check. Every
-  credential-consuming test elsewhere builds the struct literally, bypassing loaders. The
-  `pkcs12.rs` inline tests assert `extract_p12` shapes (`keys.len()/certs.len()`), which
-  pairing (a `cert.rs` concern) does not alter.
+  `is_err()` on garbage input, failing at parse before any policy check. Outside
+  `cert.rs`, the only Rust tests that drive the loaders are wasm's own:
+  `zsign-wasm/src/lib.rs:643-646` and `:747-749` load `LEAF_P12_B64` through
+  `WasmSigner::new` → `from_p12` (`lib.rs:236`); that fixture is policy-compliant
+  (codeSigning EKU, digitalSignature KU, CA:FALSE, in-window), so those tests stay green.
+  Every other credential-consuming test builds the struct literally, bypassing loaders.
+  The `pkcs12.rs` inline tests assert `extract_p12` shapes (`keys.len()/certs.len()`),
+  which pairing (a `cert.rs` concern) does not alter.
 - **Doctests:** all `from_p12`/`from_pem` examples in scope files are ```` ```ignore ````
   (never compiled); facade examples are `no_run` (compiled, never executed) — signature
   stability only, which is preserved.
@@ -461,8 +468,9 @@ rationale, not a cited source).
 - **Manifest:** `time = "0.3"` already a dependency (`Cargo.toml:17`); `x509-cert`
   extension types (`BasicConstraints`, `KeyUsage`, `ExtendedKeyUsage`) are already used by
   `cms_verify.rs` *non-test* code with `features = ["pem"]` — the load policy needs no
-  manifest change; the `builder` feature is dev-only (`Cargo.toml:54`) and is what
-  in-memory test certs will use.
+  manifest change; the `builder` feature reaches `zsign-core` transitively through `cms`'s
+  `builder` feature (`cms-0.2.3/Cargo.toml:138-152`) and is additionally declared as a
+  dev-dependency (`Cargo.toml:54`) — in-memory test certs rely on it being enabled.
 - **Docs to migrate (in-scope files only):** cert.rs module doc line 9, `SigningKeyType`
   doc line 41 ("commonly 2048 or 4096 bits" → must state the ≥2048 floor), `from_pem` doc
   error list (116-120), `from_p12` doc error list (181-186), pkcs12.rs module docs lines
@@ -555,7 +563,7 @@ rationale (three E0061 call sites, not four/E0425) and this document's
 `prf: Option<AlgorithmIdentifier>` vs the plan's `Option<ObjectIdentifier>`.
 
 The supervisor accepted the classification and authorized the fix path + round 4:
-all 7 findings were applied and committed (`1044a1d`). The negative tests now use
+all 7 findings were applied and committed (`d55447d`; pre-rebase hash `1044a1d`). The negative tests now use
 `matches!(&res, Err(Error::Certificate(m) if …))` guards with `res.as_ref().err()` on
 the panic side — `Debug` is deliberately NOT derived on credential types (it would
 format private key material); the three remaining `expect_err` calls are on
@@ -588,7 +596,7 @@ Logic-level (3, each re-verified against source before classification):
    names used bare across test bodies.
 
 Doc/nit (4+): the design's absolute "no consumer string-matches error text" claim is
-false — `zsign-wasm`'s `p12_err` (`lib.rs:144-160`, pinned by tests `:947-960`)
+false — `zsign-wasm`'s `p12_err` (`lib.rs:144-163`, pinned by tests `:947-960`)
 string-matches the two `P12Error` Display markers to map `ZSIGN_INVALID_PASSWORD`, so
 those markers are a cross-crate contract while `Error::Certificate` policy wording stays
 free; consumer-map citations drifted with the rebase (`macho/verify.rs` literal
