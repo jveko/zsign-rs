@@ -24,7 +24,15 @@ pre-existing); ticket ID in commit subjects only, never in code comments.
 
 ---
 
-### Task 1: Thread verification time and signer purpose through the chain walk
+### Task 1: Queue item 1 (part A) — thread verification time and signer purpose through the chain walk
+
+**Queue-order note:** the brief's queue is delivered as Task 1+2 (item 1: profile
+CMS verification), Task 3 (items 2+3: model + validation + retained surface),
+Task 4 (item 4: the wasm clock contract — `resolve_now`, wasm32 behavior, and the
+wall-clock-independence tests), Task 5 (gates). The `now`/purpose threading in
+this task is item 1's substrate — the profile envelope must verify certificate
+validity at the caller's instant — not item 4's delivery; item 4's public
+artifacts land after items 2-3, in queue order.
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms_verify.rs`
@@ -196,7 +204,7 @@ existing public entries must not change.
         replace_extension(
             &mut leaf,
             OID_BASIC_CONSTRAINTS,
-            &BasicConstraints { ca: true, path_len: None },
+            &BasicConstraints { ca: true, path_len_constraint: None },
         );
         let certs = vec![root, leaf.clone()];
 
@@ -218,26 +226,13 @@ existing public entries must not change.
             outcome.reason
         );
     }
-
-    #[test]
-    fn resolve_now_defaults_on_native_and_honors_explicit_values() {
-        let fallback =
-            resolve_now(None).expect("native builds default to the wall clock");
-        let drift = fallback - time::OffsetDateTime::now_utc();
-        assert!(
-            drift > time::Duration::seconds(-30) && drift < time::Duration::seconds(30),
-            "fallback drift: {drift:?}"
-        );
-        let explicit = at(T_2026_APR);
-        assert_eq!(resolve_now(Some(explicit)).unwrap(), explicit);
-    }
 ```
 
 - [ ] **Step 2: Run to confirm red**
 
 Run: `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core chain_validity_follows_injected_now`
-Expected: FAIL to compile — `verify_chain` takes 3 args; `SignerPurpose` and
-`resolve_now` do not exist.
+Expected: FAIL to compile — `verify_chain` takes 3 args and `SignerPurpose`
+does not exist.
 
 - [ ] **Step 3: Implement** in `crates/zsign-core/src/crypto/cms_verify.rs`
 
@@ -279,59 +274,62 @@ fn verify_chain(
     if let Some(reason) = purpose_reason {
 ```
 
-3. Split `leaf_purpose_reason` (:1286): keep its EKU block (absent / malformed /
-   missing codeSigning) but move the existing keyUsage + basicConstraints checks
-   — verbatim, including their messages — into a new helper, and end
-   `leaf_purpose_reason` by delegating:
+3. Split `leaf_purpose_reason` (:1286): keep its EKU block — the
+   `ext_value(leaf, OID_EXT_KEY_USAGE)` / `ExtendedKeyUsage::from_der` /
+   `eku.0.contains(&OID_CODE_SIGNING)` checks with their existing messages —
+   and move the existing keyUsage + basicConstraints checks verbatim
+   (currently :1297-1312) into a new helper, ending `leaf_purpose_reason` with
+   `leaf_ku_bc_reason(leaf)`. Concretely, after the split:
 
 ```rust
+/// End-entity purpose constraints; applied unconditionally to the leaf.
+fn leaf_purpose_reason(leaf: &x509_cert::Certificate) -> Option<String> {
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    let Some(eku_bytes) = ext_value(leaf, OID_EXT_KEY_USAGE) else {
+        return Some("leaf lacks codeSigning EKU extension".into());
+    };
+    let Ok(eku) = ExtendedKeyUsage::from_der(eku_bytes) else {
+        return Some("leaf EKU extension is malformed".into());
+    };
+    if !eku.0.contains(&OID_CODE_SIGNING) {
+        return Some(format!("leaf EKU lacks codeSigning: {:?}", eku.0));
+    }
+    leaf_ku_bc_reason(leaf)
+}
+
 /// keyUsage/basicConstraints rules shared by every leaf purpose: both
 /// extensions are optional, but when present keyUsage must set
 /// digitalSignature and basicConstraints must assert CA=false.
 fn leaf_ku_bc_reason(leaf: &x509_cert::Certificate) -> Option<String> {
     use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
-    // (existing keyUsage block moved here unchanged)
-    // (existing basicConstraints block moved here unchanged)
+    if let Some(ku_bytes) = ext_value(leaf, OID_KEY_USAGE) {
+        let Ok(ku) = KeyUsage::from_der(ku_bytes) else {
+            return Some("leaf keyUsage extension is malformed".into());
+        };
+        if !ku.digital_signature() {
+            return Some("leaf keyUsage lacks digitalSignature".into());
+        }
+    }
+    if let Some(bc_bytes) = ext_value(leaf, OID_BASIC_CONSTRAINTS) {
+        let Ok(bc) = BasicConstraints::from_der(bc_bytes) else {
+            return Some("leaf basicConstraints extension is malformed".into());
+        };
+        if bc.ca {
+            return Some("leaf basicConstraints asserts CA".into());
+        }
+    }
     None
 }
 ```
 
-4. Add next to `time_now` (:1354):
-
-```rust
-/// Resolves the verification instant for APIs that accept an explicit clock.
-///
-/// `None` falls back to the wall clock on native targets. wasm32 has no
-/// reliable clock (see `time_now`), so `None` there is a hard error instead of
-/// a silently wrong fixed timestamp: browser callers must pass
-/// `Date.now() / 1000`.
-pub(crate) fn resolve_now(now: Option<time::OffsetDateTime>) -> Result<time::OffsetDateTime> {
-    match now {
-        Some(t) => Ok(t),
-        None => {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                Ok(time_now())
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                Err(Error::Verification(
-                    "an explicit `now` timestamp is required on wasm32 (no wall \
-                     clock available); pass Date.now() / 1000"
-                        .into(),
-                ))
-            }
-        }
-    }
-}
-```
-
-   Update the `time_now` comment (:1355-1356) to say it backs only the legacy
-   `verify_code_signature*` entries and that new APIs take `now` via
-   `resolve_now`.
+4. Visibility for the clock default: change `fn time_now` (:1354) to
+   `pub(crate) fn time_now` and note in its doc that new entry points take an
+   explicit `now: Option<OffsetDateTime>` defaulted with
+   `now.unwrap_or_else(time_now)` — the wasm32 contract for that default
+   (queue item 4) lands in Task 4 as `resolve_now`.
 
 5. `verify_signed_data` (:523): add trailing parameter
-   `now: time::OffsetDateTime`; at its `verify_chain` call (:826) pass
+   `now: time::OffsetDateTime`; at its `verify_chain` call (:827) pass
    `verify_chain(&certs, cert, anchors, now, SignerPurpose::CodeSigning)`.
    (Task 2 replaces this constant with a mode dispatch.)
 
@@ -348,7 +346,7 @@ pub(crate) fn resolve_now(now: Option<time::OffsetDateTime>) -> Result<time::Off
 - [ ] **Step 4: Scoped gate (green)**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
-Expected: all `crypto` tests pass including the four new ones.
+Expected: all `crypto` tests pass including the three new ones.
 
 - [ ] **Step 5: Commit**
 
@@ -356,15 +354,14 @@ Expected: all `crypto` tests pass including the four new ones.
 
 ---
 
-### Task 2: Attached-content CMS verification (the profile envelope)
+### Task 2: Queue item 1 (part B) — attached-content CMS verification (the profile envelope)
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms_verify.rs`
   (`verify_signed_data` :523, digest gate :733, eContent skip :590, messageDigest
   :802, cdhash gates :842, `verify_signer_signature` :934, public entries :275/:295,
   `CmsVerifyReport` :229)
-- Modify: `crates/zsign-core/src/crypto/cms.rs` (test-only attached signer)
-- Modify: `crates/zsign-core/Cargo.toml` (wasm32 `sha1` needs the `oid` feature)
+- Modify: `crates/zsign-core/src/crypto/cms.rs` (test-only attached/detached signers)
 - Test: inline `mod tests` in `cms_verify.rs`
 
 **Intent:** verify a bare `ContentInfo` (no Mach-O blob wrapper) whose plist is
@@ -378,45 +375,94 @@ Add (uses the module's existing imports; `signing_err`, `SHA256_OID` are
 already defined there):
 
 ```rust
-/// Message digest used by the attached-content test signer.
+/// Digest used by the test-only content signers.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttachedDigest {
+pub(crate) enum TestDigest {
     Sha1,
     Sha256,
 }
 
-/// Builds a bare CMS SignedData over `content` with `content` attached as
-/// eContent — the provisioning-profile shape: no blob wrapper, no Apple CDHash
-/// attributes, `contentType`/`messageDigest` attributes computed by the
-/// builder. Test-only; production signing uses [`sign_code_directory`].
+impl TestDigest {
+    fn digest(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            TestDigest::Sha1 => {
+                use sha1::Digest;
+                sha1::Sha1::digest(bytes).to_vec()
+            }
+            TestDigest::Sha256 => Sha256::digest(bytes).to_vec(),
+        }
+    }
+
+    fn algorithm(self) -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned {
+            oid: match self {
+                TestDigest::Sha1 => const_oid::db::rfc5912::ID_SHA_1,
+                TestDigest::Sha256 => SHA256_OID,
+            },
+            parameters: None,
+        }
+    }
+}
+
+/// Builds a bare CMS SignedData with `content` attached as eContent — the
+/// provisioning-profile shape: no blob wrapper, no Apple CDHash attributes;
+/// `contentType`/`messageDigest` are computed by the builder. Test-only;
+/// production signing uses [`sign_code_directory`].
 #[cfg(test)]
 pub(crate) fn sign_attached_content(
     content: &[u8],
     signing_cert: &x509_cert::Certificate,
     cert_chain: &[x509_cert::Certificate],
     private_key: &rsa::RsaPrivateKey,
-    digest: AttachedDigest,
+    digest: TestDigest,
 ) -> Result<Vec<u8>> {
-    use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
-    use cms::cert::{CertificateChoices, IssuerAndSerialNumber, SignerIdentifier};
-    use cms::signed_data::EncapsulatedContentInfo;
-    use der::{Any, Tag};
-
-    let digest_algorithm = AlgorithmIdentifierOwned {
-        oid: match digest {
-            AttachedDigest::Sha1 => const_oid::db::rfc5912::ID_SHA_1,
-            AttachedDigest::Sha256 => SHA256_OID,
-        },
-        parameters: None,
-    };
     let encap = EncapsulatedContentInfo {
         econtent_type: const_oid::db::rfc5911::ID_DATA,
-        econtent: Some(Any::new(Tag::OctetString, content).map_err(|e| {
-            signing_err("Failed to attach content", e)
-        })?),
+        econtent: Some(
+            Any::new(Tag::OctetString, content)
+                .map_err(|e| signing_err("Failed to attach content", e))?,
+        ),
     };
-    let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+    sign_test_content(signing_cert, cert_chain, private_key, digest, &encap, None)
+}
+
+/// Detached variant: no eContent; `messageDigest` is computed over `content`
+/// externally (RFC 5652 §5.2). Used to prove code-signature mode still
+/// rejects a SHA-1 signer digest.
+#[cfg(test)]
+pub(crate) fn sign_detached_content(
+    content: &[u8],
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    private_key: &rsa::RsaPrivateKey,
+    digest: TestDigest,
+) -> Result<Vec<u8>> {
+    let encap = EncapsulatedContentInfo {
+        econtent_type: const_oid::db::rfc5911::ID_DATA,
+        econtent: None,
+    };
+    let external = digest.digest(content);
+    sign_test_content(
+        signing_cert,
+        cert_chain,
+        private_key,
+        digest,
+        &encap,
+        Some(external.as_slice()),
+    )
+}
+
+#[cfg(test)]
+fn sign_test_content(
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    private_key: &rsa::RsaPrivateKey,
+    digest: TestDigest,
+    encap: &EncapsulatedContentInfo,
+    external_message_digest: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let sid = SignerIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
         issuer: signing_cert.tbs_certificate.issuer.clone(),
         serial_number: signing_cert.tbs_certificate.serial_number.clone(),
     });
@@ -425,6 +471,7 @@ pub(crate) fn sign_attached_content(
         encap: &EncapsulatedContentInfo,
         sid: SignerIdentifier,
         digest_algorithm: AlgorithmIdentifierOwned,
+        external_message_digest: Option<&[u8]>,
         signing_cert: &x509_cert::Certificate,
         cert_chain: &[x509_cert::Certificate],
         signer: &S,
@@ -433,8 +480,14 @@ pub(crate) fn sign_attached_content(
         S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
         Sig: spki::SignatureBitStringEncoding,
     {
-        let sib = SignerInfoBuilder::new(signer, sid, digest_algorithm.clone(), encap, None)
-            .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
+        let sib = SignerInfoBuilder::new(
+            signer,
+            sid,
+            digest_algorithm.clone(),
+            encap,
+            external_message_digest,
+        )
+        .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
         let mut builder = SignedDataBuilder::new(encap);
         builder
             .add_digest_algorithm(digest_algorithm)
@@ -457,33 +510,50 @@ pub(crate) fn sign_attached_content(
             .map_err(|e| signing_err("Failed to encode CMS to DER", e))
     }
 
+    let digest_algorithm = digest.algorithm();
     match digest {
-        AttachedDigest::Sha256 => {
+        TestDigest::Sha256 => {
             let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(private_key.clone());
-            build(&encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
+            build(
+                encap,
+                sid,
+                digest_algorithm,
+                external_message_digest,
+                signing_cert,
+                cert_chain,
+                &signer,
+            )
         }
-        AttachedDigest::Sha1 => {
+        TestDigest::Sha1 => {
             let signer = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(private_key.clone());
-            build(&encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
+            build(
+                encap,
+                sid,
+                digest_algorithm,
+                external_message_digest,
+                signing_cert,
+                cert_chain,
+                &signer,
+            )
         }
     }
 }
 ```
 
-Notes for the implementer: the builder computes `messageDigest` from
-`encap.eContent` (cms-0.2.3 `builder.rs:195-213`) and auto-adds `contentType`,
-so no explicit digest argument is needed. `SigningKey::<sha1::Sha1>` requires no
-trait import beyond what `build`'s bounds demand.
+Notes for the implementer: all `use` statements resolve from `crypto/cms.rs`
+module scope (`SignedDataBuilder`, `SignerInfoBuilder`, `CertificateChoices`,
+`EncapsulatedContentInfo`, `SignerIdentifier`, `AlgorithmIdentifierOwned`,
+`Any`, `Tag`, `signing_err`, `SHA256_OID` are already imported there — do not
+re-import them inside these functions); `IssuerAndSerialNumber` is referenced
+by full path because the module does not import it. The attached builder
+computes `messageDigest` from `encap.eContent` (cms-0.2.3 `builder.rs:195-213`)
+and auto-adds `contentType`. `rsa`'s `sha1` feature (enabled in this crate's
+Cargo.toml) already pulls `sha1` with its `oid` feature, so
+`SigningKey::<sha1::Sha1>`'s `AssociatedOid` bound is satisfied on every
+target — no Cargo.toml change is needed.
 
-- [ ] **Step 2: wasm sha1 OID feature** in `crates/zsign-core/Cargo.toml`
-
-In the `[target.'cfg(target_arch = "wasm32")'.dependencies]` block (:42-46),
-change `sha1 = "0.10"` to `sha1 = { version = "0.10", features = ["oid"] }`
-(`rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>` below requires `AssociatedOid` on
-every target).
-
-- [ ] **Step 3: Write the failing tests** — append to `mod tests` in
-`cms_verify.rs` (add `use crate::crypto::cms::{sign_attached_content, AttachedDigest};`
+- [ ] **Step 2: Write the failing tests** — append to `mod tests` in
+`cms_verify.rs` (add `use crate::crypto::cms::{sign_attached_content, sign_detached_content, TestDigest};`
 to the module imports):
 
 ```rust
@@ -509,7 +579,7 @@ to the module imports):
             &leaf,
             &[root],
             &leaf_key,
-            AttachedDigest::Sha256,
+            TestDigest::Sha256,
         )
         .unwrap();
 
@@ -534,7 +604,7 @@ to the module imports):
             &leaf,
             &[root],
             &leaf_key,
-            AttachedDigest::Sha256,
+            TestDigest::Sha256,
         )
         .unwrap();
 
@@ -557,7 +627,7 @@ to the module imports):
             &leaf,
             &[root],
             &leaf_key,
-            AttachedDigest::Sha256,
+            TestDigest::Sha256,
         )
         .unwrap();
         let idx = envelope
@@ -587,7 +657,7 @@ to the module imports):
             &leaf,
             &[root],
             &leaf_key,
-            AttachedDigest::Sha1,
+            TestDigest::Sha1,
         )
         .unwrap();
 
@@ -622,42 +692,37 @@ to the module imports):
     }
 
     #[test]
-    fn expired_signer_cert_is_clock_dependent_not_wall_clock_dependent() {
-        let (root, leaf, leaf_key, anchors) =
-            fixed_validity_chain(T_2026_START as u64, T_2026_JUL as u64, None);
-        let envelope = sign_attached_content(
-            sample_plist(),
-            &leaf,
-            &[root],
-            &leaf_key,
-            AttachedDigest::Sha256,
-        )
-        .unwrap();
-
-        let inside =
-            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors)
+    fn code_signature_mode_still_rejects_sha1_signer_digest() {
+        let (creds, key) = rsa_credentials();
+        let content: &[u8] = b"detached sha1 content";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms =
+            sign_detached_content(content, &creds.certificate, &[], &key, TestDigest::Sha1)
                 .unwrap();
-        assert!(inside.report.valid, "errors: {:?}", inside.report.errors);
+        let wrapped = wrap(&cms);
 
-        let after =
-            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2027)), &anchors)
+        let report =
+            verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors_for(&creds))
                 .unwrap();
-        assert!(!after.report.valid);
+        assert!(!report.valid);
         assert!(
-            after.report.errors.iter().any(|e| e.contains("outside validity")),
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("only SHA-256 is supported")),
             "errors: {:?}",
-            after.report.errors
+            report.errors
         );
     }
 ```
 
-- [ ] **Step 4: Run to confirm red**
+- [ ] **Step 3: Run to confirm red**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core attached_profile_envelope_round_trip`
 Expected: FAIL to compile — `verify_cms_envelope_with_anchors`,
-`CmsEnvelopeReport`, `AttachedDigest`, `sign_attached_content` do not exist.
+`CmsEnvelopeReport`, `TestDigest`, `sign_attached_content` do not exist.
 
-- [ ] **Step 5: Implement** in `crates/zsign-core/src/crypto/cms_verify.rs`
+- [ ] **Step 4: Implement** in `crates/zsign-core/src/crypto/cms_verify.rs`
 
 1. Add the OID and digest/mode types:
 
@@ -701,7 +766,7 @@ fn verify_signed_data(
 
    - Every `return seal(report, global_errors);` becomes
      `return Ok((seal(report, global_errors)?, econtent));` — so `econtent`
-     (next point) must be declared before the first one (:655).
+     (next point) must be declared before the first one (:657).
    - Replace the eContent skip (:590-593) with capture:
 
 ```rust
@@ -751,7 +816,7 @@ fn verify_signed_data(
 
    - Return `Ok((report, econtent))` from the final `seal(report, global_errors)`.
 
-3. Digest gate (:733-738) — replace the SHA-256-only check with per-mode policy:
+3. Digest gate (:734-739) — replace the SHA-256-only check with per-mode policy:
 
 ```rust
         let signer_digest = match mode {
@@ -792,9 +857,11 @@ fn verify_signed_data(
                     SignerDigest::Sha1 => sha1::Sha1::digest(b).to_vec(),
                     SignerDigest::Sha256 => Sha256::digest(b).to_vec(),
                 };
-                attrs.message_digest
-                    .as_ref()
-                    .map(|md| md.as_slice() == computed.as_slice())
+                // `SignedAttrs::message_digest` is `Option<&[u8]>` — compare
+                // the slices directly, mirroring the existing check.
+                attrs
+                    .message_digest
+                    .map(|md| md == computed.as_slice())
                     .unwrap_or(false)
             }
             None => false,
@@ -828,11 +895,41 @@ fn verify_signed_data(
    and the aggregation (:842-847) wraps both pushes in
    `if let SignedDataMode::CodeSignature { .. } = mode { ... }`.
 
-6. `verify_signer_signature` (:934) gains `digest: SignerDigest`; in the
-   `rsa_sig && alg == OID_RSA_ENCRYPTION` branch dispatch:
+6. `verify_signer_signature` (:934) gains `digest: SignerDigest` and must also
+   accept `sha1WithRSAEncryption` — real profile SignerInfos carry that OID
+   when the fixture signs with `SigningKey::<sha1::Sha1>` (rsa-0.9.10
+   `pkcs1v15.rs:230-233`), and Apple profiles use `rsaEncryption` naming no
+   digest. Three coordinated changes inside the function:
+
+   a. The RSA predicate gains the SHA-1 OID (the constant already exists at
+   `cms_verify.rs` `OID_SHA1_WITH_RSA`, :64-65):
 
 ```rust
-            let ok = match digest {
+    let rsa_sig = sig_oid == OID_SHA256_WITH_RSA
+        || sig_oid == OID_SHA1_WITH_RSA
+        || sig_oid == OID_RSA_ENCRYPTION;
+```
+
+   b. Before the signature dispatch, pick the digest the signature actually
+   embeds — an explicit `sha1WithRSAEncryption` OID names SHA-1 but is only
+   honored when the SignerInfo digest agrees (profile mode), so
+   code-signature mode keeps its old accept set:
+
+```rust
+    let effective_digest = if sig_oid == OID_SHA256_WITH_RSA {
+        SignerDigest::Sha256
+    } else if sig_oid == OID_SHA1_WITH_RSA && digest == SignerDigest::Sha1 {
+        SignerDigest::Sha1
+    } else {
+        digest
+    };
+```
+
+   c. In the `rsa_sig && alg == OID_RSA_ENCRYPTION` branch, dispatch on
+   `effective_digest` instead of hard-coded `Sha256`:
+
+```rust
+            let ok = match effective_digest {
                 SignerDigest::Sha256 => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pub_key)
                     .verify(msg, &sig)
                     .is_ok(),
@@ -842,11 +939,16 @@ fn verify_signed_data(
             };
 ```
 
-   The `sig_oid == OID_SHA256_WITH_RSA` branch keeps SHA-256 unconditionally
-   (the OID names the digest); ECDSA stays SHA-256. Call site (:823) passes
-   `signer_digest`.
+   ECDSA stays SHA-256. The call site (:823) passes `signer_digest` (the
+   per-mode gate's result). Net effect: profile SHA-1 verifies (both with
+   `rsaEncryption` and `sha1WithRSAEncryption`), while code-signature mode
+   behaves exactly as before — its digest gate has already forced
+   `SignerDigest::Sha256`, so a `sha1WithRSAEncryption` blob still fails
+   verification, and the SHA-1 gate itself still rejects SHA-1 digest
+   algorithms outright (covered by
+   `code_signature_mode_still_rejects_sha1_signer_digest`).
 
-7. Chain call (:826): purpose now derives from the mode —
+7. Chain call (:827): purpose now derives from the mode —
    `let purpose = match mode { SignedDataMode::CodeSignature { .. } => SignerPurpose::CodeSigning, SignedDataMode::AttachedProfile => SignerPurpose::ProvisioningProfile };`
    — passed as `verify_chain(&certs, cert, anchors, now, purpose)`.
 
@@ -884,9 +986,8 @@ pub struct CmsEnvelopeReport {
 /// Verifies a provisioning-profile-style CMS envelope against
 /// [`TrustAnchors::apple_root`].
 ///
-/// `now` is the verification instant: `None` uses the wall clock on native
-/// targets and is an error on wasm32 — browser callers must pass
-/// `Date.now() / 1000`.
+/// `now` is the verification instant; `None` falls back to the wall clock
+/// (`time_now`).
 ///
 /// ```ignore
 /// let out = zsign_core::crypto::cms_verify::verify_cms_envelope(&profile_bytes, None)?;
@@ -913,7 +1014,7 @@ pub fn verify_cms_envelope_with_anchors(
     now: Option<time::OffsetDateTime>,
     anchors: &TrustAnchors,
 ) -> Result<CmsEnvelopeReport> {
-    let now = resolve_now(now)?;
+    let now = now.unwrap_or_else(time_now);
     let normalized = normalize_ber_lengths(envelope)?;
     let (report, content) = verify_signed_data(
         &normalized,
@@ -926,22 +1027,22 @@ pub fn verify_cms_envelope_with_anchors(
 }
 ```
 
-   `resolve_now` (Task 1) must be `pub(crate)` so `provisioning.rs` can reuse
-   it in Task 3 — change its visibility now if not already done.
+   (Queue item 4 replaces this `unwrap_or_else(time_now)` with `resolve_now(now)?`
+   in Task 4 — that is where the wasm32 contract lands.)
 
-- [ ] **Step 6: Scoped gate (green)**
+- [ ] **Step 5: Scoped gate (green)**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core provisioning -- --skip test_ipa_signing_is_deterministic`
 Expected: all `crypto` tests (existing + new envelope tests) and the three
 existing `provisioning` tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
-`git add -u crates/zsign-core/src/crypto/cms_verify.rs crates/zsign-core/src/crypto/cms.rs crates/zsign-core/Cargo.toml && git commit -m "feat(zsign-core): verify provisioning profile cms envelopes (ZSN-3)"`
+`git add -u crates/zsign-core/src/crypto/cms_verify.rs crates/zsign-core/src/crypto/cms.rs && git commit -m "feat(zsign-core): verify provisioning profile cms envelopes (ZSN-3)"`
 
 ---
 
-### Task 3: Profile model, validation, and the retained legacy API
+### Task 3: Queue items 2+3 — profile model, validation, and the retained legacy API
 
 **Files:**
 - Modify: `crates/zsign-core/src/provisioning.rs` (whole file: new API + retained fn)
@@ -966,13 +1067,15 @@ verbatim** plus the fixtures and new tests below (append after them):
 ```rust
     // ---- validated extraction fixtures ----
 
-    use crate::crypto::cms::{sign_attached_content, AttachedDigest};
+    use crate::crypto::cms::{sign_attached_content, TestDigest};
+    use der::Decode;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
     use std::time::{Duration as StdDuration, UNIX_EPOCH};
-    use x509_cert::builder::{Builder, CertificateBuilder, Profile, SerialNumber, Validity};
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
     use x509_cert::name::Name;
-    use x509_cert::time::Time;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::{Time, Validity};
 
     const T_2025: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
     const T_2026_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
@@ -1049,7 +1152,7 @@ verbatim** plus the fixtures and new tests below (append after them):
             &leaf_cert,
             &[root_cert.clone()],
             &leaf_key,
-            AttachedDigest::Sha256,
+            TestDigest::Sha256,
         )
         .unwrap();
         SignedProfile {
@@ -1098,8 +1201,9 @@ Then the tests:
     fn forged_plaintext_profile_is_rejected_but_legacy_extractor_is_unchanged() {
         let xml = plist_xml("");
         // Legacy contract: raw scan, no verification — unchanged.
-        let legacy = extract_entitlements_from_profile(xml.as_bytes()).unwrap();
-        assert!(legacy.unwrap().windows(16).any(|w| w == b"get-task-allow"));
+        let legacy = String::from_utf8(extract_entitlements_from_profile(xml.as_bytes()).unwrap().unwrap())
+            .unwrap();
+        assert!(legacy.contains("get-task-allow"));
         // New API: no CMS envelope at all.
         let req = ProfileRequest {
             now: Some(at(T_2026_APR)),
@@ -1155,7 +1259,7 @@ Then the tests:
         let needle = plist_xml("");
         let idx = data
             .windows(needle.len())
-            .position(|w| w == needle)
+            .position(|w| w == needle.as_bytes())
             .expect("plist embedded as eContent");
         data[idx] = b'!';
 
@@ -1203,6 +1307,54 @@ Then the tests:
     }
 
     #[test]
+    fn team_match_accepts_the_union_of_team_sources() {
+        // Case 1: TeamIdentifier absent — ApplicationIdentifierPrefix carries the team.
+        let prefix_only = signed_profile(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\">\n<dict>\n\
+             <key>Name</key><string>Test Profile</string>\n\
+             <key>ExpirationDate</key><date>2026-07-01T00:00:00Z</date>\n\
+             <key>ApplicationIdentifierPrefix</key>\n<array>\n<string>TESTTEAM</string>\n</array>\n\
+             <key>Entitlements</key>\n<dict>\n\
+             <key>application-identifier</key>\n<string>TESTTEAM.com.example.app</string>\n\
+             </dict>\n</dict>\n</plist>\n",
+        );
+        let mut req = request(&prefix_only, T_2026_APR);
+        req.expected_team_id = Some("TESTTEAM".to_string());
+        assert!(validate_and_extract_profile(&prefix_only.data, &req).is_ok());
+
+        // Case 2: TeamIdentifier says WRONGTEAM, the team-identifier
+        // entitlement says TESTTEAM — the union must accept TESTTEAM.
+        let with_entitlement = signed_profile(
+            &plist_xml("")
+                .replace(
+                    "    <string>TESTTEAM</string>\n  </array>",
+                    "    <string>WRONGTEAM</string>\n  </array>",
+                )
+                .replace(
+                    "    <key>get-task-allow</key>\n    <true/>\n",
+                    "    <key>get-task-allow</key>\n    <true/>\n    <key>com.apple.developer.team-identifier</key>\n    <string>TESTTEAM</string>\n",
+                ),
+        );
+        let mut req = request(&with_entitlement, T_2026_APR);
+        req.expected_team_id = Some("TESTTEAM".to_string());
+        assert!(validate_and_extract_profile(&with_entitlement.data, &req).is_ok());
+
+        // Case 3: TeamIdentifier alone disagrees — rejected, and the message
+        // names the profile's team.
+        let wrong_only = signed_profile(&plist_xml("").replace(
+            "    <string>TESTTEAM</string>\n  </array>",
+            "    <string>WRONGTEAM</string>\n  </array>",
+        ));
+        let mut req = request(&wrong_only, T_2026_APR);
+        req.expected_team_id = Some("TESTTEAM".to_string());
+        let err = validate_and_extract_profile(&wrong_only.data, &req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("WRONGTEAM"), "{msg}");
+        assert!(msg.contains("not the signing team TESTTEAM"), "{msg}");
+    }
+
+    #[test]
     fn explicit_app_id_covers_only_the_matching_bundle() {
         let sp = signed_profile(&plist_xml(""));
         let mut ok_req = request(&sp, T_2026_APR);
@@ -1247,6 +1399,20 @@ Then the tests:
         req.target_bundle_id = Some("com.example.app".to_string());
         let err = validate_and_extract_profile(&sp.data, &req).unwrap_err();
         assert!(err.to_string().contains("single trailing"), "{err}");
+    }
+
+    #[test]
+    fn app_id_under_a_foreign_prefix_is_rejected() {
+        let foreign = signed_profile(
+            &plist_xml("").replace(
+                "    <string>TESTTEAM.com.example.app</string>",
+                "    <string>OTHERTEAM.com.example.app</string>",
+            ),
+        );
+        let mut req = request(&foreign, T_2026_APR);
+        req.target_bundle_id = Some("com.example.app".to_string());
+        let err = validate_and_extract_profile(&foreign.data, &req).unwrap_err();
+        assert!(err.to_string().contains("does not start with"), "{err}");
     }
 
     #[test]
@@ -1379,7 +1545,7 @@ use time::OffsetDateTime;
 ///
 /// ```ignore
 /// let request = ProfileRequest {
-///     now: None, // native wall clock; wasm32 requires Date.now() / 1000
+///     now: None, // wall clock on native targets
 ///     expected_team_id: Some("TESTTEAM".into()),
 ///     target_bundle_id: Some("com.example.app".into()),
 ///     ..Default::default()
@@ -1389,8 +1555,10 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, Default)]
 pub struct ProfileRequest {
     /// Verification instant consumed by both the CMS chain check and the
-    /// profile window check. `None` uses the wall clock on native targets and
-    /// is an error on wasm32 (pass `Date.now() / 1000` there).
+    /// profile window check — one instant for both, so a caller cannot
+    /// validate the chain at one time and the window at another. `None` falls
+    /// back to the wall clock; the wasm32 contract for that fallback is
+    /// finalized with queue item 4 in Task 4.
     pub now: Option<OffsetDateTime>,
     /// Trust anchors for the profile's CMS chain. `None` uses Apple's root —
     /// production profiles are Apple-signed.
@@ -1455,7 +1623,7 @@ pub fn validate_and_extract_profile(
     profile_data: &[u8],
     request: &ProfileRequest,
 ) -> Result<ProfileInfo> {
-    let now = cms_verify::resolve_now(request.now)?;
+    let now = request.now.unwrap_or_else(cms_verify::time_now);
     let envelope = match &request.anchors {
         Some(anchors) => {
             cms_verify::verify_cms_envelope_with_anchors(profile_data, Some(now), anchors)?
@@ -1551,7 +1719,11 @@ pub fn validate_and_extract_profile(
                  cannot check coverage of \"{target}\""
             ))
         })?;
-        if !app_id_covers(&app_id, target)? {
+        let app_id_prefix = string_array(dict, "ApplicationIdentifierPrefix")?
+            .into_iter()
+            .next()
+            .or_else(|| team_identifiers.first().cloned());
+        if !app_id_covers(&app_id, app_id_prefix.as_deref(), target)? {
             return Err(Error::ProvisioningProfile(format!(
                 "Provisioning profile \"{name}\" App ID {app_id} does not cover bundle \
                  identifier {target}; use a profile whose App ID matches it"
@@ -1676,24 +1848,44 @@ fn entitlement_string(dict: &plist::Dictionary, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Apple App IDs are `PREFIX.search`: `search` is either exact or a single
-/// trailing `*` (QA1713 / Team Administration Guide). `bundle_id` arrives
-/// without the team prefix.
-fn app_id_covers(app_id: &str, bundle_id: &str) -> Result<bool> {
-    let (_, search) = app_id.split_once('.').ok_or_else(|| {
-        Error::ProvisioningProfile(format!("App ID \"{app_id}\" has no team prefix"))
+/// Apple App IDs are `PREFIX.search`: `PREFIX` is the fixed team prefix
+/// (`ApplicationIdentifierPrefix`/`TeamIdentifier`) and `search` is either
+/// exact or a single trailing `*` (QA1713 / Team Administration Guide). The
+/// candidate compared against the profile is the full `PREFIX.bundle_id`
+/// (design §4.3) — a bundle id under any other prefix never matches.
+fn app_id_covers(app_id: &str, app_id_prefix: Option<&str>, bundle_id: &str) -> Result<bool> {
+    let prefix = app_id_prefix.ok_or_else(|| {
+        Error::ProvisioningProfile(
+            "Profile has no App ID prefix (ApplicationIdentifierPrefix or TeamIdentifier); \
+             cannot check bundle coverage"
+                .into(),
+        )
     })?;
-    let stars = search.matches('*').count();
-    if stars == 0 {
-        return Ok(search == bundle_id);
+    if prefix.is_empty() || prefix.contains('.') || prefix.contains('*') {
+        return Err(Error::ProvisioningProfile(format!(
+            "App ID prefix \"{prefix}\" is malformed: a team prefix is a fixed, wildcard-free \
+             string without dots"
+        )));
     }
-    if stars > 1 || !search.ends_with('*') {
+    let rest = app_id
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('.'))
+        .ok_or_else(|| {
+            Error::ProvisioningProfile(format!(
+                "App ID \"{app_id}\" does not start with the profile's App ID prefix {prefix}"
+            ))
+        })?;
+    let stars = rest.matches('*').count();
+    if stars == 0 {
+        return Ok(rest == bundle_id);
+    }
+    if stars > 1 || !rest.ends_with('*') {
         return Err(Error::ProvisioningProfile(format!(
             "App ID \"{app_id}\" contains a wildcard Apple cannot produce: a single trailing \
              '*' is required"
         )));
     }
-    Ok(bundle_id.starts_with(&search[..search.len() - 1]))
+    Ok(bundle_id.starts_with(&rest[..rest.len() - 1]))
 }
 
 /// Serializes the `Entitlements` dictionary back to XML plist bytes, or
@@ -1741,7 +1933,159 @@ Expected: the three legacy tests plus all new tests pass.
 
 ---
 
-### Task 4: Full-suite gates and consumer compile proof
+### Task 4: Queue item 4 — wasm32 clock contract (`resolve_now`) and wall-clock-independence tests
+
+**Files:**
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (`resolve_now`, the
+  envelope entry's `now` default, `time_now` doc)
+- Modify: `crates/zsign-core/src/provisioning.rs` (the single `now`
+  resolution + `ProfileRequest.now` doc)
+- Test: inline `mod tests` in both files
+
+**Intent:** deliver item 4's public contract now that items 1-3 exist: an
+explicit timestamp parameter with a sensible native default, a hard error
+instead of a silently wrong fixed timestamp on wasm32, the documented
+`Date.now() / 1000` contract, and tests proving cert/profile expiry depend
+only on the injected `now` — never on the wall clock.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append the first two to `mod tests` in `crates/zsign-core/src/crypto/cms_verify.rs`:
+
+```rust
+    #[test]
+    fn resolve_now_defaults_on_native_and_honors_explicit_values() {
+        let fallback =
+            resolve_now(None).expect("native builds default to the wall clock");
+        let drift = fallback - time::OffsetDateTime::now_utc();
+        assert!(
+            drift > time::Duration::seconds(-30) && drift < time::Duration::seconds(30),
+            "fallback drift: {drift:?}"
+        );
+        let explicit = at(T_2026_APR);
+        assert_eq!(resolve_now(Some(explicit)).unwrap(), explicit);
+    }
+
+    #[test]
+    fn expired_signer_cert_is_clock_dependent_not_wall_clock_dependent() {
+        let (root, leaf, leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2026_JUL as u64, None);
+        let envelope = sign_attached_content(
+            sample_plist(),
+            &leaf,
+            &[root],
+            &leaf_key,
+            TestDigest::Sha256,
+        )
+        .unwrap();
+
+        let inside =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors)
+                .unwrap();
+        assert!(inside.report.valid, "errors: {:?}", inside.report.errors);
+
+        let after =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2027)), &anchors)
+                .unwrap();
+        assert!(!after.report.valid);
+        assert!(
+            after.report.errors.iter().any(|e| e.contains("outside validity")),
+            "errors: {:?}",
+            after.report.errors
+        );
+    }
+```
+
+Append to `mod tests` in `crates/zsign-core/src/provisioning.rs`:
+
+```rust
+    #[test]
+    fn profile_window_is_driven_by_request_now_not_wall_clock() {
+        let sp = signed_profile(&plist_xml(""));
+        // Fixed instant inside the 2026-01-01..2026-07-01 window — passes
+        // whatever today's date is.
+        assert!(validate_and_extract_profile(&sp.data, &request(&sp, T_2026_APR)).is_ok());
+        // One instant after ExpirationDate — rejected.
+        let err = validate_and_extract_profile(&sp.data, &request(&sp, T_2027)).unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        // One instant before CreationDate — rejected as not yet valid.
+        let err = validate_and_extract_profile(&sp.data, &request(&sp, T_2025)).unwrap_err();
+        assert!(err.to_string().contains("not valid until"), "{err}");
+    }
+```
+
+- [ ] **Step 2: Run to confirm red**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core resolve_now_defaults`
+Expected: FAIL to compile — `resolve_now` does not exist.
+
+- [ ] **Step 3: Implement**
+
+In `crates/zsign-core/src/crypto/cms_verify.rs`:
+
+1. Add next to `time_now` (:1354):
+
+```rust
+/// Resolves the verification instant for APIs that accept an explicit clock.
+///
+/// `None` falls back to the wall clock on native targets. wasm32 has no
+/// reliable clock (see [`time_now`]), so `None` there is a hard error instead
+/// of a silently wrong fixed timestamp: browser callers must pass
+/// `Date.now() / 1000`.
+pub(crate) fn resolve_now(now: Option<time::OffsetDateTime>) -> Result<time::OffsetDateTime> {
+    match now {
+        Some(t) => Ok(t),
+        None => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Ok(time_now())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(Error::Verification(
+                    "an explicit `now` timestamp is required on wasm32 (no wall \
+                     clock available); pass Date.now() / 1000"
+                        .into(),
+                ))
+            }
+        }
+    }
+}
+```
+
+2. Rewrite the `time_now` comment (:1355-1356): it now backs only the legacy
+   `verify_code_signature*` entries and `resolve_now`'s native arm; every new
+   API takes `now: Option<OffsetDateTime>` and resolves it through
+   `resolve_now`.
+
+3. In `verify_cms_envelope_with_anchors`, replace
+   `let now = now.unwrap_or_else(time_now);` with `let now = resolve_now(now)?;`
+   and extend the `verify_cms_envelope` doc: “`None` uses the wall clock on
+   native targets and is an error on wasm32 — browser callers must pass
+   `Date.now() / 1000`.”
+
+In `crates/zsign-core/src/provisioning.rs`:
+
+4. Replace `let now = request.now.unwrap_or_else(cms_verify::time_now);` with
+   `let now = cms_verify::resolve_now(request.now)?;` and restore the
+   `ProfileRequest.now` doc sentence: “`None` uses the wall clock on native
+   targets and is an error on wasm32 (pass `Date.now() / 1000` there)” —
+   including the request example comment.
+
+- [ ] **Step 4: Scoped gate (green)**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core -- --skip test_ipa_signing_is_deterministic`
+Expected: all `zsign-core` tests pass, including the three new ones (the
+wasm32 arm of `resolve_now` is compile-checked later by the Task 5 wasm
+`cargo check`).
+
+- [ ] **Step 5: Commit**
+
+`git add -u crates/zsign-core/src/crypto/cms_verify.rs crates/zsign-core/src/provisioning.rs && git commit -m "feat(zsign-core): require explicit verification clock on wasm32 (ZSN-3)"`
+
+---
+
+### Task 5: Full-suite gates and consumer compile proof
 
 **Files:** none changed; verification only.
 
@@ -1758,7 +2102,7 @@ blocker — stop and diagnose (skill: systematic-debugging).
 Run: `cargo check -p zsign-wasm --target wasm32-unknown-unknown`
 Expected: OK (the target may be absent on this machine — attempt once, record
 the outcome honestly; CI runs the same check). This is what proves
-`resolve_now`'s wasm arm and the `sha1`/`oid` feature change compile.
+`resolve_now`'s wasm arm compiles.
 
 - [ ] **Step 3: Consumer compile proof**
 
@@ -1779,18 +2123,27 @@ Expected: 3 passed, unchanged from baseline (this is the ZSN-3 rule that keeps
 
 ## Self-review (plan vs spec)
 
-- **Spec coverage:** design §4 architecture → Tasks 1-3; §4.1 purpose policy →
-  Task 1; §4.2 digest agility → Task 2; §4.3 wildcard matching → Task 3
-  (`app_id_covers`); §4.4 clock plumbing → Tasks 1-3 (`resolve_now`,
-  `ProfileRequest.now`); §5 tests 1-10 → Task 2 (1,3,4,9) and Task 3
-  (1,5,6,7,8,9,10) plus Task 1 (cert-clock); retained API (queue item 3) →
-  Task 3 steps 4.6 + Task 4 step 4; wasm contract (queue item 4) → Task 1
-  (`resolve_now`), Task 2 step 2 (sha1 oid), Task 4 step 2.
-- **Hostname:** design known-items records it as unimplementable (no field);
-  no task implements it — deliberate, not a gap.
-- **Placeholder scan:** no TBD/TODO; every step shows concrete code or commands.
+- **Queue order:** Task 1+2 = queue item 1 (their internal `now`/purpose
+  threading is item 1's substrate); Task 3 = queue items 2+3 (model, validation,
+  retained legacy API with its regression tests); Task 4 = queue item 4
+  (`resolve_now`, wasm32 contract, clock-independence tests); Task 5 = gates.
+- **Spec coverage:** design §4 architecture → Tasks 1-4; §4.1 purpose policy →
+  Task 1; §4.2 digest agility (SHA-1|SHA-256 in profile mode, SHA-256-only in
+  code mode) → Task 2 + its `code_signature_mode_still_rejects_sha1_signer_digest`;
+  §4.3 prefix-based wildcard matching → Task 3 (`app_id_covers` +
+  `app_id_under_a_foreign_prefix_is_rejected`); §4.4 clock plumbing → Task 4;
+  design §5 tests → Task 2 (forged/dual-pin/tamper/SHA-1),
+  Task 3 (expiry/team/union/app-id/device/retained), Task 4 (cert+profile
+  window at injected `now`); retained API (queue rule 3) → Task 3 + Task 5
+  step 4; wasm contract (queue item 4) → Task 4 + Task 5 step 2.
+- **Hostname:** design known-items records it as unimplementable (no field in
+  the format); no task implements it — deliberate, not a gap.
+- **Placeholder scan:** no TBD/TODO; every step shows concrete code or commands;
+  no signature-only blocks.
 - **Type consistency:** `fixed_validity_chain -> (root, leaf, leaf_key, anchors)`
-  used identically in Tasks 1-2; `sign_attached_content(content, cert, chain,
-  key, digest)` matches cms.rs definition and both call sites;
-  `verify_signed_data(cms, content, mode, anchors, now)` matches both call sites;
-  `ProfileRequest`/`ProfileInfo` field names match tests and implementation.
+  used identically in Tasks 1/2/4; `TestDigest` + `sign_attached_content` /
+  `sign_detached_content(content, cert, chain, key, digest)` match cms.rs and
+  every call site; `verify_signed_data(cms, content, mode, anchors, now)` matches
+  both call sites; `app_id_covers(app_id, prefix, bundle_id)` matches its call
+  site and tests; `ProfileRequest`/`ProfileInfo` field names match tests and
+  implementation; `resolve_now` is the single clock resolver in Task 4.

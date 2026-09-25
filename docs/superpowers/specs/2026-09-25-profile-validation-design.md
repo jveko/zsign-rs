@@ -24,7 +24,7 @@ librarian source-verifying external contracts):
 - **ScoutCmsVerify:** full public/private map of the post-ZSN-23 `cms_verify.rs`;
   `leaf_purpose_reason` (`:1286-1314`) requires the codeSigning EKU unconditionally;
   `verify_signed_data` (`:523-880`) skips the optional `[0] eContent` unread (`:590-593`);
-  digest gate is SHA-256-only (`:733-738`); `time_now()` (`:1354`) has exactly one caller,
+  digest gate is SHA-256-only (`:734-739`); `time_now()` (`:1354`) has exactly one caller,
   `verify_chain` (`:1036`); citations `provisioning.rs:12-42` and
   `builder.rs:471` exact, `ipa/mod.rs:286` drifted to `:289`.
 - **ScoutProfileConsumers:** exactly one producer and four production consumers of
@@ -190,14 +190,24 @@ certificate signatures. Code-signature mode stays SHA-256-only.
 ### 4.3 Wildcard matching
 
 - Read `application-identifier` **or** `com.apple.application-identifier` (macOS).
-- Explicit App ID (no `*`): `target == "PREFIX." + bundle_id` exact match.
-- Wildcard: exactly one `*`, last character (mid-string/multiple `*` ⇒ reject as
-  "not producible by Apple"); compare `PREFIX.bundleid` against the App ID with the
-  trailing `*` stripped, as a prefix (empty match allowed — Apple's wording "starts
-  with" favors it; flagged in known items).
+- The candidate is the full `PREFIX.bundle_id`, where `PREFIX` comes from
+  `ApplicationIdentifierPrefix[0]` (fallback `TeamIdentifier[0]`); a missing,
+  dotted, or wildcard-bearing prefix is rejected when a target bundle id is
+  being checked.
+- Explicit App ID (no `*` in the search part): candidate == App ID exactly.
+- Wildcard: exactly one `*`, last character of the search part (mid-string or
+  multiple `*` ⇒ reject as "not producible by Apple"); compare the candidate
+  against the search part with the trailing `*` stripped, as a prefix (empty
+  match allowed — Apple's wording "starts with" favors it; flagged in known
+  items).
 - Comparison is case-sensitive (bundle identifiers are case-sensitive per Apple).
 
 ### 4.4 Clock plumbing
+
+**Delivery order:** the internal `now` threading ships with queue item 1 (the
+envelope entry needs it); the public contract — `resolve_now`, the wasm32 error,
+the `Date.now() / 1000` documentation, and the clock-independence tests — ships
+as queue item 4, after items 2-3, per the brief's ordered queue.
 
 - `verify_chain(certs, leaf, anchors, now, purpose)` — `now` becomes a parameter;
   the single internal `time_now()` call moves to the public boundaries.
@@ -212,10 +222,12 @@ certificate signatures. Code-signature mode stays SHA-256-only.
 
 Fixtures are generated in-test (macho/fixtures precedent) — no committed binaries:
 
-- `#[cfg(test)] pub(crate)` profile-signing helper in `crypto/cms.rs` reusing
-  `build_cms_signed_data`: attached eContent (the plist bytes), no CDHash attrs,
-  digest SHA-256 (and a SHA-1 variant), built on `Profile::Leaf` credentials issued
-  by a test root.
+- Test-only signers in `crypto/cms.rs` (`#[cfg(test)] pub(crate)`
+  `sign_attached_content` / `sign_detached_content`) built directly on the
+  `cms` crate's `SignedDataBuilder` — `build_cms_signed_data` cannot be reused
+  because its context hard-codes the Apple CDHash attributes: attached eContent
+  (the plist bytes), no CDHash attrs, digest SHA-256 (and a SHA-1 variant),
+  built on `Profile::Leaf` credentials issued by a test root.
 - Chain fixtures reuse the `cms_verify.rs` helpers' idiom: `build_rsa_root`-style
   test root + leaf issued by it; anchors injected with `TrustAnchors::from_certificates`.
 
