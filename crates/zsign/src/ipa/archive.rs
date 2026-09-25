@@ -7,7 +7,7 @@
 //! # Features
 //!
 //! - Configurable compression via [`CompressionLevel`]
-//! - Preserves Unix file permissions and symlinks
+//! - Preserves Unix file permissions and symlinks whose targets satisfy the extractor's policy (absolute, escaping, non-UTF-8, or over-long targets are rejected at creation)
 //! - Creates proper directory structure for iOS deployment
 //!
 //! # Examples
@@ -136,6 +136,39 @@ fn needs_zip64(uncompressed_len: u64) -> bool {
     uncompressed_len > ZIP64_SIZE_GATE
 }
 
+/// Largest symlink target the extractor will read back for a written
+/// archive; mirrors `MAX_SYMLINK_TARGET_BYTES` in the extract module,
+/// which is not editable from this lane.
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
+
+/// Validates a symlink target against the extractor's target policy before
+/// it is written, so every archive the writer accepts re-extracts through
+/// `extract_ipa` with its targets byte-identical. Returns the target.
+fn checked_symlink_target(entry_name: &str, target: &std::ffi::OsStr) -> Result<String> {
+    let target = target.to_str().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Non-UTF-8 symlink target for archive entry: {entry_name}"),
+        ))
+    })?;
+    if target.starts_with('/') || target.split('/').any(|component| component == "..") {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsafe symlink target for archive entry {entry_name}: {target}"),
+        )));
+    }
+    if target.len() > MAX_SYMLINK_TARGET_BYTES {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Symlink target too long for archive entry {entry_name}: {} bytes",
+                target.len()
+            ),
+        )));
+    }
+    Ok(target.to_string())
+}
+
 /// Creates an IPA file from a signed `.app` bundle.
 ///
 /// The app bundle is placed inside a `Payload/` directory in the archive,
@@ -168,6 +201,8 @@ fn needs_zip64(uncompressed_len: u64) -> bool {
 /// - The app bundle doesn't exist or is not a directory
 /// - The output file cannot be created
 /// - Any file cannot be read during archiving
+/// - symlink targets that are absolute, escaping (`..`), non-UTF-8, or
+///   longer than 4096 bytes
 ///
 /// Returns [`Error::Zip`] if the ZIP archive cannot be written.
 pub fn create_ipa(
@@ -330,11 +365,9 @@ fn write_tree(
             zip.add_directory(&archive_path, options)
                 .map_err(Error::Zip)?;
         } else if metadata.file_type().is_symlink() {
-            // Handle symlink using the zip crate's add_symlink method
             let target = fs::read_link(path)?;
-            let target_str = target.to_string_lossy();
-
-            zip.add_symlink(&archive_path, target_str, options)
+            let target = checked_symlink_target(&archive_path, target.as_os_str())?;
+            zip.add_symlink(&archive_path, &target, options)
                 .map_err(Error::Zip)?;
         } else {
             // Regular file — use Stored for pre-compressed formats
@@ -386,6 +419,7 @@ fn zip_entry_name(relative: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipa::extract_ipa;
     use std::io::Read;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -696,5 +730,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_checked_symlink_target_boundaries() {
+        assert_eq!(
+            checked_symlink_target("e", std::ffi::OsStr::new("Versions/Current/x")).unwrap(),
+            "Versions/Current/x",
+            "framework-style relative targets pass verbatim"
+        );
+        let max = "a".repeat(MAX_SYMLINK_TARGET_BYTES);
+        assert!(
+            checked_symlink_target("e", std::ffi::OsStr::new(&max)).is_ok(),
+            "a target of exactly the extractor's limit is accepted"
+        );
+        let too_long = "a".repeat(MAX_SYMLINK_TARGET_BYTES + 1);
+        let err = checked_symlink_target("e", std::ffi::OsStr::new(&too_long))
+            .expect_err("targets above the extractor's limit are rejected");
+        assert!(err.to_string().contains("too long"), "{err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::ffi::OsStr::from_bytes(b"bad\xfftarget");
+            assert!(
+                checked_symlink_target("e", non_utf8).is_err(),
+                "non-UTF-8 targets are rejected rather than lossily rewritten"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_ipa_rejects_unsafe_symlink_targets() {
+        for target in ["/etc/passwd", "../escape", "sub/../../escape"] {
+            let temp = TempDir::new().unwrap();
+            let app = create_test_app_bundle(temp.path());
+            std::os::unix::fs::symlink(target, app.join("BadLink")).unwrap();
+            let out = temp.path().join("out.ipa");
+            let err = create_ipa(&app, &out, CompressionLevel::DEFAULT)
+                .expect_err("unsafe symlink target must fail at creation");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Unsafe symlink target"),
+                "target {target}: {msg}"
+            );
+            assert!(msg.contains("BadLink"), "entry named: {msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_ipa_framework_symlink_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let app = create_test_app_bundle(temp.path());
+        let versions = app
+            .join("Frameworks")
+            .join("Extra.framework")
+            .join("Versions");
+        fs::create_dir_all(versions.join("A")).unwrap();
+        fs::write(versions.join("A").join("resource.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("A", versions.join("Current")).unwrap();
+        std::os::unix::fs::symlink(
+            "Versions/Current/resource.txt",
+            app.join("Frameworks").join("Extra.framework").join("Extra"),
+        )
+        .unwrap();
+
+        let out = temp.path().join("framework.ipa");
+        create_ipa(&app, &out, CompressionLevel::DEFAULT).expect("creation succeeds");
+
+        let extracted = temp.path().join("extracted");
+        extract_ipa(&out, &extracted).unwrap();
+        let root = extracted
+            .join("Payload")
+            .join("Test.app")
+            .join("Frameworks")
+            .join("Extra.framework");
+        assert_eq!(
+            std::fs::read_link(root.join("Versions").join("Current")).unwrap(),
+            std::path::Path::new("A"),
+            "targets round-trip verbatim"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("Extra")).unwrap(),
+            std::path::Path::new("Versions/Current/resource.txt"),
+            "targets round-trip verbatim"
+        );
     }
 }
