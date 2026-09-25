@@ -735,7 +735,8 @@ fn code_signing_eku() -> ExtendedKeyUsage {
 /// (pattern from `cms_verify.rs` tests; mutation invalidates the cert's own
 /// signature, which load-time policy never checks).
 fn replace_extension(cert: &mut Certificate, id: ObjectIdentifier, value: &impl der::Encode) {
-    use der::Encode; // `value.to_der()` below; the trait must be in scope here
+    // No `use der::Encode` here: the `&impl der::Encode` bound already brings
+    // the trait's methods into scope, and an import would be flagged unused.
     let bytes = value.to_der().unwrap();
     let exts = cert.tbs_certificate.extensions.get_or_insert_with(Vec::new);
     exts.retain(|e| e.extn_id != id);
