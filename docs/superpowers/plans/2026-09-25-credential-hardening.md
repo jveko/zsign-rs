@@ -276,8 +276,7 @@ fn select_identity_reports_no_match() {
     let certs = vec![der_of(&cert2)];
     let res = select_identity(&keys, &certs);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("no certificate") && m.contains("1 private key"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("no certificate") && m.contains("1 private key")),
         "expected no-match rejection, got {:?}",
         res.as_ref().err()
     );
@@ -287,8 +286,7 @@ fn select_identity_reports_no_match() {
 fn from_p12_rejects_ambiguous_identity() {
     let res = SigningCredentials::from_p12(IDENTITY_DUP, "testpassword");
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("2 identities") && m.contains("CN=zsign-test-fixture"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("2 identities") && m.contains("CN=zsign-test-fixture")),
         "expected ambiguous-identity rejection, got {:?}",
         res.as_ref().err()
     );
@@ -771,8 +769,7 @@ fn from_pem_rejects_expired_leaf() {
     );
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("expired") && m.contains("CN=zsign expired"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("expired") && m.contains("CN=zsign expired")),
         "expected expired rejection, got {:?}",
         res.as_ref().err()
     );
@@ -791,8 +788,7 @@ fn from_pem_rejects_not_yet_valid_leaf() {
     );
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("not yet valid") && m.contains("CN=zsign future"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("not yet valid") && m.contains("CN=zsign future")),
         "expected not-yet-valid rejection, got {:?}",
         res.as_ref().err()
     );
@@ -804,8 +800,7 @@ fn from_pem_rejects_leaf_without_eku() {
     let cert = build_cert("CN=zsign no eku", "CN=zsign no eku", &key, &key, present(), None);
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("codeSigning") && m.contains("CN=zsign no eku"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning") && m.contains("CN=zsign no eku")),
         "expected missing-EKU rejection, got {:?}",
         res.as_ref().err()
     );
@@ -818,7 +813,7 @@ fn from_pem_rejects_leaf_with_wrong_purpose_eku() {
     let cert = build_cert("CN=zsign tls leaf", "CN=zsign tls leaf", &key, &key, present(), Some(server_auth));
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m) if m.contains("codeSigning"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning")),
         "expected wrong-purpose rejection, got {:?}",
         res.as_ref().err()
     );
@@ -831,8 +826,7 @@ fn from_pem_rejects_leaf_without_digital_signature() {
     replace_extension(&mut cert, OID_KEY_USAGE, &KeyUsage(KeyUsages::KeyCertSign.into()));
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("digitalSignature") && m.contains("CN=zsign weak ku"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("digitalSignature") && m.contains("CN=zsign weak ku")),
         "expected KU rejection, got {:?}",
         res.as_ref().err()
     );
@@ -849,8 +843,7 @@ fn from_pem_rejects_ca_leaf() {
     );
     let res = load(&cert, &key);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("CA") && m.contains("CN=zsign ca leaf"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("CA") && m.contains("CN=zsign ca leaf")),
         "expected CA=true rejection, got {:?}",
         res.as_ref().err()
     );
@@ -878,8 +871,7 @@ fn from_p12_rejects_non_policy_fixture() {
         "testpassword",
     );
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("codeSigning") && m.contains("CN=zsign-test-fixture"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning") && m.contains("CN=zsign-test-fixture")),
         "expected non-compliant fixture rejection, got {:?}",
         res.as_ref().err()
     );
@@ -1092,8 +1084,7 @@ const WEAK_RSA1024: &[u8] = include_bytes!("fixtures/weak_rsa1024.p12");
 fn from_p12_rejects_weak_rsa_key() {
     let res = SigningCredentials::from_p12(WEAK_RSA1024, "testpassword");
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("1024") && m.contains("2048"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
         "expected weak-RSA rejection naming both bit counts, got {:?}",
         res.as_ref().err()
     );
@@ -1116,8 +1107,7 @@ fn from_pem_rejects_weak_rsa_key() {
     let (cert_pem, key_pem) = leaf_pems(&cert, &key);
     let res = SigningCredentials::from_pem(&cert_pem, &key_pem, None);
     assert!(
-        matches!(&res, Err(Error::Certificate(m)
-            if m.contains("1024") && m.contains("2048"))),
+        matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
         "expected weak-RSA rejection naming both bit counts, got {:?}",
         res.as_ref().err()
     );
