@@ -2347,7 +2347,7 @@ Add to `mod tests` in `crates/zsign-core/src/crypto/cms_verify.rs` (import
             leaf_key.to_public_key().to_public_key_der().unwrap().as_ref(),
         )
         .unwrap();
-        let leaf_cert = CertificateBuilder::new(
+        let mut leaf_builder = CertificateBuilder::new(
             Profile::Leaf {
                 issuer: root_name.clone(),
                 enable_key_agreement: false,
@@ -2362,9 +2362,14 @@ Add to `mod tests` in `crates/zsign-core/src/crypto/cms_verify.rs` (import
             leaf_pub,
             &root_key,
         )
-        .unwrap()
-        .build::<p256::ecdsa::DerSignature>()
         .unwrap();
+        // The chain test asserts SignerPurpose::CodeSigning, whose leaf rule
+        // requires the codeSigning EKU — without it the test would fail on
+        // purpose instead of the ECDSA certificate-signature parse.
+        leaf_builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let leaf_cert = leaf_builder.build::<p256::ecdsa::DerSignature>().unwrap();
 
         let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
         (root_cert, leaf_cert, anchors)
