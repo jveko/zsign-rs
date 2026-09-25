@@ -47,7 +47,8 @@ impl MachOInfo {
 #[wasm_bindgen]
 pub struct WasmSigner {
     credentials: SigningCredentials,
-    entitlements: Option<Vec<u8>>,
+    profile_entitlements: Option<Vec<u8>>,
+    entitlements_override: Option<Vec<u8>>,
     resource_builder: CodeResourcesBuilder,
     streaming_hashes: HashMap<String, StreamingHashState>,
 }
@@ -73,15 +74,57 @@ impl WasmSigner {
 
         Ok(WasmSigner {
             credentials,
-            entitlements,
+            profile_entitlements: entitlements,
+            entitlements_override: None,
             resource_builder: CodeResourcesBuilder::new(),
             streaming_hashes: HashMap::new(),
         })
     }
 
-    /// Get the extracted entitlements (if any).
+    /// Get the effective entitlements: the override when set, otherwise the
+    /// profile-derived entitlements (if any).
     pub fn entitlements(&self) -> Option<Vec<u8>> {
-        self.entitlements.clone()
+        self.effective_entitlements().map(<[u8]>::to_vec)
+    }
+
+    /// Override the entitlements used for signing.
+    ///
+    /// `Some(bytes)` must be an XML or binary plist dictionary whose values
+    /// the signer can encode to DER (strings, booleans, integers, arrays,
+    /// dictionaries — Data/Date/Real are rejected here rather than at sign
+    /// time) — it replaces the profile-derived entitlements until cleared.
+    /// `None` clears the override, falling back to the profile-derived
+    /// entitlements. To sign with no entitlements while holding a profile,
+    /// construct the signer without profile bytes instead.
+    pub fn set_entitlements(&mut self, data: Option<Vec<u8>>) -> Result<(), JsError> {
+        match data {
+            Some(bytes) => {
+                let value: plist::Value = plist::from_bytes(&bytes).map_err(|e| {
+                    JsError::new(&format!(
+                        "entitlements must be a valid XML or binary plist dictionary: {e}"
+                    ))
+                })?;
+                if value.as_dictionary().is_none() {
+                    return Err(JsError::new(
+                        "entitlements plist must contain a top-level dictionary",
+                    ));
+                }
+                zsign_core::codesign::der::plist_to_der(&bytes).map_err(|e| {
+                    JsError::new(&format!(
+                        "entitlements contain types the signer cannot encode: {e}"
+                    ))
+                })?;
+                self.entitlements_override = Some(bytes);
+            }
+            None => self.entitlements_override = None,
+        }
+        Ok(())
+    }
+
+    fn effective_entitlements(&self) -> Option<&[u8]> {
+        self.entitlements_override
+            .as_deref()
+            .or(self.profile_entitlements.as_deref())
     }
 
     /// Set the main executable name for CodeResources exclusion.
@@ -197,7 +240,7 @@ impl WasmSigner {
             .map(|s| s.is_executable)
             .unwrap_or(false);
         let entitlements: Option<&[u8]> = if is_executable {
-            self.entitlements.as_deref()
+            self.effective_entitlements()
         } else {
             Some(zsign_core::macho::EMPTY_ENTITLEMENTS)
         };
@@ -226,7 +269,7 @@ impl WasmSigner {
         zsign_core::macho::sign_any_macho(
             &macho,
             identifier,
-            self.entitlements.as_deref(),
+            self.effective_entitlements(),
             &self.credentials,
             info_plist.as_deref(),
             code_resources.as_deref(),
@@ -625,5 +668,66 @@ pub mod tests {
             entitlements_slot(&d),
             "executable input must carry the profile entitlements when loaded"
         );
+    }
+
+    fn parse_dict(xml: &[u8]) -> plist::Dictionary {
+        let v: plist::Value = plist::from_bytes(xml).expect("fixture plist parses");
+        v.as_dictionary().expect("top-level dict").clone()
+    }
+
+    const OVERRIDE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.example.override</key><true/>
+</dict></plist>
+"#;
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn entitlements_setter_overrides_then_reverts_to_profile() {
+        let mut signer = new_signer_with_profile();
+        let derived = signer
+            .entitlements()
+            .expect("profile-derived entitlements exist");
+        assert!(parse_dict(&derived).contains_key("application-identifier"));
+
+        signer
+            .set_entitlements(Some(OVERRIDE_XML.as_bytes().to_vec()))
+            .expect("valid dictionary accepted");
+        assert_eq!(
+            parse_dict(&signer.entitlements().expect("override is effective")),
+            parse_dict(OVERRIDE_XML.as_bytes())
+        );
+
+        signer.set_entitlements(None).expect("clear succeeds");
+        assert_eq!(
+            parse_dict(&signer.entitlements().expect("profile fallback returns")),
+            parse_dict(&derived)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn entitlements_setter_rejects_invalid_input() {
+        let mut signer = new_signer();
+        let e1 = signer
+            .set_entitlements(Some(b"not a plist".to_vec()))
+            .expect_err("garbage rejected");
+        assert!(err_message(e1).contains("plist dictionary"));
+
+        let arr = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><array><string>x</string></array></plist>"#;
+        let e2 = signer
+            .set_entitlements(Some(arr.to_vec()))
+            .expect_err("non-dictionary rejected");
+        assert!(err_message(e2).contains("dictionary"));
+
+        // values the signer's DER encoder refuses (Data/Date/Real, der.rs:176-188)
+        // must fail at set time, not at sign time
+        let with_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>k</key><data>AA==</data></dict></plist>"#;
+        let e3 = signer
+            .set_entitlements(Some(with_data.to_vec()))
+            .expect_err("DER-unsupported value rejected");
+        let m3 = err_message(e3);
+        assert!(m3.contains("cannot encode"), "got: {m3}");
     }
 }
