@@ -152,7 +152,10 @@ fn reject_encrypted(macho: &MachOFile, identifier: &str, allow_encrypted: bool) 
 
 /// Signs any Mach-O binary (single-arch or FAT), returns signed bytes.
 ///
-/// Automatically selects entitlements based on executable type:
+/// Dispatch follows the container kind: a FAT/Universal container is signed
+/// slice-by-slice and reassembled (even when it holds a single architecture),
+/// while a thin binary is signed in place. Automatically selects entitlements
+/// based on executable type:
 /// - Executables use the provided entitlements
 /// - Non-executables (dylibs, frameworks) use empty entitlements
 pub fn sign_any_macho(
@@ -176,7 +179,7 @@ pub fn sign_any_macho(
     };
     reject_encrypted(macho, identifier, allow_encrypted)?;
 
-    if macho.slices().len() == 1 {
+    if !macho.is_fat() {
         sign_macho(
             macho,
             identifier,
@@ -203,7 +206,7 @@ pub fn sign_any_macho(
 /// Signs a single-architecture Mach-O binary.
 ///
 /// Builds a complete code signature and embeds it into the binary.
-/// For FAT binaries, use [`sign_macho_all_slices`] instead.
+/// For FAT binaries, use [`sign_any_macho`] instead.
 ///
 /// # Arguments
 ///
@@ -253,9 +256,10 @@ pub fn sign_macho(
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
-    if macho.slices().len() != 1 {
+    if macho.is_fat() {
         return Err(crate::Error::MachO(
-            "sign_macho only supports single-arch Mach-O; use sign_macho_all_slices for FAT binaries".into()
+            "sign_macho signs thin Mach-O only; use sign_any_macho for FAT/Universal binaries"
+                .into(),
         ));
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
@@ -295,9 +299,10 @@ pub fn sign_macho_adhoc(
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
-    if macho.slices().len() != 1 {
+    if macho.is_fat() {
         return Err(crate::Error::MachO(
-            "sign_macho_adhoc only supports single-arch Mach-O".into(),
+            "sign_macho_adhoc signs thin Mach-O only; use sign_any_macho for FAT/Universal binaries"
+                .into(),
         ));
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
@@ -1133,6 +1138,47 @@ mod tests {
                 slice.cpu_type
             );
         }
+    }
+
+    #[test]
+    fn test_sign_any_macho_preserves_one_arch_fat_container() {
+        let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
+        let macho = MachOFile::parse(fat).unwrap();
+        assert!(macho.is_fat() && macho.slices().len() == 1);
+        let creds = test_credentials();
+        let signed = sign_any_macho(&macho, "com.zsign.onefat", None, &creds, None, None, false)
+            .expect("one-arch FAT must sign through the FAT-capable path");
+        assert_eq!(
+            &signed[0..4],
+            &[0xca, 0xfe, 0xba, 0xbe],
+            "one-arch FAT output must keep the fat_header, not be stripped to thin"
+        );
+        let m = MachOFile::parse(signed).unwrap();
+        assert!(m.is_fat(), "output must reparse as a FAT container");
+        assert_eq!(m.slices().len(), 1);
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "embedded slice must be signed"
+        );
+    }
+
+    #[test]
+    fn test_thin_only_signers_reject_fat_containers() {
+        let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
+        let macho = MachOFile::parse(fat).unwrap();
+        let creds = test_credentials();
+        let err = sign_macho(&macho, "com.zsign.no", None, &creds, None, None, false)
+            .expect_err("thin-only signer must reject a container, never strip it");
+        assert!(
+            err.to_string().contains("sign_any_macho"),
+            "error must point at the FAT-capable entry: {err}"
+        );
+        let err = sign_macho_adhoc(&macho, "com.zsign.no", None, None, None, false)
+            .expect_err("adhoc thin-only signer must reject a container");
+        assert!(
+            err.to_string().contains("sign_any_macho"),
+            "error must point at the FAT-capable entry: {err}"
+        );
     }
 
     #[test]
