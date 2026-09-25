@@ -611,6 +611,18 @@ impl<'a> CodeDirectory<'a> {
             0
         };
         let page_size_log2 = data[39];
+        // Legal CodeDirectory page sizes: 12..=16 (2^log2-byte pages; 4096 on iOS,
+        // 16384 on modern macOS) plus 0, which Apple's verifier treats as one page
+        // covering the whole code region. Everything else would either shift-overflow
+        // or degrade hashing to per-byte work.
+        match page_size_log2 {
+            0 | 12..=16 => {}
+            other => {
+                return Err(crate::Error::Verification(format!(
+                    "unsupported CodeDirectory page size log2 {other}"
+                )));
+            }
+        }
         let team_offset_raw = if version >= CODEDIRECTORY_VERSION_TEAMID {
             rd_u32(48)
         } else {
@@ -854,25 +866,43 @@ pub enum PageCheck {
 /// hashed in `page_size`-sized chunks with a partial last page hashed as-is,
 /// matching both the signer and Apple's verifier.
 pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
-    // Page size comes from the CodeDirectory (log2): 4096 on iOS, 16384 on
-    // modern macOS system binaries.
-    let page_size = 1usize << cd.page_size_log2;
-
     let limit = cd.effective_code_limit();
     let code_len = code.len() as u64;
     let region_len_u64 = limit.min(code_len);
+
+    // pageSize 0 means one page covering the entire code region (Apple's
+    // whole-file page); 12..=16 means 2^log2-byte pages. Parse validates the
+    // range, but the field is public — treat anything else as a count
+    // mismatch instead of shifting blindly.
+    let page_size_u64: u64 = match cd.page_size_log2 {
+        0 => region_len_u64.max(1),
+        log2 @ 12..=16 => 1u64 << log2,
+        _ => {
+            return PageCheck::CountMismatch {
+                stored: cd.n_code_slots as usize,
+                computed: 0,
+            }
+        }
+    };
+
     // Guard against a CodeDirectory claiming more code than exists.
     if limit > code_len {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
-            computed: region_len_u64.div_ceil(page_size as u64) as usize,
+            computed: region_len_u64.div_ceil(page_size_u64) as usize,
         };
     }
     let region_len = region_len_u64 as usize; // safe: <= code.len()
 
     let stored = cd.code_hashes();
-    let expected_slots = region_len.div_ceil(page_size);
-    if stored.len() != expected_slots * cd.hash_size {
+    let expected_slots = region_len.div_ceil(page_size_u64 as usize);
+    let Some(stored_len) = expected_slots.checked_mul(cd.hash_size) else {
+        return PageCheck::CountMismatch {
+            stored: cd.n_code_slots as usize,
+            computed: expected_slots,
+        };
+    };
+    if stored.len() != stored_len {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
             computed: expected_slots,
@@ -883,7 +913,7 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
     }
 
     let region = &code[..region_len];
-    for (i, chunk) in region.chunks(page_size).enumerate() {
+    for (i, chunk) in region.chunks(page_size_u64 as usize).enumerate() {
         let digest = match cd.hash_type {
             CS_HASHTYPE_SHA1 => Sha1::digest(chunk).to_vec(),
             CS_HASHTYPE_SHA256 => Sha256::digest(chunk).to_vec(),
@@ -1740,6 +1770,82 @@ mod tests {
             PageCheck::CountMismatch {
                 stored: 1,
                 computed: 1
+            }
+        );
+    }
+    /// Craft a CodeDirectory from the real builder, then patch header byte 39
+    /// (pageSize log2) — the field the builder always writes as 12.
+    fn cd_bytes_with_page_size(log2: u8) -> Vec<u8> {
+        let code = vec![0x5au8; 4096];
+        let mut cd = CodeDirectoryBuilder::new("com.example.pages", &code).build_sha256();
+        cd[39] = log2;
+        cd
+    }
+
+    #[test]
+    fn parse_rejects_page_size_log2_above_16() {
+        for log2 in [17u8, 20, 63, 64, 127, 255] {
+            let err = CodeDirectory::parse(&cd_bytes_with_page_size(log2)).unwrap_err();
+            assert!(
+                matches!(&err, crate::Error::Verification(m) if m.contains("page size log2")),
+                "log2 {log2}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_per_byte_page_size() {
+        // log2 1/2/.../11 would hash 2/4/.../2048-byte "pages"; 1 = per-byte SHA-256 DoS.
+        for log2 in [1u8, 6, 11] {
+            assert!(CodeDirectory::parse(&cd_bytes_with_page_size(log2)).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_accepts_whole_file_and_legal_page_sizes() {
+        for log2 in [0u8, 12, 13, 14, 15, 16] {
+            CodeDirectory::parse(&cd_bytes_with_page_size(log2))
+                .unwrap_or_else(|e| panic!("legal page size {log2} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn whole_file_page_size_hashes_region_as_one_slot() {
+        // Builder emits exactly one code slot for <=4096 bytes of code, hashing
+        // the region in one digest — identical to Apple's pageSize=0 whole-file page.
+        let code = vec![0x5au8; 4096];
+        let cd_bytes = cd_bytes_with_page_size(0);
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(check_code_pages(&cd, &code), PageCheck::Matched);
+
+        // A region shorter than codeLimit hits the pre-existing `limit > code_len`
+        // guard; with whole-file page size the computed count is 1 (region_len /
+        // region_len), pre-fix it was 1000 (page_size = 1). Either way: no panic,
+        // CountMismatch — pin the post-fix exact values.
+        let short = &code[..1000];
+        assert_eq!(
+            check_code_pages(&cd, short),
+            PageCheck::CountMismatch {
+                stored: 1,
+                computed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn check_code_pages_rejects_mutated_page_size_without_panic() {
+        // Post-fix, parse rejects every illegal page size, so the only way the
+        // consumer's fallback arm is reached is a consumer mutating the pub
+        // field — which must fail closed, not shift blindly (pre-fix: 1 << 33
+        // succeeds on x86_64 and the check proceeds with a bogus page size).
+        let bytes = cd_bytes_with_page_size(12);
+        let mut cd = CodeDirectory::parse(&bytes).unwrap();
+        cd.page_size_log2 = 33;
+        assert_eq!(
+            check_code_pages(&cd, &[0x5au8; 4096]),
+            PageCheck::CountMismatch {
+                stored: 1,
+                computed: 0
             }
         );
     }
