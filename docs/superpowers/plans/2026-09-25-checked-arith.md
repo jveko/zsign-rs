@@ -72,8 +72,9 @@ fn whole_file_page_size_hashes_region_as_one_slot() {
     // guard; with whole-file page size the computed count is 1 (region_len /
     // region_len), pre-fix it was 1000 (page_size = 1). Either way: no panic,
     // CountMismatch — pin the post-fix exact values.
-assert_eq!(
-    check_code_pages(&cd, short),
+    let short = &code[..1000];
+    assert_eq!(
+        check_code_pages(&cd, short),
     PageCheck::CountMismatch { stored: 1, computed: 1 }
 );
 }
