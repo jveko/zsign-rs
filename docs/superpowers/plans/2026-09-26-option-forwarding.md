@@ -351,7 +351,7 @@ Expected: PASS.
             goblin::mach::Mach::Fat(_) => panic!("thin binary expected"),
         };
         assert!(
-            macho.libs.iter().any(|l| l == "/usr/lib/libzsn.dylib"),
+            macho.libs.contains(&"/usr/lib/libzsn.dylib"),
             "injected dylib missing from signed load commands: {:?}",
             macho.libs
         );
@@ -495,7 +495,7 @@ unaffected).
 Fixture rationale: `extract_entitlements_from_profile` is public and
 deliberately CMS-unverified (`zsign-core/src/provisioning.rs:379-385`, doc
 comment) — an XML plist with a top-level `Entitlements` dict
-(`entitlements_to_xml`, provisioning.rs:362-365) is a complete input. The
+(`entitlements_to_xml`, provisioning.rs:362-371) is a complete input. The
 0x0005 entry is emitted for signed executables (read side:
 `macho/verify.rs:250,326`).
 
@@ -734,7 +734,7 @@ file):
 ```
 
 The input MUST be a bare Mach-O: `.ipa`/`.app` inputs read the profile at the
-`ipa/mod.rs:299` seam, which is lane zsn34's and stays unfixed by design.
+`ipa/mod.rs:296` seam, which is lane zsn34's and stays unfixed by design.
 
 - [ ] **Step 2: Run the test to verify it FAILS**
 
@@ -862,7 +862,7 @@ Expected: PASS.
   (d)→Task 4, (e ×2 conflicts)→Task 5, (h builder site)→Task 6, (i)→Task 7.
   Already-satisfied (f)(g)(i production) and the `-V` conflict are recorded in
   the design matrix and deliberately have no implementation task. Seams
-  (`ipa/mod.rs:299`, `sign_standalone_dylib`) and docs-lane notes are
+  (`ipa/mod.rs:296`, `sign_standalone_dylib`) and docs-lane notes are
   report-only. Forwarding acceptance ("one observable-effect test per path") is
   satisfied by Tasks 1 (ipa), 2 (bundle repack), 3+4 (macho).
 - **Placeholder scan:** every task shows real test code, real production code,
