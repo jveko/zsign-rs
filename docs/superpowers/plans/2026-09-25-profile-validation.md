@@ -103,7 +103,6 @@ existing public entries must not change.
         .unwrap();
 
         let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        let leaf_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(leaf_key.clone());
         let leaf_name = Name::from_str("CN=zsn3 fixed-time leaf").unwrap();
         let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
             leaf_key.to_public_key().to_public_key_der().unwrap().as_ref(),
@@ -1227,7 +1226,6 @@ verbatim** plus the fixtures and new tests below (append after them):
         .unwrap();
 
         let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        let leaf_signing = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(leaf_key.clone());
         let leaf_name = Name::from_str("CN=zsn3 profile test leaf").unwrap();
         let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
             leaf_key.to_public_key().to_public_key_der().unwrap().as_ref(),
