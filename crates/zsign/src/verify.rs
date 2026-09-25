@@ -164,16 +164,165 @@ fn has_nested_bundle_component(rel: &Path, ignore_last: bool) -> bool {
         .any(|c| is_bundle_dir(Path::new(c.as_os_str())))
 }
 
-/// Determines whether a file should be omitted from the unsealed-file scan,
-/// mirroring `CodeResourcesBuilder::should_exclude` and the files2 omissions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleAction {
+    Include,
+    Omit,
+    Optional,
+}
+enum RulePattern {
+    Always,
+    Contains(&'static str),
+    Locversion,
+    Prefix(&'static str),
+    Exact(&'static str),
+    Dsym,
+    DsStore,
+}
+struct Rule {
+    pattern: RulePattern,
+    action: RuleAction,
+    weight: f64,
+}
+
+fn compile_pattern(pattern: &str) -> Option<RulePattern> {
+    Some(match pattern {
+        "^.*" => RulePattern::Always,
+        "^.*\\.lproj/" => RulePattern::Contains(".lproj/"),
+        "^.*\\.lproj/locversion.plist$" => RulePattern::Locversion,
+        "^Base\\.lproj/" => RulePattern::Prefix("Base.lproj/"),
+        "^version\\.plist$" => RulePattern::Exact("version.plist"),
+        ".*\\.dSYM($|/)" => RulePattern::Dsym,
+        "^(.*/)?\\.DS_Store$" => RulePattern::DsStore,
+        "^Info\\.plist$" => RulePattern::Exact("Info.plist"),
+        "^PkgInfo$" => RulePattern::Exact("PkgInfo"),
+        "^embedded\\.provisionprofile$" => RulePattern::Exact("embedded.provisionprofile"),
+        _ => return None,
+    })
+}
+
+fn pattern_matches(pattern: &RulePattern, rel: &str) -> bool {
+    match pattern {
+        RulePattern::Always => true,
+        RulePattern::Contains(needle) => rel.contains(needle),
+        RulePattern::Locversion => {
+            // ^.*\.lproj/locversion.plist$: the dot before "plist" is
+            // unescaped in the builder's emitted pattern, so it stands for
+            // exactly one arbitrary character (regex ".", newline excluded).
+            // Never narrow it to a literal dot.
+            rel.match_indices(".lproj/locversion").any(|(idx, _)| {
+                let rest = &rel[idx + ".lproj/locversion".len()..];
+                let mut chars = rest.chars();
+                matches!(chars.next(), Some(c) if c != '\n') && chars.as_str() == "plist"
+            })
+        }
+        RulePattern::Prefix(prefix) => rel.starts_with(prefix),
+        RulePattern::Exact(text) => rel == *text,
+        RulePattern::Dsym => rel.ends_with(".dSYM") || rel.contains(".dSYM/"),
+        RulePattern::DsStore => rel == ".DS_Store" || rel.ends_with("/.DS_Store"),
+    }
+}
+
+// Tie-break on equal weight, strictest first: Include beats Omit beats
+// Optional. Never derive PartialOrd on RuleAction — derived order would
+// make Optional outrank Include on a tie.
+fn tie_rank(action: RuleAction) -> u8 {
+    match action {
+        RuleAction::Include => 0,
+        RuleAction::Omit => 1,
+        RuleAction::Optional => 2,
+    }
+}
+
+fn compile_rules(dict: &plist::Dictionary, errors: &mut Vec<String>) -> Vec<Rule> {
+    let mut out = Vec::new();
+    for (pattern_str, spec) in dict {
+        let Some(pattern) = compile_pattern(pattern_str) else {
+            errors.push(format!("unsupported CodeResources rule: {pattern_str}"));
+            continue;
+        };
+        let (action, weight) = match spec {
+            plist::Value::Boolean(true) => (RuleAction::Include, 1.0),
+            plist::Value::Boolean(false) => (RuleAction::Omit, 1.0),
+            plist::Value::Dictionary(d) => {
+                let bad_key = d
+                    .keys()
+                    .any(|k| !matches!(k.as_str(), "omit" | "optional" | "weight"));
+                let bad_type = matches!(d.get("omit"), Some(v) if !matches!(v, plist::Value::Boolean(_)))
+                    || matches!(d.get("optional"), Some(v) if !matches!(v, plist::Value::Boolean(_)))
+                    || matches!(d.get("weight"), Some(v)
+                        if !matches!(v, plist::Value::Real(_) | plist::Value::Integer(_)));
+                let omit = matches!(d.get("omit"), Some(plist::Value::Boolean(true)));
+                let optional = matches!(d.get("optional"), Some(plist::Value::Boolean(true)));
+                let weight = match d.get("weight") {
+                    None => 1.0,
+                    // plist::Integer is a struct, not a primitive: convert
+                    // through as_signed/as_unsigned and fail closed on
+                    // out-of-range values via the is_finite() check below.
+                    // Map each Option to f64 BEFORE combining — or_else
+                    // requires the same T, and the arms differ (i64/u64).
+                    Some(plist::Value::Integer(w)) => w
+                        .as_signed()
+                        .map(|v| v as f64)
+                        .or_else(|| w.as_unsigned().map(|v| v as f64))
+                        .unwrap_or(f64::NAN),
+                    Some(plist::Value::Real(w)) => *w,
+                    _ => 1.0,
+                };
+                if bad_key || bad_type || (omit && optional) || !weight.is_finite() {
+                    errors.push(format!(
+                        "unsupported CodeResources rule: {pattern_str}: invalid spec"
+                    ));
+                    continue;
+                }
+                // Weight-only dictionaries (e.g. ^Base\.lproj/ {weight: 1010})
+                // resolve to Include here.
+                let action = if omit {
+                    RuleAction::Omit
+                } else if optional {
+                    RuleAction::Optional
+                } else {
+                    RuleAction::Include
+                };
+                (action, weight)
+            }
+            _ => {
+                errors.push(format!(
+                    "unsupported CodeResources rule: {pattern_str}: invalid spec"
+                ));
+                continue;
+            }
+        };
+        out.push(Rule {
+            pattern,
+            action,
+            weight,
+        });
+    }
+    out
+}
+
+fn rule_action(rules: &[Rule], rel: &str) -> Option<RuleAction> {
+    let mut best: Option<&Rule> = None;
+    for rule in rules {
+        if !pattern_matches(&rule.pattern, rel) {
+            continue;
+        }
+        best = Some(match best {
+            None => rule,
+            Some(b) => match rule.weight.total_cmp(&b.weight) {
+                std::cmp::Ordering::Greater => rule,
+                std::cmp::Ordering::Equal if tie_rank(rule.action) < tie_rank(b.action) => rule,
+                _ => b,
+            },
+        });
+    }
+    best.map(|r| r.action)
+}
+
+/// Determines whether a path is structurally omitted before rule evaluation.
 fn is_rule_omitted(rel: &str, main_executable: Option<&str>) -> bool {
     if rel.starts_with("_CodeSignature/") || rel == "_CodeSignature" {
-        return true;
-    }
-    if rel == "Info.plist" || rel == "PkgInfo" || rel == ".DS_Store" {
-        return true;
-    }
-    if rel.ends_with(".lproj/") {
         return true;
     }
     if let Some(exe) = main_executable {
@@ -425,6 +574,7 @@ fn verify_code_resource_entry(
     rel: &str,
     entry: &plist::Value,
     out: &mut CodeResourcesVerification,
+    rules: &[Rule],
     errors: &mut Vec<String>,
 ) -> Result<()> {
     let entry_dict = match entry.as_dictionary() {
@@ -459,7 +609,12 @@ fn verify_code_resource_entry(
         let metadata = match std::fs::symlink_metadata(&file_path) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                out.missing.push(rel.to_string());
+                if !matches!(
+                    rule_action(rules, rel),
+                    Some(RuleAction::Optional) | Some(RuleAction::Omit)
+                ) {
+                    out.missing.push(rel.to_string());
+                }
                 return Ok(());
             }
             Err(e) => return Err(crate::Error::Io(e)),
@@ -477,7 +632,12 @@ fn verify_code_resource_entry(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                out.missing.push(rel.to_string());
+                if !matches!(
+                    rule_action(rules, rel),
+                    Some(RuleAction::Optional) | Some(RuleAction::Omit)
+                ) {
+                    out.missing.push(rel.to_string());
+                }
             }
             Err(e) => return Err(crate::Error::Io(e)),
         }
@@ -487,7 +647,12 @@ fn verify_code_resource_entry(
     let metadata = match std::fs::symlink_metadata(&file_path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            out.missing.push(rel.to_string());
+            if !matches!(
+                rule_action(rules, rel),
+                Some(RuleAction::Optional) | Some(RuleAction::Omit)
+            ) {
+                out.missing.push(rel.to_string());
+            }
             return Ok(());
         }
         Err(e) => return Err(crate::Error::Io(e)),
@@ -499,7 +664,12 @@ fn verify_code_resource_entry(
     let data = match std::fs::read(&file_path) {
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            out.missing.push(rel.to_string());
+            if !matches!(
+                rule_action(rules, rel),
+                Some(RuleAction::Optional) | Some(RuleAction::Omit)
+            ) {
+                out.missing.push(rel.to_string());
+            }
             return Ok(());
         }
         Err(e) => return Err(crate::Error::Io(e)),
@@ -538,6 +708,31 @@ fn check_code_resources(
         errors.push("CodeResources has no files2 dictionary".into());
         return Ok(out);
     };
+    let rules_dict = match root.get("rules2") {
+        Some(value) => match value.as_dictionary() {
+            Some(dict) => Some(dict),
+            None => {
+                errors.push("CodeResources rules2 is not a dictionary".into());
+                None
+            }
+        },
+        None => match root.get("rules") {
+            Some(value) => match value.as_dictionary() {
+                Some(dict) => Some(dict),
+                None => {
+                    errors.push("CodeResources rules is not a dictionary".into());
+                    None
+                }
+            },
+            None => {
+                errors.push("CodeResources has no rules dictionary".into());
+                None
+            }
+        },
+    };
+    let rules = rules_dict
+        .map(|dict| compile_rules(dict, errors))
+        .unwrap_or_default();
     let Some(files2_value) = root.get("files2") else {
         errors.push("CodeResources has no files2 dictionary".into());
         return Ok(out);
@@ -574,7 +769,7 @@ fn check_code_resources(
             if entry.as_dictionary().is_none() {
                 continue;
             }
-            verify_code_resource_entry(bundle, rel, entry, &mut out, errors)?;
+            verify_code_resource_entry(bundle, rel, entry, &mut out, &rules, errors)?;
         }
     }
     if let Some(files) = files {
@@ -587,7 +782,12 @@ fn check_code_resources(
                 let data = match std::fs::read(&file_path) {
                     Ok(data) => data,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        out.missing.push(rel.clone());
+                        if !matches!(
+                            rule_action(&rules, rel),
+                            Some(RuleAction::Optional) | Some(RuleAction::Omit)
+                        ) {
+                            out.missing.push(rel.clone());
+                        }
                         continue;
                     }
                     Err(e) => return Err(crate::Error::Io(e)),
@@ -598,7 +798,7 @@ fn check_code_resources(
                     out.mismatched.push(rel.clone());
                 }
             } else {
-                verify_code_resource_entry(bundle, rel, entry, &mut out, errors)?;
+                verify_code_resource_entry(bundle, rel, entry, &mut out, &rules, errors)?;
             }
         }
     }
@@ -625,9 +825,13 @@ fn check_code_resources(
         disk_files.insert(rel);
     }
     for rel in disk_files {
-        if !sealed_set.contains(&rel) {
-            out.unsealed.push(rel);
+        if sealed_set.contains(&rel) {
+            continue;
         }
+        if rule_action(&rules, &rel) == Some(RuleAction::Omit) {
+            continue;
+        }
+        out.unsealed.push(rel);
     }
 
     Ok(out)
@@ -1060,6 +1264,89 @@ mod tests {
             cr.mismatched.iter().any(|m| m.contains("Info.plist")),
             "{:?}",
             cr.mismatched
+        );
+    }
+
+    #[test]
+    fn optional_lproj_deletion_after_signing_stays_valid() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle_with(td.path(), |app| {
+            fs::create_dir_all(app.join("en.lproj")).unwrap();
+            fs::write(app.join("en.lproj").join("Localizable.strings"), b"hi").unwrap();
+        });
+        fs::remove_dir_all(app.join("en.lproj")).unwrap();
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            report.valid(),
+            "rules2 marks .lproj optional (weight 1000): {:?}",
+            report.bundle
+        );
+    }
+
+    #[test]
+    fn base_lproj_deletion_is_not_optional() {
+        // Guard for weight precedence: ^Base\.lproj/ (1010, include) must beat
+        // ^.*\.lproj/ (1000, optional), so a sealed Base.lproj file may not vanish.
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle_with(td.path(), |app| {
+            fs::create_dir_all(app.join("Base.lproj")).unwrap();
+            fs::write(app.join("Base.lproj").join("Notes.strings"), b"x").unwrap();
+        });
+        fs::remove_dir_all(app.join("Base.lproj")).unwrap();
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            !report.valid(),
+            "Base.lproj is required by weight precedence"
+        );
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        assert!(!cr.missing.is_empty(), "{:?}", cr);
+    }
+
+    #[test]
+    fn omitted_locversion_deletion_stays_valid() {
+        // Omit must tolerate absence: the builder seals *.lproj/locversion.plist
+        // (its files2 drop list is only Info.plist/PkgInfo/*.DS_Store) while the
+        // rules declare it omit at weight 1100.
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle_with(td.path(), |app| {
+            fs::create_dir_all(app.join("en.lproj")).unwrap();
+            fs::write(app.join("en.lproj").join("locversion.plist"), b"x").unwrap();
+        });
+        fs::remove_file(app.join("en.lproj").join("locversion.plist")).unwrap();
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            report.valid(),
+            "an omitted-but-sealed entry may vanish: {:?}",
+            report.bundle
+        );
+    }
+
+    #[test]
+    fn unsupported_rule_is_reported() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        rewrite_code_resources(&app, |dict| {
+            let rules2 = dict.get_mut("rules2").unwrap().as_dictionary_mut().unwrap();
+            rules2.insert("^secret\\.bin$".into(), plist::Value::Boolean(true));
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(!report.valid());
+        assert!(
+            report
+                .bundle
+                .as_ref()
+                .unwrap()
+                .errors
+                .iter()
+                .any(|e| e.contains("unsupported CodeResources rule")),
+            "got {:?}",
+            report.bundle.as_ref().unwrap().errors
         );
     }
 }
