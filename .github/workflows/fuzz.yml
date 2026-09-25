@@ -1,0 +1,48 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "43 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-30
+      - uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+      - name: build fuzz targets
+        run: cargo fuzz build --features fuzzing
+      - name: fuzz smoke
+        run: |
+          set -eu
+          targets=$(cargo fuzz list)
+          status=0
+          for target in $targets; do
+            mkdir -p "fuzz/target/smoke-corpus/$target"
+            [ -d "fuzz/corpus/$target" ] || { echo "missing seed corpus for $target"; exit 1; }
+            cargo fuzz run "$target" --features fuzzing \
+              "fuzz/target/smoke-corpus/$target" "fuzz/corpus/$target" -- \
+              -max_total_time=30 -timeout=25 -rss_limit_mb=2048 || status=$?
+          done
+          exit $status
+      - name: upload crash artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
