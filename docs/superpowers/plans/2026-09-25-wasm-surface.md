@@ -88,6 +88,12 @@ openssl x509 -in .tmptmp/zsn40-cert.pem -noout -subject -dates -text | grep -E '
 
 (Write all outputs under `.tmptmp/`, never `/tmp` — tmpfs quota flakes.)
 
+**Scratch cleanup (mandatory):** `.tmptmp/` is NOT gitignored (`.gitignore`
+covers `tmp/` only) and these files include a private key. After pasting the
+base64 into the test module, run
+`rm -f .tmptmp/zsn40-key.pem .tmptmp/zsn40-cert.pem .tmptmp/zsn40.p12`.
+Stage only exact file paths in this lane — never a broad `git add`.
+
 Verify the printed cert: `OU=ZSN40TEST`, `CA:FALSE`, `digitalSignature`, `codeSigning`, notAfter ≈ +10 years (must be after 2027-01-15). If `-days 3650` starts at now (2026-09-25) that satisfies the window; the design doc's exact dates are illustrative — the constraint is "covers native now and 2027-01-15". Paste `base64 -w0` output into the test module as `const LEAF_P12_B64: &str` (split into concatenated 76-char lines for reviewability).
 
 - [ ] **Step 2: Write the failing tests (red)**
@@ -102,9 +108,33 @@ pub mod tests {
     use sha2::{Digest as _, Sha256};
     use wasm_bindgen_test::*;
 
-    const LEAF_P12_B64: &str = "<pasted base64>";
+    // TEMPLATE — replace with the Step 1 `base64 -w0` output (the committed
+    // lib.rs carries the real fixture; this line is not meant to compile as-is):
+    const LEAF_P12_B64: &str = "<paste the generated fixture from Step 1 here>";
 
-    fn decode_base64(s: &str) -> Vec<u8> { /* ~15-line standard decoder, test-local */ }
+    fn decode_base64(s: &str) -> Vec<u8> {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity(s.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for &b in s.bytes() {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'=' {
+                break;
+            }
+            let val = ALPHA.iter().position(|&a| a == b).expect("valid base64 char") as u32;
+            buf = (buf << 6) | val;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
+    }
 
     const MINIMAL_MACHO: &[u8] =
         include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
@@ -233,7 +263,7 @@ pub mod tests {
 
 - [ ] **Step 3: Run both gates, confirm red**
 
-`TMPDIR=$PWD/.tmptmp cargo test -p zsign-wasm` → `sign_macho_default_emits_sha256_only_for_thin_input` FAILS (output is dual) and `sign_macho_rejects_fat_input` FAILS (FAT accepted). The dual and non-executable tests pass pre-change — they are regression pins for the rewrite (they go red only if the task's implementation drops dual support or the entitlements replication). `wasm-pack test --node crates/zsign-wasm` → same failures under node.
+`TMPDIR=$PWD/.tmptmp cargo test -p zsign-wasm` → `sign_macho_default_emits_sha256_only_for_thin_input` FAILS (output is dual). `sign_macho_rejects_fat_input` does not run natively — a plain `#[wasm_bindgen_test]` is never registered under cargo test (its body compiles as dead code only). The dual and non-executable tests pass pre-change — they are regression pins for the rewrite (they go red only if the task's implementation drops dual support or the entitlements replication). `wasm-pack test --node crates/zsign-wasm` → BOTH `sign_macho_default_emits_sha256_only_for_thin_input` and `sign_macho_rejects_fat_input` FAIL under node (FAT accepted today).
 
 - [ ] **Step 4: Implement**
 
@@ -725,7 +755,7 @@ Red check: `hash_file_chunk`/`hash_file` currently return `()`/`bool`, so `.expe
 
 - [ ] **Step 3: Gates green, commit**
 
-Both gates pass (4 dual + 2 wasm-only tests added).
+Both gates pass (3 dual + 2 wasm-only tests added).
 Commit: `fix(zsign-wasm): seal code-resources paths against stream interleaving (ZSN-40)`
 
 ---
@@ -779,7 +809,7 @@ Commit: `fix(zsign-wasm): seal code-resources paths against stream interleaving 
     }
 ```
 
-Red check: no `.code` property exists yet → `error_code` returns `None` → assertion failures.
+Red check: compile failure — before the migration the methods return `Result<_, JsError>` while `error_code(&e)` takes `&JsValue` (the mismatch is the red). After Steps 2-3 the types line up and the assertions then fail at runtime only if a `.code` property is missing.
 
 - [ ] **Step 2: Implement the machinery**
 

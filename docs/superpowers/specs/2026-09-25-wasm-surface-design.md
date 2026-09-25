@@ -38,7 +38,9 @@ The browser-facing signing surface is unsafe in five ways and untested in one:
     **thin-only**. FAT SHA-256-only = ZSN-33 (not this lane).
   - `sign_macho_adhoc` (290-316): thin-only, dual, no credentials.
   - `sign_slice_complete(..., sha256_only)` (410-417): when true, skips the
-    SHA-1 CD (479-487), signs the SHA-256 CD (515), omits CDHash v1 (519-523),
+    SHA-1 CD (479-487), signs the SHA-256 CD (515), omits the SHA-1 entry
+    from the CDHash v1 attribute (519-523 — the attribute itself is still
+    emitted with a single truncated-SHA-256 entry, cms_verify.rs:897-900),
     omits the legacy SHA-1 slot (536-538).
 - Entitlements selection: `sign_any_macho` passes `EMPTY_ENTITLEMENTS` for
   non-executables (signer.rs:167-177); `SigningContext::new` builds the
@@ -101,8 +103,10 @@ The browser-facing signing surface is unsafe in five ways and untested in one:
   covers **both** real now and 2027-01-15.
 - wasm-bindgen contracts (source-verified, versions from Cargo.lock:
   wasm-bindgen 0.2.128, wasm-bindgen-test 0.3.78, js-sys 0.3.105):
-  - `#[wasm_bindgen_test]` is compiled out of native `cargo test` entirely
-    (macro emits only a `#[cfg(target_family = "wasm")]` export); with
+  - `#[wasm_bindgen_test]` is not registered under native `cargo test`: the
+    macro's runner export is `#[cfg(target_family = "wasm")]`, so the
+    function body still compiles (under `allow(dead_code)`) but never runs
+    natively; with
     `unsupported = test` the SAME function also becomes a real native `#[test]`
     (wasm-bindgen-test-macro:146-147, guide usage.md:32-36). Tests must live
     at crate root or in a `pub mod` (guide usage.md:42-43).
@@ -234,8 +238,10 @@ runs before parsing/copying):
   rejecting legitimate long paths for no memory-pressure benefit. Recorded so
   the omission reads as a decision, not an oversight.
 - `ensure_size(len, max, surface, remedy) -> Result<(), JsValue>` private
-  helper; the three Mach-O surfaces share a private `parse_macho_checked`
-  helper so the guard cannot be forgotten on one of them.
+  helper; each Mach-O surface calls it as its first statement (one uniform
+  line per method — no separate parse helper is introduced; the wiring is
+  pinned by the per-constant boundary tests and the cheap-surface
+  integrations).
 - Wiring proof strategy (see §4): exact-boundary unit tests on `ensure_size`
   for every constant + cheap over-limit integration tests on the smallest
   surfaces; a 513 MiB allocation is not made in CI (identical call site,
@@ -366,8 +372,9 @@ Structural facts driving the design:
   definition runs as a native `#[test]` (the "native-run subset") and as a
   node test. Only JS-free paths get this attribute — on native targets every
   JS import panics at call time.
-- Wasm-only tests use plain `#[wasm_bindgen_test]` (compiled out of native
-  cargo test): anything asserting an error, `parse_info_plist` (builds
+- Wasm-only tests use plain `#[wasm_bindgen_test]` (never registered under
+  native cargo test — the wasm export is cfg-gated, the body compiles as
+  dead code): anything asserting an error, `parse_info_plist` (builds
   `js_sys::Object`), and the `.code` property contract.
 
 Fixture strategy (no new files, no new deps, CI-safe):
