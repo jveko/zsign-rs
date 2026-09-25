@@ -458,12 +458,13 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
     }
 
     if let Some((offset, seg)) = linkedit_cmd {
-        let linkedit_end = seg.fileoff + seg.filesize;
-        let new_filesize = (sig_offset + signature.len()) as u64 - seg.fileoff;
-
-        if (sig_offset + signature.len()) as u64 > linkedit_end {
-            update_linkedit_segment(&mut output, offset, new_filesize)?;
-        }
+        let sig_end = (sig_offset as u64)
+            .checked_add(signature.len() as u64)
+            .ok_or_else(|| Error::MachO("signature end overflow".into()))?;
+        let new_filesize = sig_end
+            .checked_sub(seg.fileoff)
+            .ok_or_else(|| Error::MachO("signature end precedes the __LINKEDIT segment".into()))?;
+        update_linkedit_segment(&mut output, offset, new_filesize)?;
     }
 
     Ok(output)
@@ -1861,5 +1862,35 @@ mod tests {
         )
         .expect("aligned re-sign must succeed");
         crate::macho::MachOFile::parse(second).expect("re-signed output parses");
+    }
+    #[test]
+    fn test_embed_signature_shrink_respans_linkedit() {
+        let signed = crate::macho::fixtures::make_signed_minimal_macho(0x800);
+        let small = [0xBBu8; 0x40];
+        let out = embed_signature(&signed, &small)
+            .expect("re-signing with a smaller signature must succeed");
+        let reparsed = crate::macho::MachOFile::parse(out.clone())
+            .expect("shrinking re-sign output must reparse: a stale __LINKEDIT filesize would exceed the file");
+        let (_, fileoff, vmsize_after, filesize) = reparsed.slices()[0]
+            .metadata
+            .linkedit_cmd
+            .expect("__LINKEDIT present");
+        assert_eq!(
+            fileoff + filesize,
+            out.len() as u64,
+            "__LINKEDIT must end exactly at the new file end"
+        );
+        assert_eq!(
+            out.len(),
+            0x2000 + small.len(),
+            "output must drop the old 0x800-byte slot"
+        );
+        // update_linkedit_segment may GROW vmsize to the 16 KiB-aligned minimum
+        // (0x4000 here) but must never shrink it below the original page.
+        assert!(vmsize_after >= filesize, "vmsize must cover filesize");
+        assert!(
+            vmsize_after >= 0x1000,
+            "vmsize must never shrink below the original page"
+        );
     }
 }
