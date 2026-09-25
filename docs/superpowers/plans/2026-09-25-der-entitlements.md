@@ -133,7 +133,9 @@ to
 ```
 
 - [ ] **Step 1.4: Run the gate.** Expected: `27 passed` unit (baseline 26 + 1
-  new), `0 failed`; doctests `2 passed`.
+  new), `0 failed`. Note: this filtered command reports no doctest section —
+  doctests run separately (`cargo test -p zsign-core --doc` → 26 passed) and
+  are not part of the mid-flight gate.
 
 - [ ] **Step 1.5: Commit**
 

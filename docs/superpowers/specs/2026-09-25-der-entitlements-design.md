@@ -320,8 +320,9 @@ ad-hoc bundle); no diagnostic content is removed.
   der -- --skip test_ipa_signing_is_deterministic` (the brief's command; the
   loose `der` filter matches 26 unit tests — the 12 `codesign::der` tests plus
   14 incidental `der`-substring matches across `code_directory`/`superblob`/
-  `verify`/`pkcs12` tests — plus the 2 der doctests). Baseline measured at
-  c9ff0fb: 26 passed, 0 failed (unit filter), doctests green.
+  `verify`/`pkcs12` tests). Baseline measured at c9ff0fb: 26 passed, 0 failed.
+  The filtered command reports no doctest section; doctests are verified
+  separately via `cargo test -p zsign-core --doc` (26 passed at base).
   `cargo fmt`/`clippy`/`hk` are NOT run mid-flight (orchestrator gates at
   merge); the pre-commit hook runs automatically on each commit.
 
