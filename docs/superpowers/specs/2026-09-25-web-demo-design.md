@@ -98,6 +98,10 @@ Correctness contract the demo mirrors:
       `_CodeSignature`), identifier = file stem, **no** plist/CodeResources args;
    c. root only: write `embedded.mobileprovision` **before** the scan (profile bytes
       are hashed into the root CodeResources);
+   c2. before the bundle loop, native signs standalone `.dylib` files recursively as a
+      pre-pass (`mod.rs:380-383`, `:569-649`, identifier = file stem, no plist/CR) —
+      the demo's per-bundle "immediate non-main" rule (§3.2) subsumes it: every
+      non-main binary is signed exactly once, before its bundle's scan;
    d. scan the whole subtree (follow_links=false) with exclusions = root-anchored
       `_CodeSignature` + own main executable → write `_CodeSignature/CodeResources`.
       Parent therefore seals: nested **signed** executable bytes, nested `Info.plist`,
@@ -106,14 +110,20 @@ Correctness contract the demo mirrors:
       entries produced by the builder's symlink path (`zsign-core code_resources.rs:445-446`),
       with legacy `files` skipping symlinks (`:414-416`);
    e. sign this bundle's main executable with (own identifier, own plist bytes, own
-      CodeResources bytes); entitlements only for the root bundle (`mod.rs:394-395`).
+      CodeResources bytes). Entitlements: native passes the profile entitlements to the
+      root bundle's binaries (main executable **and** its immediate non-main Mach-Os —
+      `mod.rs:668-680`) and `None` to every nested-bundle binary (`mod.rs:394-395`).
 4. **Bundle-ID rewrite** targets the **root** Info.plist only
    (`mod.rs:370-371`), parse-any-encoding → mutate → serialize (native always emits
    XML), before any CodeResources generation (`:370-377` before `:385+`).
 5. **Symlink output**: `zip.add_symlink` with mode `0o120777`, made-by Unix, target
    bytes Stored (`archive.rs:254-260`, zip 7.2.0 `write.rs:1549-1573`).
-6. **Fail-closed**: every step `?`-propagates; the output IPA exists only after total
-   success; encrypted Mach-O is a hard error.
+6. **Fail-closed**: every step `?`-propagates and any signing error aborts before
+   repack (`sign()` order: `mod.rs:281` before `:283`); the repacked archive's contents
+   are only complete after total success (qualification: `create_ipa` opens/truncates
+   the output file before archive I/O finishes, `archive.rs:199-203` — a partial file
+   may exist after an I/O failure, but never after a *signing* failure). Encrypted
+   Mach-O is a hard error.
 
 ### 1.4 External contracts (`VerifyExternalContracts`, source-verified)
 
@@ -133,7 +143,7 @@ Correctness contract the demo mirrors:
   (which `isSymlinkEntry` does). Writer options read by `addFile`: `versionMadeBy`
   (`zip-writer.js:403`, actual default 768 = `0x0300`, pass `(3<<8)|20`),
   `externalFileAttributes` (`:444`, default 0), `unixMode` (`:407`), `directory`
-  (`:445`), `msDosCompatible`/`msdosAttributes*` (`:402/:424-425`); there is **no**
+  (`:448`), `msDosCompatible`/`msdosAttributes*` (`:402/:424-425`); there is **no**
   `unixPermissions` option (that is JSZip) and no first-class symlink support. A
   non-zero `externalFileAttributes` is **not** masked: Unix defaults fire only when it
   is 0 (`:453-465`); the value is recomposed as `((unixMode & 0xffff) << 16) |
@@ -220,8 +230,14 @@ Correctness contract the demo mirrors:
   executable fails install anyway; that is "silent unsigning" with extra steps.
 - **Tradeoffs recorded:** identifiers for non-main binaries = file stem and nested main
   executables = nested `CFBundleIdentifier` (native semantics) — the UI bundle-ID field
-  rewrites the root only; wasm embeds profile entitlements into every signed binary
-  (native: root executable only) — not suppressible from JS (§6).
+  rewrites the root only. Entitlements parity (FIX 13): wasm applies instance
+  entitlements to **every** `sign_macho` call, so the demo runs **two signers** — a root
+  signer `new WasmSigner(p12, password, profile)` (entitlements present; used for the
+  root bundle's main executable and immediate non-main Mach-Os, matching
+  `mod.rs:668-680`) and a nested signer `new WasmSigner(p12, password, null)`
+  (profile omitted → no entitlements, `lib.rs:59-77`; used for every nested bundle,
+  matching `mod.rs:394-395`). Cost: one extra credential parse per run. This makes the
+  original §6.1 cross-lane request unnecessary — see §6.
 
 ### 2.4 Bundle-ID rewrite
 
@@ -236,13 +252,24 @@ Correctness contract the demo mirrors:
     → fix every offset-table entry pointing past the splice (Δ shift) + trailer
     `offsetTableOffset`. Handles type-5 (ASCII) and type-6 (UTF-16BE) string encodings
     and extended-length markers; re-encodes the value as an ASCII type-5 object — the
-    UI validates the new id against `^[A-Za-z0-9._-]+$` so it is always ASCII
+    helper validates the new id **unconditionally, before the equality fast path**
+    (always invoked at sign time, even when no change is requested) against
+    `^[A-Za-z0-9._-]+$` / max 255 chars, so the spliced value is always ASCII
     (marker types verified empirically against Python `plistlib`, design §1.4);
   - XML (`<?xml`/`<plist`): replace the `<string>` value following
     `<key>CFBundleIdentifier</key>`;
   - anything else (no CFBundleIdentifier key, non-string value, unknown format) →
     throw a precise error (fail-closed; native inserts a missing key — known
-    divergence, §5).
+    divergence, §5). Additional fail-closed rejections (cold-review round 1): input
+    shorter than 8 bytes; trailer **not adjacent** to the offset table
+    (`offsetTableOffset + numObjects * offsetIntSize !== bytes.length - 32` →
+    "unsupported binary plist layout"); any object ref ≥ `numObjects` or any stored
+    object offset ≥ `offsetTableOffset`; any string/dict payload ending past
+    `offsetTableOffset`; a **shared value object** (the `CFBundleIdentifier` value
+    referenced from anywhere besides that one dict slot — binary plists may
+    deduplicate equal strings, so splicing would corrupt the other key → reject);
+    a shifted offset that no longer fits the current `offsetIntSize` (e.g. 1-byte
+    tables past 255 bytes → reject instead of wrapping).
   The rewritten bytes feed **both** `sign_macho_fat`'s `info_plist` argument and the
   zip write, preserving wasm's byte-identity requirement (§1.2).
 - **Rejected:** B — blocks this lane on a parallel lane's schedule; C — silently
@@ -268,7 +295,7 @@ Correctness contract the demo mirrors:
 - **Candidates:** (A) explicit symlink branch on both the CodeResources and zip-write
   sides; (B) post-write central-directory byte patch; (C) leave the implicit
   pass-through as-is.
-- **Empirical finding (probe, run at locked zip.js 2.8.23, `examples/web/probe-symlink.mjs`,
+- **Empirical finding (probe, run at locked zip.js 2.8.23, `/tmp/zsn41-probes/symlink.mjs`,
   throwaway — not committed):** authoring a zip with a symlink entry
   (`externalFileAttributes = 0o120777 << 16`, `versionMadeBy = 788`) and re-emitting it
   with the demo's exact write options (`externalFileAttributes: entry… || UNIX_FILE_0644`,
@@ -282,11 +309,19 @@ Correctness contract the demo mirrors:
      file hash; native emits `{"symlink": target}` via the builder's symlink path.
      Fix: detect symlink entries and call `signer.add_symlink(relPath, target)`
      (same path namespace as `hash_file`).
-  2. Write: add an explicit `isSymlinkEntry(entry)` branch
-     (`(externalFileAttributes >>> 16) & 0xF000) === 0xA000`) that emits the target
-     bytes with the original attributes and Unix made-by, instead of relying on
-     `|| fallback` pass-through. The `|| UNIX_FILE_0644` fallback stays for genuine
-     regular files with zero attributes.
+  2. Write: add an explicit `isSymlinkEntry(entry)` branch that emits the target
+     bytes with the original attributes, Unix made-by, and `compressionMethod: 0`
+     (Stored — matching native `add_symlink`; zip.js would otherwise deflate), instead
+     of relying on `|| fallback` pass-through. Detection (cold-review FIX 7):
+     `((entry.versionMadeBy >> 8) === 3) && ((((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0)) & 0xF000) === 0xA000` —
+     the made-by gate plus either the central-directory mode or the mode zip.js
+     derives from a `0x7855` Unix extra field (`zip-reader.js:808-838`). The
+     `|| UNIX_FILE_0644` fallback stays for genuine regular files with zero
+     attributes. The branch runs **after** directory handling and the reserved-path
+     skips (a symlink planted at `_CodeSignature/…` or `embedded.mobileprovision` must
+     stay excluded with those paths), and the scan rejects targets > 4096 bytes
+     before `add_symlink` (native's cap, `extract.rs:103-109`; zip.js enforces
+     nothing).
   3. Hashing symlink targets as file content is removed (replaced by 1); the write of
      target bytes continues (that *is* a symlink's content).
 - **Rejected:** B — unnecessary, probe proves pass-through works; C — leaves CR
@@ -334,10 +369,14 @@ Correctness contract the demo mirrors:
   service).**
   - **Guards (documented in the error text):** reject input files > 512 MiB in
     `loadIpa`; after `getEntries`, reject archives whose declared uncompressed total
-    for bundle entries exceeds 2 GiB (zip-bomb guard); during hashing, keep a
-    cumulative counter of actually-decompressed bytes and abort past the same 2 GiB
-    (central-directory sizes can lie). One helper `assertArchiveWithinLimits` used by
-    both phases.
+    over **all non-directory entries** exceeds 2 GiB (zip-bomb guard; both phases use
+    the same sum, keeping the helper prefix-free). Runtime backstop (cold-review fix):
+    at every decompression, if an entry's actual bytes exceed its **declared**
+    `uncompressedSize`, throw immediately — that is the lying-central-directory case,
+    and together with the declared-total cap it bounds total expansion. No
+    cross-read cumulative counter: the per-bundle scans re-read nested subtrees once
+    per ancestor level, so summing read events would false-reject legitimate large
+    bundles. One helper `assertArchiveWithinLimits` used by both phases.
   - **Release:** no full `fileMap` at all. Per-bundle processing (item 3) reads one
     entry at a time: resources are hashed immediately and never retained; only
     signed/executable bytes, generated CodeResources, the rewritten plist, and the
@@ -348,9 +387,13 @@ Correctness contract the demo mirrors:
   - Object URLs: remember the previous `URL.createObjectURL` result and
     `revokeObjectURL` it when a new run starts (currently every successful sign leaks
     a blob).
-  - `hash_file` takes `&[u8]` — glue behavior for wasm-side freeing is **verified
-    against `pkg/zsign_wasm.js` during implementation** (plan step); if the glue does
-    not free, note it as a wasm-side finding (§6) and cap expectations in the report.
+  - `hash_file` takes `&[u8]`: the generated glue (`pkg/zsign_wasm.js:120-127`)
+    `malloc`s argument buffers and frees **no** arguments (all glue frees are return
+    buffers). Empirically settled by probe: a metric-validated node run (known 200 MB
+    alloc → `200.0` MB delta) showed 100 × 4 MB borrowed-arg calls → arrayBuffers
+    delta `0.0`, RSS delta `0.1 MB` — **no per-call accumulation**; deallocation
+    happens on the generated-Rust-shim side, so the wasm heap is bounded by live data,
+    not by bytes hashed. The plan re-runs this probe pattern during implementation.
   - **Deferred, explicitly:** true streaming (`zip.js` writable-stream writer +
     `hash_file_chunk`) — the API exists (`hash_file_chunk`) but interleaving it with
     deepest-first bundle ordering is not worth it at demo scale; recorded in §5 and the
@@ -376,47 +419,75 @@ Single file `main.js`, keeping the existing two-phase UX (load → configure →
 ### 3.2 Sign pipeline (replaces steps 3-9 of the current `signIpa`)
 
 ```
-init wasm (idempotent) → new WasmSigner (throws on bad creds) → open ZipReader (one
-reader for hash + write passes, closed in finally)
+init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, profile)
+    and nestedSigner = new WasmSigner(p12, password, null)   // entitlements parity, §2.3
+→ open ZipReader (one reader for scan + write passes, closed in finally)
 → getEntries → findAppRoot (file-derived) → assertArchiveWithinLimits
+→ metadata pass: reject any entry whose filename differs from its trim() (the zip.js
+    writer trims names — sealing and output must share one canonical name, FIX 17);
+    collect source directory names (for later dir-entry synthesis)
 → read root Info.plist → wasmReady? parse_info_plist : XML fallback
     → executable name: missing/empty → THROW (item 5, before any resource work)
     → bundleId input is the root identifier (UI field)
-→ metadata pass: build bundle set {prefix → depth}: root + ancestor dirs with ext
+→ build bundle set {prefix → depth}: root + ancestor dirs with ext
   app/framework/appex (case-insensitive); sort deepest-first
 → classify: for each file entry under root, resolve executable membership
     (root main exec must match a Mach-O by relative path → else THROW, item 2/5)
-→ per bundle B, deepest-first:
-    1. read B's Info.plist (root: rewrite via rewriteBundleIdentifier if id changed;
-       root's rewritten bytes replace the map entry so the zip write matches)
+→ per bundle B, deepest-first, using signer = (B is root ? rootSigner : nestedSigner):
+    1. read B's Info.plist. ROOT ONLY, ALWAYS call
+       infoPlistData = rewriteBundleIdentifier(infoPlistData, bundleIdInput.value)
+       (validates unconditionally, identity-fast-paths, §2.4) and ALWAYS
+       signedFiles[rootPrefix + "Info.plist"] = infoPlistData  (BLOCKER 2)
     2. sign immediate non-main Mach-Os of B (subtree minus deeper bundles minus
        _CodeSignature): identifier = fileStem(relPath), args (null, null);
        successes → signedFiles[fullPath]; failures → logged + collected
        → if any failures: THROW aggregated (item 2) before any hashing of B
-    3. reset_resources(); set_main_executable(B.execName)
-    4. scan: every file entry under B's prefix, relPath = strip(prefix):
-         - source embedded.mobileprovision at ROOT: hash profileBytes instead
-         - symlink entry → add_symlink(relPath, targetText)
-         - else → hash_file(relPath, signedFiles[fullPath] ?? fresh bytes)
+    3. signer.reset_resources(); signer.set_main_executable(B.execName)
+    4. scan B: hash every FILE entry under B's prefix (relPath = strip(prefix)),
+       plus every signedFiles key under B's prefix that has NO source file entry
+       (virtual entries — generated nested CodeResources of already-sealed children,
+       BLOCKER 1):
+         - root embedded.mobileprovision: hash profileBytes (source bytes skipped)
+         - symlink entry → signer.add_symlink(relPath, targetText) (target ≤ 4096 B)
+         - else → signer.hash_file(relPath, signedFiles[fullPath] ?? fresh source bytes)
+           — a path EXPECTED to carry an override (bundle main execs, generated CRs,
+             root plist, root profile) missing from signedFiles at this point throws
+             (namespace invariant, FIX 11: signedFiles keys are ALWAYS full zip paths)
        (builder's should_exclude auto-skips B's _CodeSignature + B's main exec;
-        nested deeper bundles' current signed bytes + their _CodeSignature are
-        included — native parity)
-    5. CR_B = build_code_resources();
-       signedFiles[prefix + "_CodeSignature/CodeResources"] = CR_B
-    6. signedFiles[execFullPath] = sign_macho_fat(currentExecBytes, identifier_B,
-       plistBytes_B, CR_B)   // identifier_B = root: UI id (rewritten plist id);
-                             // nested: own CFBundleIdentifier || fileStem(prefix)
-                             // plistBytes_B: root rewritten, nested raw
-→ output write pass (same reader, entries re-read):
-    iterate source entries: __MACOSX skipped; root _CodeSignature subtree skipped
-    (re-emitted synthetically below); root embedded.mobileprovision skipped
-    (re-emitted with profileBytes); anything present in signedFiles emitted from the
-    map (signed binaries, all generated CRs, rewritten plist); symlink entries from
-    source emitted via the explicit symlink branch (target bytes + original attrs);
-    everything else emitted from a fresh read with original attrs/made-by/lastModDate
-    → then synthetic adds: root _CodeSignature/ dir, root CodeResources,
-      embedded.mobileprovision
-→ close writer → success UI: textContent summary + object URL (previous URL revoked)
+        deeper bundles' current signed bytes + their _CodeSignature are included —
+        native parity)
+    5. CR_B = signer.build_code_resources();
+       signedFiles[B.prefix + "_CodeSignature/CodeResources"] = CR_B
+    6. signedFiles[execFullPath] = signer.sign_macho_fat(currentExecBytes,
+       identifier_B, plistBytes_B, CR_B)   // identifier_B = root: validated UI id
+                                           // (== rewritten plist id); nested:
+                                           // own CFBundleIdentifier || fileStem(prefix)
+       // BEFORE the write pass: assert every bundle's execFullPath and CR path is
+       // present in signedFiles, else THROW (FIX 11)
+→ counters for the summary UI (BLOCKER 6): machoSigned += successful sign calls;
+  processedFiles = non-directory source entries under root (set in metadata pass)
+→ output write pass — one uniform rule, in this exact order (FIX 12):
+    emitted = new Set(); sourceDirs = <from metadata pass>
+    for (entry of entries):
+      1. name = entry.filename; skip if name starts with "__MACOSX/"
+      2. if entry.directory:
+           skip if name is inside the root _CodeSignature subtree (reserved);
+           else emit dir with original attrs; sourceDirs already known; continue
+      3. reserved skip: name inside root _CodeSignature subtree, or name ==
+         rootPrefix + "embedded.mobileprovision" (source bytes replaced below)
+      4. if signedFiles.has(name): emit signedFiles bytes (original attrs/made-by/
+         lastModDate where the entry existed; generated attrs otherwise); mark emitted
+      5. else if isSymlinkEntry(entry): emit target bytes, externalFileAttributes
+         unchanged, versionMadeBy Unix, compressionMethod 0 (Stored)
+      6. else: fresh-read source bytes (per-entry actual ≤ declared check) → emit
+    then append unmatched output (BLOCKER 1): for key of [...signedFiles.keys()
+      .filter(k => !emitted.has(k)).sort()]:
+      - if key ends with "_CodeSignature/CodeResources" and its "_CodeSignature/"
+        directory is neither a source dir nor already emitted → emit that dir entry
+        first (root and nested alike — no special-cased synthetic block)
+      - emit signedFiles[key]
+→ zipWriter.close() → success UI only: textContent summary (processedFiles,
+  machoSigned, output size, elapsed) + object URL (previous URL revoked)
 ```
 
 Notes:
@@ -424,11 +495,15 @@ Notes:
 - Hashing happens once per bundle level over that level's subtree (native does the
   same via per-level scans — double hashing of nested subtrees is native-parity, not
   waste introduced here).
+- `signedFiles` is the single **final-byte override map**, keyed by full zip path for
+  its entire lifetime (root-relative keys of the interim Task 2 code are migrated when
+  Task 3 lands). Membership = "this path's final content is generated". Missing
+  expected overrides throw; ordinary resources fall back to a fresh source read.
 - The write pass runs only after every bundle sealed successfully (fail-closed: no
   output exists on error).
-- `loadIpa` uses `findAppRoot` + `assertArchiveWithinLimits` for early UX errors but
-  performs no signing state; `signIpa` re-derives everything from its own reader (no
-  shared mutable discovery state beyond `wasmReady`).
+- `loadIpa` uses `findAppRoot` + `assertArchiveWithinLimits` (limits added by Task 9)
+  for early UX errors but performs no signing state; `signIpa` re-derives everything
+  from its own reader (no shared mutable discovery state beyond `wasmReady`).
 
 ### 3.3 Error model
 
@@ -451,11 +526,12 @@ Notes:
 - **Red/green for pure logic:** throwaway node scripts that extract the helper
   functions from `main.js` source (balanced-brace slicing) and assert fixtures —
   e.g. `rewriteBundleIdentifier` on XML + binary plists (structural assertions:
-  byte-diff bounds, marker preservation, offset-table consistency, re-parse with an
-  independent minimal bplist reader in the probe), `findAppRoot` on file-only /
-  dir-ful / multi-app fixtures, `isSymlinkEntry` on fixture attrs. Red = the pre-fix
-  behavior described in the task; green = assertion passes. Probes are deleted before
-  the lane's commits (not committed — scope allows only main.js/index.html/
+  byte-diff bounds, marker preservation, offset-table consistency, re-parse with
+  Python `plistlib.loads` — an independent implementation), `findAppRoot` on
+  file-only / dir-ful / multi-app fixtures, `assertArchiveWithinLimits` on fabricated
+  entry metadata, `isSymlinkEntry` on fixture attrs. Red = the pre-fix
+  behavior described in the task; green = assertion passes. Probes live in
+  `/tmp/zsn41-probes/` (outside the repo — scope allows only main.js/index.html/
   package.json scripts).
 - **Behavioral scenarios without a harness:** each task records the exact failing
   observation pre-fix (e.g. "dylib signing throws → log shows ✗ … yet Done in …s and
@@ -473,15 +549,19 @@ Notes:
    IPA Info.plists always carry it; divergence chosen to keep the pure helper small.
 3. **Root-only rewrite**: UI bundle-ID edits do not touch nested `.appex`/`.framework`
    identifiers — matches native (`mod.rs:370-371`).
-4. **Entitlements**: wasm embeds profile entitlements in every signed binary; native
-   only in the root executable. Not controllable from JS (§6, cross-lane).
+4. **Entitlements**: handled in-lane via the two-signer split (§2.3) — root bundle's
+   binaries signed with the profile signer (entitlements), nested bundles with the
+   no-profile signer, matching native (`mod.rs:394-395`, `:668-680`). Residual
+   ergonomics only: the split costs one extra credential parse (§6).
 5. **Strictness**: exactly-one `.app` enforced (brief) where native takes the first
    found (§2.7).
 6. **Review divergence on item 6**: write-side symlink loss not reproduced at zip.js
    2.8.23 (probe output in §2.6); fix targets the sealing-side defect + explicit
    branch. Reported prominently.
-7. **Bundle-ID UI input validation**: `^[A-Za-z0-9._-]+$` enforced at sign time (also
-   the ASCII precondition of the bplist splice).
+7. **Bundle-ID input validation**: `^[A-Za-z0-9._-]+$` (≤255 chars) is enforced by
+   `rewriteBundleIdentifier` itself, which is invoked at sign time on **every** run
+   including the identity path (the HTML input has no pattern attribute — validation
+   lives in the helper, not the UI).
 8. **AppleDouble `._*` files** inside the bundle are still copied/hashed (pre-existing,
    out of queue — listed in the report's out-of-scope observations).
 9. **`dataDescriptor: false`** writer setting retained (pre-existing; probe shows it
@@ -489,17 +569,22 @@ Notes:
 10. **Out-of-scope observations** (from the anchor scout, report-only): no
     `response.ok` checks on wasm fetch; double `initWasm` (safe per glue idempotency);
     dead module state (`ipaEntries`, `appPrefix`, `appName` in load-phase);
-    summary labels count attempted, not successful, signs; `outputName` edge cases
+    `outputName` edge cases
     for non-`.ipa` inputs; stale-credential retention across IPA reloads; dead
-    `<pre id="plist-output">`. None fixed here — queue discipline.
+    `<pre id="plist-output">`. None fixed here — queue discipline (the summary-counter
+    item formerly listed here IS fixed — Task 3 supplies `processedFiles`/`machoSigned`).
 
 ## 6. Cross-lane requests (ZSN-40, wasm)
 
-1. Optional entitlements suppression for non-root/nested signing (native parity:
-   entitlements only in the root executable's signature).
+1. ~~Entitlements suppression~~ — **resolved in-lane**: the demo's second, profile-less
+   `WasmSigner` (`lib.rs:59-77`) achieves native entitlement parity without any wasm
+   change (§2.3). What remains is ergonomics: an explicit entitlements setter would
+   avoid the second credential parse.
 2. Stable error identity (code field) would let the demo distinguish e.g.
    `InvalidPassword` from other cert failures without substring matching — currently
    the raw `Display` text is shown to the user (acceptable for a demo).
-3. Confirm glue-side freeing of `&[u8]` arguments (`hash_file`) — if args leak into
-   linear memory, wasm heap grows with total hashed bytes; demo mitigations are
-   documented in §2.9 either way.
+3. ~~Argument-buffer freeing~~ — **resolved with evidence (no change needed)**: the
+   glue frees no arguments (`pkg/zsign_wasm.js:120-127`) yet a metric-validated probe
+   showed zero accumulation across 100 × 4 MB borrowed-arg calls (§2.9) — the
+   generated Rust shim deallocates. Wasm heap is bounded by live data; the §2.9 guard
+   values stand.
