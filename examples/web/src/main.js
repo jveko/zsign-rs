@@ -181,6 +181,9 @@ function decodeStrict(bytes, what) {
 const HASH_FILE_MAX = 128 * 1024 * 1024; // landed wasm hash_file buffer limit
 const HASH_CHUNK = 64 * 1024 * 1024;
 
+const MAX_P12_BYTES = 4 * 1024 * 1024; // landed wasm credential limits, checked here for a friendlier error
+const MAX_PROFILE_BYTES = 16 * 1024 * 1024;
+
 function hashEntry(signer, relPath, bytes) {
   if (bytes.length <= HASH_FILE_MAX) {
     signer.hash_file(relPath, bytes);
@@ -590,7 +593,6 @@ function updateSignButton() {
   const ready =
     ipaFile !== null &&
     p12Bytes !== null &&
-    p12Password.value.length > 0 &&
     profileBytes !== null &&
     bundleIdInput.value.length > 0;
   signBtn.disabled = !ready;
@@ -612,6 +614,11 @@ p12Btn.addEventListener("click", () => p12Input.click());
 p12Input.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  if (file.size > MAX_P12_BYTES) {
+    log(`P12 is ${formatSize(file.size)} — at most ${formatSize(MAX_P12_BYTES)} supported`, "err");
+    e.target.value = "";
+    return;
+  }
   p12Bytes = await readFileAsUint8Array(file);
   p12Btn.textContent = file.name;
   p12Btn.classList.add("has-file");
@@ -622,13 +629,17 @@ profileBtn.addEventListener("click", () => profileInput.click());
 profileInput.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  if (file.size > MAX_PROFILE_BYTES) {
+    log(`Profile is ${formatSize(file.size)} — at most ${formatSize(MAX_PROFILE_BYTES)} supported`, "err");
+    e.target.value = "";
+    return;
+  }
   profileBytes = await readFileAsUint8Array(file);
   profileBtn.textContent = file.name;
   profileBtn.classList.add("has-file");
   updateSignButton();
 });
 
-p12Password.addEventListener("input", updateSignButton);
 bundleIdInput.addEventListener("input", updateSignButton);
 
 // --- Signing flow ---
