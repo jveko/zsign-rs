@@ -5,6 +5,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use zsign_rs::codesign::verify::{PageCheck, SpecialSlotCheck};
 use zsign_rs::verify::MachOVerifyReport;
 use zsign_rs::{SigningCredentials, ZSign};
@@ -95,14 +96,22 @@ struct Cli {
     verify: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run(Cli::parse())
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err}");
+            // signing/credential failures: unchanged contract (design, item 1)
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Runs the CLI from parsed arguments (testable without argv).
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if cli.verify {
-        return run_verify(&cli.input);
+        return Ok(run_verify(&cli.input));
     }
 
     let mut signer = if cli.adhoc {
@@ -170,35 +179,40 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::from(0))
 }
 
-/// Runs the deep verifier and maps the report to the exit-code contract:
-/// 0 valid, 1 invalid, 2 hard error.
-fn run_verify(input: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Maps verification to the exit-code contract: 0 valid, 1 invalid,
+/// 2 could-not-complete (unreadable/unsupported input or a report with
+/// top-level errors).
+fn run_verify(input: &std::path::Path) -> ExitCode {
     let report = match input
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .as_deref()
     {
-        Some("ipa") => zsign_rs::verify::verify_ipa(input)?,
-        Some("app") => zsign_rs::verify::verify_bundle(input)?,
-        _ => zsign_rs::verify::verify_macho_file(input)?,
+        Some("ipa") => zsign_rs::verify::verify_ipa(input),
+        Some("app") => zsign_rs::verify::verify_bundle(input),
+        _ => zsign_rs::verify::verify_macho_file(input),
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(2);
+        }
     };
 
     print_report(&report);
 
     if report.valid() {
-        Ok(())
+        ExitCode::from(0)
     } else if report.errors.is_empty() {
-        std::process::exit(1)
+        ExitCode::from(1)
     } else {
         eprintln!("error: verification could not complete");
-        for e in &report.errors {
-            eprintln!("  {e}");
-        }
-        std::process::exit(2)
+        ExitCode::from(2)
     }
 }
 
@@ -211,9 +225,6 @@ fn print_report(report: &zsign_rs::VerifyReport) {
     }
     if let Some(bundle) = &report.bundle {
         print_bundle(bundle, 0);
-    }
-    for w in &report.warnings {
-        println!("warning: {w}");
     }
     if !report.errors.is_empty() {
         for e in &report.errors {
@@ -393,6 +404,7 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -494,6 +506,140 @@ mod tests {
         std::fs::write(app.join("Enc"), encrypted_macho()).unwrap();
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
         app
+    }
+
+    /// Path to the freshly built zsign-cli binary, building it once per test process.
+    /// Cargo does not build the bin target for unit tests (no tests/ dir), so the child
+    /// `cargo build` is what makes the executable exist and be current. The child
+    /// mirrors this test binary's profile: CI also runs `cargo test --workspace
+    /// --release` (ci.yml:62), and a release test run resolves target/release/zsign-cli
+    /// — a debug-only build would leave that path missing at merge.
+    fn zsign_bin() -> &'static std::path::Path {
+        static BIN: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+            let exe = std::env::current_exe().expect("test executable path");
+            let profile_dir = exe
+                .parent()
+                .expect("deps dir")
+                .parent()
+                .expect("profile dir");
+            let mut build = std::process::Command::new("cargo");
+            build.args(["build", "-p", "zsign-cli", "-q"]);
+            if !cfg!(debug_assertions) {
+                build.arg("--release");
+            }
+            let out = build.output().expect("spawn cargo build for zsign-cli");
+            assert!(
+                out.status.success(),
+                "cargo build -p zsign-cli failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            profile_dir.join(format!("zsign-cli{}", std::env::consts::EXE_SUFFIX))
+        });
+        &BIN
+    }
+
+    struct CliRun {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Runs the built binary with `args`, scrubbing any inherited ZSIGN_PASSWORD
+    /// before applying `envs`, and captures its exit code and streams.
+    fn run_cli(args: &[&OsStr], envs: &[(&str, &str)]) -> CliRun {
+        let out = std::process::Command::new(zsign_bin())
+            .args(args)
+            .env_remove("ZSIGN_PASSWORD")
+            .envs(envs.iter().copied())
+            .output()
+            .expect("spawn zsign-cli");
+        CliRun {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    const MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
+
+    #[test]
+    fn verify_valid_input_exits_zero() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let signed = dir.path().join("signed.bin");
+        let sign = run_cli(
+            &[
+                OsStr::new("-a"),
+                OsStr::new("-o"),
+                signed.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(sign.code, 0, "adhoc sign failed: {}", sign.stderr);
+        let v = run_cli(&[OsStr::new("-V"), signed.as_os_str()], &[]);
+        assert_eq!(v.code, 0, "expected 0, stderr: {}", v.stderr);
+        assert!(v.stdout.contains("verified: yes"), "stdout: {}", v.stdout);
+    }
+
+    #[test]
+    fn verify_invalid_input_exits_one() {
+        // unsigned minimal macho: slice error (no LC_CODE_SIGNATURE), top-level errors empty
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let v = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
+        assert_eq!(v.code, 1, "expected 1, stderr: {}", v.stderr);
+        assert!(v.stdout.contains("verified: no"), "stdout: {}", v.stdout);
+    }
+
+    #[test]
+    fn verify_missing_file_exits_two() {
+        let dir = TempDir::new().unwrap();
+        let v = run_cli(
+            &[OsStr::new("-V"), dir.path().join("nope.bin").as_os_str()],
+            &[],
+        );
+        assert_eq!(v.code, 2, "expected 2, stderr: {}", v.stderr);
+        assert!(v.stderr.starts_with("error: "), "stderr: {}", v.stderr);
+        // regression pin: Rust's Result-termination prefix must not come back
+        assert!(!v.stderr.starts_with("Error:"), "stderr: {}", v.stderr);
+    }
+
+    #[test]
+    fn verify_invalid_zip_exits_two() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("garbage.ipa");
+        std::fs::write(&input, b"this is not a zip archive").unwrap();
+        let v = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
+        assert_eq!(v.code, 2, "expected 2, stderr: {}", v.stderr);
+    }
+
+    #[test]
+    fn verify_non_macho_input_exits_two() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("plain.bin");
+        std::fs::write(&input, b"#!/bin/sh\necho hi\n").unwrap();
+        let v = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
+        assert_eq!(v.code, 2, "expected 2, stderr: {}", v.stderr);
+    }
+
+    #[test]
+    fn verify_bound_slot_without_bundle_context_exits_two() {
+        // bundle signing binds slot content on its main executable (IpaSigner's
+        // adhoc path passes info_data/code_resources, ipa/mod.rs:1029-1035);
+        // verifying that executable loose (no bundle context) makes
+        // verify_macho_file populate top-level report errors => exit 2
+        let dir = TempDir::new().unwrap();
+        let app = make_encrypted_app(dir.path());
+        let sign = run_cli(&[OsStr::new("-a"), OsStr::new("-f"), app.as_os_str()], &[]);
+        assert_eq!(sign.code, 0, "bundle sign failed: {}", sign.stderr);
+        let loose = dir.path().join("loose.bin");
+        std::fs::copy(app.join("Enc"), &loose).unwrap();
+        let v = run_cli(&[OsStr::new("-V"), loose.as_os_str()], &[]);
+        assert_eq!(v.code, 2, "expected 2, stderr: {}", v.stderr);
+        assert!(v.stdout.contains("verified: no"), "stdout: {}", v.stdout);
     }
 
     #[test]
