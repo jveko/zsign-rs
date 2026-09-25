@@ -444,3 +444,56 @@ rationale, not a cited source).
   6-9 (PRF/bag capability claims), `collect_bags` doc 684-686 + skip comment 716-717,
   `decrypt_key_bag` doc 722, `Pbkdf2Parameter` doc 512-516 (grammar already *names*
   keyLength/prf while the code drops them).
+
+## Cold review outcome — STOPPED at the adjudication gate (2026-09-25)
+
+Round 1: `NOT-READY` (16 findings — non-compilable Task-4 snippets, prose-only tests,
+undefined fixture constants, broken verification pipelines, design/plan API mismatches).
+All 16 were applied and committed (`f145d19`, `e50cd85`).
+
+Round 2 (fresh re-review, told which fixes landed): 11/12 round-1 fixes LANED,
+verification-pipelines fix NOT-LANED, plus 10 new findings → `VERDICT: NOT-READY`.
+The brief's binding adjudication rule — *NOT-READY after re-review + ANY logic-level
+defect → STOP and report* — is triggered, so implementation did not start.
+
+### Findings classified logic-level (trigger the STOP)
+
+1. **Panic path in plan test code** — multi-RDN test DNs contain spaces after commas
+   (plan Task 1 `wwdr_issuer_injects_missing_intermediate_and_root` and
+   `provided_chain_is_completed_without_duplicates`): `Name::from_str` →
+   `AttributeTypeAndValue::from_str` does not trim (`x509-cert-0.2.5/src/attr.rs:226-231`
+   → `ObjectIdentifier::new(" CN")` errors) → the helper's `.unwrap()` aborts before the
+   chain logic runs. Verified directly against the vendored source.
+2. **Contradictory `from_pem` control-flow instruction** — the plan simultaneously says
+   the password gate (`cert.rs:141-144`, head of the `if/else if` expression) stays
+   untouched and replaces that expression; the fix requires restructuring production
+   control flow (standalone `if password.is_some()` before decode).
+3. **Compile-breaking production snippets** — `build_cert` borrows a temporary signer
+   (E0716); `select_identity` calls `to_der()` without `der::Encode` in scope (E0599);
+   the policy OID constants/`ext_value` use bare `ObjectIdentifier` with no production
+   import; Task 5's direct `collect_bags` calls lack the new `depth` argument.
+4. **Impossible RED sequencing** — Tasks 1 and 5 claim compile-failing tests and
+   runtime-red tests coexist in one test binary; a build error prevents any run.
+5. **Task-1 PEM test breaks Task 2's gate** — the self-signed no-EKU certificate asserted
+   to load must fail once the policy lands, unless made policy-compliant (codeSigning
+   EKU) in Task 1.
+6. **Task 5 tests are prose-only** (no bodies) — violates the brief's no-placeholder rule.
+
+### Findings classified doc/nit (recorded for the fix round)
+
+- Duplicate-fixture verification still uses `-clcerts` (misses serial 0402 on OpenSSL
+  3.6.3) and the awk writes `Bag Attributes` into `dup_.pem` (spurious third file);
+  raw-keybag grep pattern `key bag` cannot detect `Shrouded Keybag`.
+- `-nodes` explanation imprecise; design item-5 wording vs fixtures (in-memory DER *and*
+  an additional `raw_keybag.p12` E2E fixture); design says "three new fixtures" but four
+  are planned; `plan:218` wrongly claims `x509_cert::spki` does not exist (it re-exports
+  `spki`); design wrongly claims the pkcs12 test module imports `der::Encode` (it imports
+  `Decode`); `plan:801` names the private module `key_usage` (actual name `keyusage`).
+
+### State at STOP
+
+- Docs committed: `4a87a64` (design+plan), `f145d19` (round-1 fixes), `e50cd85`
+  (import-note delta, disclosed to the round-2 reviewer). No source or fixture commits.
+- Baseline gate measured green: `59 passed; 0 failed` for the mandated scoped command.
+- Worktree untouched beyond docs: `crates/zsign-core/src/crypto/{cert.rs,pkcs12.rs}` are
+  byte-identical to `c9ff0fb`; all nine committed fixtures intact; zero new fixtures.
