@@ -638,9 +638,11 @@ Notes:
    IPA Info.plists always carry it; divergence chosen to keep the pure helper small.
 3. **Root-only rewrite**: UI bundle-ID edits do not touch nested `.appex`/`.framework`
    identifiers — matches native (`mod.rs:370-371`).
-4. **Entitlements**: handled in-lane via the two-signer split (§2.3) — root bundle's
-   binaries signed with the profile signer (entitlements), nested bundles with the
-   no-profile signer, matching native (`mod.rs:394-395`, `:668-680`). Residual
+4. **Entitlements**: handled in-lane via the two-signer split (§2.3) — the root main
+   executable uses the profile signer; nested main executables use the no-profile
+   signer; root and nested **non-executables** receive `EMPTY_ENTITLEMENTS` under
+   either signer (`signer.rs:168-175`) — matching native (`mod.rs:394-395`,
+   `:668-680` through the same core path). Residual
    ergonomics only: the split costs one extra credential parse (§6).
 5. **Strictness**: exactly-one `.app` enforced (brief) where native takes the first
    found (§2.7).
