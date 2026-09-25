@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 workspace, goblin (Mach-O/FAT parse), rayon, in-memory `#[cfg(test)]` fixtures.
 
-**Design:** `docs/superpowers/specs/2026-09-25-fat-universal-design.md` (authoritative for decisions/alternatives). **Gate per task:** `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core macho -- --skip test_ipa_signing_is_deterministic` (task 8 additionally `TMPDIR=$PWD/.tmptmp cargo test -p zsign builder`). Never run `cargo fmt`/`clippy`/`hk`. One conventional commit per task, controller-authored.
+**Design:** `docs/superpowers/specs/2026-09-25-fat-universal-design.md` (authoritative for decisions/alternatives). **Gate per task:** `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core macho -- --skip test_ipa_signing_is_deterministic` (task 8 additionally `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs builder` — the facade package is `zsign-rs`). Never run `cargo fmt`/`clippy`/`hk`. One conventional commit per task, controller-authored.
 
 **Shared test fixture (added in Task 1, used by every later task)** — `crates/zsign-core/src/macho/fixtures.rs`:
 
@@ -52,6 +52,25 @@ pub fn make_fat_macho(slices: &[Vec<u8>], aligns: &[u32]) -> Vec<u8> {
 ```
 
 Tests may derive a second arch by patching `make_minimal_macho()` bytes 4..8 to `0x0100_0007` (x86_64 cputype) — the body parses identically and gives order assertions a visible signal.
+
+Also added in Task 1 (writer.rs tests need signing credentials, but `signer.rs:912 test_credentials()` and `verify.rs:573 rsa_credentials()` live in private per-file `mod tests` and fixtures.rs is the only shared test module):
+
+```rust
+/// Self-signed Leaf signing credentials for cross-file tests: RSA-2048,
+/// `Profile::Leaf` (issuer == subject), code-signing EKU (1.3.6.1.5.5.7.3.3),
+/// digitalSignature KU, CA=false, `team_id: Some("TESTTEAM")` — the same
+/// fixture recipe as macho/verify.rs's `rsa_credentials`, exported so
+/// writer.rs tests can sign FAT containers.
+pub(crate) fn test_signing_credentials() -> crate::crypto::SigningCredentials {
+    // Body lifted from crates/zsign-core/src/macho/verify.rs `rsa_credentials()`
+    // (lines 573-606): generate an RSA-2048 key, build a self-issued Leaf
+    // profile with the attributes above, return SigningCredentials. Do not
+    // invent API — copy the existing construction verbatim and adjust only
+    // the common name if needed for uniqueness across test binaries.
+}
+```
+
+(Writer.rs sketches call `test_signing_credentials()`; signer.rs sketches keep using that file's existing `test_credentials()`; facade builder tests keep `crate::test_util::test_credentials()`.)
 
 ---
 
@@ -178,7 +197,7 @@ fn test_embed_fat_requires_one_signed_slice_per_arch() {
         b
     }], &[12, 12]);
     let macho = MachOFile::parse(fat.clone()).unwrap();
-    let creds = test_credentials();
+    let creds = test_signing_credentials();
     let full = sign_macho_all_slices(&macho, "com.zsign.set", None, &creds, None, None, false).unwrap();
     assert_eq!(full.len(), 2);
 
@@ -264,7 +283,7 @@ fn test_embed_fat_aligns_each_slice_to_its_declared_exponent() {
     // align 15 on the first arch: 16 KiB placement (today's hardcode) violates 2^15.
     let fat = make_fat_macho(&[make_minimal_macho(), b], &[15, 12]);
     let macho = MachOFile::parse(fat).unwrap();
-    let creds = test_credentials();
+    let creds = test_signing_credentials();
     let signed = sign_any_macho(&macho, "com.zsign.align", None, &creds, None, None, false).unwrap();
 
     let n = u32::from_be_bytes(signed[4..8].try_into().unwrap());
@@ -370,12 +389,16 @@ fn test_sign_preserves_fat_slice_trailing_bytes() {
     let s = &m.slices()[0];
     let end = s.offset + s.code_sig_offset.unwrap() as usize;
     let got = &signed[s.offset + tail_start..end];
+    // Pre-fix dataoff == tail_start (0x2000) makes this range EMPTY, so the
+    // length pin is the red proof; post-fix dataoff == 0x2400 covers the tail.
+    assert_eq!(got.len(), 0x400,
+        "signature must start after the full {:#x}-byte tail, got {:#x}-byte range", 0x400, got.len());
     assert!(got.iter().all(|&b| b == 0xAB),
         "trailing bytes must be preserved (and hashed) before the signature; got {:02x?}", &got[..8.min(got.len())]);
 }
 ```
 
-- [ ] **Step 2 — run red:** parser test fails (`code_length == a.len()` ≠ declared); signer test fails (realloc rebuild drops the tail ⇒ region reads `0x00`/signature bytes).
+- [ ] **Step 2 — run red:** parser test fails (`code_length == a.len()` ≠ declared); signer test fails the `got.len() == 0x400` pin (pre-fix `dataoff == tail_start` ⇒ empty range; the `.all(0xAB)` alone would be vacuous — the length pin is the red proof).
 - [ ] **Step 3 — implement** in `parser.rs` `parse_single`:
   1. Delete the whole `let slice_data = if base_offset == 0 { data } else { …content-end clamp… };` block (338-371 — through the `slice_end` bounds checks, immediately before `let code_length` at 373) — its bounds are already guaranteed by `MachOFile::parse`'s per-arch validation (186-201) and the LC/LINKEDIT checks (306-328); `is_big_endian_macho(data, base_offset)` is untouched (does not use the local).
   2. `let code_length = code_sig_offset.map(|o| o as usize).unwrap_or(declared_size);` (keeps the existing `code_length > declared_size ⇒ Err` check below it, which still guards hostile `dataoff`).
@@ -410,7 +433,7 @@ fn test_embed_fat_rejects_arch_range_beyond_file() {
     // sign on the intact container, then hand embed_fat a truncated copy of it:
     let fat = make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12]);
     let macho = MachOFile::parse(fat.clone()).unwrap();
-    let full = sign_macho_all_slices(&macho, "com.zsign.trunc", None, &test_credentials(), None, None, false).unwrap();
+    let full = sign_macho_all_slices(&macho, "com.zsign.trunc", None, &test_signing_credentials(), None, None, false).unwrap();
     let cut = fat[..fat.len() - 0x800].to_vec();
     let err = embed_signature_fat(&cut, &full)
         .expect_err("container whose arch ranges exceed it must be rejected");
@@ -432,15 +455,16 @@ fn test_embed_fat_rejects_overflowing_arch_range() {
 
 #[test]
 fn test_embed_fat_rejects_overlapping_slices() {
-    // arch[0] = [0x1030, 0x3030), arch[1] = [0x2030, 0x4030): both regions
-    // parse as Mach-O (the 0x30 in the offsets is the 8+2*20-byte container
-    // header, so slice 0's header + LCs sit below slice 1's start) and the
-    // ranges overlap by 0x1000 bytes.
-    const HEADER: usize = 8 + 2 * 20; // 48
-    let mut fat = vec![0u8; 0x4030];
+    // arch[0] = [0x1000, 0x3000), arch[1] = [0x2000, 0x4000): both regions
+    // parse as Mach-O (slice 0's header + LCs live below 0x2000, where slice
+    // 1 begins) and the ranges overlap by 0x1000 bytes. The fat_arch table
+    // starts at offset 8 (right after the 8-byte fat_header) where goblin
+    // reads it; slice placement at 0x1000+ clears the 48-byte table.
+    const HEADER: usize = 8;
+    let mut fat = vec![0u8; 0x4000];
     fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
     fat[4..8].copy_from_slice(&2u32.to_be_bytes());
-    for (i, (off, size)) in [(0x1030u32, 0x2000u32), (0x2030u32, 0x2000u32)]
+    for (i, (off, size)) in [(0x1000u32, 0x2000u32), (0x2000u32, 0x2000u32)]
         .into_iter()
         .enumerate()
     {
@@ -451,10 +475,10 @@ fn test_embed_fat_rejects_overlapping_slices() {
         fat[e + 12..e + 16].copy_from_slice(&size.to_be_bytes());
         fat[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
     }
-    fat[0x1030..0x3030].copy_from_slice(&make_minimal_macho());
-    fat[0x2030..0x4030].copy_from_slice(&make_minimal_macho());
+    fat[0x1000..0x3000].copy_from_slice(&make_minimal_macho());
+    fat[0x2000..0x4000].copy_from_slice(&make_minimal_macho());
     let macho = MachOFile::parse(fat.clone()).unwrap(); // both slices parse
-    let full = sign_macho_all_slices(&macho, "com.zsign.overlap", None, &test_credentials(), None, None, false).unwrap();
+    let full = sign_macho_all_slices(&macho, "com.zsign.overlap", None, &test_signing_credentials(), None, None, false).unwrap();
     let err = embed_signature_fat(&fat, &full)
         .expect_err("overlapping slices must be rejected");
     assert!(err.to_string().contains("overlap"), "{err}"); // pre-fix: Ok
@@ -549,7 +573,7 @@ fn test_inject_dylib_command_injects_every_fat_slice_then_signs() {
     }
 
     // injected container must still be signable end-to-end:
-    let creds = test_credentials();
+    let creds = test_signing_credentials();
     let signed = sign_any_macho(&m, "com.zsign.injectfat", None, &creds, None, None, false)
         .expect("signing after FAT injection must succeed");
     let ms = MachOFile::parse(signed).unwrap();
@@ -663,7 +687,7 @@ fn test_sign_macho_adhoc_rejects_fat() {
 }
 ```
   Doc comment on `ZSign::sign_macho`: direct-sign accepts FAT/Universal binaries (sha256-only default and dual path); adhoc mode rejects containers.
-- [ ] **Step 4 — run green:** `TMPDIR=$PWD/.tmptmp cargo test -p zsign builder` AND the core gate. **Commit:** `fix(zsign): route fat direct-sign through fat-capable path (ZSN-33)`.
+- [ ] **Step 4 — run green:** `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs builder` AND the core gate. **Commit:** `fix(zsign): route fat direct-sign through fat-capable path (ZSN-33)`.
 
 **Acceptance:** builder default signs a two-arch FAT (container + both signatures + sha256-only CDs via task 1), dual path works, adhoc fails closed.
 
@@ -737,9 +761,9 @@ Plus **migrate the existing pin** `signer.rs:1402` `assert_eq!(exec_seg_base, 0x
      pub text_segment_fileoff: u64,
      ```
      init `text_segment_fileoff: 0` alongside `text_segment_base`; set it in both `Segment64` (`seg.fileoff`) and `Segment32` (`seg.fileoff as u64`) `__TEXT` arms; add to the struct literal. Update the existing field docs: `text_segment_base` → "Base virtual address of `__TEXT` (vmaddr — consumed by the verifier's exact-match arm; NOT emitted as execSegBase)"; `text_segment_size` → "File-backed size of `__TEXT` (`filesize`, zero-fill excluded) — the `execSegLimit` value and the `text_segment_filesize` member of the fileoff/filesize rider pair."
-  2. `signer.rs:825`: `.exec_seg_base(slice.text_segment_fileoff)` (limit line unchanged). Leave the flag block 783-790 untouched (already Apple-parity — tests now lock it).
+  2. `signer.rs:825`: `.exec_seg_base(slice.text_segment_fileoff)` (limit line unchanged). Leave the flag block 783-790 untouched — its MAIN_BINARY decision is Apple-parity (`signer.cpp:650/808`) and the tests below lock it; entitlement-derived bits / platform gating are recorded divergences (design §1.2, §5), out of queue.
   3. `fixtures.rs`: `make_minimal_dylib()` = `make_minimal_macho()` bytes with `filetype` at offset **12..16** patched to `6u32.to_le_bytes()` (`MH_DYLIB` — `mach_header_64` layout: magic 0..4, cputype 4..8, cpusubtype 8..12, filetype 12..16, ncmds 16..20; same offset the wasm fixture uses at `zsign-wasm/src/lib.rs:1013`), doc comment stating its purpose.
-- [ ] **Step 4 — run green** + full gate — the verifier suite is the compatibility proof: `exec_segment_range_mismatch_is_rejected`, `main_binary_flag_is_required_for_executables`, `test_exec_seg_limit_written_from_filesize`, `test_text_segment_size_is_file_backed_extent`, `test_big_endian_sign_parse_roundtrip`, `test_sign_then_verify_roundtrip` (via its migrated pin), plus facade `cargo test -p zsign verify` spot-run for the `errors.len()==1` tripwires. **Commit:** `fix(macho): emit exec seg base as text fileoff, lock main-binary flag (ZSN-33)`.
+- [ ] **Step 4 — run green** + full gate — the verifier suite is the compatibility proof: `exec_segment_range_mismatch_is_rejected`, `main_binary_flag_is_required_for_executables`, `test_exec_seg_limit_written_from_filesize`, `test_text_segment_size_is_file_backed_extent`, `test_big_endian_sign_parse_roundtrip`, `test_sign_then_verify_roundtrip` (via its migrated pin), plus facade `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs verify` spot-run for the `errors.len()==1` tripwires. **Commit:** `fix(macho): emit exec seg base as text fileoff, lock main-binary flag (ZSN-33)`.
 
 **Acceptance:** CD `execSegBase == __TEXT.fileoff` per slice (thin + every FAT slice); `MAIN_BINARY` set on every `MH_EXECUTE` slice and clear on the dylib; all verifier tests green (their `file_space_ok` arm accepts fileoff emission — traced in design §1.1).
 
