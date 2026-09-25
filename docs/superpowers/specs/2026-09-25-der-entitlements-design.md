@@ -100,14 +100,18 @@ Candidates considered:
   civil-date arithmetic (inverse of days-from-civil on epoch-seconds computed
   with `div_euclid`), formatted `YYYYMMDDHHMMSSZ`; if nanoseconds are nonzero
   append `.` + 9 fractional digits with trailing zeros stripped (X.690 §11.7.3
-  canonical form); year outside 0..=9999 → `Error::DerEncoding` (explicit error
-  channel, no panic). Real stays rejected (unchanged).
+  canonical form); year outside 0..=9999 → `Error::DerEncoding` carrying the
+  epoch-seconds value (explicit error channel). The message must NOT format the
+  `Date` with `Debug`: `Date`'s `Debug` calls `to_xml_format()`, which itself
+  `expect()`s/`unwrap()`s (`plist-1.10.1/src/date.rs:39-44,89-91`), so the
+  numeric epoch value is used instead — that keeps the whole path
+  panic-free. Real stays rejected (unchanged).
 - B: format via `Date::to_xml_format()` string surgery (strip `-`, `:`, `T`).
   Rejected: `to_xml_format` internally `expect()`s a representable
   `UtcDateTime` and `unwrap()`s the RFC 3339 format
   (`plist-1.10.1/src/date.rs:39-44`) — an out-of-range binary-plist date could
-  panic inside the formatter before we can validate anything; option A cannot
-  panic and lets us return a typed error instead.
+  panic inside the formatter before we can validate anything; option A derives
+  the calendar fields arithmetically and returns a typed error instead.
 - C: keep rejecting Data/Date. Rejected: directly contradicts the brief's item 2
   (Data evidence is strong: Apple `kCESerializedData` + ldid `0x04`).
 
@@ -220,11 +224,20 @@ Candidates for the certificate handover:
   brief did not ask for, and macOS acceptance of either shape is only
   observable on the CI runner anyway.
 
-**Decision:** option A (the brief's canonical ZSN-23 fix). Residual risk
-recorded: whether macOS `codesign --verify --strict` accepts a self-signed
-end-entity as its own trust anchor is observable only on the macOS runner
-(ZSN-31's job); `bash -n` + shellcheck-by-eye is the local validation bar the
-brief sets.
+**Decision:** option A (the brief's canonical ZSN-23 fix). **Assumption +
+fallback recorded (advisor finding):** the flip contradicts the script's own
+former rationale that `CA:TRUE` is what makes the certificate pass
+SecTrustEvaluate's code-signing policy, so the design *assumes* a self-signed
+end-entity still passes macOS `codesign --verify --deep --strict` (designated
+requirement match against its own implicit anchor). `bash -n` cannot validate
+trust behavior; the assumption is observable only on the macOS runner
+(ZSN-31's job). **Defined fallback if CI rejects:** export the certificate
+into a temporary keychain and trust it there
+(`security add-trusted-cert -d -r trustRoot -k "$WORK/cs.keychain"` plus
+`security set-key-partition-list`/search-list wiring) so SecTrust has an
+anchor — a script-local change touching no repo code. Note the deeper
+cold-review finding below: `zsign -V` cannot accept this certificate
+regardless of the CA bit, which is why the agreement section changes.
 
 Candidates for the entitlements round-trip step:
 - **A (chosen):** synthesize a fixture profile in `$WORK` (XML plist with an
@@ -242,9 +255,22 @@ Candidates for the entitlements round-trip step:
      this is the documented `codesign --generate-entitlement-der` golden-vector
      cross-check the brief asks for);
   3. `codesign -d --entitlements - --der` equals our slot-7 payload (display
-     path byte agreement);
-  4. `zsign -V` agrees with codesign on the entitlements-signed bundle
-     (`agree_valid` extension).
+     path byte agreement).
+  There is deliberately **no `zsign -V` assertion** in this step: CLI
+  verification (`main.rs:180-190` → `verify_code_signature`) anchors only to
+  the embedded Apple Root (`cms_verify.rs:275-287,328-343`); a self-signed
+  chain is accepted solely when its SPKI is in that anchor set
+  (`cms_verify.rs:1113-1150`), otherwise the report carries "certificate
+  chain is not anchored to a trusted root" (`cms_verify.rs:858-860`). The
+  script's self-signed certificate can therefore never satisfy `zsign -V`, and
+  injecting custom anchors needs an out-of-scope CLI interface. **Cold-review
+  finding applied:** the *pre-existing* section-7 `agree_valid "cert-signed
+  bundle"` line is latent-red under exactly this policy and is removed by this
+  lane (the ad-hoc line stays: ad-hoc signatures are valid by construction via
+  `adhoc_report()`, `cms_verify.rs:345-351`; `/bin/ls` and the tamper control
+  are unaffected). This coverage loss is reported to the orchestrator; it can
+  only be restored by a custom-anchor verification path (CLI/ZSN-10
+  territory).
   The brief's `--entitlements :-` spelling is modernized to `--entitlements -`
   + `--xml`/`--der` per the current man page (colon prefix deprecated; Quinn,
   Apple Developer Forums thread 729855) — intent unchanged, one decision
@@ -261,8 +287,9 @@ dict, an array (`application-groups`), and a `<data>` value; **no `<date>`**
 (no Apple ground truth, see item 2). All ZSN-31 diagnostics writes are
 preserved verbatim (`:30-36`, `:43-47`, `:135` content) and the new step
 appends its outputs to `$DIAG` in the same style. Insertion renumbers the
-following step headers (5→6, 6→7, 7→8 with `7a-7d` → `8a-8d`); no diagnostic
-content is removed.
+following step headers (5→6, 6→7, 7→8 with `7a-7d` → `8a-8d`; section 8a's
+cert-signed `agree_valid` line is removed per the finding above, leaving the
+ad-hoc bundle); no diagnostic content is removed.
 
 ## Impact analysis (verified in-worktree)
 
@@ -290,11 +317,13 @@ content is removed.
   `test_ipa_signing_is_deterministic` is unaffected (it never builds DER
   anyway).
 - **Gate:** `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core
-  der -- --skip test_ipa_signing_is_deterministic` (brief's command; matches
-  12 der unit tests + 2 doctests + the 4 der-named superblob/code_directory
-  tests). Baseline measured at c9ff0fb: 26 passed, 0 failed (unit filter),
-  doctests green. `cargo fmt`/`clippy`/`hk` are NOT run mid-flight (orchestrator
-  gates at merge); the pre-commit hook runs automatically on each commit.
+  der -- --skip test_ipa_signing_is_deterministic` (the brief's command; the
+  loose `der` filter matches 26 unit tests — the 12 `codesign::der` tests plus
+  14 incidental `der`-substring matches across `code_directory`/`superblob`/
+  `verify`/`pkcs12` tests — plus the 2 der doctests). Baseline measured at
+  c9ff0fb: 26 passed, 0 failed (unit filter), doctests green.
+  `cargo fmt`/`clippy`/`hk` are NOT run mid-flight (orchestrator gates at
+  merge); the pre-commit hook runs automatically on each commit.
 
 ## Known items for the orchestrator (out of lane scope or recorded risks)
 
@@ -304,8 +333,8 @@ content is removed.
    minimal empty SET` — stale pre-canonical illustration. Doc-only (cannot
    fail), and superblob.rs is not in this lane's scope; reported, not edited.
 3. **Apple's generator comparator is unverified.** The script's byte
-   cross-check (step 7 assertion 2) is the empirical answer; mixed-length keys
-   in the fixture are deliberate so a divergence is actually observable.
+   cross-check (section 5, assertion 2) is the empirical answer; mixed-length
+   keys in the fixture are deliberate so a divergence is actually observable.
 4. **Date has no Apple-side evidence** (see item 2) — implemented per brief
    directive; excluded from the script cross-check.
 5. **ZSN-25's XML/DER equivalence check does not exist yet** (ScoutEmitPath):
@@ -313,6 +342,14 @@ content is removed.
    semantics described here; nothing to migrate today.
 6. **Brief line anchors superseded:** schema text is `der.rs:8-14`, root loop
    `:240-256`, 12 unit tests not 11 (see corrections table).
+7. **`zsign -V` agreement against self-signed certificates is impossible under
+   the default anchor policy** (`verify_code_signature` → Apple Root only,
+   `cms_verify.rs:275-287`; self-signed accepted only via SPKI match
+   `cms_verify.rs:1113-1150`). The interop script's pre-existing
+   `agree_valid "cert-signed bundle"` line was therefore latent-red at c9ff0fb;
+   this lane removes it (ad-hoc/`/bin/ls`/tamper agreement lines stay).
+   Restoring cert-signed `zsign -V` coverage requires a custom-anchor CLI
+   verification path — deferred to the CLI/verify lanes, not this one.
 
 ## Deferred lanes (untouched by this design)
 

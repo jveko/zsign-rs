@@ -258,8 +258,8 @@ fn generalized_time(date: plist::Date) -> Result<String> {
     let (year, month, day) = civil_from_days(days);
     if !(0..=9999).contains(&year) {
         return Err(Error::DerEncoding(format!(
-            "date {:?} is outside the GeneralizedTime year range",
-            date
+            "date value {}s from the Unix epoch is outside the GeneralizedTime year range",
+            secs
         )));
     }
     let mut out = format!(
@@ -342,8 +342,8 @@ with
     }
 ```
 
-- [ ] **Step 2.5: Run the gate.** Expected: `29 passed` unit (27 + 3 new; the
-  renamed test replaces its predecessor), `0 failed`.
+- [ ] **Step 2.5: Run the gate.** Expected: `30 passed` unit (27 + 3 new; the
+  renamed test is net-zero against its predecessor), `0 failed`.
 
 - [ ] **Step 2.6: Commit**
 
@@ -501,7 +501,7 @@ with
 //! macOS verification and iOS 15+ installs.
 ```
 
-- [ ] **Step 3.5: Run the gate.** Expected: `30 passed` unit (29 + 1), `0
+- [ ] **Step 3.5: Run the gate.** Expected: `31 passed` unit (30 + 1), `0
   failed`. If `test_plist_to_der_simple`/`test_plist_to_der_empty` fail, the
   envelope assembly regressed — re-read Step 3.3; their vectors are
   order-insensitive (≤1 key) and must stay green.
@@ -581,8 +581,8 @@ plist parses u64-range XML integers.)
 /// - An integer value lies outside the i64 range
 ```
 
-- [ ] **Step 4.5: Run the gate and commit the fix.** Expected: `31 passed`
-  unit (30 + 1), `0 failed`.
+- [ ] **Step 4.5: Run the gate and commit the fix.** Expected: `32 passed`
+  unit (31 + 1), `0 failed`.
 
 ```bash
 git add crates/zsign-core/src/codesign/der.rs
@@ -673,8 +673,8 @@ git commit -m "fix(codesign): reject integers outside the i64 range in der encod
     }
 ```
 
-- [ ] **Step 4.7: Run the gate and commit the vectors.** Expected: `34 passed`
-  unit (31 + 3), `0 failed`.
+- [ ] **Step 4.7: Run the gate and commit the vectors.** Expected: `35 passed`
+  unit (32 + 3), `0 failed`.
 
 ```bash
 git add crates/zsign-core/src/codesign/der.rs
@@ -833,8 +833,8 @@ Notes for the implementer:
 - `app` is reassigned here on purpose; the later structural section reassigns
   it to `$WORK/cert/Test.app`.
 
-- [ ] **Step 5.3: Renumber the following sections and extend the agreement
-  step.** Replace the headers
+- [ ] **Step 5.3: Renumber the following sections and drop the impossible
+  self-signed `zsign -V` agreement.** Replace the headers
 
 ```bash
 # 5. Structural asserts on the signed main binary (format regressions).
@@ -843,14 +843,33 @@ Notes for the implementer:
 ```
 
 with `# 6.`, `# 7.`, `# 8.` (keep their second lines verbatim), and rename the
-in-section markers `7a.`→`8a.`, `7b.`→`8b.`, `7c.`→`8c.`, `7d.`→`8d.`. Then,
-after the `8d` tamper-control block and before the final `echo "PASS..."`,
-append:
+in-section markers `7a.`→`8a.`, `7b.`→`8b.`, `7c.`→`8c.`, `7d.`→`8d.`.
+
+Then, in the renamed section 8, remove the cert-signed agreement line: CLI
+verification anchors only to the embedded Apple Root
+(`cms_verify.rs:275-287`), and a self-signed chain is accepted only when its
+SPKI is in that anchor set (`cms_verify.rs:1113-1150`), otherwise the report
+carries "certificate chain is not anchored to a trusted root"
+(`cms_verify.rs:858-860`) — the line is latent-red at c9ff0fb. Replace
 
 ```bash
-# 8e. The entitlements-signed bundle must satisfy both verifiers too.
-agree_valid "cert-signed bundle with entitlements" "$WORK/ent/Test.app"
+# 7a. The two bundles codesign accepted in steps 3/4.
+agree_valid "cert-signed bundle" "$WORK/cert/Test.app"
+agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
 ```
+
+with
+
+```bash
+# 8a. The ad-hoc bundle codesign accepted in step 4. The cert-signed bundle
+# cannot be listed here: zsign -V anchors only to the Apple Root, so a
+# self-signed certificate never verifies.
+agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
+```
+
+Do NOT add a `zsign -V` check for the entitlements-signed bundle anywhere — it
+is self-signed for the same reason; section 5's ground truth is codesign plus
+the byte-level slot -7 asserts.
 
 - [ ] **Step 5.4: Validate locally (macOS-only behavior runs on the CI
   runner).**
@@ -871,7 +890,7 @@ Shellcheck findings are reviewed by eye: suppress nothing, fix real issues in
 the new code only.
 
 - [ ] **Step 5.5: Run the cargo gate once more** (nothing in Rust changed, but
-  the gate guards accidental drift). Expected: `34 passed`, `0 failed`.
+  the gate guards accidental drift). Expected: `35 passed`, `0 failed`.
 
 - [ ] **Step 5.6: Commit**
 
