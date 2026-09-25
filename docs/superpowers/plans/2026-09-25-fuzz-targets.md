@@ -403,9 +403,9 @@ fn main() {
     let code: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
 
     let cd_sha256 = CodeDirectoryBuilder::new("com.example.fuzzseed", &code)
-        .info_hash([0xAB; 32])
-        .requirements_hash([0xCD; 32])
-        .entitlements_hash([0xEF; 32])
+        .info_hash(vec![0xAB; 32])
+        .requirements_hash(vec![0xCD; 32])
+        .entitlements_hash(vec![0xEF; 32])
         .build_sha256();
     let cd_sha1 = CodeDirectoryBuilder::new("com.example.fuzzseed", &code).build_sha1();
     let cd_team = CodeDirectoryBuilder::new("com.example.fuzzseed", &code)
@@ -443,7 +443,7 @@ fn main() {
     write(&out.join("verify_code_signature/signed_macho_adhoc.bin"), &signed);
 
     let p12 = fs::read(manifest.join(
-        "../../crates/zsign-core/src/crypto/fixtures/modern_pbes2_aes256.p12",
+        "../../crates/zsign-core/src/crypto/fixtures/identity_single.p12",
     ))
     .expect("p12 fixture");
     let creds = SigningCredentials::from_p12(&p12, "testpassword").expect("fixture loads");
@@ -465,8 +465,11 @@ fn main() {
 
 Expected output: every `expect` succeeds and prints the seed sizes. Contingencies (record
 which applied): if `SigningCredentials::from_p12` rejects `modern_pbes2_aes256.p12`, retry
-`identity_single.p12` then `modern_aes128.p12`; if `sign_code_directory` errors, record the
-error verbatim and drop both CMS seeds (31 of 33 files remain; state this as a plan
+`identity_single.p12` then `modern_aes128.p12` — **applied**: `modern_pbes2_aes256.p12` was
+rejected post-ZSN-37 (`extended key usage extension missing (codeSigning EKU required)`), so
+the generator used `identity_single.p12` (the committed CMS seeds carry that cert); if
+`sign_code_directory` errors, record the
+error verbatim and drop both CMS seeds (34 of 36 files remain; state this as a plan
 deviation).
 
 - [ ] **Step 4: Run the generator and delete it**
