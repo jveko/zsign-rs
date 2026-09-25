@@ -105,3 +105,84 @@ pub(crate) fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<
     }
     data
 }
+
+/// Realistic two-segment arm64 Mach-O with `__TEXT.fileoff == 0` (the layout
+/// produced by the linker) and a `__text` section inside `__TEXT`.
+/// With `tight_gap`, the section starts only 8 bytes after the last load
+/// command, i.e. there is no room to append a 16-byte load command.
+pub(crate) fn make_text_fileoff0_macho(tight_gap: bool) -> Vec<u8> {
+    let mut b = Vec::new();
+    macro_rules! u32w {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
+    macro_rules! u64w {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u64).to_le_bytes())
+        };
+    }
+    macro_rules! name {
+        ($s:expr, $len:expr) => {{
+            let mut n = [0u8; 16];
+            n[..$s.len()].copy_from_slice($s.as_bytes());
+            b.extend_from_slice(&n[..$len]);
+        }};
+    }
+    u32w!(0xfeedfacf); // MH_MAGIC_64
+    u32w!(0x0100_000c); // CPU_TYPE_ARM64
+    u32w!(0);
+    u32w!(2); // MH_EXECUTE
+    u32w!(3); // ncmds
+    u32w!(152 + 72 + 24); // sizeofcmds = 248
+    u32w!(1); // MH_NOUNDEFS
+    u32w!(0);
+    // LC_SEGMENT_64 "__TEXT": fileoff 0, filesize 0x1000, one __text section
+    u32w!(0x19);
+    u32w!(152);
+    name!("__TEXT", 16);
+    u64w!(0x1_0000_0000);
+    u64w!(0x1000);
+    u64w!(0);
+    u64w!(0x1000);
+    u32w!(7);
+    u32w!(7);
+    u32w!(1);
+    u32w!(0);
+    name!("__text", 16);
+    name!("__TEXT", 16);
+    u64w!(0x1_0000_0000); // addr
+    u64w!(4); // size
+    u32w!(if tight_gap { 32 + 248 + 8 } else { 0x400 }); // section file offset
+    u32w!(0);
+    u32w!(0);
+    u32w!(0);
+    u32w!(0x8000_0400); // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    u32w!(0);
+    u32w!(0);
+    u32w!(0);
+    // LC_SEGMENT_64 "__LINKEDIT": fileoff 0x1000, filesize 0 (signature home)
+    u32w!(0x19);
+    u32w!(72);
+    name!("__LINKEDIT", 16);
+    u64w!(0x1_0000_1000);
+    u64w!(0x1000);
+    u64w!(0x1000);
+    u64w!(0);
+    u32w!(1);
+    u32w!(1);
+    u32w!(0);
+    u32w!(0);
+    // LC_BUILD_VERSION (24 bytes)
+    u32w!(0x32);
+    u32w!(24);
+    u32w!(1);
+    u32w!(0x000f_0000);
+    u32w!(0x000f_0000);
+    u32w!(0);
+    assert_eq!(b.len(), 280, "load commands end at 32 + 248");
+    b.resize(0x1000, 0);
+    b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]); // __text at 0x1000
+    b.resize(0x2000, 0);
+    b
+}

@@ -58,7 +58,7 @@ pub struct MachOMetadata {
     pub linkedit_cmd: Option<(usize, u64, u64, u64)>,
     /// Byte offset after the last load command.
     pub max_load_cmd_end: usize,
-    /// Byte offset of the first segment's file data.
+    /// Lowest file offset of file-backed content (nonzero sections and nonzero fileoff/filesize segments), bounding load-command insertion; 4096 when none exists.
     pub first_segment_offset: usize,
     /// Whether the binary is big-endian.
     pub is_big_endian: bool,
@@ -221,6 +221,19 @@ impl MachOFile {
         let mut max_load_cmd_end: usize = 0;
         let mut first_segment_offset: u64 = u64::MAX;
 
+        for segment in &macho.segments {
+            if let Ok(sections) = segment.sections() {
+                for (section, _) in sections {
+                    if section.size > 0 && section.offset > 0 {
+                        let section_offset = section.offset as u64;
+                        if section_offset < first_segment_offset {
+                            first_segment_offset = section_offset;
+                        }
+                    }
+                }
+            }
+        }
+
         for lc in &macho.load_commands {
             let lc_end = lc.offset + lc.command.cmdsize();
             if lc_end > max_load_cmd_end {
@@ -242,7 +255,7 @@ impl MachOFile {
                         meta_linkedit_cmd =
                             Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
                     }
-                    if seg.fileoff > 0 && seg.fileoff < first_segment_offset {
+                    if seg.fileoff > 0 && seg.filesize > 0 && seg.fileoff < first_segment_offset {
                         first_segment_offset = seg.fileoff;
                     }
                 }
@@ -251,7 +264,10 @@ impl MachOFile {
                         text_segment_size = seg.vmsize as u64;
                         text_segment_base = seg.vmaddr as u64;
                     }
-                    if seg.fileoff > 0 && (seg.fileoff as u64) < first_segment_offset {
+                    if seg.fileoff > 0
+                        && seg.filesize > 0
+                        && (seg.fileoff as u64) < first_segment_offset
+                    {
                         first_segment_offset = seg.fileoff as u64;
                     }
                 }
@@ -733,5 +749,16 @@ mod tests {
         assert_eq!(enc.cryptoff, 0x1000);
         assert_eq!(enc.cryptsize, 0x2000);
         assert!(slice.is_encrypted(), "32-bit cryptid=1 must be encrypted");
+    }
+
+    #[test]
+    fn test_fileoff0_metadata_bound_is_first_section() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(false);
+        let macho = super::MachOFile::parse(data).expect("fixture must parse");
+        let meta = &macho.slices()[0].metadata;
+        assert_eq!(
+            meta.first_segment_offset, 0x400,
+            "metadata insertion bound must come from the first file-backed section"
+        );
     }
 }

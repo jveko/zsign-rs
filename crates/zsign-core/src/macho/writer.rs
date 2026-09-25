@@ -168,18 +168,16 @@ fn realloc_code_sign_space_single(
     } else {
         let first_segment_offset = find_first_segment_offset(macho);
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
-        let new_load_commands_end = max_load_cmd_end + new_cmd_size;
-
-        if new_load_commands_end > first_segment_offset {
-            let header_size = if is_64 { 32 } else { 28 };
-            let current_sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
-            let available_space = first_segment_offset - (header_size + current_sizeofcmds);
-
-            if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
-                return Err(Error::MachO(
-                    "No space for LC_CODE_SIGNATURE in load commands area".into(),
-                ));
-            }
+        let header_size = if is_64 { 32 } else { 28 };
+        let sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
+        let insert_end = max_load_cmd_end
+            .max(header_size + sizeofcmds)
+            .checked_add(new_cmd_size)
+            .ok_or_else(|| Error::MachO("load command end overflow".into()))?;
+        if insert_end > first_segment_offset || insert_end > output.len() {
+            return Err(Error::MachO(
+                "No space for LC_CODE_SIGNATURE in load commands area".into(),
+            ));
         }
 
         write_u32(
@@ -491,9 +489,10 @@ fn add_code_signature_command(
     let first_segment_offset = find_first_segment_offset(macho);
 
     let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
-    let new_load_commands_end = load_commands_end + new_cmd_size;
-
-    if new_load_commands_end > first_segment_offset {
+    let new_load_commands_end = load_commands_end
+        .checked_add(new_cmd_size)
+        .ok_or_else(|| Error::MachO("load command end overflow".into()))?;
+    if new_load_commands_end > first_segment_offset || new_load_commands_end > data.len() {
         return Err(Error::MachO(
             "No space for LC_CODE_SIGNATURE in load commands area".into(),
         ));
@@ -589,14 +588,74 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
         match cmd {
             LC_SEGMENT_64 => {
                 let fileoff = read_u64(input, offset + 40, is_big_endian)? as usize;
-                if fileoff > 0 && fileoff < first_segment_offset {
+                let filesize = read_u64(input, offset + 48, is_big_endian)?;
+                if fileoff > 0 && filesize > 0 && fileoff < first_segment_offset {
                     first_segment_offset = fileoff;
+                }
+                let nsects = read_u32(input, offset + 64, is_big_endian)? as usize;
+                let sects_bytes = nsects
+                    .checked_mul(80)
+                    .ok_or_else(|| Error::MachO("section count overflow".into()))?;
+                let sects_start = offset
+                    .checked_add(72)
+                    .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                let sects_end = sects_start
+                    .checked_add(sects_bytes)
+                    .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                let lc_end = offset
+                    .checked_add(cmdsize)
+                    .ok_or_else(|| Error::MachO("load command size overflow".into()))?;
+                if sects_end > lc_end || sects_end > input.len() {
+                    return Err(Error::MachO("section table exceeds load command".into()));
+                }
+                for i in 0..nsects {
+                    let sect = sects_start
+                        .checked_add(
+                            i.checked_mul(80)
+                                .ok_or_else(|| Error::MachO("section count overflow".into()))?,
+                        )
+                        .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                    let size = read_u64(input, sect + 40, is_big_endian)?;
+                    let soff = read_u32(input, sect + 48, is_big_endian)? as usize;
+                    if size > 0 && soff > 0 && soff < first_segment_offset {
+                        first_segment_offset = soff;
+                    }
                 }
             }
             LC_SEGMENT => {
                 let fileoff = read_u32(input, offset + 32, is_big_endian)? as usize;
-                if fileoff > 0 && fileoff < first_segment_offset {
+                let filesize = read_u32(input, offset + 36, is_big_endian)?;
+                if fileoff > 0 && filesize > 0 && fileoff < first_segment_offset {
                     first_segment_offset = fileoff;
+                }
+                let nsects = read_u32(input, offset + 48, is_big_endian)? as usize;
+                let sects_bytes = nsects
+                    .checked_mul(68)
+                    .ok_or_else(|| Error::MachO("section count overflow".into()))?;
+                let sects_start = offset
+                    .checked_add(56)
+                    .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                let sects_end = sects_start
+                    .checked_add(sects_bytes)
+                    .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                let lc_end = offset
+                    .checked_add(cmdsize)
+                    .ok_or_else(|| Error::MachO("load command size overflow".into()))?;
+                if sects_end > lc_end || sects_end > input.len() {
+                    return Err(Error::MachO("section table exceeds load command".into()));
+                }
+                for i in 0..nsects {
+                    let sect = sects_start
+                        .checked_add(
+                            i.checked_mul(68)
+                                .ok_or_else(|| Error::MachO("section count overflow".into()))?,
+                        )
+                        .ok_or_else(|| Error::MachO("section table overflow".into()))?;
+                    let size = read_u32(input, sect + 36, is_big_endian)?;
+                    let soff = read_u32(input, sect + 40, is_big_endian)? as usize;
+                    if size > 0 && soff > 0 && soff < first_segment_offset {
+                        first_segment_offset = soff;
+                    }
                 }
             }
             _ => {}
@@ -673,20 +732,26 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
 fn find_first_segment_offset(macho: &MachO) -> usize {
     let mut min_offset: u64 = u64::MAX;
 
+    for segment in &macho.segments {
+        if let Ok(sections) = segment.sections() {
+            for (section, _) in sections {
+                if section.size > 0 && section.offset > 0 {
+                    min_offset = min_offset.min(section.offset as u64);
+                }
+            }
+        }
+    }
     for lc in &macho.load_commands {
         match &lc.command {
-            CommandVariant::Segment64(seg) if seg.fileoff > 0 && seg.fileoff < min_offset => {
-                min_offset = seg.fileoff;
+            CommandVariant::Segment64(seg) if seg.fileoff > 0 && seg.filesize > 0 => {
+                min_offset = min_offset.min(seg.fileoff);
             }
-            CommandVariant::Segment32(seg)
-                if seg.fileoff > 0 && (seg.fileoff as u64) < min_offset =>
-            {
-                min_offset = seg.fileoff as u64;
+            CommandVariant::Segment32(seg) if seg.fileoff > 0 && seg.filesize > 0 => {
+                min_offset = min_offset.min(seg.fileoff as u64);
             }
             _ => {}
         }
     }
-
     if min_offset == u64::MAX {
         4096
     } else {
@@ -925,19 +990,17 @@ pub fn realloc_code_sign_space_with_metadata(
         ));
     } else {
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
-        let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
-
-        if new_load_commands_end > metadata.first_segment_offset {
-            let header_size = if metadata.is_64 { 32 } else { 28 };
-            let current_sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
-            let available_space =
-                metadata.first_segment_offset - (header_size + current_sizeofcmds);
-
-            if available_space < LINKEDIT_DATA_COMMAND_SIZE as usize {
-                return Err(Error::MachO(
-                    "No space for LC_CODE_SIGNATURE in load commands area".into(),
-                ));
-            }
+        let header_size = if metadata.is_64 { 32 } else { 28 };
+        let sizeofcmds = read_u32(&output, 20, is_big_endian)? as usize;
+        let insert_end = metadata
+            .max_load_cmd_end
+            .max(header_size + sizeofcmds)
+            .checked_add(new_cmd_size)
+            .ok_or_else(|| Error::MachO("load command end overflow".into()))?;
+        if insert_end > metadata.first_segment_offset || insert_end > output.len() {
+            return Err(Error::MachO(
+                "No space for LC_CODE_SIGNATURE in load commands area".into(),
+            ));
         }
 
         let cmd_offset = metadata.max_load_cmd_end;
@@ -971,7 +1034,7 @@ pub fn realloc_code_sign_space_with_metadata(
             checked_u32(code_length, "code_length")?,
             sig_datasize,
         ));
-        updated_metadata.max_load_cmd_end = new_load_commands_end;
+        updated_metadata.max_load_cmd_end = insert_end;
     }
 
     output.resize(new_length, 0);
@@ -1043,9 +1106,11 @@ fn add_code_signature_command_with_metadata(
     datasize: u32,
 ) -> Result<()> {
     let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
-    let new_load_commands_end = metadata.max_load_cmd_end + new_cmd_size;
-
-    if new_load_commands_end > metadata.first_segment_offset {
+    let new_load_commands_end = metadata
+        .max_load_cmd_end
+        .checked_add(new_cmd_size)
+        .ok_or_else(|| Error::MachO("load command end overflow".into()))?;
+    if new_load_commands_end > metadata.first_segment_offset || new_load_commands_end > data.len() {
         return Err(Error::MachO(
             "No space for LC_CODE_SIGNATURE in load commands area".into(),
         ));
@@ -1442,5 +1507,77 @@ mod tests {
         assert_eq!(cmdsize % 8, 0);
         assert_eq!(cmdsize, 24 + 8); // 32
         assert_eq!(read_u32(&output, 20, false).unwrap(), 72 + 32);
+    }
+
+    #[test]
+    fn test_inject_dylib_refuses_section_clobber_with_fileoff0_text() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(true);
+        let err = inject_dylib_command(&data, "@rpath/libtest.dylib", false)
+            .expect_err("8-byte gap before the first section must refuse a new load command");
+        let msg = match err {
+            crate::Error::MachO(m) => m,
+            other => panic!("expected MachO error, got {other:?}"),
+        };
+        assert!(
+            msg.contains("no space"),
+            "message must explain missing room: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_inject_dylib_keeps_section_bytes_with_fileoff0_text() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(false);
+        let section_off = 0x400;
+        let before = data[section_off..section_off + 4].to_vec();
+        let output = inject_dylib_command(&data, "@rpath/libtest.dylib", false)
+            .expect("comfortable gap must accept the new load command");
+        assert_eq!(
+            &output[section_off..section_off + 4],
+            &before[..],
+            "section bytes must be preserved"
+        );
+        assert_eq!(read_u32(&output, 16, false).unwrap(), 4, "ncmds must grow");
+    }
+
+    #[test]
+    fn test_metadata_first_segment_offset_sees_fileoff0_sections() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(false);
+        let macho = crate::macho::MachOFile::parse(data).expect("fixture must parse");
+        let meta = &macho.slices()[0].metadata;
+        assert_eq!(
+            meta.first_segment_offset, 0x400,
+            "insertion bound must be the first section offset, not a later segment fileoff"
+        );
+    }
+
+    #[test]
+    fn test_realloc_refuses_insertion_across_first_section() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(true);
+        let macho = crate::macho::MachOFile::parse(data.clone()).expect("fixture must parse");
+        let meta = macho.slices()[0].metadata.clone();
+        let result = realloc_code_sign_space_with_metadata(&data, &meta, data.len());
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("adding LC_CODE_SIGNATURE into an 8-byte gap must be refused"),
+        };
+        let msg = match err {
+            crate::Error::MachO(m) => m,
+            other => panic!("expected MachO error, got {other:?}"),
+        };
+        assert!(
+            msg.contains("No space"),
+            "message must explain missing room: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sign_refuses_tight_fileoff0_fixture() {
+        let data = crate::macho::fixtures::make_text_fileoff0_macho(true);
+        let macho = crate::macho::MachOFile::parse(data).expect("fixture must parse");
+        assert!(
+            crate::macho::sign_macho_adhoc(&macho, "com.example.tight", None, None, None, false)
+                .is_err(),
+            "signing must not overwrite __text by appending LC_CODE_SIGNATURE"
+        );
     }
 }
