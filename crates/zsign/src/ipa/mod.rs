@@ -278,6 +278,7 @@ impl<'a> IpaSigner<'a> {
         // Components between the extraction root and the bundle root come
         // from the archive: none of them may be a symlink.
         Self::resolve_within(temp_dir.path(), &app_bundle)?;
+        Self::ensure_single_app_bundle(&temp_dir.path().join("Payload"))?;
         self.sign_bundle_from_options(&app_bundle)?;
 
         create_ipa(&app_bundle, output_ipa, self.compression_level)?;
@@ -511,6 +512,33 @@ impl<'a> IpaSigner<'a> {
         }
         Self::check_no_symlink_components(root, relative)?;
         Ok(root.join(relative))
+    }
+
+    /// Rejects archives whose `Payload/` holds more than one `.app` bundle.
+    ///
+    /// `extract_ipa` selects the first `Payload/*.app` it meets in `read_dir`
+    /// order, so a multi-candidate archive would be signed and repacked from
+    /// an arbitrary pick. Failing here names every candidate instead.
+    fn ensure_single_app_bundle(payload_dir: &Path) -> Result<()> {
+        let mut candidates: Vec<String> = Vec::new();
+        for entry in fs::read_dir(payload_dir)? {
+            let path = entry?.path();
+            if path.is_dir() && path.extension().is_some_and(|ext| ext == "app") {
+                if let Some(name) = path.file_name() {
+                    candidates.push(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+        candidates.sort();
+        if candidates.len() > 1 {
+            return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
+                std::borrow::Cow::Owned(format!(
+                    "multiple .app bundles in Payload/: {}",
+                    candidates.join(", ")
+                )),
+            )));
+        }
+        Ok(())
     }
 
     /// Walk `relative` below `root`: reject symlink components, stop at the
@@ -1783,6 +1811,37 @@ mod tests {
         assert!(
             message.contains("Pre-existing symlink"),
             "error must name the cause: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_multiple_app_bundles() {
+        let temp = TempDir::new().unwrap();
+        let ipa_path = temp.path().join("multi.ipa");
+        let file = fs::File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/First.app/", options).unwrap();
+        zip.add_directory("Payload/Second.app/", options).unwrap();
+        zip.finish().unwrap();
+
+        let output = temp.path().join("signed.ipa");
+        let err = IpaSigner::new(&crate::test_util::test_credentials())
+            .sign(&ipa_path, &output)
+            .expect_err("two .app bundles must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple .app bundles"),
+            "actionable message: {msg}"
+        );
+        assert!(
+            msg.contains("First.app") && msg.contains("Second.app"),
+            "candidates named: {msg}"
+        );
+        assert!(
+            !output.exists(),
+            "no output may be written for an ambiguous archive"
         );
     }
 }
