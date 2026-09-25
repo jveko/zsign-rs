@@ -44,7 +44,7 @@ Test fixtures are embedded/`include_bytes!` in the test module — tracked files
 - `PROFILE_XML: &str` — minimal provisioning-profile stand-in: XML plist containing an `Entitlements` dict (`get-task-allow` true + `application-identifier` string). `extract_entitlements_from_profile` (provisioning.rs:12-42) only requires `<?xml`, `</plist`, bounds, and re-serializes the `Entitlements` value.
 - `new_signer()` / `new_signer_with_profile()` helpers wrapping `WasmSigner::new` (profile fixture = `PROFILE_XML`).
 - Test-module imports (beyond `use super::*; use wasm_bindgen_test::*;`): explicit `use sha1::{Digest as _, Sha1}; use sha2::{Digest as _, Sha256};` — `use super::*` does not carry the parent's anonymous `Digest as _` imports, so the trait must be re-imported locally for `Sha1::digest(...)` to resolve.
-- `err_message(err: impl Into<JsValue>) -> String` — `JsValue::from(err).unchecked_into::<js_sys::Error>().message().into()`. `JsError` does not implement `JsCast` (wasm-bindgen lib.rs:1839-1870), so errors must go through `JsValue` first; the same helper keeps compiling after Task 5 (error type becomes `JsValue`, which also satisfies `Into<JsValue>`).
+- `err_message(err: impl Into<JsValue>) -> String` — `let value: JsValue = err.into();` then `value.unchecked_into::<js_sys::Error>().message().into()`. Note: use `.into()`, NOT `JsValue::from(err)` — `From<T>` cannot be resolved from an `Into<JsValue>` bound on a generic parameter (no reverse blanket impl). `JsError` does not implement `JsCast` (wasm-bindgen lib.rs:1839-1870), so errors must go through `JsValue` first; the same helper keeps compiling after Task 5 (error type becomes `JsValue`, which also satisfies `Into<JsValue>`).
 - `anchored_verify(signed, creds)` = `anchored_verify_slice(signed, 0, creds)`; `anchored_verify_slice(signed, slice_idx, creds) -> CmsVerifyReport` — parse the slice's superblob (`MachOFile::parse` → signature offset = `slice.offset + code_sig_offset` → `zsign_core::codesign::verify::parse_superblob`), then locate BOTH code directories by hash type and call `verify_code_signature_with_anchors`:
   - content = `primary.raw()` (the CMS signs the primary CD — signer.rs:515; superblob.rs:544-545);
   - `cd_sha1` = `Some(Sha1::digest(sha1_cd.raw()))` when a SHA-1 CD exists (primary or alternate), else `None`;
@@ -121,7 +121,8 @@ pub mod tests {
     }
 
     fn err_message(err: impl Into<JsValue>) -> String {
-        JsValue::from(err).unchecked_into::<js_sys::Error>().message().into()
+        let value: JsValue = err.into();
+        value.unchecked_into::<js_sys::Error>().message().into()
     }
 
     /// (has_sha1_cd, has_sha256_cd) over primary + alternate code directories.

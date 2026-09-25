@@ -441,6 +441,16 @@ determinism skip therefore irrelevant to this lane's scoped gates).
 - Deferred core API: `sign_any_macho` has no hash-algorithm parameter; this
   design routes around it from the wasm layer rather than changing core
   (out of scope).
+- Cold-review adjudication record (round 2, NOT-READY): the single residual
+  finding was the plan's `err_message` helper spelled as
+  `JsValue::from(err)` under an `impl Into<JsValue>` bound — `From<T>` is
+  not derivable from an `Into` bound on a generic parameter, so the snippet
+  would not compile. Classified **doc-level (API spelling)**: no control
+  flow, error channel, match arm, panic path, or bounds check is affected;
+  the helper's design (convert to `JsValue`, then `unchecked_into`) is
+  unchanged. Corrected in the plan to `let value: JsValue = err.into();`
+  and recorded here per the adjudication rule; reported prominently in the
+  lane's final report.
 
 ## 4. API delta (contract for examples/web and external JS consumers)
 
