@@ -9,8 +9,8 @@
 
 use crate::codesign::constants::*;
 use crate::codesign::verify::{
-    check_code_pages, check_special_slots, parse_superblob, self_consistent_blobs, CodeDirectory,
-    PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
+    check_code_pages, check_special_slots, der_entitlements_to_plist, parse_superblob,
+    self_consistent_blobs, CodeDirectory, PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
 };
 use crate::Result;
 use sha1::Sha1;
@@ -238,6 +238,53 @@ fn verify_slice(
     }
     report.pages = check_code_pages_in_file(strongest, data, slice);
     report.special_slots = strongest_slots.unwrap_or_default();
+    let child = |slot: u32| superblob.entries.iter().find(|e| e.slot == slot);
+    let xml_bound = primary
+        .special_slot_hash(5)
+        .map(|h| h.iter().any(|&b| b != 0))
+        .unwrap_or(false);
+    let der_bound = primary
+        .special_slot_hash(7)
+        .map(|h| h.iter().any(|&b| b != 0))
+        .unwrap_or(false);
+    if let Some(xml_entry) = child(CSSLOT_ENTITLEMENTS) {
+        let xml_val = match plist::from_bytes::<plist::Value>(xml_entry.payload()) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("XML entitlements do not parse: {e}"));
+                None
+            }
+        };
+        match child(CSSLOT_DER_ENTITLEMENTS) {
+            Some(der_entry) => match der_entitlements_to_plist(der_entry.payload()) {
+                Ok(der_val) => {
+                    if let Some(xml_val) = &xml_val {
+                        if &der_val != xml_val {
+                            report
+                                .errors
+                                .push("XML and DER entitlements dictionaries differ".to_string());
+                        }
+                    }
+                }
+                Err(e) => report
+                    .errors
+                    .push(format!("DER entitlements do not parse: {e}")),
+            },
+            None => {}
+        }
+    }
+    // Binding rule: a bound -5 on a modern main executable requires a BOUND -7 child.
+    if xml_bound
+        && slice.is_executable
+        && primary.version >= CODEDIRECTORY_VERSION_EXECSEG
+        && !(der_bound && child(CSSLOT_DER_ENTITLEMENTS).is_some())
+    {
+        report.errors.push(
+            "XML entitlements bound (slot -5) without bound DER entitlements (slot -7)".to_string(),
+        );
+    }
 
     // CMS signature. An exact 8-byte CSMAGIC_BLOBWRAPPER header is what
     // codesign emits for ad-hoc output; the shortcut also requires CS_ADHOC.
@@ -379,7 +426,7 @@ mod tests {
     use super::*;
     use crate::codesign::constants::{
         CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY,
-        CSSLOT_SIGNATURESLOT,
+        CSSLOT_DER_ENTITLEMENTS, CSSLOT_SIGNATURESLOT,
     };
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
@@ -457,6 +504,61 @@ mod tests {
             let s = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
             (s == slot).then(|| u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize)
         })
+    }
+
+    const ENT_PLIST: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.example.ent</key><string>same</string></dict></plist>"#;
+
+    fn adhoc_ent_fixture() -> Vec<u8> {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        sign_macho_adhoc(
+            &macho,
+            "com.example.ent",
+            Some(ENT_PLIST),
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// File offset of a SuperBlob child inside `signed` (slice 0 only).
+    fn child_off_in_signed(signed: &[u8], slot: u32) -> usize {
+        let m = MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        sig_off + entry_offset(&signed[sig_off..sig_off + sig_len], slot).unwrap()
+    }
+
+    /// Rewrite stored special slot `k` (1-based) in BOTH CodeDirectories:
+    /// digest of `content` under each CD's own hash type, or all-zero when `None`.
+    fn bind_special_slot(signed: &mut [u8], k: usize, content: Option<&[u8]>) {
+        let m = MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let cds: Vec<usize> = [CSSLOT_CODEDIRECTORY, CSSLOT_ALTERNATE_CODEDIRECTORIES]
+            .iter()
+            .map(|s| sig_off + entry_offset(&signed[sig_off..sig_off + sig_len], *s).unwrap())
+            .collect();
+        for cd in cds {
+            let hash_offset =
+                u32::from_be_bytes(signed[cd + 16..cd + 20].try_into().unwrap()) as usize;
+            let hash_size = signed[cd + 36] as usize;
+            let hash_type = signed[cd + 37];
+            let start = cd + hash_offset - k * hash_size;
+            let bytes: Vec<u8> = match content {
+                None => vec![0; hash_size],
+                Some(c) => match hash_type {
+                    1 => Sha1::digest(c).to_vec(),
+                    _ => Sha256::digest(c).to_vec(),
+                },
+            };
+            assert_eq!(bytes.len(), hash_size);
+            signed[start..start + hash_size].copy_from_slice(&bytes);
+        }
     }
 
     fn build_two_slice_fat() -> Vec<u8> {
@@ -964,6 +1066,60 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("special slot -2 is bound but its content was not supplied")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+    #[test]
+    fn differing_xml_der_entitlements_are_rejected() {
+        let mut signed = adhoc_ent_fixture();
+        // Flip ONE character inside the DER child's value: same length -> still valid
+        // DER, semantically different dictionary ("same" -> "sane").
+        let der_off = child_off_in_signed(&signed, CSSLOT_DER_ENTITLEMENTS);
+        let der_len =
+            u32::from_be_bytes(signed[der_off + 4..der_off + 8].try_into().unwrap()) as usize;
+        let pos = signed[der_off..der_off + der_len]
+            .windows(4)
+            .position(|w| w == b"same")
+            .expect("value bytes in DER");
+        signed[der_off + pos + 2] = b'n'; // "same" -> "sane", same length
+                                          // Rebind -7 in both CDs so the integrity check stays green and the compare runs:
+        let der_bytes = signed[der_off..der_off + der_len].to_vec();
+        bind_special_slot(&mut signed, 7, Some(&der_bytes));
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("XML and DER entitlements dictionaries differ")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn missing_der_for_modern_main_executable_is_rejected() {
+        let mut signed = adhoc_ent_fixture();
+        // Unbind -7 in both CDs (zero the stored hash): present-but-unbound must fail.
+        bind_special_slot(&mut signed, 7, None);
+        // Drop the 0x0007 index entry by renaming its slot type to an unknown value
+        // (routing and the magic table ignore unknown slots; offsets stay valid).
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let count =
+            u32::from_be_bytes(signed[sig_off + 8..sig_off + 12].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = sig_off + 12 + i * 8;
+            if u32::from_be_bytes(signed[e..e + 4].try_into().unwrap()) == CSSLOT_DER_ENTITLEMENTS {
+                signed[e..e + 4].copy_from_slice(&0x0040u32.to_be_bytes());
+            }
+        }
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0].errors.iter().any(|e| e.contains(
+                "XML entitlements bound (slot -5) without bound DER entitlements (slot -7)"
+            )),
             "errors: {:?}",
             report.slices[0].errors
         );

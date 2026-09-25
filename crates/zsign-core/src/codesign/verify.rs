@@ -53,6 +53,15 @@ pub struct SlotEntry<'a> {
     pub blob: &'a [u8],
 }
 
+impl<'a> SlotEntry<'a> {
+    /// The child's payload: its declared bytes AFTER the 8-byte magic+length
+    /// header. Semantic parsers (plist, DER) need this; the special-slot
+    /// hashes cover the FULL blob including the header.
+    pub fn payload(&self) -> &'a [u8] {
+        &self.blob[8..]
+    }
+}
+
 /// A parsed code signature SuperBlob (`CSMAGIC_EMBEDDED_SIGNATURE`).
 #[derive(Debug, Clone)]
 pub struct SuperBlob<'a> {
@@ -613,6 +622,239 @@ pub fn self_consistent_blobs<'a>(
     (requirements, entitlements, der_entitlements)
 }
 
+const DER_ENTRIES_CONTAINERS: [u8; 5] = [0xb0, 0x31, 0x30, 0x60, 0xa0];
+
+fn der_error(message: impl Into<String>) -> crate::Error {
+    crate::Error::DerEncoding(message.into())
+}
+
+fn read_der_tlv(bytes: &[u8]) -> Result<(u8, &[u8], &[u8])> {
+    if bytes.len() < 2 {
+        return Err(der_error("truncated DER tag or length"));
+    }
+    let tag = bytes[0];
+    let first = bytes[1];
+    let (content_len, content_start) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 {
+            return Err(der_error("indefinite DER lengths are not supported"));
+        }
+        if count > std::mem::size_of::<usize>() {
+            return Err(der_error("DER length is too large"));
+        }
+        let length_end = 2usize
+            .checked_add(count)
+            .ok_or_else(|| der_error("DER length extent overflow"))?;
+        let length_bytes = bytes
+            .get(2..length_end)
+            .ok_or_else(|| der_error("truncated DER long-form length"))?;
+        let mut content_len = 0usize;
+        for &byte in length_bytes {
+            content_len = (content_len << 8) | byte as usize;
+        }
+        (content_len, length_end)
+    };
+    let end = content_start
+        .checked_add(content_len)
+        .ok_or_else(|| der_error("DER value extent overflow"))?;
+    let content = bytes
+        .get(content_start..end)
+        .ok_or_else(|| der_error("DER value length overruns input"))?;
+    Ok((tag, content, bytes.get(end..).unwrap_or_default()))
+}
+
+fn der_integer(content: &[u8]) -> Result<plist::Value> {
+    let (&first, prefix) = content
+        .split_first()
+        .ok_or_else(|| der_error("empty DER INTEGER"))?;
+    let negative = first & 0x80 != 0;
+    let significant = if negative {
+        prefix.iter().skip_while(|&&byte| byte == 0xff).count()
+    } else {
+        prefix.iter().skip_while(|&&byte| byte == 0x00).count()
+    };
+    if prefix.len() - significant > 1 || content.len() > 8 {
+        return Err(der_error("non-minimal or oversized DER INTEGER"));
+    }
+    let mut value = if negative {
+        -1i128 << (8 * content.len())
+    } else {
+        0
+    };
+    for &byte in content {
+        value = (value << 8) | byte as i128;
+    }
+    let value = i64::try_from(value).map_err(|_| der_error("DER INTEGER does not fit i64"))?;
+    Ok(plist::Value::Integer(value.into()))
+}
+
+fn der_string(tag: u8, content: &[u8]) -> Result<plist::Value> {
+    let string = match tag {
+        0x0c => std::str::from_utf8(content)
+            .map_err(|_| der_error("invalid DER UTF8String"))?
+            .to_owned(),
+        0x16 => {
+            if !content.is_ascii() {
+                return Err(der_error("invalid DER IA5String"));
+            }
+            // SAFETY: `is_ascii` proves every byte is below 0x80.
+            unsafe { std::str::from_utf8_unchecked(content) }.to_owned()
+        }
+        0x1e => {
+            if content.len() % 2 != 0 {
+                return Err(der_error("invalid DER BMPString length"));
+            }
+            let units = content
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+            let utf16 = units.collect::<Vec<_>>();
+            String::from_utf16(&utf16)
+                .map_err(|_| der_error("invalid DER BMPString surrogate pair"))?
+        }
+        _ => return Err(der_error(format!("unsupported DER string tag 0x{tag:02x}"))),
+    };
+    Ok(plist::Value::String(string))
+}
+
+fn der_time(tag: u8, content: &[u8]) -> Result<plist::Value> {
+    let text = std::str::from_utf8(content).map_err(|_| der_error("invalid DER time encoding"))?;
+    let digits = text
+        .strip_suffix('Z')
+        .ok_or_else(|| der_error("DER time must use UTC 'Z' offset"))?;
+    let (fraction, digits) = match digits.find(['.', ',']) {
+        Some(index) => (digits[index..].replace(',', "."), &digits[..index]),
+        None => (String::new(), digits),
+    };
+    let expected = match tag {
+        0x17 => 12,
+        0x18 => 14,
+        _ => return Err(der_error("invalid DER time tag")),
+    };
+    if digits.len() != expected || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(der_error("invalid DER time digits"));
+    }
+    let year = if tag == 0x17 {
+        let yy: i32 = digits[0..2].parse().unwrap();
+        if yy < 50 {
+            2000 + yy
+        } else {
+            1900 + yy
+        }
+    } else {
+        digits[0..4].parse().unwrap()
+    };
+    let date_start = if tag == 0x17 { 2 } else { 4 };
+    let rfc3339 = format!(
+        "{year:04}-{}-{}T{}:{}:{}{fraction}Z",
+        &digits[date_start..date_start + 2],
+        &digits[date_start + 2..date_start + 4],
+        &digits[date_start + 4..date_start + 6],
+        &digits[date_start + 6..date_start + 8],
+        &digits[date_start + 8..date_start + 10]
+    );
+    let date =
+        plist::Date::from_xml_format(&rfc3339).map_err(|_| der_error("invalid DER time value"))?;
+    Ok(plist::Value::Date(date))
+}
+
+fn decode_der_entries(content: &[u8], depth: u32) -> Result<plist::Value> {
+    if depth > 32 {
+        return Err(der_error("DER nesting depth exceeds 32"));
+    }
+    let mut dictionary = plist::Dictionary::new();
+    let mut remaining = content;
+    while !remaining.is_empty() {
+        let (tag, pair, rest) = read_der_tlv(remaining)?;
+        if tag != 0x30 {
+            return Err(der_error("DER entitlement entry is not a SEQUENCE"));
+        }
+        let (key_tag, key, key_rest) = read_der_tlv(pair)?;
+        if key_tag != 0x0c || key_rest.is_empty() {
+            return Err(der_error("DER entitlement entry has an invalid key"));
+        }
+        let key = std::str::from_utf8(key)
+            .map_err(|_| der_error("invalid DER entitlement key"))?
+            .to_owned();
+        let (value_tag, value_bytes, value_rest) = read_der_tlv(key_rest)?;
+        if !value_rest.is_empty() {
+            return Err(der_error("DER entitlement entry has extra values"));
+        }
+        dictionary.insert(key, decode_der_value(value_tag, value_bytes, depth + 1)?);
+        remaining = rest;
+    }
+    Ok(plist::Value::Dictionary(dictionary))
+}
+
+fn parse_tlv(bytes: &[u8], depth: u32) -> Result<plist::Value> {
+    if depth > 32 {
+        return Err(der_error("DER nesting depth exceeds 32"));
+    }
+    let (tag, content, remaining) = read_der_tlv(bytes)?;
+    if !remaining.is_empty() {
+        return Err(der_error("trailing bytes after DER value"));
+    }
+    decode_der_value(tag, content, depth)
+}
+
+fn decode_der_value(tag: u8, content: &[u8], depth: u32) -> Result<plist::Value> {
+    if depth > 32 {
+        return Err(der_error("DER nesting depth exceeds 32"));
+    }
+    match tag {
+        0x01 => match content {
+            [0x00] => Ok(plist::Value::Boolean(false)),
+            [0xff] => Ok(plist::Value::Boolean(true)),
+            _ => Err(der_error("invalid DER BOOLEAN value")),
+        },
+        0x02 => der_integer(content),
+        0x0c | 0x16 | 0x1e => der_string(tag, content),
+        0x04 => Ok(plist::Value::Data(content.to_vec())),
+        0x17 | 0x18 => der_time(tag, content),
+        0x30 => {
+            let mut values = Vec::new();
+            let mut remaining = content;
+            while !remaining.is_empty() {
+                let (child_tag, child_content, rest) = read_der_tlv(remaining)?;
+                values.push(decode_der_value(child_tag, child_content, depth + 1)?);
+                remaining = rest;
+            }
+            Ok(plist::Value::Array(values))
+        }
+        0x70 => {
+            let (version_tag, _version, rest) = read_der_tlv(content)?;
+            if version_tag != 0x02 {
+                return Err(der_error("DER entitlements envelope lacks INTEGER version"));
+            }
+            let (entries_tag, entries, entries_rest) = read_der_tlv(rest)?;
+            if !entries_rest.is_empty() || !DER_ENTRIES_CONTAINERS.contains(&entries_tag) {
+                return Err(der_error("invalid DER entitlements entries container"));
+            }
+            decode_der_entries(entries, depth + 1)
+        }
+        0x31 | 0x60 | 0xa0 | 0xb0 => decode_der_entries(content, depth + 1),
+        0x05 => Err(der_error("DER NULL is not a supported plist value")),
+        _ => Err(der_error(format!("unsupported DER tag 0x{tag:02x}"))),
+    }
+}
+
+pub(crate) fn der_entitlements_to_plist(der: &[u8]) -> Result<plist::Value> {
+    let (tag, content, remaining) = read_der_tlv(der)?;
+    if !remaining.is_empty() {
+        return Err(der_error("trailing bytes after DER entitlements"));
+    }
+    let value = if DER_ENTRIES_CONTAINERS.contains(&tag) {
+        decode_der_entries(content, 0)?
+    } else {
+        parse_tlv(der, 0)?
+    };
+    if !matches!(value, plist::Value::Dictionary(_)) {
+        return Err(der_error("DER entitlements root is not a dictionary"));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -821,6 +1063,49 @@ mod tests {
         assert_eq!(cd.n_special_slots, 2);
         assert_eq!(cd.special_slot_hash(1), Some(&[0xAB; 32][..]));
         assert_eq!(cd.special_slot_hash(2), Some(&[0xCD; 32][..]));
+    }
+
+    #[test]
+    fn der_entitlements_round_trip() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.example.flag</key><true/>
+<key>com.example.count</key><integer>7</integer>
+<key>com.example.name</key><string>demo</string>
+<key>com.example.list</key><array><string>a</string><integer>2</integer></array>
+<key>com.example.nested</key><dict><key>inner</key><string>v</string></dict>
+</dict></plist>"#;
+        let der = crate::codesign::der::plist_to_der(xml).unwrap();
+        let decoded = der_entitlements_to_plist(&der).unwrap();
+        let expected = plist::from_bytes::<plist::Value>(xml.as_slice()).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn der_v0_and_v1_shapes_parse() {
+        // v1 as the repo encoder emits (der.rs:258-276):
+        //   0x70 { INTEGER 1, 0xb0 { SEQUENCE{ UTF8String "k", UTF8String "v" } } }
+        let v1 = [
+            0x70u8, 0x0d, 0x02, 0x01, 0x01, 0xb0, 0x08, 0x30, 0x06, 0x0c, 0x01, b'k', 0x0c, 0x01,
+            b'v',
+        ];
+        // v0: the bare entries SET with no envelope (older Apple blobs)
+        let v0 = [0x31u8, 0x08, 0x30, 0x06, 0x0c, 0x01, b'k', 0x0c, 0x01, b'v'];
+        for bytes in [v1.as_slice(), v0.as_slice()] {
+            let v = der_entitlements_to_plist(bytes).unwrap();
+            assert_eq!(
+                v.as_dictionary().unwrap().get("k").unwrap().as_string(),
+                Some("v")
+            );
+        }
+    }
+
+    #[test]
+    fn der_malformed_is_error() {
+        assert!(der_entitlements_to_plist(&[0x31, 0x02, 0xff, 0xff]).is_err()); // length overrun
+        assert!(der_entitlements_to_plist(&[]).is_err());
+        assert!(der_entitlements_to_plist(&[0x70, 0x02, 0x05, 0x00]).is_err()); // no INTEGER version
     }
 
     #[test]
