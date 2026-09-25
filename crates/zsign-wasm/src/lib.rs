@@ -1347,4 +1347,117 @@ pub mod tests {
         assert!(e.is_instance_of::<js_sys::Error>());
         assert!(!err_message(e).is_empty());
     }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn constructor_extracts_profile_entitlements_and_team_id() {
+        let signer = new_signer_with_profile();
+        assert_eq!(signer.team_id().as_deref(), Some("ZSN40TEST"));
+        let ents = signer.entitlements().expect("profile entitlements");
+        let dict = parse_dict(&ents);
+        assert_eq!(
+            dict.get("application-identifier")
+                .and_then(|v| v.as_string()),
+            Some("ZSN40TEST.com.zsign.test")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn constructor_rejects_bad_profile() {
+        let e = match WasmSigner::new(
+            &decode_base64(LEAF_P12_B64),
+            "test",
+            Some(b"<not a profile".to_vec()),
+        ) {
+            Ok(_) => panic!("bad profile must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PROFILE".into()));
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn adhoc_sign_round_trip_verifies_without_credentials() {
+        let signed = zsign_core::macho::sign_macho_adhoc(
+            &zsign_core::macho::MachOFile::parse(MINIMAL_MACHO.to_vec()).unwrap(),
+            "com.zsign.test",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("adhoc sign");
+        let report = zsign_core::macho::verify::verify_macho(
+            &signed,
+            &zsign_core::codesign::verify::SignatureInputs::none(),
+        )
+        .expect("verify report");
+        let slice = &report.slices[0];
+        assert!(slice.signed && slice.adhoc);
+        assert_eq!(
+            slice.pages,
+            zsign_core::codesign::verify::PageCheck::Matched
+        );
+        assert!(
+            report.is_valid(),
+            "adhoc round-trip must verify: {:?}",
+            slice.errors
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_info_plist_handles_xml_binary_absent_keys_and_bad_input() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.zsign.test</string>
+  <key>CFBundleExecutable</key><string>Test</string>
+</dict></plist>"#;
+        let v = WasmSigner::parse_info_plist(xml).expect("xml parses");
+        assert_eq!(
+            js_sys::Reflect::get(&v, &"bundle_id".into())
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("com.zsign.test")
+        );
+        assert_eq!(
+            js_sys::Reflect::get(&v, &"executable".into())
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("Test")
+        );
+
+        // binary plist round-trip
+        let mut dict = plist::Dictionary::new();
+        dict.insert("CFBundleIdentifier".into(), "com.zsign.binary".into());
+        let value = plist::Value::Dictionary(dict);
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &value).expect("serialize binary plist");
+        assert!(buf.starts_with(b"bplist00"));
+        let v = WasmSigner::parse_info_plist(&buf).expect("binary parses");
+        assert_eq!(
+            js_sys::Reflect::get(&v, &"bundle_id".into())
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("com.zsign.binary")
+        );
+
+        // absent keys default to empty strings (matches the method docs)
+        let v = WasmSigner::parse_info_plist(br#"<plist version="1.0"><dict/></plist>"#)
+            .expect("empty dict");
+        assert_eq!(
+            js_sys::Reflect::get(&v, &"bundle_id".into())
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("")
+        );
+
+        // non-dictionary plist → coded error
+        let e = WasmSigner::parse_info_plist(
+            br#"<plist version="1.0"><array><string>x</string></array></plist>"#,
+        )
+        .expect_err("not a dictionary");
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PLIST".into()));
+    }
 }
