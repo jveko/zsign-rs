@@ -13,7 +13,8 @@ use crate::codesign::verify::{
     PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
 };
 use crate::Result;
-use sha1::{Digest, Sha1};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 /// Report of the verification of one architecture slice.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -134,6 +135,8 @@ fn verify_slice(
         return Ok(report);
     };
 
+    let cds = emitted_cds(&superblob);
+
     report.signed = true;
     report.adhoc = primary.is_adhoc();
     report.identifier = primary.identifier().map(str::to_owned);
@@ -187,21 +190,27 @@ fn verify_slice(
             return Ok(report);
         }
 
-        let cd_sha256: [u8; 32] = primary.cdhash_sha256();
-        let cd_sha1 = alternate_sha1(&superblob);
-        match crate::crypto::cms_verify::verify_code_signature(
-            cms_blob,
-            primary.raw(),
-            cd_sha1.as_ref(),
-            &cd_sha256,
-        ) {
-            Ok(cms_report) => {
-                if !cms_report.valid {
-                    report.errors.extend(cms_report.errors.clone());
+        let (cd_sha1, cd_sha256_opt) = cdhash_pair(&cds);
+        match cd_sha256_opt {
+            None => report.errors.push(
+                "CMS signature present but no SHA-256 CodeDirectory to bind CDHash v2".to_string(),
+            ),
+            Some(cd_sha256) => {
+                match crate::crypto::cms_verify::verify_code_signature(
+                    cms_blob,
+                    primary.raw(),
+                    cd_sha1.as_ref(),
+                    &cd_sha256,
+                ) {
+                    Ok(cms_report) => {
+                        if !cms_report.valid {
+                            report.errors.extend(cms_report.errors.clone());
+                        }
+                        report.cms = Some(cms_report);
+                    }
+                    Err(e) => report.errors.push(format!("CMS verification error: {e}")),
                 }
-                report.cms = Some(cms_report);
             }
-            Err(e) => report.errors.push(format!("CMS verification error: {e}")),
         }
     } else if primary.is_adhoc() {
         report.cms = Some(crate::crypto::cms_verify::adhoc_report());
@@ -212,6 +221,31 @@ fn verify_slice(
     }
 
     Ok(report)
+}
+
+/// Every emitted CodeDirectory: primary first, then alternates, in slot order.
+fn emitted_cds<'a>(superblob: &'a SuperBlob<'a>) -> Vec<&'a CodeDirectory<'a>> {
+    let mut cds = Vec::with_capacity(1 + superblob.alternate_code_directories.len());
+    if let Some(p) = superblob.code_directory.as_ref() {
+        cds.push(p);
+    }
+    cds.extend(superblob.alternate_code_directories.iter());
+    cds
+}
+
+/// The CDHash pair bound into the CMS attributes, selected BY EMITTED TYPE:
+/// v1's first entry hashes the SHA-1 CD, v1's second entry and v2 hash the
+/// SHA-256 CD. `None` when that type is not emitted.
+fn cdhash_pair(cds: &[&CodeDirectory<'_>]) -> (Option<[u8; 20]>, Option<[u8; 32]>) {
+    let sha1 = cds.iter().find(|cd| cd.is_sha1()).map(|cd| {
+        let d: [u8; 20] = Sha1::digest(cd.raw()).into();
+        d
+    });
+    let sha256 = cds.iter().find(|cd| cd.is_sha256()).map(|cd| {
+        let d: [u8; 32] = Sha256::digest(cd.raw()).into();
+        d
+    });
+    (sha1, sha256)
 }
 
 /// Page check variant that reads exactly the slice's byte range from the
@@ -234,24 +268,6 @@ fn check_code_pages_in_file(
         };
     };
     check_code_pages(cd, range)
-}
-
-/// SHA-1 digest of the alternate (SHA-1) CodeDirectory, for the CDHash v1
-/// attribute binding — `Some` only for legacy dual output.
-fn alternate_sha1(superblob: &SuperBlob<'_>) -> Option<[u8; 20]> {
-    for cd in &superblob.alternate_code_directories {
-        if cd.is_sha1() {
-            return Some(Sha1::digest(cd.raw()).into());
-        }
-    }
-    // A single-slot SHA-1 primary without an alternate (ancient output) — not
-    // something we emit, but match the digest shape if encountered.
-    if let Some(primary) = &superblob.code_directory {
-        if primary.is_sha1() && superblob.alternate_code_directories.is_empty() {
-            return Some(Sha1::digest(primary.raw()).into());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -302,7 +318,9 @@ mod tests {
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
     use crate::macho::fixtures::make_minimal_macho;
-    use crate::macho::{sign_any_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile};
+    use crate::macho::{
+        sign_any_macho, sign_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile,
+    };
     use der::Decode;
     use sha2::{Digest, Sha256};
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -497,12 +515,14 @@ mod tests {
             slice.code_sig_size.unwrap() as usize,
         );
         let sb = parse_superblob(&bin[off..off + size]).unwrap();
-        let cd = sb.code_directory.as_ref().unwrap();
+        let cds = emitted_cds(&sb);
+        let (cd_sha1, cd_sha256) = cdhash_pair(&cds);
+        let cd_sha256 = cd_sha256.expect("emitted SHA-256 CodeDirectory");
         crate::crypto::cms_verify::verify_code_signature_with_anchors(
             sb.cms.expect("signed superblob carries a CMS slot"),
-            cd.raw(),
-            None,
-            &cd.cdhash_sha256(),
+            sb.code_directory.as_ref().expect("primary").raw(),
+            cd_sha1.as_ref(),
+            &cd_sha256,
             &crate::crypto::cms_verify::TrustAnchors::from_certificates(vec![creds
                 .certificate
                 .clone()]),
@@ -700,5 +720,29 @@ mod tests {
         let parsed = parse_superblob(&sb).unwrap();
         assert!(parsed.code_directory.is_some());
         assert!(parsed.cms.is_some());
+    }
+    #[test]
+    fn dual_signing_binds_cdhash_pair() {
+        let creds = rsa_credentials();
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        // sign_macho signs in DUAL mode (sha256_only=false): SHA-1 primary at slot 0,
+        // SHA-256 alternate at 0x1000, CMS over the primary.
+        let signed =
+            sign_macho(&macho, "com.example.dual", None, &creds, None, None, false).unwrap();
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid());
+        let slice = &report.slices[0];
+        assert!(slice.signed && !slice.adhoc);
+        // Pre-fix: cdhash v1/v2 errors inflate this beyond 1.
+        assert_eq!(slice.errors.len(), 1, "errors: {:?}", slice.errors);
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        assert_eq!(slice.pages, PageCheck::Matched);
+        let cms = slice.cms.as_ref().unwrap();
+        assert!(cms.signature_ok && cms.message_digest_ok && cms.chain_ok);
+        assert!(cms.cdhash_v1_ok, "v1 errors: {:?}", cms.errors);
+        assert!(cms.cdhash_v2_ok, "v2 errors: {:?}", cms.errors);
+        let injected = cms_report_with_test_anchor(&signed, &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
     }
 }
