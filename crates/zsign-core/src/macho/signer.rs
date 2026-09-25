@@ -1165,6 +1165,38 @@ mod tests {
     }
 
     #[test]
+    fn test_sign_preserves_fat_slice_trailing_bytes() {
+        let mut a = make_minimal_macho();
+        let tail_start = a.len();
+        // Bytes past the last file-backed segment, inside the declared
+        // fat_arch size: the signature must start after them, and they must
+        // survive verbatim in the signed output.
+        a.extend(std::iter::repeat(0xAB).take(0x400));
+        let mut b = make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed
+        let fat = make_fat_macho(&[a, b], &[12, 12]);
+        let macho = MachOFile::parse(fat).unwrap();
+        let creds = test_credentials();
+        let signed = sign_any_macho(&macho, "com.zsign.tail", None, &creds, None, None, false)
+            .expect("FAT signing must succeed");
+        let m = MachOFile::parse(signed.clone()).expect("signed output reparses");
+        let s = &m.slices()[0];
+        let end = s.offset + s.code_sig_offset.expect("signed slice") as usize;
+        let got = &signed[s.offset + tail_start..end];
+        assert_eq!(
+            got.len(),
+            0x400,
+            "signature must start after the full 0x400-byte tail, got 0x{:x}-byte range",
+            got.len()
+        );
+        assert!(
+            got.iter().all(|byte| *byte == 0xAB),
+            "trailing bytes must be preserved before the signature; got {:02x?}",
+            &got[..8.min(got.len())]
+        );
+    }
+
+    #[test]
     fn test_thin_only_signers_reject_fat_containers() {
         let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
         let macho = MachOFile::parse(fat).unwrap();

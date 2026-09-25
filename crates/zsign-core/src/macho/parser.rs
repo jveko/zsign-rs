@@ -132,7 +132,9 @@ pub struct ArchSlice {
     /// Base virtual address of the `__TEXT` segment (used for
     /// `execSegBase` in code signing).
     pub text_segment_base: u64,
-    /// Length of code to be signed (excludes existing signature).
+    /// Length of code to be signed: the existing signature start
+    /// (`LC_CODE_SIGNATURE.dataoff`), or the full declared size for unsigned
+    /// slices (thin: whole file).
     pub code_length: usize,
     /// Cached load command metadata for writer functions.
     pub metadata: MachOMetadata,
@@ -335,44 +337,7 @@ impl MachOFile {
 
         let is_big_endian = is_big_endian_macho(data, base_offset);
 
-        let slice_data = if base_offset == 0 {
-            data
-        } else {
-            let end = macho
-                .load_commands
-                .iter()
-                .filter_map(|lc| match &lc.command {
-                    CommandVariant::Segment64(seg) => {
-                        seg.fileoff.checked_add(seg.filesize).map(|v| v as usize)
-                    }
-                    CommandVariant::Segment32(seg) => (seg.fileoff as u64)
-                        .checked_add(seg.filesize as u64)
-                        .map(|v| v as usize),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(declared_size)
-                .min(declared_size);
-            let slice_end = base_offset.checked_add(end).ok_or_else(|| {
-                Error::MachO(format!(
-                    "parse_single: offset {} + size {} overflow",
-                    base_offset, end
-                ))
-            })?;
-            if slice_end > data.len() {
-                return Err(Error::MachO(format!(
-                    "parse_single: slice extends beyond data (offset={}, size={}, data_len={})",
-                    base_offset,
-                    end,
-                    data.len()
-                )));
-            }
-            &data[base_offset..slice_end]
-        };
-
-        let code_length = code_sig_offset
-            .map(|o| o as usize)
-            .unwrap_or(slice_data.len());
+        let code_length = code_sig_offset.map(|o| o as usize).unwrap_or(declared_size);
 
         if code_length > declared_size {
             return Err(Error::MachO(format!(
@@ -383,7 +348,7 @@ impl MachOFile {
 
         Ok(ArchSlice {
             offset: 0,
-            size: slice_data.len(),
+            size: declared_size,
             cpu_type,
             is_64,
             is_executable,
@@ -814,5 +779,27 @@ mod tests {
         let exec_seg_limit = u64::from_be_bytes(cd.raw()[72..80].try_into().unwrap());
         assert_eq!(exec_seg_limit, 0x1000,
             "CodeDirectory execSegLimit must equal __TEXT.filesize (byte offsets as in signer.rs:1400-1403)");
+    }
+
+    #[test]
+    fn test_unsigned_fat_code_length_covers_declared_size() {
+        use crate::macho::fixtures::{make_fat_macho, make_minimal_macho};
+
+        let mut a = make_minimal_macho();
+        let declared = a.len() + 0x400;
+        // Trailing bytes past the last file-backed segment, still inside the
+        // arch's declared fat_arch size: they are code and must be hashed.
+        a.extend(std::iter::repeat(0xAB).take(0x400));
+        let fat = make_fat_macho(&[a, make_minimal_macho()], &[12, 12]);
+        let macho = MachOFile::parse(fat).expect("fixture must parse");
+        let slice = &macho.slices()[0];
+        assert_eq!(
+            slice.code_length, declared,
+            "unsigned FAT slices must hash up to the declared arch size, not the last segment end"
+        );
+        assert_eq!(
+            slice.size, declared,
+            "declared arch size must include the tail"
+        );
     }
 }
