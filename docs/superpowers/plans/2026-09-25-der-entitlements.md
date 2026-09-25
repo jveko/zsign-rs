@@ -837,8 +837,9 @@ Notes for the implementer:
 - `app` is reassigned here on purpose; the later structural section reassigns
   it to `$WORK/cert/Test.app`.
 
-- [ ] **Step 5.3: Renumber the following sections and drop the impossible
-  self-signed `zsign -V` agreement.** Replace the headers
+- [ ] **Step 5.3: Renumber the following sections and dual-pin the self-signed
+  `zsign -V` agreement (supervisor ruling, ZSN-25 option b).** Replace the
+  headers
 
 ```bash
 # 5. Structural asserts on the signed main binary (format regressions).
@@ -847,14 +848,19 @@ Notes for the implementer:
 ```
 
 with `# 6.`, `# 7.`, `# 8.` (keep their second lines verbatim), and rename the
-in-section markers `7a.`→`8a.`, `7b.`→`8b.`, `7c.`→`8c.`, `7d.`→`8d.`.
+in-section markers `7b.`→`8c.`, `7c.`→`8d.`, `7d.`→`8e.` (the `7a` block is
+replaced wholesale below).
 
-Then, in the renamed section 8, remove the cert-signed agreement line: CLI
-verification anchors only to the embedded Apple Root
-(`cms_verify.rs:275-287`), and a self-signed chain is accepted only when its
-SPKI is in that anchor set (`cms_verify.rs:1113-1150`), otherwise the report
-carries "certificate chain is not anchored to a trusted root"
-(`cms_verify.rs:858-860`) — the line is latent-red at c9ff0fb. Replace
+Then, in the renamed section 8, replace the `7a` block: CLI verification
+anchors only to the embedded Apple Root (`cms_verify.rs:275-287`), and a
+self-signed chain is accepted only when its SPKI is in that anchor set
+(`cms_verify.rs:1113-1150`), so `verified: yes` is impossible by design —
+pin structural validity PLUS the expected anchoring failure instead. Both
+surfaces were probed against the landed CLI before writing these greps: the
+bundle report prints no error text (print_bundle keeps per-binary CMS errors
+internal, exit 1), while the detached main binary prints the anchoring
+verdict (exit 2) with two expected `cannot verify special slot ... without
+bundle context` errors that must NOT be asserted against. Replace
 
 ```bash
 # 7a. The two bundles codesign accepted in steps 3/4.
@@ -865,9 +871,33 @@ agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
 with
 
 ```bash
-# 8a. The ad-hoc bundle codesign accepted in step 4. The cert-signed bundle
-# cannot be listed here: zsign -V anchors only to the Apple Root, so a
-# self-signed certificate never verifies.
+# 8a. Cert-signed bundle: codesign accepts it (step 3), but zsign -V anchors
+#     only to the Apple Root, so a self-signed signature must never report
+#     verified: yes — pin structural validity plus the anchoring failure.
+VB=$("$ZIGN" -V "$WORK/cert/Test.app" 2>&1 || true)
+printf '%s\n' "$VB" >>"$DIAG"
+grep -q '^verified: no'                     <<<"$VB" || fail "zsign -V must not report verified: yes for the cert-signed bundle:\n$VB"
+grep -q '^    arm64: pages ok, CMS INVALID' <<<"$VB" || fail "zsign -V did not reach the structural+CMS verdict for the cert-signed bundle:\n$VB"
+grep -q '^  code resources: ok'             <<<"$VB" || fail "zsign -V did not confirm sealed top-level code resources for the cert-signed bundle:\n$VB"
+if grep -qi mismatch <<<"$VB"; then
+    fail "zsign -V reported structural mismatches on the cert-signed bundle:\n$VB"
+fi
+
+# The detached main binary exposes the anchoring verdict: the bundle report
+# keeps CMS details internal, so pin the parse evidence and the expected
+# failure text on the binary instead.
+VM=$("$ZIGN" -V "$WORK/cert/Test.app/Test" 2>&1 || true)
+printf '%s\n' "$VM" >>"$DIAG"
+grep -q '^verified: no'                   <<<"$VM" || fail "zsign -V accepted the self-signed main binary:\n$VM"
+grep -q 'not anchored to a trusted root'   <<<"$VM" || fail "zsign -V missing the expected anchoring failure:\n$VM"
+grep -q 'signer: CN=zsign interop CI'      <<<"$VM" || fail "zsign -V did not parse the self-signed CMS signer:\n$VM"
+grep -q 'cms: INVALID (chain: CN=zsign interop CI, anchor: false)' <<<"$VM" || fail "zsign -V did not report the expected unanchored self-signed CMS state:\n$VM"
+if grep -qi mismatch <<<"$VM"; then
+    fail "zsign -V reported structural mismatches on the cert-signed main binary:\n$VM"
+fi
+echo "OK  zsign -V dual-pin: structure valid + unanchored (expected) for cert-signed bundle"
+
+# 8b. The ad-hoc bundle codesign accepted in step 4.
 agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
 ```
 

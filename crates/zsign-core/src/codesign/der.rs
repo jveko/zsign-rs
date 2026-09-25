@@ -309,6 +309,7 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
 /// - The resulting DER encoding is empty
 /// - An unsupported plist type is encountered (Real)
 /// - An integer value lies outside the i64 range
+/// - A date value lies outside the GeneralizedTime year range
 ///
 /// # Examples
 ///

@@ -263,14 +263,23 @@ Candidates for the entitlements round-trip step:
   (`cms_verify.rs:1113-1150`), otherwise the report carries "certificate
   chain is not anchored to a trusted root" (`cms_verify.rs:858-860`). The
   script's self-signed certificate can therefore never satisfy `zsign -V`, and
-  injecting custom anchors needs an out-of-scope CLI interface. **Cold-review
-  finding applied:** the *pre-existing* section-7 `agree_valid "cert-signed
-  bundle"` line is latent-red under exactly this policy and is removed by this
-  lane (the ad-hoc line stays: ad-hoc signatures are valid by construction via
-  `adhoc_report()`, `cms_verify.rs:345-351`; `/bin/ls` and the tamper control
-  are unaffected). This coverage loss is reported to the orchestrator; it can
-  only be restored by a custom-anchor verification path (CLI/ZSN-10
-  territory).
+  injecting custom anchors needs an out-of-scope CLI interface. **Supervisor
+  ruling from ZSN-25 (option b, applied):** the *pre-existing* section-7
+  `agree_valid "cert-signed bundle"` assertion is rewritten to a DUAL-PIN
+  instead of being deleted — `codesign --verify` stays green on the
+  self-signed bundle (step 3 asserts it), while `zsign -V` must report (i)
+  structural validity and (ii) the expected anchoring failure, never
+  `verified: yes`. Grounding: a local probe of the landed CLI showed the
+  bundle surface emits `verified: no`, `arm64: pages ok, CMS INVALID`,
+  `code resources: ok` but NO error text (print_bundle keeps per-binary CMS
+  errors internal), while `-V` on the detached main binary emits
+  `error: certificate chain is not anchored to a trusted root`,
+  `signer: CN=zsign interop CI`, `cms: INVALID (chain: CN=zsign interop CI,
+  anchor: false)` (exit 2; bundle exits 1). Section 8a pins both surfaces and
+  appends both outputs to `$DIAG`; the ad-hoc/`/bin/ls`/tamper `agree_valid`
+  lines are unchanged. A *positive* `verified: yes` for self-signed bundles
+  remains impossible under the default anchors and would need a
+  custom-anchor CLI path (CLI/ZSN-10 territory).
   The brief's `--entitlements :-` spelling is modernized to `--entitlements -`
   + `--xml`/`--der` per the current man page (colon prefix deprecated; Quinn,
   Apple Developer Forums thread 729855) — intent unchanged, one decision
@@ -343,14 +352,32 @@ ad-hoc bundle); no diagnostic content is removed.
    semantics described here; nothing to migrate today.
 6. **Brief line anchors superseded:** schema text is `der.rs:8-14`, root loop
    `:240-256`, 12 unit tests not 11 (see corrections table).
-7. **`zsign -V` agreement against self-signed certificates is impossible under
-   the default anchor policy** (`verify_code_signature` → Apple Root only,
-   `cms_verify.rs:275-287`; self-signed accepted only via SPKI match
-   `cms_verify.rs:1113-1150`). The interop script's pre-existing
-   `agree_valid "cert-signed bundle"` line was therefore latent-red at c9ff0fb;
-   this lane removes it (ad-hoc/`/bin/ls`/tamper agreement lines stay).
-   Restoring cert-signed `zsign -V` coverage requires a custom-anchor CLI
-   verification path — deferred to the CLI/verify lanes, not this one.
+7. **`zsign -V` can never report `verified: yes` for self-signed certificates
+   under the default anchor policy** (`verify_code_signature` → Apple Root
+   only, `cms_verify.rs:275-287`; self-signed accepted only via SPKI match
+   `cms_verify.rs:1113-1150`). Supervisor ruling (ZSN-25, option b) applied:
+   the interop script's cert-signed `zsign -V` assertion is now a dual-pin on
+   BOTH surfaces — bundle (structural: `verified: no`, `pages ok`,
+   `CMS INVALID`, `code resources: ok`, no mismatch) and detached main binary
+   (anchoring failure text, `signer:`, `anchor: false`) — with both outputs
+   logged to `$DIAG`. Positive agreement for cert-signed bundles stays out of
+   scope (custom-anchor CLI path deferred to the CLI/verify lanes).
+
+## Supervisor scope additions (ZSN-25 rulings, recorded)
+
+1. **Dual-pin interop assertion (applied):** see item 5's assertion list and
+   known item 7 — the script's section 8a pins the bundle-structural surface
+   and the detached-main-binary anchoring surface, grounded by local CLI probe
+   outputs; ZSN-31 diagnostics untouched (both probe outputs are appended to
+   `$DIAG`), `codesign --verify` stays green via step 3.
+2. **DER doc accuracy (verified landed):** the module doc no longer claims
+   key-lexicographic sorting (it states the X.690 clause 11.6 encoded-bytes
+   rule, landed with the ordering task); `encode_value`'s doc list documents
+   the Data/Date mappings; `plist_to_der`'s `# Errors` list names only Real
+   plus the integer/date range errors; the Real-policy decision (keep
+   rejecting — Apple's serialized type set has no Real and both reference
+   implementations reject it) is recorded in item 2 above. A grep for
+   `Keys are sorted|lexicograph` in der.rs returns no stale claims.
 
 ## Deferred lanes (untouched by this design)
 

@@ -272,15 +272,39 @@ agree_invalid() {
     echo "OK  zsign -V rejects $label"
 }
 
-# 8a. The ad-hoc bundle codesign accepted in step 4. The cert-signed bundle
-# cannot be listed here: zsign -V anchors only to the Apple Root, so a
-# self-signed certificate never verifies.
+# 8a. Cert-signed bundle: codesign accepts it (step 3), but zsign -V anchors
+#     only to the Apple Root, so a self-signed signature must never report
+#     verified: yes — pin structural validity plus the anchoring failure.
+VB=$("$ZIGN" -V "$WORK/cert/Test.app" 2>&1 || true)
+printf '%s\n' "$VB" >>"$DIAG"
+grep -q '^verified: no'                     <<<"$VB" || fail "zsign -V must not report verified: yes for the cert-signed bundle:\n$VB"
+grep -q '^    arm64: pages ok, CMS INVALID' <<<"$VB" || fail "zsign -V did not reach the structural+CMS verdict for the cert-signed bundle:\n$VB"
+grep -q '^  code resources: ok'             <<<"$VB" || fail "zsign -V did not confirm sealed top-level code resources for the cert-signed bundle:\n$VB"
+if grep -qi mismatch <<<"$VB"; then
+    fail "zsign -V reported structural mismatches on the cert-signed bundle:\n$VB"
+fi
+
+# The detached main binary exposes the anchoring verdict: the bundle report
+# keeps CMS details internal, so pin the parse evidence and the expected
+# failure text on the binary instead.
+VM=$("$ZIGN" -V "$WORK/cert/Test.app/Test" 2>&1 || true)
+printf '%s\n' "$VM" >>"$DIAG"
+grep -q '^verified: no'                   <<<"$VM" || fail "zsign -V accepted the self-signed main binary:\n$VM"
+grep -q 'not anchored to a trusted root'   <<<"$VM" || fail "zsign -V missing the expected anchoring failure:\n$VM"
+grep -q 'signer: CN=zsign interop CI'      <<<"$VM" || fail "zsign -V did not parse the self-signed CMS signer:\n$VM"
+grep -q 'cms: INVALID (chain: CN=zsign interop CI, anchor: false)' <<<"$VM" || fail "zsign -V did not report the expected unanchored self-signed CMS state:\n$VM"
+if grep -qi mismatch <<<"$VM"; then
+    fail "zsign -V reported structural mismatches on the cert-signed main binary:\n$VM"
+fi
+echo "OK  zsign -V dual-pin: structure valid + unanchored (expected) for cert-signed bundle"
+
+# 8b. The ad-hoc bundle codesign accepted in step 4.
 agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
 
-# 8b. A real Apple-signed system binary (FAT, 16 KB pages, Apple chain).
+# 8c. A real Apple-signed system binary (FAT, 16 KB pages, Apple chain).
 agree_valid "Apple-signed /bin/ls" /bin/ls
 
-# 8c. An ad-hoc signature produced by codesign itself.
+# 8d. An ad-hoc signature produced by codesign itself.
 cp /bin/ls "$WORK/ls-adhoc"
 codesign --force -s - "$WORK/ls-adhoc" 2>/dev/null
 agree_valid "codesign ad-hoc output" "$WORK/ls-adhoc"
