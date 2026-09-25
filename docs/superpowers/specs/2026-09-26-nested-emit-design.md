@@ -359,9 +359,9 @@ to prove the whitelist is no longer the sole predicate.
 | Site | Change |
 |---|---|
 | `ipa/mod.rs:431-437` `is_bundle_directory` | deleted; both callers (`:421`, `:765`) call `crate::bundle::is_nested_bundle_dir` |
-| `ipa/mod.rs:578-592` `calculate_bundle_depth` | rewritten to cumulative-prefix evaluation: iterate `strip_prefix(root)` components, accumulate `root.join(prefix…)`, count prefixes satisfying the predicate (also fixes the existing case-sensitivity asymmetry with collect; paths not under the root now yield depth 0 instead of counting suffix components — an intended change: the function only ever receives paths collected from that root, and depth feeds only the deepest-first sort) |
+| `ipa/mod.rs:578-592` `calculate_bundle_depth` | rewritten to cumulative-prefix evaluation: iterate `strip_prefix(root)` components, accumulate `root.join(prefix…)`, count prefixes satisfying the predicate (also fixes the existing case-sensitivity asymmetry with collect; the `strip_prefix` failure branch is defensive and unreachable — the sole caller passes `WalkDir` paths under the root, exactly as the old `.unwrap_or(bundle_path)` fallback was) |
 | `verify.rs:143-152` `is_bundle_dir` | deleted; `:456` calls the shared predicate with the full path |
-| `verify.rs:157-165` `has_nested_bundle_component` | gains `root: &Path`; evaluates the predicate on cumulative `root.join(prefix)` components (both call sites `:456`, `:466` sit inside `verify_bundle_dir(root, dir, rel)`, which has `root`) |
+| `verify.rs:157-165` `has_nested_bundle_component` | gains a base-path parameter `dir: &Path` (NOT `root`: `rel` is computed as `p.strip_prefix(dir)` at `verify.rs:452`, so only `dir.join(prefix)` exists on disk below depth 0 — `root.join(rel)` would fail the markers read and silently disable the location/package-type arms); evaluates the predicate on cumulative `dir.join(prefix)` components (call sites `:456`, `:466` sit inside `verify_bundle_dir(root, dir, rel)`) |
 | docs | doc comments naming the old whitelist (`ipa/mod.rs:13-22`, `:406`, `verify.rs:12-14`, `:82`) updated to the new recognition rule |
 
 `ensure_single_app_bundle` (root `Payload/*.app` selection,
@@ -505,9 +505,21 @@ plist. For each output assert, via `parse_superblob` on the
 `code_sig_offset/size` region: no entry with `slot == 0x0005` and none with
 `0x0007` (no entitlements blob), the primary CD's
 `special_slot_hash(5)` (via `sb.code_directory.as_ref().expect("primary CD")`)
-is `None` or all-zero (slot −5 unbound), and `verify_macho` reports the binary
-valid (existing verify path). Pre-fix: RED on every entry (empty or real
-dict bound into −5). The strengthened WASM pin
+is `None` or all-zero (slot −5 unbound). Verify leg (choice recorded per
+supervisor): the **adhoc entry carries the strict `is_valid()` proof** —
+adhoc output carries no certificate and bypasses certificate gating
+(`macho/verify.rs:405-406`), so `verify_macho` must report zero errors
+(the item-1 "still verifies via the existing verify path" criterion;
+empirically confirmed for a non-executable with no entitlements slot); the
+three identity-signed entries are **dual-pinned** per the
+`macho/verify.rs:952-965` pattern: `report` not valid, and the credential
+gate is the *only* failure (`slice.errors.len() == 1`, the fixture leaf's
+missing codeSigning EKU — a string already pinned in-tree by
+`codesign/cms_verify.rs` tests). Rejected alternative: plumbing the
+private `cms_report_with_test_anchor` helper out of the verify tests to
+force full validity on credentialed entries — cross-module churn, no extra
+proof. Pre-fix: RED on every entry (empty or real dict bound into −5).
+The strengthened WASM pin
 (`non_executable_input_ignores_profile_entitlements`) additionally asserts
 `entitlements_slot(&a) == None` instead of only `a == b`.
 
@@ -529,9 +541,15 @@ assert on `Frameworks/libfoo.dylib`:
 4. discovery seam: `find_immediate_macho_binaries(&app, &set)` where `set`
    is built from `find_standalone_dylibs` excludes the dylib (mirrors the
    `:1671` precedent);
-5. `verify_bundle(&app)` → `report.valid()` (ipa sign→verify path).
+5. `verify_bundle(&app)` **dual-pin** (the `verify.rs:1105-1127`
+   `signed_bundle_verifies` contract): identity-signed output is
+   credential-gated, so "ipa sign→verify passes" = bundle-level errors
+   empty + `code_resources.valid()` + every binary's only failure is the
+   single fixture credential-gate error — any structural defect (pages,
+   slots, sealing) would add a second error or flip these assertions.
 
-Pre-fix RED comes from assertion 2 (single CD) — assertions 4's parameter
+Pre-fix RED comes from assertion 2 (single CD — empirically confirmed:
+the dylib's SuperBlob has no `0x1000` today) — assertion 4's parameter
 does not exist pre-fix, so the task sequence is: red e2e test first
 (assertions 1-3,5 with old API), implement threading, then add assertion 4.
 The existing `test_symlinked_dylib_is_skipped_and_target_untouched` is
@@ -550,7 +568,11 @@ migrated to the new `find_immediate_macho_binaries` signature.
   exists, the signed `Foo` has identifier `com.test.foo.xpc` (bundle
   relationship: bundle id, not file stem) and no entitlements slot;
 - `verify_bundle(&app)` valid with exactly one nested entry whose `path`
-  is `XPCServices/Foo.xpc` (verifier co-migration).
+  is `XPCServices/Foo.xpc` (verifier co-migration). The strict
+  `report.valid()` assertion is sound here because the test signs adhoc —
+  adhoc output is not certificate-gated, and an adhoc-signed folder bundle
+  incl. a nested framework was empirically confirmed to reach
+  `valid() == true` pre-change.
 
 Plus focused unit tests for `is_nested_bundle_dir` in
 `crates/zsign/src/bundle/mod.rs` (inline `#[cfg(test)]` module per repo

@@ -80,29 +80,69 @@ fn test_non_executable_signing_carries_no_entitlements() {
                 "{via}: slot -5 must be unbound, got {h:02x?}"
             ),
         }
-        let report = crate::macho::verify_macho(
-            signed,
-            &crate::codesign::verify::SignatureInputs::none(),
-        )
-        .unwrap_or_else(|e| panic!("{via}: verify must accept the signed dylib: {e}"));
-        assert!(
-            report.is_valid(),
-            "{via}: verify errors: {:?}",
-            report.slices.iter().flat_map(|s| &s.errors).collect::<Vec<_>>()
-        );
+    }
+
+    fn verify(signed: &[u8]) -> crate::macho::MachOVerifyReport {
+        crate::macho::verify_macho(signed, &crate::codesign::verify::SignatureInputs::none())
+            .unwrap_or_else(|e| panic!("verify must accept the signed dylib: {e}"))
     }
 
     let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_dylib()).unwrap();
     let creds = test_credentials();
 
-    let signed = sign_macho(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false).unwrap();
-    assert_no_entitlements(&signed, "sign_macho");
-    let signed = sign_macho_sha256_only(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false).unwrap();
-    assert_no_entitlements(&signed, "sign_macho_sha256_only");
+    // Adhoc entry: strict verify leg — adhoc output carries no certificate,
+    // so "still verifies via the existing verify path" means report.is_valid()
+    // with zero errors (empirically true for this fixture shape).
     let signed = sign_macho_adhoc(&macho, "com.zsign.dylib", Some(ENT), None, None, false).unwrap();
     assert_no_entitlements(&signed, "sign_macho_adhoc");
-    let signed = sign_any_macho(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false).unwrap();
-    assert_no_entitlements(&signed, "sign_any_macho");
+    let report = verify(&signed);
+    assert!(
+        report.is_valid(),
+        "sign_macho_adhoc: dylib must verify clean: {:?}",
+        report.slices[0].errors
+    );
+
+    // Credential-signed entries: dual-pin contract (the macho/verify.rs
+    // verify_signed_binary_round_trip pattern) — identity output can never
+    // pass strict verify, so pin that the credential gate is the ONLY
+    // problem: exactly one error, the fixture leaf's missing codeSigning
+    // EKU (Profile::Root test cert; the string itself is in-tree-pinned at
+    // codesign/cms_verify.rs). Re-litigating the fixture cert shape is out
+    // of scope here — the structural claim is errors.len() == 1.
+    let gated: [(&str, Vec<u8>); 3] = [
+        (
+            "sign_macho",
+            sign_macho(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false).unwrap(),
+        ),
+        (
+            "sign_macho_sha256_only",
+            sign_macho_sha256_only(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false)
+                .unwrap(),
+        ),
+        (
+            "sign_any_macho",
+            sign_any_macho(&macho, "com.zsign.dylib", Some(ENT), &creds, None, None, false)
+                .unwrap(),
+        ),
+    ];
+    for (via, signed) in gated {
+        assert_no_entitlements(&signed, via);
+        let report = verify(&signed);
+        assert!(!report.is_valid(), "{via}: fixture must stay credential-gated");
+        let slice = &report.slices[0];
+        assert!(slice.signed, "{via}: output must carry a signature");
+        assert_eq!(
+            slice.errors.len(),
+            1,
+            "{via}: only the credential gate may fail, got {:?}",
+            slice.errors
+        );
+        assert!(
+            slice.errors[0].contains("leaf lacks codeSigning EKU extension"),
+            "{via}: unexpected gate: {}",
+            slice.errors[0]
+        );
+    }
 }
 ```
 
@@ -119,12 +159,26 @@ sites (`macho/verify.rs:937`).
 — always bind `sb.code_directory.as_ref().expect("primary CD")` first, as
 `crates/zsign/src/verify.rs:1002` does.
 
+Verify-leg design (recorded per supervisor ruling): the **adhoc entry
+carries the strict `is_valid()` proof** for item 1's "still verifies via
+the existing verify path" criterion — adhoc slices bypass certificate
+gating entirely (`macho/verify.rs:405-406` substitutes the adhoc CMS
+report), so strict validity is achievable and was empirically confirmed
+for a non-executable signed with no entitlements slot. Identity-signed
+output is structurally verified via the repo's dual-pin contract instead
+(`macho/verify.rs:952-965`: all problems must collapse to the single
+credential gate). Rejected alternative: reusing the verify.rs test-module
+helper `cms_report_with_test_anchor` to force full validity on
+credentialed entries — it is private to that test module and plumbing it
+across modules is churn with no extra proof value.
+
 - [ ] **Step 1.2: Run the test to verify it fails**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core non_executable_signing -- --skip test_ipa_signing_is_deterministic`
 Expected: FAIL — every entry binds slot −5 (`sign_macho`/`sign_macho_adhoc`
 with the supplied `ENT`, `sign_any_macho`/sha256 with `ENT` or the empty
-dict), so the `slot != 0x0005` assert fires.
+dict), so the `slot != 0x0005` assert inside `assert_no_entitlements`
+fires before any verify leg is reached.
 
 - [ ] **Step 1.3: Implement the coercion, delete the injections**
 
@@ -215,9 +269,12 @@ once the coercion lands; update them (comments only, no behavior change):
 
 - [ ] **Step 1.4: Sweep for leftover references**
 
-Run: `grep -rn "EMPTY_ENTITLEMENTS\|empty entitlements" crates docs README.md 2>/dev/null`
-Expected: zero hits in code/docs (the grep is the check; if an external doc
-describes the old behavior, update that sentence).
+Run: `grep -rn "EMPTY_ENTITLEMENTS\|empty entitlements" crates README.md 2>/dev/null`
+Expected: zero hits under `crates/` and in README.md (code, comments, and
+crate-level docs only). `docs/` is deliberately out of scope: this lane's
+own plan/design quote the old text as migration instructions, and earlier
+lanes' specs record what those lanes actually did — historical records,
+not stale claims; do not rewrite them to silence the grep.
 
 - [ ] **Step 1.5: Run the test to verify it passes + scoped neighbors**
 
@@ -311,12 +368,56 @@ fn test_standalone_dylib_signed_exactly_once() {
         "no entitlements blob may be applied to a dylib"
     );
 
+    // Dual-pin contract (the verify.rs signed_bundle_verifies pattern): the
+    // bundle is identity-signed with the shared Profile::Root test cert, so
+    // report.valid() is credential-gated by construction. "sign→verify
+    // passes" therefore means: bundle-level errors empty, CodeResources
+    // sealed and re-hashed correctly, and every binary's ONLY failure is the
+    // fixture credential gate (exactly one error). Any structural defect —
+    // broken pages, unbound slots, bad sealing — would add a second error or
+    // flip these assertions.
     let report = crate::verify::verify_bundle(&app).expect("verify must run");
     assert!(
-        report.valid(),
-        "ipa sign→verify must pass: {:?}",
-        report.bundle.as_ref().map(|b| &b.errors)
+        !report.valid(),
+        "identity-signed bundle must be credential-gated, not silently invalid"
     );
+    let bundle = report.bundle.as_ref().expect("bundle verification");
+    assert!(
+        bundle.errors.is_empty(),
+        "bundle-level errors must be empty: {:?}",
+        bundle.errors
+    );
+    let cr = bundle
+        .code_resources
+        .as_ref()
+        .expect("bundle CodeResources verification");
+    assert!(
+        cr.valid(),
+        "sealed CodeResources must verify: mismatched={:?} missing={:?} unsealed={:?}",
+        cr.mismatched,
+        cr.missing,
+        cr.unsealed
+    );
+    for binary in &bundle.binaries {
+        let slice = &binary
+            .report
+            .as_ref()
+            .unwrap_or_else(|| panic!("Mach-O report for {}", binary.path))
+            .slices[0];
+        assert_eq!(
+            slice.errors.len(),
+            1,
+            "{}: only the credential gate may fail, got {:?}",
+            binary.path,
+            slice.errors
+        );
+        assert!(
+            slice.errors[0].contains("leaf lacks codeSigning EKU extension"),
+            "{}: unexpected gate: {}",
+            binary.path,
+            slice.errors[0]
+        );
+    }
 }
 ```
 
@@ -326,7 +427,12 @@ discriminator is the code-directory shape — pass A signs with the dual
 SHA-1+SHA-256 entries (`sign_standalone_dylib` → `sign_macho`,
 `ipa/mod.rs:652`), pass B with the default `sha256_only = true`
 single-CD path (`sign_binary` → `sign_macho_sha256_only`, `:1039`). Any
-second pass destroys the `0x1000` alternate CD.
+second pass destroys the `0x1000` alternate CD. (Pre-change state
+empirically confirmed: a `Frameworks/libfoo.dylib` under this exact fixture
+signs with `has_alt_cd=false` today, so Step 2.3's red is real.) The EKU
+gate string is the in-tree-pinned credential-gate message for Profile::Root
+fixtures (`codesign/cms_verify.rs` pins `leaf lacks codeSigning EKU` in
+its own tests).
 
 - [ ] **Step 2.3: Run the test to verify it fails**
 
@@ -396,7 +502,7 @@ identifier, entitlements) stays intact.
 
 (d) Migrate the existing direct caller in the tests module
 (`test_symlinked_dylib_is_skipped_and_target_untouched`, `ipa/mod.rs:1671-1707`,
-`#[cfg(unix)]`): its `find_immediate_macho_binaries(&app)` call at `:1694`
+`#[cfg(unix)]`): its `find_immediate_macho_binaries(&app)` call at `:1693`
 becomes
 
 ```rust
@@ -537,6 +643,15 @@ fn test_xpc_service_is_discovered_and_signed_as_nested_bundle() {
     );
 }
 ```
+
+Assertion-leg note: this test signs **adhoc**, and adhoc output is not
+certificate-gated (`macho/verify.rs:405-406` substitutes the adhoc CMS
+report), so the strict `vreport.valid()` assertion is correct here — unlike
+Task 2's identity-signed fixture. Empirically confirmed pre-change: an
+adhoc-signed folder bundle **including a nested `.framework`** reaches
+`verify_bundle().valid() == true` with zero bundle/binary/CodeResources
+problems, so the assertion exercises the post-fix XPC recursion the same
+way.
 
 - [ ] **Step 3.2: Write the predicate unit tests (they fail to compile —
   the function does not exist yet)**
@@ -762,14 +877,15 @@ fn calculate_bundle_depth(&self, bundle_path: &Path, root_bundle: &Path) -> usiz
 }
 ```
 
-Intended behavior notes (call these out, do not "fix" them): the previous
-implementation used `strip_prefix(root_bundle).unwrap_or(bundle_path)` and
-still counted suffix components for paths not under the root — the rewrite
-returns 0 instead. That is deliberate: callers only ever pass paths
-collected from `root_bundle`, and depth feeds only the deepest-first sort
-at `sign_bundle`. Re-evaluating `is_nested_bundle_dir` per component may
-re-read an intermediate bundle's Info.plist once per component below it —
-negligible for bundle-shaped trees and the price of one shared predicate.
+Unreachable-branch note (state it as such; do not document or test it as a
+behavior change): `strip_prefix(root_bundle)` can only fail for paths
+outside the root, and the sole caller — `collect_nested_bundles` — passes
+`WalkDir::new(root_bundle)` paths (`ipa/mod.rs:414-419`), so the
+`else { return 0 }` branch is defensive and can never fire (the previous
+`.unwrap_or(bundle_path)` fallback was equally unreachable). Re-evaluating
+`is_nested_bundle_dir` per component may re-read an intermediate bundle's
+Info.plist once per component below it — negligible for bundle-shaped
+trees and the price of one shared predicate.
 
 (c) Doc updates in this file: the tree/module doc at `:13-22` (add an
 `XPCServices/ └── *.xpc/` example under the tree if the doc shows a
@@ -785,20 +901,26 @@ inside nested-code bundle directories").
 (a) Delete `is_bundle_dir` (`:143-152`). At `:456`, replace with
 `crate::bundle::is_nested_bundle_dir(p)`.
 
-(b) Change `has_nested_bundle_component` (`:157-165)` to evaluate the
-predicate on cumulative full paths:
+(b) Change `has_nested_bundle_component` (`:157-165`) to evaluate the
+predicate on cumulative full paths. **The base path is `dir`, not `root`**:
+`rel` is computed as `p.strip_prefix(dir)` at `verify.rs:452`, so only
+`dir.join(prefix)` names an existing path — below depth 0
+(`dir != root`, e.g. when recursing into a nested bundle at `:541-542`)
+`root.join(rel)` would not exist on disk, the markers read would fail
+closed, and the new location/package-type arms would silently disable
+themselves while the extension arm kept the scoped gates green:
 
 ```rust
-/// True when any ancestor component of `rel` (below `root`) names a
-/// nested-code bundle directory. With `ignore_last` the final component is
-/// exempt, which lets a directory entry itself be the bundle while its
-/// ancestors must not be.
-fn has_nested_bundle_component(root: &Path, rel: &Path, ignore_last: bool) -> bool {
+/// True when any ancestor component of `rel` (relative to the bundle dir
+/// `dir` currently being verified) names a nested-code bundle directory.
+/// With `ignore_last` the final component is exempt, which lets a
+/// directory entry itself be the bundle while its ancestors must not be.
+fn has_nested_bundle_component(dir: &Path, rel: &Path, ignore_last: bool) -> bool {
     let mut components: Vec<_> = rel.components().collect();
     if ignore_last {
         components.pop();
     }
-    let mut prefix = root.to_path_buf();
+    let mut prefix = dir.to_path_buf();
     components
         .iter()
         .any(|c| {
@@ -812,7 +934,7 @@ Note: `prefix.push` inside `any` accumulates across iterations (each
 component extends the previous prefix) — that is the intended
 cumulative-prefix evaluation; do not reset `prefix` per iteration.
 
-(c) Update both call sites (`:456`, `:466`) to pass `root` as the first
+(c) Update both call sites (`:456`, `:466`) to pass `dir` as the first
 argument (both sit inside `verify_bundle_dir(root, dir, rel)`, which has
 it). If either call site constructs `rel` differently, re-read the
 surrounding walk code (`:416-543`) before editing.
@@ -879,9 +1001,21 @@ orchestrator lands the branch with `wt merge --no-squash`.
 
 | Ticket acceptance | Proof |
 |---|---|
-| 1. MH_DYLIB asserts neither slot −5 nor an entitlements blob; still verifies via the existing verify path; new MH_DYLIB round-trip | `test_non_executable_signing_carries_no_entitlements` — four entries × (no `0x0005`/`0x0007` child, unbound −5, `verify_macho` valid) |
-| 2. `Frameworks/*.dylib` under a root `.app` signed once, identifier stable, main-app entitlements never applied, ipa sign→verify passes | `test_standalone_dylib_signed_exactly_once` — identifier `libfoo`, surviving dual CD (`0x1000`) as the signed-once discriminator, no `0x0005`, `verify_bundle` valid; discovery seam locked by the migrated `test_symlinked_dylib_is_skipped_and_target_untouched` |
-| 3. XPC-service-shaped fixture discovered and signed with bundle relationship intact; extension whitelist no longer the sole predicate | `test_xpc_service_is_discovered_and_signed_as_nested_bundle` — `.xpc` ∉ whitelist yet collected at depth 1, own `_CodeSignature/CodeResources`, bundle-id identifier, Info.plist slot −1 bound, no entitlements, verifier recognizes the same bundle (`nested[0].path`) |
+| 1. MH_DYLIB asserts neither slot −5 nor an entitlements blob; still verifies via the existing verify path; new MH_DYLIB round-trip | `test_non_executable_signing_carries_no_entitlements` — four entries × (no `0x0005`/`0x0007` child, unbound −5); strict `verify_macho().is_valid()` on the adhoc entry (adhoc output is not certificate-gated); the three identity-signed entries dual-pinned to exactly one credential-gate error (`macho/verify.rs:952-965` pattern) |
+| 2. `Frameworks/*.dylib` under a root `.app` signed once, identifier stable, main-app entitlements never applied, ipa sign→verify passes | `test_standalone_dylib_signed_exactly_once` — identifier `libfoo`, surviving dual CD (`0x1000`) as the signed-once discriminator, no `0x0005`, `verify_bundle` dual-pin (bundle errors empty + CodeResources valid + every binary's only failure the fixture credential gate — the `verify.rs:1105-1127` pattern); discovery seam locked by the migrated `test_symlinked_dylib_is_skipped_and_target_untouched` |
+| 3. XPC-service-shaped fixture discovered and signed with bundle relationship intact; extension whitelist no longer the sole predicate | `test_xpc_service_is_discovered_and_signed_as_nested_bundle` — `.xpc` ∉ whitelist yet collected at depth 1, own `_CodeSignature/CodeResources`, bundle-id identifier, Info.plist slot −1 bound, no entitlements, verifier recognizes the same bundle (`nested[0].path`), adhoc strict `verify_bundle().valid()` |
+
+Empirical pre-verification (throwaway probe, run during the amend cycle and
+deleted; no repo footprint): (a) an adhoc-signed folder bundle incl. a
+nested `.framework` reaches `verify_bundle().valid() == true`; (b) an
+adhoc-signed dylib with no entitlements slot reaches
+`verify_macho().is_valid() == true` with zero errors; (c) a
+credentialed-signer dylib today has no `0x1000` alternate CD (the Task 2
+red is real) and its verify errors collapse to exactly
+`["leaf lacks codeSigning EKU extension"]`; (d) a credentialed folder
+bundle yields empty bundle errors, `cr.valid()`, and one credential-gate
+error per binary (CMS signature/digest/cdhash checks true, chain/anchoring
+false).
 
 Known coverage limit (recorded): no provisioning-profile fixture exists in
 this workspace, so the item-2 test runs with `entitlements = None` on both
