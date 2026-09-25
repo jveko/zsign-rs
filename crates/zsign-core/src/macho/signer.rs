@@ -470,6 +470,7 @@ fn sign_slice_complete(
                 slice_data,
                 &slice.metadata,
                 slice.code_length,
+                estimated_sig_size,
             )?;
 
             let new_slice = ArchSlice {
@@ -604,6 +605,7 @@ fn sign_slice_complete(
                     slice_data,
                     &slice.metadata,
                     slice.code_length,
+                    padded_sig_size,
                 )?;
                 let new_slice = ArchSlice {
                     offset: slice.offset,
@@ -1279,6 +1281,54 @@ mod tests {
         assert_eq!(macho.slices()[0].text_segment_size, 0x1000);
         assert_eq!(macho.slices()[0].text_segment_base, 0x1_0000_0000);
         assert_eq!(macho.code_bytes(&macho.slices()[0]).len(), 0x2000);
+    }
+
+    #[test]
+    fn test_sign_with_large_entitlements_fits_reserve() {
+        // A ~20 KiB entitlements plist pushes the signer's own tight estimate
+        // past the writer's formula reserve, so the expansion must be sized from
+        // the estimate the signer actually hands to prepare. Re-signing the
+        // output covers the window where the declared reserve is already there.
+        let mut ent = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n",
+        );
+        for i in 0..400 {
+            ent.push_str(&format!(
+                "<key>com.example.pad{i}</key><string>{}</string>\n",
+                "x".repeat(30)
+            ));
+        }
+        ent.push_str("</dict>\n</plist>\n");
+        assert!(
+            ent.len() > 16_000,
+            "fixture must exceed the formula reserve headroom: {}",
+            ent.len()
+        );
+
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let creds = test_credentials();
+        let first = sign_macho(
+            &macho,
+            "com.zsign.bigents",
+            Some(ent.as_bytes()),
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .expect("tight-heavy estimate must be covered by realloc");
+
+        let m = MachOFile::parse(first.clone()).expect("signed output must reparse");
+        sign_macho(
+            &m,
+            "com.zsign.bigents",
+            Some(ent.as_bytes()),
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .expect("re-sign of the signed output must succeed with the reserve flowing into realloc");
     }
 
     #[test]

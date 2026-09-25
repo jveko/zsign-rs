@@ -1150,6 +1150,11 @@ use super::parser::MachOMetadata;
 
 /// Expands a Mach-O binary to accommodate a code signature using cached metadata.
 ///
+/// The buffer is always expanded to also cover `estimated_signature_size` bytes
+/// of signature reserve at the 16-aligned signature offset — the signer's size
+/// estimate, or the padded size on a retry — in addition to the space computed
+/// from the code-signature-space formula and any already-declared reserve.
+///
 /// Returns the expanded binary and updated metadata reflecting any changes made
 /// (e.g., new LC_CODE_SIGNATURE command or updated __LINKEDIT).
 ///
@@ -1159,10 +1164,12 @@ use super::parser::MachOMetadata;
 /// - The binary is 32-bit (not supported)
 /// - No `__LINKEDIT` segment exists
 /// - No space for `LC_CODE_SIGNATURE` in load commands area
+/// - The signature reserve end overflows `usize`
 pub fn realloc_code_sign_space_with_metadata(
     data: &[u8],
     metadata: &MachOMetadata,
     code_length: usize,
+    estimated_signature_size: usize,
 ) -> Result<(Vec<u8>, MachOMetadata)> {
     if !metadata.is_64 {
         return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
@@ -1186,7 +1193,12 @@ pub fn realloc_code_sign_space_with_metadata(
         Some((lc_offset, _, _)) => declared_signature_end(data, lc_offset, is_big_endian)?,
         None => None,
     };
-    let required = declared_end.map_or(formula_end, |end| end.max(formula_end));
+    let reserve_end = sig_offset
+        .checked_add(estimated_signature_size)
+        .ok_or_else(|| Error::MachO("signature reserve end overflow".into()))?;
+    let required = declared_end
+        .map_or(formula_end, |end| end.max(formula_end))
+        .max(reserve_end);
     if required <= data.len() {
         return Ok((data.to_vec(), metadata.clone()));
     }
@@ -1833,7 +1845,12 @@ mod tests {
         let data = crate::macho::fixtures::make_text_fileoff0_macho(true);
         let macho = crate::macho::MachOFile::parse(data.clone()).expect("fixture must parse");
         let meta = macho.slices()[0].metadata.clone();
-        let result = realloc_code_sign_space_with_metadata(&data, &meta, data.len());
+        let result = realloc_code_sign_space_with_metadata(
+            &data,
+            &meta,
+            data.len(),
+            calculate_signature_space(data.len()) - data.len(),
+        );
         let err = match result {
             Err(err) => err,
             Ok(_) => panic!("adding LC_CODE_SIGNATURE into an 8-byte gap must be refused"),
@@ -1997,14 +2014,66 @@ mod tests {
             is_big_endian: false,
             is_64: true,
         };
-        let (out, meta) = realloc_code_sign_space_with_metadata(&data, &metadata, 0x3000)
-            .expect("expansion must succeed");
+        let (out, meta) = realloc_code_sign_space_with_metadata(
+            &data,
+            &metadata,
+            0x3000,
+            calculate_signature_space(0x3000) - 0x3000,
+        )
+        .expect("expansion must succeed");
         let (_, dataoff, datasize) = meta.code_sig_cmd.expect("metadata echoes the command");
         assert!(
             (dataoff as usize) + (datasize as usize) <= out.len(),
             "declared range {dataoff:#x}+{datasize:#x} must fit in {:#x}-byte output",
             out.len()
         );
+    }
+
+    #[test]
+    fn test_realloc_expands_to_cover_caller_reserve() {
+        // A caller whose estimate is tighter than the formula's own reserve needs
+        // that larger reserve reflected in the output length; prepare's capacity
+        // guard then accepts the same reserve against the expanded buffer.
+        let data = make_minimal_macho();
+        let macho = crate::macho::MachOFile::parse(data.clone()).expect("fixture must parse");
+        let meta = macho.slices()[0].metadata.clone();
+        let code_length = data.len();
+        let formula_reserve = calculate_signature_space(code_length) - code_length;
+        let reserve = formula_reserve + 0x1000;
+
+        let (out, out_meta) =
+            realloc_code_sign_space_with_metadata(&data, &meta, code_length, reserve)
+                .expect("realloc must honor a caller reserve larger than its formula");
+
+        let sig_offset = align_to(code_length, 16);
+        assert!(
+            out.len() >= sig_offset + reserve,
+            "expanded buffer must cover sig_offset + reserve: len={:#x} need={:#x}",
+            out.len(),
+            sig_offset + reserve
+        );
+        let mut buf = out;
+        prepare_code_in_place(&mut buf, &out_meta, code_length, reserve)
+            .expect("prepare with the same reserve must fit after realloc");
+    }
+
+    #[test]
+    fn test_realloc_reserve_smaller_than_prepare_reserve_fails_cleanly() {
+        // Genuinely too-small reserve: realloc grows for R, but prepare declaring
+        // a larger reserve must still be refused by the capacity guard rather
+        // than writing a signature range past the end of the buffer.
+        let data = make_minimal_macho();
+        let macho = crate::macho::MachOFile::parse(data.clone()).expect("fixture must parse");
+        let meta = macho.slices()[0].metadata.clone();
+        let code_length = data.len();
+
+        let (out, out_meta) =
+            realloc_code_sign_space_with_metadata(&data, &meta, code_length, 0x100)
+                .expect("small-but-valid realloc call succeeds");
+        let mut buf = out;
+        let err = prepare_code_in_place(&mut buf, &out_meta, code_length, 0x8000)
+            .expect_err("reserve genuinely too small for prepare must stay a clean Err");
+        assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
     #[test]
@@ -2121,8 +2190,13 @@ mod tests {
             is_64: true,
         };
         // metadata variant
-        let (out, meta) = realloc_code_sign_space_with_metadata(&data, &metadata, 0x2001)
-            .expect("expansion must succeed");
+        let (out, meta) = realloc_code_sign_space_with_metadata(
+            &data,
+            &metadata,
+            0x2001,
+            calculate_signature_space(0x2001) - 0x2001,
+        )
+        .expect("expansion must succeed");
         let (_, dataoff, datasize) = meta.code_sig_cmd.expect("metadata echoes the command");
         assert_eq!(
             dataoff % 16,
