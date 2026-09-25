@@ -616,6 +616,74 @@ const TAG_CTX1: Tag = Tag::ContextSpecific {
     number: TagNumber::new(1),
 };
 
+/// Reads one definite-length TLV (tag byte, body, bytes consumed).
+/// `normalize_ber_lengths` has already rewritten indefinite lengths, so only
+/// short and long definite forms appear here.
+fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let tag = *bytes
+        .first()
+        .ok_or_else(|| Error::Verification("TLV stream is empty".into()))?;
+    let len0 = *bytes
+        .get(1)
+        .ok_or_else(|| Error::Verification("truncated TLV length".into()))?;
+    let (len, header) = if len0 < 0x80 {
+        (len0 as usize, 2)
+    } else {
+        let n = (len0 & 0x7F) as usize;
+        if n == 0 || n > 8 {
+            return Err(Error::Verification("unsupported TLV length form".into()));
+        }
+        let lb = bytes
+            .get(2..2 + n)
+            .ok_or_else(|| Error::Verification("truncated TLV length".into()))?;
+        let mut len = 0usize;
+        for b in lb {
+            len = (len << 8) | *b as usize;
+        }
+        (len, 2 + n)
+    };
+    let end = header
+        .checked_add(len)
+        .ok_or_else(|| Error::Verification("TLV length overflows the stream".into()))?;
+    let body = bytes
+        .get(header..end)
+        .ok_or_else(|| Error::Verification("truncated TLV body".into()))?;
+    Ok((tag, body, end))
+}
+
+/// Decodes one `0x04` primitive or `0x24` constructed OCTET STRING TLV into
+/// its value bytes. A constructed body is consecutive primitive segments
+/// (BER 8.7); anything else is rejected.
+fn decode_octet_string_stream(bytes: &[u8]) -> Result<Vec<u8>> {
+    let (tag, body, used) = read_tlv(bytes)?;
+    if used != bytes.len() {
+        return Err(Error::Verification(
+            "trailing data after the OCTET STRING TLV".into(),
+        ));
+    }
+    match tag {
+        0x04 => Ok(body.to_vec()),
+        0x24 => {
+            let mut out = Vec::new();
+            let mut rest = body;
+            while !rest.is_empty() {
+                let (seg_tag, seg_body, used) = read_tlv(rest)?;
+                if seg_tag != 0x04 {
+                    return Err(Error::Verification(
+                        "constructed eContent contains a non-OCTET STRING segment".into(),
+                    ));
+                }
+                out.extend_from_slice(seg_body);
+                rest = &rest[used..];
+            }
+            Ok(out)
+        }
+        other => Err(Error::Verification(format!(
+            "eContent is not an OCTET STRING (tag 0x{other:02x})"
+        ))),
+    }
+}
+
 fn verify_signed_data(
     cms: &[u8],
     content: Option<&[u8]>,
@@ -686,32 +754,29 @@ fn verify_signed_data(
     // Optional [0] EXPLICIT eContent { OCTET STRING }; detached signatures omit it.
     let mut econtent: Option<Vec<u8>> = None;
     if !encap_r.is_finished() {
-        let ec = AnyRef::decode(&mut encap_r)
-            .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
-        if ec.tag() != TAG_CTX0 {
-            return Err(Error::Verification(format!(
-                "eContent is not in [0] EXPLICIT wrapper (tag {:?})",
-                ec.tag()
-            )));
-        }
-        let mut ecr = reader(ec.value(), "malformed eContent wrapper")?;
-        if !ecr.is_finished() {
-            let inner = AnyRef::decode(&mut ecr)
-                .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
-            if inner.tag() != Tag::OctetString {
-                return Err(Error::Verification(
-                    "attached eContent is not an OCTET STRING".into(),
-                ));
+        match mode {
+            SignedDataMode::CodeSignature { .. } => {
+                // Code signatures never consume eContent: keep the pre-patch
+                // tolerant skip so an odd encoding can never hard-fail a path
+                // whose digest target is the caller-supplied content.
+                let _ = AnyRef::decode(&mut encap_r);
             }
-            if !ecr.is_finished() {
-                return Err(Error::Verification(
-                    "eContent wrapper has trailing data after the OCTET STRING".into(),
-                ));
+            SignedDataMode::AttachedProfile => {
+                let ec = AnyRef::decode(&mut encap_r)
+                    .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
+                if ec.tag() != TAG_CTX0 {
+                    return Err(Error::Verification(format!(
+                        "eContent is not in [0] EXPLICIT wrapper (tag {:?})",
+                        ec.tag()
+                    )));
+                }
+                if !ec.value().is_empty() {
+                    econtent = Some(decode_octet_string_stream(ec.value())?);
+                }
             }
-            econtent = Some(inner.value().to_vec());
         }
     }
-    if !encap_r.is_finished() {
+    if matches!(mode, SignedDataMode::AttachedProfile) && !encap_r.is_finished() {
         return Err(Error::Verification(
             "encapContentInfo has trailing fields after eContent".into(),
         ));
@@ -3459,6 +3524,123 @@ mod tests {
                 .any(|e| e.contains("outside validity")),
             "errors: {:?}",
             after.report.errors
+        );
+    }
+
+    // ---- final-review fix: constructed eContent tolerance ----
+
+    /// Hand-built ContentInfo whose encapContentInfo carries a BER constructed
+    /// OCTET STRING (tag 0x24, two primitive segments) and an empty
+    /// signerInfos set — structurally well-formed, cryptographically empty.
+    fn hand_built_constructed_econtent_cms() -> Vec<u8> {
+        let id_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+        let id_signed_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+        let seg1 = der_tlv(0x04, b"part1");
+        let seg2 = der_tlv(0x04, b"part2");
+        let constructed = der_tlv(0x24, &[seg1, seg2].concat());
+        let econtent = der_tlv(0xA0, &constructed);
+        let encap = der_tlv(0x30, &[der_tlv(0x06, &id_data), econtent].concat());
+        let signed_data = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0x01]),
+                der_tlv(0x31, &[]),
+                encap,
+                der_tlv(0x31, &[]),
+            ]
+            .concat(),
+        );
+        der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_signed_data), der_tlv(0xA0, &signed_data)].concat(),
+        )
+    }
+
+    #[test]
+    fn code_signature_entry_tolerates_unparseable_econtent() {
+        // Pre-patch behavior: the wrapper was skipped unread, so an odd
+        // eContent could never turn an integrity outcome into a hard error.
+        let cms = hand_built_constructed_econtent_cms();
+        let wrapped = wrap(&cms);
+        let content: &[u8] = b"caller-supplied code directory";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let anchors = anchors_for(&rsa_credentials().0);
+        let report =
+            verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors)
+                .expect("code-signature entry must stay report-based for odd eContent");
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("no SignerInfo present")),
+            "errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn attached_entry_flattens_constructed_econtent_segments() {
+        let cms = hand_built_constructed_econtent_cms();
+        let anchors = anchors_for(&rsa_credentials().0);
+        let out = verify_cms_envelope_with_anchors(&cms, Some(at(T_2026_APR)), &anchors)
+            .expect("attached entry parses constructed eContent via segment flattening");
+        assert!(!out.report.valid);
+        assert_eq!(out.content.as_deref(), Some(&b"part1part2"[..]));
+    }
+
+    #[test]
+    fn attached_entry_rejects_trailing_encap_fields() {
+        // A field after eContent inside the encapContentInfo SEQUENCE must be
+        // a hard error on the attached entry (entry-level pin of the guard).
+        let id_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+        let id_signed_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+        let econtent = der_tlv(0xA0, &der_tlv(0x04, b"payload"));
+        let encap = der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_data), econtent, der_tlv(0x05, &[])].concat(),
+        );
+        let signed_data = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0x01]),
+                der_tlv(0x31, &[]),
+                encap,
+                der_tlv(0x31, &[]),
+            ]
+            .concat(),
+        );
+        let cms = der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_signed_data), der_tlv(0xA0, &signed_data)].concat(),
+        );
+
+        let anchors = anchors_for(&rsa_credentials().0);
+        let err =
+            verify_cms_envelope_with_anchors(&cms, Some(at(T_2026_APR)), &anchors).unwrap_err();
+        assert!(
+            err.to_string().contains("trailing fields after eContent"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn octet_stream_rejects_trailing_data() {
+        let mut bytes = der_tlv(0x04, b"head");
+        bytes.extend_from_slice(&der_tlv(0x05, &[])); // stray NULL after the TLV
+        assert!(decode_octet_string_stream(&bytes).is_err());
+    }
+
+    #[test]
+    fn constructed_octet_stream_rejects_non_octet_segments() {
+        // A constructed body containing a non-0x04 segment is malformed.
+        let bad = der_tlv(0x24, &der_tlv(0x02, &[0x01]));
+        assert!(decode_octet_string_stream(&bad).is_err());
+        // Primitive single TLV decodes to its value.
+        assert_eq!(
+            decode_octet_string_stream(&der_tlv(0x04, b"plain")).unwrap(),
+            b"plain"
         );
     }
 }
