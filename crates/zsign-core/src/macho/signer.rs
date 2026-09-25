@@ -401,6 +401,10 @@ pub fn sign_macho_all_slices(
 ///
 /// `sha256_only` selects whether each slice gets a SHA-256-only code
 /// directory (no SHA-1 slot) or the default SHA-1 + SHA-256 set.
+// Mirrors the frozen 7-argument public sibling plus the sha256_only mode
+// flag; a wrapper struct for a private two-caller helper would add
+// indirection without shrinking the public surface.
+#[allow(clippy::too_many_arguments)]
 fn sign_all_slices_impl(
     macho: &MachOFile,
     identifier: &str,
@@ -1111,8 +1115,8 @@ mod tests {
                 let typ = read_u32(blob, 12 + i * 8);
                 let eoff = read_u32(blob, 16 + i * 8) as usize;
                 let is_cd_slot = typ == CSSLOT_CODEDIRECTORY
-                    || (typ >= CSSLOT_ALTERNATE_CODEDIRECTORIES
-                        && typ < CSSLOT_ALTERNATE_CODEDIRECTORIES + 5);
+                    || (CSSLOT_ALTERNATE_CODEDIRECTORIES..CSSLOT_ALTERNATE_CODEDIRECTORIES + 5)
+                        .contains(&typ);
                 if !is_cd_slot {
                     continue;
                 }
@@ -1175,7 +1179,7 @@ mod tests {
         // Bytes past the last file-backed segment, inside the declared
         // fat_arch size: the signature must start after them, and they must
         // survive verbatim in the signed output.
-        a.extend(std::iter::repeat(0xAB).take(0x400));
+        a.extend(std::iter::repeat_n(0xAB, 0x400));
         let mut b = make_minimal_macho();
         b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed
         let fat = make_fat_macho(&[a, b], &[12, 12]);

@@ -797,7 +797,7 @@ mod tests {
         let declared = a.len() + 0x400;
         // Trailing bytes past the last file-backed segment, still inside the
         // arch's declared fat_arch size: they are code and must be hashed.
-        a.extend(std::iter::repeat(0xAB).take(0x400));
+        a.extend(std::iter::repeat_n(0xAB, 0x400));
         let fat = make_fat_macho(&[a, make_minimal_macho()], &[12, 12]);
         let macho = MachOFile::parse(fat).expect("fixture must parse");
         let slice = &macho.slices()[0];
