@@ -540,20 +540,14 @@ pub enum SpecialSlotCheck {
     Missing,
 }
 
-/// Verifies the CodeDirectory's special-slot hashes.
-///
-/// `hash_requirements`/`hash_entitlements`/`hash_der_entitlements` are the
-/// blob bytes hashed into slots −2/−5/−7; they are taken from the SuperBlob
-/// (the blob is self-hashed). `info_plist`/`code_resources` come from
-/// [`SignatureInputs`].
+/// Verifies the CodeDirectory's special-slot hashes against caller inputs and
+/// SuperBlob children.
 ///
 /// Returns one entry per special slot, ordered −1 downward (index 0 = −1).
 pub fn check_special_slots(
     cd: &CodeDirectory<'_>,
     inputs: &SignatureInputs<'_>,
-    hash_requirements: Option<&[u8]>,
-    hash_entitlements: Option<&[u8]>,
-    hash_der_entitlements: Option<&[u8]>,
+    superblob: &SuperBlob<'_>,
 ) -> Vec<SpecialSlotCheck> {
     let n = cd.n_special_slots as usize;
     let mut out = Vec::with_capacity(n);
@@ -566,17 +560,24 @@ pub fn check_special_slots(
             out.push(SpecialSlotCheck::Missing);
             continue;
         }
-        // map k -> slot -k content
+        let slot_child = |slot: u32| {
+            superblob
+                .entries
+                .iter()
+                .find(|e| e.slot == slot)
+                .map(|e| e.blob)
+        };
         let content: Option<&[u8]> = match k {
             1 => inputs.info_plist,
-            2 => hash_requirements,
             3 => inputs.code_resources,
-            // -4 application slot: content unavailable at the Mach-O level
-            4 => None,
-            5 => hash_entitlements,
-            // -6 rep-specific: unavailable
-            6 => None,
-            7 => hash_der_entitlements,
+            2 => slot_child(CSSLOT_REQUIREMENTS),
+            5 => slot_child(CSSLOT_ENTITLEMENTS),
+            7 => slot_child(CSSLOT_DER_ENTITLEMENTS),
+            8 => slot_child(CSSLOT_LAUNCH_CONSTRAINT_SELF),
+            9 => slot_child(CSSLOT_LAUNCH_CONSTRAINT_PARENT),
+            10 => slot_child(CSSLOT_LAUNCH_CONSTRAINT_RESPONSIBLE),
+            11 => slot_child(CSSLOT_LIBRARY_CONSTRAINT),
+            4 | 6 => None,
             _ => None,
         };
         let Some(content) = content else {
@@ -594,32 +595,6 @@ pub fn check_special_slots(
         });
     }
     out
-}
-
-/// Verify that the requirements/entitlements/der-entitlements blobs in the
-/// SuperBlob hash to the corresponding special slots. Returns the blob bytes
-/// for use by the CMS/attribute checks.
-/// The requirements, XML-entitlements, and DER-entitlements blobs of a
-/// SuperBlob (each bounded to its own length header).
-pub type SlotBlobs<'a> = (Option<&'a [u8]>, Option<&'a [u8]>, Option<&'a [u8]>);
-
-pub fn self_consistent_blobs<'a>(
-    superblob: &SuperBlob<'a>,
-    cd: &CodeDirectory<'_>,
-) -> SlotBlobs<'a> {
-    let mut requirements = None;
-    let mut entitlements = None;
-    let mut der_entitlements = None;
-    for entry in &superblob.entries {
-        match entry.slot {
-            CSSLOT_REQUIREMENTS => requirements = Some(entry.blob),
-            CSSLOT_ENTITLEMENTS => entitlements = Some(entry.blob),
-            CSSLOT_DER_ENTITLEMENTS => der_entitlements = Some(entry.blob),
-            _ => {}
-        }
-    }
-    let _ = cd;
-    (requirements, entitlements, der_entitlements)
 }
 
 const DER_ENTRIES_CONTAINERS: [u8; 5] = [0xb0, 0x31, 0x30, 0x60, 0xa0];
@@ -1112,5 +1087,52 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_superblob(&[0u8; 64]).is_err());
         assert!(CodeDirectory::parse(&[0u8; 64]).is_err());
+    }
+
+    fn synth_cd_with_slot8(child: &[u8]) -> Vec<u8> {
+        // 0x20400 layout: 88-byte header + ident + 8 special slots + 0 code slots.
+        let ident = b"com.example.lc\0";
+        let n_special = 8usize;
+        let hash_size = 32usize;
+        let hash_offset = 88 + ident.len() + n_special * hash_size;
+        let mut cd = vec![0u8; hash_offset];
+        cd[0..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+        cd[4..8].copy_from_slice(&(hash_offset as u32).to_be_bytes());
+        cd[8..12].copy_from_slice(&CODEDIRECTORY_VERSION.to_be_bytes());
+        cd[16..20].copy_from_slice(&(hash_offset as u32).to_be_bytes()); // hashOffset
+        cd[20..24].copy_from_slice(&88u32.to_be_bytes()); // identOffset
+        cd[24..28].copy_from_slice(&(n_special as u32).to_be_bytes());
+        cd[36] = hash_size as u8;
+        cd[37] = CS_HASHTYPE_SHA256;
+        cd[39] = 12; // pageSize log2
+        cd[88..88 + ident.len()].copy_from_slice(ident);
+        let digest = Sha256::digest(child);
+        cd[hash_offset - 8 * hash_size..hash_offset - 7 * hash_size].copy_from_slice(&digest);
+        cd
+    }
+
+    #[test]
+    fn launch_constraint_content_comes_from_superblob_slot_8() {
+        let child: Vec<u8> = [
+            0xfade8181u32.to_be_bytes(), // CSMAGIC_LAUNCH_CONSTRAINT
+            12u32.to_be_bytes(),
+            [0u8; 4],
+        ]
+        .concat();
+        let cd_bytes = synth_cd_with_slot8(&child);
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(cd.n_special_slots, 8);
+
+        let total = (12 + 8 + child.len()) as u32;
+        let mut sb = synth_superblob(total, &[(CSSLOT_LAUNCH_CONSTRAINT_SELF, 20)]);
+        sb[20..20 + child.len()].copy_from_slice(&child);
+        let parsed = parse_superblob(&sb).expect("slot 0x0008 child parses");
+        let checks = check_special_slots(&cd, &SignatureInputs::none(), &parsed);
+        assert_eq!(checks[7], SpecialSlotCheck::Matched); // k=8 verified against 0x0008
+
+        let empty = synth_superblob(20, &[]);
+        let parsed_empty = parse_superblob(&empty).unwrap();
+        let checks2 = check_special_slots(&cd, &SignatureInputs::none(), &parsed_empty);
+        assert_eq!(checks2[7], SpecialSlotCheck::NotChecked);
     }
 }

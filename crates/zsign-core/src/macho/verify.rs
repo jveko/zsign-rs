@@ -10,7 +10,7 @@
 use crate::codesign::constants::*;
 use crate::codesign::verify::{
     check_code_pages, check_special_slots, der_entitlements_to_plist, parse_superblob,
-    self_consistent_blobs, CodeDirectory, PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
+    CodeDirectory, PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
 };
 use crate::Result;
 use sha1::Sha1;
@@ -197,8 +197,7 @@ fn verify_slice(
     let mut pairs: Vec<(String, Vec<SpecialSlotCheck>)> = Vec::with_capacity(cds.len());
     let mut strongest_slots = None;
     for cd in &cds {
-        let (req_blob, ent_blob, der_blob) = self_consistent_blobs(&superblob, cd);
-        let checks = check_special_slots(cd, inputs, req_blob, ent_blob, der_blob);
+        let checks = check_special_slots(cd, inputs, &superblob);
         let is_primary = std::ptr::eq(*cd, primary);
         if std::ptr::eq(*cd, strongest) {
             strongest_slots = Some(checks.clone());
@@ -931,8 +930,7 @@ mod tests {
                 CSSLOT_ALTERNATE_CODEDIRECTORIES,
             )
             .unwrap();
-        // Corrupt the child's hashType (byte 37) — the magic at [0..4) stays intact so
-        // task 4's slot-magic table does not change this assertion's message.
+        // Corrupt the child's hashType (byte 37) while preserving its magic.
         signed[cd + 37] = 0x07;
         // Pre-fix: the parse failure is silently dropped and this binary verifies.
         let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
@@ -1120,6 +1118,32 @@ mod tests {
             report.slices[0].errors.iter().any(|e| e.contains(
                 "XML entitlements bound (slot -5) without bound DER entitlements (slot -7)"
             )),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+    #[test]
+    fn bound_launch_constraint_without_blob_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.lc", Some(ENT_PLIST), None, None, false).unwrap();
+        // Grow the special-slot window 7 -> 8 on the primary CD. The new -8 region
+        // [hashOffset-160, hashOffset-140) overlaps exec-seg header/ident bytes, which
+        // are deterministically nonzero for this fixture => stored hash "bound";
+        // no 0x0008 child exists => content unavailable => elevation must fire.
+        let cd = child_off_in_signed(&signed, CSSLOT_CODEDIRECTORY);
+        let n_special = u32::from_be_bytes(signed[cd + 24..cd + 28].try_into().unwrap());
+        assert_eq!(
+            n_special, 7,
+            "fixture precondition: main + entitlements binds 7 slots"
+        );
+        signed[cd + 24..cd + 28].copy_from_slice(&8u32.to_be_bytes());
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("special slot -8 is bound but its content was not supplied")),
             "errors: {:?}",
             report.slices[0].errors
         );
