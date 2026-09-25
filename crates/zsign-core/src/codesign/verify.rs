@@ -1941,6 +1941,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_code_region_reports_empty() {
+        // The Empty verdict is matched by the out-of-scope slice verifier
+        // (macho/verify.rs push_page_errors); pin it so reordering the
+        // stored-length guard ahead of the Empty return cannot pass silently.
+        let cd_bytes = CodeDirectoryBuilder::new("com.example.empty", b"").build_sha256();
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(check_code_pages(&cd, b""), PageCheck::Empty);
+    }
+
+    #[test]
     fn special_slot_hash_is_panic_free_on_inconsistent_header() {
         let cd_bytes = CodeDirectoryBuilder::new("com.example.bound", &[0x11u8; 4096])
             .requirements_hash(vec![0xcd; 32])

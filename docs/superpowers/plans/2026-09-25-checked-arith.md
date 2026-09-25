@@ -527,7 +527,7 @@ for slot in &slots[start..] {
 }
 ```
 
-Notes (review round 1): the always-present `-6`/`-4` placeholder slots are pushed as `&empty` where `empty = vec![0u8; hash_size]` — correctly sized, they pass. The assert is a **hard panic on the public builder API** for any caller that mixes hash sizes (documented trusted-path contract, same class as `panic!("Unsupported hash type")` at `:589`); `build_special_slots` itself is a private method (`fn`, `code_directory.rs:545`), so out-of-scope files can only reach it through `build_sha1/256(_from_hashes)`. The sole production caller, `macho/signer.rs:793-843`, selects algorithm-matched digests via `is_sha1` from `DualHash { sha1, sha256 }` (`:852-874`), so no in-repo signing flow trips it.
+Notes (review round 1): the always-present `-6`/`-4` placeholder slots are pushed as `&empty` where `empty = vec![0u8; hash_size]` — correctly sized, they pass. The assert is a **hard panic on the public builder API** for any caller that mixes hash sizes (documented trusted-path contract, same class as `panic!("Unsupported hash type")` at `:591`); `build_special_slots` itself is a private method (`fn`, `code_directory.rs:545`), so out-of-scope files can only reach it through `build_sha1/256(_from_hashes)`. The sole production caller, `macho/signer.rs:793-843`, selects algorithm-matched digests via `is_sha1` from `DualHash { sha1, sha256 }` (`:852-874`), so no in-repo signing flow trips it.
 
 - [ ] **Step 6: Run scoped gate (debug + release evidence)**
 

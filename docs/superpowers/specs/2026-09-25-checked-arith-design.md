@@ -59,7 +59,7 @@ Line numbers are re-anchored to the current tree (the old review's numbers drift
 
 ### (e) superblob u32 narrowings
 
-- **E1 — checked narrowing helper with release-active panic (CHOSEN).** `pub(crate) fn u32_len(value: usize, what: &str) -> u32` in `code_directory.rs` (imported by `superblob.rs` via `super::code_directory::u32_len`) — `u32::try_from(value).unwrap_or_else(|_| panic!("{what} length {value} exceeds u32::MAX"))` — plus `checked_mul`/`checked_add` on the u32 arithmetic (`count * 8`, `current_offset += …`), applied at every `as u32` listed in audit (e). Panic only fires for inputs ≥4 GiB — unreachable through the crate's enforced limits (Mach-O ≤512 MiB, plists ≤16 MiB), and when reached (direct public-API misuse) a loud failure beats emitting a self-inconsistent blob that the hardened reader will later reject. In-repo precedent for trusted-path builder panics: `code_directory.rs:589` `panic!("Unsupported hash type")`.
+- **E1 — checked narrowing helper with release-active panic (CHOSEN).** `pub(crate) fn u32_len(value: usize, what: &str) -> u32` in `code_directory.rs` (imported by `superblob.rs` via `super::code_directory::u32_len`) — `u32::try_from(value).unwrap_or_else(|_| panic!("{what} length {value} exceeds u32::MAX"))` — plus `checked_mul`/`checked_add` on the u32 arithmetic (`count * 8`, `current_offset += …`), applied at every `as u32` listed in audit (e). Panic only fires for inputs ≥4 GiB — unreachable through the crate's enforced limits (Mach-O ≤512 MiB, plists ≤16 MiB), and when reached (direct public-API misuse) a loud failure beats emitting a self-inconsistent blob that the hardened reader will later reject. In-repo precedent for trusted-path builder panics: `code_directory.rs:591` `panic!("Unsupported hash type")`.
 - E2 — `build_superblob(entries) -> Result<Vec<u8>>`: rejected — breaks `macho/signer.rs:548/:658` and `codesign/mod.rs` doctest (constraint 2; out of scope).
 - E3 — saturating/clamping arithmetic: rejected — silently corrupt signature output is the exact defect class this ticket exists to remove.
 
@@ -144,7 +144,7 @@ Out-of-scope observations for other lanes: see §7.
 
 ## 7. Explicitly out of this lane (observed, documented, not fixed)
 
-- `cms_verify.rs:643-644` `len = (len << 8) | *b` inside `read_tlv` (signed-attrs TLV reader — *not* the BER normalizer region; brief: “if your fix needs non-BER changes there, STOP and report”). Silent bit-loss only on 32-bit with >4-byte lengths; the following `checked_add` + extent `get()` rejects the result. Noted for ZSN-4/possible follow-up ticket.
+- `cms_verify.rs:641` `len = (len << 8) | *b` inside `read_tlv` (signed-attrs TLV reader — *not* the BER normalizer region; brief: “if your fix needs non-BER changes there, STOP and report”. Anchor is as of base `0f07c30`; the line sits at `:651` after this lane's depth-const insert). Silent bit-loss only on 32-bit with >4-byte lengths; the following `checked_add` + extent `get()` rejects the result. Noted for ZSN-4/possible follow-up ticket.
 - `macho/verify.rs:843` `1usize << signed[cd + 39]` — ZSN-25 file, read-only per brief; test-side fixture code pinned to page size 12.
 - `macho/parser.rs:439` `start + slice.code_length` — parser territory (other lanes).
 - hash_type↔hash_size pairing check at parse (see §6) — beyond findings (a)–(i); current whitelists already fail closed.
