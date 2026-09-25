@@ -248,12 +248,16 @@ Correctness contract the demo mirrors:
   executable fails install anyway; that is "silent unsigning" with extra steps.
 - **Tradeoffs recorded:** identifiers for non-main binaries = file stem and nested main
   executables = nested `CFBundleIdentifier` (native semantics) — the UI bundle-ID field
-  rewrites the root only. Entitlements parity (FIX 13): wasm applies instance
-  entitlements to **every** `sign_macho` call, so the demo runs **two signers** — a root
-  signer `new WasmSigner(p12, password, profile)` (entitlements present; used for the
-  root bundle's main executable and immediate non-main Mach-Os, matching
-  `mod.rs:668-680`) and a nested signer `new WasmSigner(p12, password, null)`
-  (profile omitted → no entitlements, `lib.rs:59-77`; used for every nested bundle,
+  rewrites the root only. Entitlements parity: `sign_macho_fat` delegates to
+  `zsign-core`'s `sign_any_macho`, which applies the instance's entitlements to
+  **executable** slices and `EMPTY_ENTITLEMENTS` to non-executables
+  (`crates/zsign-core/src/macho/signer.rs:168-175`) — dylibs/framework binaries never
+  carry profile entitlements under either signer, so what the two-signer split actually
+  decides is the **nested main executables**: the demo runs **two signers** — a root
+  signer `new WasmSigner(p12, password, profile)` (entitlements present; the root main
+  executable is signed with them, matching the root-level flow of `mod.rs:668-680`)
+  and a nested signer `new WasmSigner(p12, password, null)`
+  (profile omitted → no entitlements, `lib.rs:238-241`; used for every nested bundle,
   matching `mod.rs:394-395`). Cost: one extra credential parse per run. This makes the
   original §6.1 cross-lane request unnecessary — see §6.
 
@@ -462,7 +466,9 @@ Single file `main.js`, keeping the existing two-phase UX (load → configure →
 - `isSymlinkEntry(entry) -> boolean` — §2.6.
 - `assertArchiveWithinLimits(entries, file)` — §2.9 guards.
 - `tryExtractBundleId/tryExtractExecutableName(plist, wasmReady)` — existing, all call
-  sites now pass the flag.
+  sites now pass the flag; while wasm is ready, `parse_info_plist` failures propagate
+  (`ZSIGN_INVALID_PLIST`) — the XML-regex fallback exists ONLY for the
+  wasm-unavailable path.
 
 ### 3.2 Sign pipeline (replaces steps 3-9 of the current `signIpa`)
 
@@ -522,7 +528,9 @@ FIRST (synchronously, before any await): snapshot the run inputs —
            through the append-unmatched rule; without the insert the output would
            lose the profile entirely
          - symlink entry → signer.add_symlink(relPath, targetText) (strict UTF-8
-           decode; declared and actual size ≤ 4096 B enforced around the read — §2.6)
+           decode; declared and actual size ≤ 4096 B enforced around the read — §2.6.
+           FINAL state; staged: Task 3 hashes symlink payloads as regular files,
+           Task 6 declares readCapped/decodeStrict and converts this branch)
          - else → hashEntry(signer, relPath, signedFiles[fullPath] ?? fresh source bytes)
            — chunk-routes buffers > 128 MiB (§3.1). NO in-scan existence expectation:
            B's own main executable is excluded from B's round by the builder and only
