@@ -105,7 +105,9 @@ struct CliRun {
 }
 
 fn run_cli(args: &[&std::ffi::OsStr], envs: &[(&str, &str)]) -> CliRun { /* spawn zsign_bin(),
-    capture output, map exit code (None => -1) */ }
+    capture output, map exit code (None => -1). Environment handling: start from the
+    inherited env, REMOVE any inherited ZSIGN_PASSWORD (so a developer's shell export
+    cannot flake the tests), then apply the `envs` pairs on top. */ }
 ```
 
 Subprocess tests pass absolute paths only (fixtures written into `TempDir`), so the
@@ -198,9 +200,10 @@ fn verify_non_macho_input_exits_two() {
 
 #[test]
 fn verify_bound_slot_without_bundle_context_exits_two() {
-    // adhoc .app sign binds slot -1 on its main executable; verifying that
-    // executable loose (no bundle context) makes verify_macho_file populate
-    // top-level report errors => "could not complete" => 2.
+    // bundle signing binds slot content on its main executable (IpaSigner's
+    // adhoc path passes info_data/code_resources, ipa/mod.rs:1029-1035);
+    // verifying that executable loose (no bundle context) makes
+    // verify_macho_file populate top-level report errors => exit 2
     let dir = TempDir::new().unwrap();
     let app = make_encrypted_app(dir.path());
     let sign = run_cli(&[OsStr::new("-a"), OsStr::new("-f"), app.as_os_str()], &[]);
@@ -516,6 +519,26 @@ fn key_route_pkcs12_content_loads_with_password() {
 }
 
 #[test]
+fn pkcs12_content_with_certificate_names_the_conflict() {
+    let dir = TempDir::new().unwrap();
+    let key = dir.path().join("identity.p12");
+    std::fs::write(&key, IDENTITY_P12).unwrap();
+    let input = dir.path().join("in.bin");
+    std::fs::write(&input, MINIMAL_MACHO).unwrap();
+    // the OID check runs before the certificate is read, so a nonexistent
+    // -c path proves the misuse error fires first
+    let r = run_cli(
+        &[OsStr::new("-k"), key.as_os_str(), OsStr::new("-c"),
+          dir.path().join("absent.pem").as_os_str(), OsStr::new("-o"),
+          dir.path().join("o.bin").as_os_str(), input.as_os_str()],
+        &[],
+    );
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("PKCS#12"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("--certificate"), "stderr: {}", r.stderr);
+}
+
+#[test]
 fn pem_key_without_certificate_names_the_missing_flag() {
     let dir = TempDir::new().unwrap();
     let key = dir.path().join("key.pem");
@@ -589,8 +612,21 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
         return Ok(SigningCredentials::from_pem(&cert_data, &key_data, None)?);
     }
     match &cli.certificate {
-        // no PEM marker + certificate present => DER key: PEM-wrap in memory
+        // no PEM marker + certificate present: PKCS#12 content here is a
+        // flag-combination mistake, not a key file — detect before the cert
+        // loader misdiagnoses the ASN.1 as a broken certificate
         Some(cert_path) => {
+            const P12_PKCS7_DATA_OID: &[u8] =
+                &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+            if key_data
+                .windows(P12_PKCS7_DATA_OID.len())
+                .any(|w| w == P12_PKCS7_DATA_OID)
+            {
+                return Err("--private-key contains a PKCS#12 file, which cannot be \
+                    combined with --certificate; pass -k alone (password via -p) or \
+                    use --pkcs12"
+                    .into());
+            }
             let cert_data = std::fs::read(cert_path)?;
             let wrapped = pem_wrap_der(&key_data);
             Ok(SigningCredentials::from_pem(&cert_data, wrapped.as_bytes(), None)?)
@@ -668,13 +704,24 @@ fn env_password_signs_p12_without_flag() {
 
 #[test]
 fn argv_password_beats_env_password() {
-    // env set to the wrong password; argv carries the right one
+    // env-only wrong password must FAIL first (proves the env value is read
+    // at all), then flag+wrong-env must succeed (proves the flag wins) —
+    // either case alone cannot distinguish precedence from env being ignored
     let dir = TempDir::new().unwrap();
     let key = dir.path().join("identity.p12");
     std::fs::write(&key, IDENTITY_P12).unwrap();
     let input = dir.path().join("in.bin");
     std::fs::write(&input, MINIMAL_MACHO).unwrap();
-    let out = dir.path().join("out.bin");
+
+    let env_only = run_cli(
+        &[OsStr::new("-k"), key.as_os_str(), OsStr::new("-o"),
+          dir.path().join("o1.bin").as_os_str(), input.as_os_str()],
+        &[("ZSIGN_PASSWORD", "wrong-password")],
+    );
+    assert_eq!(env_only.code, 1, "env value must be read: {}", env_only.stderr);
+    assert!(env_only.stderr.contains("MAC mismatch"), "stderr: {}", env_only.stderr);
+
+    let out = dir.path().join("o2.bin");
     let r = run_cli(
         &[OsStr::new("-k"), key.as_os_str(), OsStr::new("-p"),
           OsStr::new("testpassword"), OsStr::new("-o"), out.as_os_str(),
@@ -720,9 +767,10 @@ const EMPTY_PASSWORD_P12: &[u8] =
 
 #[test]
 fn empty_password_container_is_never_treated_as_missing() {
-    // no flag, no env: the "" trial succeeds past MAC, so neither the
-    // channel-hint error nor a prompt may fire (stdin is piped here, and a
-    // prompt would hang a CI job)
+    // no flag, no env: this fixture's `""` trial fails at the certificate
+    // policy gate (not MAC), and a non-password failure must surface verbatim —
+    // never the "no password supplied" channel hint, and never a prompt
+    // (stdin is piped here, and a prompt would hang a CI job)
     let dir = TempDir::new().unwrap();
     let key = dir.path().join("empty.p12");
     std::fs::write(&key, EMPTY_PASSWORD_P12).unwrap();
@@ -733,8 +781,9 @@ fn empty_password_container_is_never_treated_as_missing() {
           dir.path().join("o.bin").as_os_str(), input.as_os_str()],
         &[],
     );
-    assert!(!r.stderr.contains("MAC mismatch"), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("MAC mismatch"), "not a password failure: {}", r.stderr);
     assert!(!r.stderr.contains("ZSIGN_PASSWORD"), "must not demand a password: {}", r.stderr);
+    assert!(!r.stderr.contains("no password supplied"), "verbatim surface: {}", r.stderr);
 }
 ```
 
@@ -767,37 +816,42 @@ exercise the no-password paths.
 
 ```rust
 /// Resolves the PKCS#12 password: flag/env first; otherwise the historical
-/// empty-password attempt, and only if that fails does a single interactive
-/// no-echo prompt run (TTY only — piped stdin degrades to this error).
+/// empty-password attempt, and only a *password-shaped* trial failure may
+/// prompt (TTY) or name the password channels (non-TTY). Other failures
+/// (policy rejection, corruption) surface verbatim — they are not password
+/// problems and must not be reported as "no password supplied".
 fn resolve_p12_password(cli: &Cli, data: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(pw) = &cli.password {
         return Ok(pw.clone());
     }
-    match SigningCredentials::from_p12(data, "") {
-        Ok(_) => Ok(String::new()), // empty-password containers never prompt
-        Err(trial_err) => {
-            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                let prompted = rpassword::prompt_password("PKCS#12 password: ")
-                    .map_err(|e| format!("password prompt failed: {e}"))?;
-                // one retry: surface its loader error untouched if wrong
-                SigningCredentials::from_p12(data, &prompted)?;
-                Ok(prompted)
-            } else {
-                Err(format!(
-                    "{trial_err}; no password supplied: pass -p/--password or set \
-                     ZSIGN_PASSWORD (stdin is not a terminal, cannot prompt)"
-                ).into())
-            }
-        }
+    let trial_err = match SigningCredentials::from_p12(data, "") {
+        Ok(_) => return Ok(String::new()), // empty-password containers never prompt
+        Err(e) => e.to_string(),
+    };
+    // Same two markers the wasm adapter sniffs for "wrong/needed password"
+    let password_shaped = trial_err.contains("invalid PKCS#12 password (MAC mismatch)")
+        || trial_err.contains("PKCS#12 decryption failed");
+    if !password_shaped {
+        return Err(trial_err.into());
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // one prompt, no pre-validation: the call site's from_p12 is the
+        // single retry (a wrong prompt surfaces its loader error there)
+        let prompted = rpassword::prompt_password("PKCS#12 password: ")
+            .map_err(|e| format!("password prompt failed: {e}"))?;
+        Ok(prompted)
+    } else {
+        Err(format!(
+            "{trial_err}; no password supplied: pass -p/--password or set \
+             ZSIGN_PASSWORD (stdin is not a terminal, cannot prompt)"
+        ).into())
     }
 }
 ```
 
-Design note: `resolve_p12_password` pre-validates with `from_p12(data, "")` — the
-call site then calls `from_p12(data, &resolved)` exactly once with the resolved
-password (the empty-success path re-parses; acceptable: p12 parse is milliseconds and
-the code stays branch-free at the call site). Never put the password into any error
-string.
+Parse cost (recorded in the design doc): flag/env = one p12 parse; the trial paths
+parse twice (trial + call site) — forced because `extract_p12` is `pub(crate)` and
+zsign-core is out of fence.
 
 4. `load_credentials` p12 branches (`--pkcs12` and `-k` content route) replace
    `let password = cli.password.as_deref().unwrap_or("");` with
@@ -935,7 +989,10 @@ fn credential_io_errors_name_the_file() {
 
 ```rust
 #[command(group = clap::ArgGroup::new("credentials")
-    .args(["pkcs12", "certificate", "private_key"]))]
+    .args(["pkcs12", "certificate", "private_key"])
+    .multiple(true))] // mandatory: non-multiple groups auto-conflict their members
+                      // in clap 4.6.7 (validator.rs:509-515), which would reject
+                      // the legitimate -c + -k pairing
 ```
 
    and each of `pkcs12`/`certificate`/`private_key` gains
@@ -969,9 +1026,11 @@ fn read_credential_file(path: &std::path::Path, label: &str) -> Result<Vec<u8>, 
 
      This replaces the silently-ignored `None` at the old main.rs:386 (the loader's
      identical guard at cert.rs:476-480 stays unreachable — the CLI side is the
-     contract). Ordering matters: it must fire before the `-c` requirement so the
-     tests above observe the mandated message even without a certificate present.
-     The p12 branches keep using the password normally.
+     contract). Order within the key branch is load-bearing for one case: an
+     *unencrypted* key with `-p/--password` and no `-c` must produce the mandated
+     message (password check first), while an unencrypted key with no password and
+     no `-c` must still produce the `--certificate` error — the sniff block falls
+     through cleanly in that case. The p12 branches keep using the password normally.
    - Delete the old fallthrough message ("Must provide either --pkcs12 or both
      --certificate and --private-key", old main.rs:390): clap's required-group now
      guarantees a credential arg reaches this function. The structural

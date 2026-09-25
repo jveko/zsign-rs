@@ -102,6 +102,12 @@ rule "migrate every caller" governs).
 | 2 | could not complete (constructor `Err` or unverifiable report) | — (sign failures stay 1) | POSIX >1 = trouble; clap `USAGE_CODE = 2`; codesign invalid-args = 2 |
 | 2 (clap) | usage/parse errors (clap-owned, unchanged) | same | GNU ls / argparse / clap |
 
+Scope notes for machine consumers: the report-based class (`report.errors` non-empty)
+exists only for bare-Mach-O inputs (`verify_macho_file` is the sole writer);
+bundle/IPA problems — including a corrupt or unreadable binary *inside* a bundle —
+are completed-negative report verdicts and exit **1**, while bundle/IPA runs reach 2
+only through constructor failures (unreadable input, invalid zip, extraction failure).
+
 Accepted overlap: usage errors and verify-hard-errors both exit 2 — clap hardcodes
 this (`clap_builder/src/util/mod.rs:32`); overriding it would require `try_parse`
 plumbing for no documented benefit. The ecosystem has no majority (grype: findings=2
@@ -127,15 +133,20 @@ Exit-code test classes (all subprocess-level, as the brief requires):
 - **0:** adhoc-sign `include_bytes!`-ed `crates/zsign/src/ipa/fixtures/minimal_macho.bin`
   (the same fixture zsign-wasm's proven adhoc roundtrip uses, lib.rs:700/1441-1466),
   then `-V` the output → 0. Adhoc is the only fixture class that can verify valid:
-  credential-signed output is permanently "not anchored to a trusted root"
-  (zsign/src/verify.rs:1106-1113, :1229-1246); CLI adhoc signing binds no `-1`/`-3`
-  slots (builder.rs:306-314) so top-level `errors` stays empty.
+  credential-signed output is permanently "not anchored to the trusted root"
+  (zsign/src/verify.rs:1106-1113, :1229-1246); bare-Mach-O adhoc signing binds no
+  `-1`/`-3` slots (builder.rs:306-314 passes `None` for info/code-resources), so
+  top-level `errors` stays empty.
 - **1:** `-V` the unsigned `minimal_macho.bin` → slice error (no
   `LC_CODE_SIGNATURE`) lives at slice level, top-level `errors` empty → 1.
 - **2:** three constructor-`Err` classes per the brief: nonexistent path (Io),
   `garbage.ipa` (invalid zip), non-Mach-O bytes with a Mach-O-ish name (Core);
-  plus the report-based class: verify the bundle-signed main executable copied out of
-  its `.app` (bound `-1`, no context) → 2.
+  plus the report-based class: verify the main executable copied out of an adhoc-signed
+  `.app` — bundle signing DOES bind slot content (IpaSigner's adhoc path passes
+  `info_data`/`code_resources`, ipa/mod.rs:1029-1035), so the loose file has a bound
+  `-1` that `verify_macho_file` reports as unverifiable without bundle context
+  (verify.rs:349-360) → 2. The plan pins this expectation; if the red gate refutes
+  it, the implementer reports the actual exit code instead of weakening the contract.
 
 ## Item 2 — `--json` output (ZSN-5)
 
@@ -194,8 +205,16 @@ PEM → DER → PKCS#12 (src/openssl.cpp:876-907, no extension sniffing).
 | no PEM marker | absent | **p12 route** → `from_p12(bytes, password)` | flag → env → `""` trial → prompt (item 4) |
 
   PEM + no `-c` → error naming the missing `--certificate`. p12 content + `-c`
-  (misuse) → DER-wrap fails parsing with the file named — acceptable; the help text
-  states the `-k`-alone-means-p12 rule. `--pkcs12` keeps its behavior, now long-only.
+  (misuse) → **detected before any parsing**: a PKCS#12 authSafe `ContentInfo` always
+  carries the pkcs7-data OID (`1.2.840.113549.1.7.2`, DER bytes
+  `06 09 2A 86 48 86 F7 0D 01 07 02`) which a PKCS#8 key never contains; when the
+  `-k` bytes contain that OID **and** `-c` is present, the CLI fails with
+  `--private-key contains a PKCS#12 file, which cannot be combined with
+  --certificate; pass -k alone (password via -p) or use --pkcs12` instead of letting
+  the certificate loader misdiagnose ASN.1 as a broken certificate (a heuristic for a
+  misuse error, not a security gate — a false positive would require a DER key
+  embedding pkcs7-data). The help text states the `-k`-alone-means-p12 rule.
+  `--pkcs12` keeps its behavior, now long-only.
   Upstream's DER-cert support (`-c` accepts DER, openssl.cpp:909) is **not** in the
   brief's item 3 → stays PEM-only, recorded as a follow-up.
 
@@ -231,14 +250,27 @@ PEM → DER → PKCS#12 (src/openssl.cpp:876-907, no extension sniffing).
   for the p12 routes: (1) `--password` argv value (clap: flag beats env,
   parser.rs:1417-1421); (2) `ZSIGN_PASSWORD` env (same arg via clap `env`); (3)
   neither set → attempt `from_p12(bytes, "")` first (preserves today's
-  empty-password behavior for CI/piped use — `""` is a valid p12 password and is
-  fixture-proven, pkcs12.rs:909/922); (4) that attempt fails →
-  `std::io::stdin().is_terminal()`? one no-echo `rpassword::prompt_password` and a
-  single retry (any failure after an explicit flag/env password surfaces the loader
-  error untouched — no prompt) : clear error naming `-p/--password` and
-  `ZSIGN_PASSWORD` ("stdin is not a terminal"). At most one prompt ever; the
-  password never appears in messages or logs (credential types have no `Debug`
-  impls, cert.rs:92-107, so it cannot leak through formatting).
+  empty-password behavior for CI/piped use — `""` is a valid p12 password at the
+  extraction layer, fixture-proven pkcs12.rs:909/922); (4) that attempt fails →
+  **classify the failure**: only the two password-shaped markers the wasm adapter
+  already sniffs — `invalid PKCS#12 password (MAC mismatch)` and
+  `PKCS#12 decryption failed` (zsign-wasm/src/lib.rs:145-163) — mean "a password is
+  needed". Password-shaped → `std::io::stdin().is_terminal()`? one no-echo
+  `rpassword::prompt_password` and a single retry, or a clear error naming
+  `-p/--password` and `ZSIGN_PASSWORD` ("stdin is not a terminal"). Any other trial
+  failure (policy rejection, corruption, non-identity containers) is surfaced
+  **verbatim, without the password-channel hint** — an empty-password container whose
+  certificate fails the code-signing policy must not be reported as "no password
+  supplied". Failures after an explicit flag/env password likewise surface untouched
+  (no prompt, no hint). At most one prompt ever; the password never appears in
+  messages or logs (credential types have no `Debug` impls, cert.rs:92-107, so it
+  cannot leak through formatting).
+- **Parse cost (known, recorded):** the trial makes the no-flag path parse the p12 up
+  to **twice** (trial + call-site re-parse with the resolved `""`), and the prompt
+  path twice as well (prompted value parsed once at the call site — no separate
+  pre-validation). The flag/env path parses exactly once. A single-parse design would
+  need the MAC check exposed publicly, but `extract_p12` is `pub(crate)`
+  (pkcs12.rs:106) and zsign-core is out of this lane's edit fence.
 - **P2.** Prompt on every TTY when unset, error otherwise — rejected: breaks
   empty-password non-TTY workflows (today's implicit `""`), and forces a pointless
   prompt for empty-password p12s.
@@ -274,7 +306,11 @@ from echoing the live env value.
   exported must not make `zsign -V file` a usage error; `--password` in verify mode
   is ignored (documented).
 - **Credential group:** an explicit `credentials` ArgGroup (`pkcs12`,
-  `certificate`, `private_key`), and each member carries
+  `certificate`, `private_key`) declared with **`.multiple(true)`** — mandatory:
+  clap 4.6.7 auto-adds mutual conflicts between members of a non-multiple group
+  (validator.rs:509-515), which would reject the legitimate `-c` + `-k` pairing and
+  make the PEM/DER routes unreachable; with `multiple(true)` the only exclusivity is
+  the explicit `pkcs12.conflicts_with_all`. Each member carries
   `required_unless_present_any = ["adhoc", "verify", "credentials"]`. This is the
   clap-idiomatic "required group with adhoc/verify exceptions": a required ArgGroup
   itself has no `required_unless*` and its validation ignores conflicts (L2:
@@ -376,8 +412,8 @@ one valid + one invalid + one error run.
 
 | Crate | Where | Why | Lock impact | License (deny.toml) |
 |---|---|---|---|---|
-| `serde` (derive) + `serde_json` | `[dependencies]`, item 2 | `--json`; no workspace crate depends on serde (S2) | versions already in lock (1.0.229 / 1.0.151); only `zsign-cli`'s dep list changes + `rtoolbox` below | MIT/Apache-2.0 ✓ |
-| `base64` | `[dependencies]`, item 3 | DER key → PEM wrap for the `-k` route (no public DER loader exists, S3) | already in lock (0.22.1) | MIT OR Apache-2.0 ✓ |
+| `serde` (derive) + `serde_json` | `[dependencies]`, item 2 | `--json`; no workspace crate depends on serde (S2) | versions already resolved in the lock (1.0.229 / 1.0.151); the `zsign-cli` dependency list changes (a lock edit, committed with the task) | MIT/Apache-2.0 ✓ |
+| `base64` | `[dependencies]`, item 3 | DER key → PEM wrap for the `-k` route (no public DER loader exists, S3) | already resolved in the lock (0.22.1); adds `zsign-cli` to its dependents | MIT OR Apache-2.0 ✓ |
 | `rpassword` | `[dependencies]`, item 4 | no-echo TTY prompt (see item 4) | +1 entry `rtoolbox 0.0.6` | Apache-2.0 ✓ both |
 | `clap` features `["derive", "env"]` | item 4 | `env = "ZSIGN_PASSWORD"` attribute is a hard compile error without it | zero (cfg switch in locked clap_builder) | — |
 | dev-deps | — | **none** (assert_cmd rejected: cannot locate-or-build from unit tests, ~6 lock entries, silent-stale-binary hazard — L2 source-cited) | — | — |
