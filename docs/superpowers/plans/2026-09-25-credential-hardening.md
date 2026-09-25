@@ -711,6 +711,12 @@ git commit -m "feat(crypto): select pkcs12 identity by spki pair (zsn-37)"
 
 - [ ] **Step 2.1: Write the failing tests (red)**
 
+Ordering note (added during implementation): the tests below reference the four
+`OID_*` constants that Step 2.3 introduces. Land Step 2.3's constants block FIRST —
+`use const_oid::ObjectIdentifier;` at module scope plus the four `const OID_...` lines,
+pure data with no policy logic — so the module compiles and this step's red is
+*behavioral* exactly as Step 2.2 states (the constants enforce nothing by themselves).
+
 Test helpers — `fresh_2048`, `window`, `present`, `build_cert`, `leaf_pems`, `der_of`,
 `pkcs8_of` already exist from Task 1 in the same `mod tests`; Task 2 adds:
 
