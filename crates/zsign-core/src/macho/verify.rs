@@ -486,7 +486,8 @@ fn cdhash_pair(cds: &[&CodeDirectory<'_>]) -> (Option<[u8; 20]>, Option<[u8; 32]
 }
 
 /// Page check variant that reads exactly the slice's byte range from the
-/// file, using the CodeDirectory `codeLimit` as authoritative. A codeLimit
+/// file, using the effective code limit — `codeLimit64` when the 0x20300+
+/// CodeDirectory binds it, else `codeLimit` — as authoritative. A limit
 /// beyond the slice therefore overruns the bounded region and reports
 /// `CountMismatch` instead of hashing the next architecture.
 fn check_code_pages_in_file(

@@ -304,12 +304,18 @@ METADATA is governed by the strongest viable CD):
   the strongest CD — its result IS the metadata verdict that `is_valid` gates on via
   errors).
 - special slots: run `check_special_slots(cd, inputs, req, ent, der)` for every
-  emitted CD (pre-task-6 signature), collect `(label, checks)` pairs where label =
-  `""` for primary and `alternate {SHA-1|SHA-256} ` (label from
-  `if cd.is_sha1() { "SHA-1" } else { "SHA-256" }`) — the pairs are task 3's
-  elevation hand-off. Push `Mismatch` findings from all pairs NOW (tagged);
+  emitted CD (pre-task-6 signature) and keep BOTH vectors side by side in this step:
+  `let primary_slot_checks = check_special_slots(primary, …)` (used for its
+  `Mismatch` pushes AND carried into task 3's `pairs` as the `""`-labelled entry)
+  and the per-alternate runs, collected into `pairs: Vec<(String,
+  Vec<SpecialSlotCheck>)>` where label = `""` for primary and
+  `alternate {SHA-1|SHA-256} ` (label from
+  `if cd.is_sha1() { "SHA-1" } else { "SHA-256" }`). THEN assign the metadata once:
   `report.special_slots = check_special_slots(strongest, …)` — the strongest CD's
-  vector is the metadata. `NotChecked` elevation for BOTH primary and alternates
+  vector is the metadata; `report.special_slots` must never be the source the pairs
+  are built from (it holds the strongest run, not the primary's).
+  Push `Mismatch` findings from all pairs NOW (tagged);
+  `NotChecked` elevation for BOTH primary and alternates
   lands in task 3.
 - identity (`identifier`, `adhoc`) and the CMS `content` argument stay the PRIMARY
   (the CMS signs slot 0; strongest must NEVER be applied to `content`).
