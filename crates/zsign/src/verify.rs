@@ -346,9 +346,30 @@ pub fn verify_macho_file(path: impl AsRef<Path>) -> Result<VerifyReport> {
         &zsign_core::codesign::verify::SignatureInputs::none(),
     )
     .map_err(crate::Error::Core)?;
+    let mut slot_errors: Vec<String> = Vec::new();
+    for slice in &macho.slices {
+        if !slice.signed {
+            continue;
+        }
+        if slice.special_slots.first()
+            == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
+        {
+            slot_errors.push(
+                "cannot verify special slot -1 (Info.plist) without bundle context".to_string(),
+            );
+        }
+        if slice.special_slots.get(2)
+            == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
+        {
+            slot_errors.push(
+                "cannot verify special slot -3 (CodeResources) without bundle context".to_string(),
+            );
+        }
+    }
     Ok(VerifyReport {
         input: path.display().to_string(),
         macho: Some(macho),
+        errors: slot_errors,
         ..VerifyReport::default()
     })
 }
@@ -469,23 +490,19 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
                             if !slice.signed {
                                 continue;
                             }
-                            // Slot -1 (index 0) and -3 (index 2): if the CD
-                            // declares them but the content file is missing,
-                            // signal an unbound signature.
-                            if !slice.special_slots.is_empty()
-                                && slice.special_slots[0]
-                                    == zsign_core::codesign::verify::SpecialSlotCheck::NotChecked
-                                && info_plist.is_none()
+                            // Slot -1 (index 0) and -3 (index 2): if verification
+                            // cannot check a declared binding, signal an unbound
+                            // signature.
+                            if slice.special_slots.first()
+                                == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
                             {
                                 bv.errors.push(
                                     "signature binds Info.plist (slot -1) but the file is missing"
                                         .into(),
                                 );
                             }
-                            if slice.special_slots.len() >= 3
-                                && slice.special_slots[2]
-                                    == zsign_core::codesign::verify::SpecialSlotCheck::NotChecked
-                                && code_resources.is_none()
+                            if slice.special_slots.get(2)
+                                == Some(&zsign_core::codesign::verify::SpecialSlotCheck::NotChecked)
                             {
                                 bv.errors.push(
                                     "signature binds CodeResources (slot -3) but the file is missing"
@@ -1059,6 +1076,27 @@ mod tests {
         let mut out = Vec::new();
         plist::to_writer_xml(&mut out, &value).unwrap();
         fs::write(&cr, out).unwrap();
+    }
+
+    #[test]
+    fn bare_verify_of_bundle_binary_reports_unchecked_slots() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        let extracted = td.path().join("extracted-bin");
+        fs::write(&extracted, fs::read(app.join("Test")).unwrap()).unwrap();
+        let report = verify_macho_file(&extracted).unwrap();
+        assert!(
+            !report.valid(),
+            "a binary binding bundle resources cannot verify bare"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("without bundle context")),
+            "got {:?}",
+            report.errors
+        );
     }
 
     #[test]
