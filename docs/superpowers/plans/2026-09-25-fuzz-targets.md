@@ -323,12 +323,12 @@ git commit -m "feat(fuzz): add cargo-fuzz crate with six parser targets (ZSN-4)"
 - Create: `fuzz/corpus/pkcs12/*.bin` (13 files)
 - Create: `fuzz/corpus/verify_code_signature/*.bin` (3 files)
 - Create: `fuzz/corpus/superblob/*.bin` (3 files)
-- Create: `fuzz/corpus/code_directory/*.bin` (3 files)
-- Create: `fuzz/corpus/plist_to_der/*.xml` (9 files)
+- Create: `fuzz/corpus/code_directory/*.bin` (4 files — includes `cd_tiny_code.bin`)
+- Create: `fuzz/corpus/plist_to_der/*.xml` (11 files)
 - Create: `fuzz/corpus/provisioning/*` (2 files)
 - Temporary (deleted before commit): `.tmptmp/gen/` throwaway generator crate
 
-Total: 33 committed seed files.
+Total: 36 committed seed files.
 
 - [ ] **Step 1: Copy the plain-derived seeds**
 
@@ -402,15 +402,21 @@ fn main() {
     let out = manifest.join("../../fuzz/corpus");
     let code: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
 
-    let cd_sha256 = CodeDirectoryBuilder::new("com.example.fuzzseed", &code).build_sha256();
+    let cd_sha256 = CodeDirectoryBuilder::new("com.example.fuzzseed", &code)
+        .info_hash([0xAB; 32])
+        .requirements_hash([0xCD; 32])
+        .entitlements_hash([0xEF; 32])
+        .build_sha256();
     let cd_sha1 = CodeDirectoryBuilder::new("com.example.fuzzseed", &code).build_sha1();
     let cd_team = CodeDirectoryBuilder::new("com.example.fuzzseed", &code)
         .team_id("ABCDE12345")
         .build_sha256();
+    let cd_tiny = CodeDirectoryBuilder::new("com.example.fuzzseed", b"fuzzseed!").build_sha256();
 
     write(&out.join("code_directory/cd_sha256.bin"), &cd_sha256);
     write(&out.join("code_directory/cd_sha1.bin"), &cd_sha1);
     write(&out.join("code_directory/cd_team.bin"), &cd_team);
+    write(&out.join("code_directory/cd_tiny_code.bin"), &cd_tiny);
 
     write(
         &out.join("superblob/sb_cd_req.bin"),
@@ -470,19 +476,25 @@ TMPDIR=$PWD/.tmptmp cargo run --manifest-path .tmptmp/gen/Cargo.toml --release
 rm -rf .tmptmp/gen
 ```
 
-- [ ] **Step 5: Transcribe the plist seeds (exactly 9 files)**
+- [ ] **Step 5: Transcribe the plist seeds (exactly 11 files)**
 
 - Transcribe these **input** plist literals of the golden tests in
   `crates/zsign-core/src/codesign/der.rs` (tests span `:384-723`), one file each:
-  `dict_empty.xml`, `dict_simple.xml`, `dict_nested.xml`, `dict_array.xml`, `dict_time.xml`
-  (the date/GeneralizedTime case), and `dict_bigint.xml` (the out-of-i64 rejection input at
+  `dict_empty.xml`, `dict_simple.xml`, `dict_nested.xml`, `dict_array.xml`,
+  `dict_date_data.xml` (from `test_plist_to_der_data_and_date_in_envelope` — name must
+  resolve to its source test), and `dict_bigint.xml` (the out-of-i64 rejection input at
   `der.rs:610`). If one of these tests builds its input with `format!` instead of a literal,
   construct the equivalent XML from the test's intent and note it.
 - Construct (no copyable literal exists — verified): `dict_long.xml` = the same
   single-`<key>`/`<string>` XML the long-form test builds with `"x".repeat(130)`
   (`test_plist_to_der_long_form_lengths`, `der.rs:653-677`); `dict_negint.xml` = a dict with
   one `<integer>-42</integer>` entry (the negative-int cases at `der.rs:705-723` are
-  `encode_value` unit tests with no XML fixture).
+  `encode_value` unit tests with no XML fixture); `dict_real.xml` = one
+  `<key>k</key><real>1.5</real>` entry (unsupported-Real rejection path);
+  `dict_sorted.xml` = two keys in reverse sort order (`<key>zz</key><true/>` then
+  `<key>aa</key><false/>`) so SET-member sorting runs. Every file: single root dict,
+  exactly one `</dict>` before `</plist>` (a doubled close makes plist 1.10.1 reject the
+  seed — verified).
 - Copy `PROFILE_XML` (`crates/zsign-wasm/src/lib.rs:703-716`) to
   `fuzz/corpus/provisioning/profile_plist.xml` **and**
   `fuzz/corpus/plist_to_der/profile_plist.xml`.
@@ -492,7 +504,7 @@ rm -rf .tmptmp/gen
 ```sh
 git check-ignore fuzz/corpus/superblob/sb_empty.bin; echo "ignore-exit=$?"    # expect exit 1 (a real corpus path)
 du -sk fuzz/corpus/*                                                        # every dir < 256
-find fuzz/corpus -type f | wc -l                                            # expect exactly 33
+find fuzz/corpus -type f | wc -l                                            # expect exactly 36
 git status --short                                                          # exactly fuzz/corpus/** (plus .tmptmp/ which must be EMPTY/removed)
 ```
 
