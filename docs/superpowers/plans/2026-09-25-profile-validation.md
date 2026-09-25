@@ -2620,6 +2620,13 @@ covering constructed/indefinite eContent through the code-signature entry."
     }
 
     #[test]
+    fn octet_stream_rejects_trailing_data() {
+        let mut bytes = der_tlv(0x04, b"head");
+        bytes.extend_from_slice(&der_tlv(0x05, &[])); // stray NULL after the TLV
+        assert!(decode_octet_string_stream(&bytes).is_err());
+    }
+
+    #[test]
     fn constructed_octet_stream_rejects_non_octet_segments() {
         // A constructed body containing a non-0x04 segment is malformed.
         let bad = der_tlv(0x24, &der_tlv(0x02, &[0x01]));
@@ -2717,7 +2724,12 @@ fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], usize)> {
 /// its value bytes. A constructed body is consecutive primitive segments
 /// (BER 8.7); anything else is rejected.
 fn decode_octet_string_stream(bytes: &[u8]) -> Result<Vec<u8>> {
-    let (tag, body, _) = read_tlv(bytes)?;
+    let (tag, body, used) = read_tlv(bytes)?;
+    if used != bytes.len() {
+        return Err(Error::Verification(
+            "trailing data after the OCTET STRING TLV".into(),
+        ));
+    }
     match tag {
         0x04 => Ok(body.to_vec()),
         0x24 => {
@@ -2761,7 +2773,7 @@ Expected: all green (existing + the three new tests).
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
 Expected: green; baseline counts were 182 `zsign-core` / 89 `zsign-rs` tests
-plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b + 3 Task-2c = 37, exact
+plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b + 4 Task-2c = 38, exact
 numbers recorded in the lane report). Any other pre-existing failure is a
 blocker — stop and diagnose (skill: systematic-debugging).
 
