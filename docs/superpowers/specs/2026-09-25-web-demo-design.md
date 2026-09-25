@@ -44,42 +44,54 @@
   (`:517`) and `zipReader.close()` (`:516`) are success-only; `URL.createObjectURL`
   (`:532`) is never revoked.
 
-### 1.2 wasm API (`MapWasmApi`, READ-ONLY `crates/zsign-wasm/src/lib.rs`, 244 lines)
+### 1.2 wasm API (`crates/zsign-wasm/src/lib.rs` — LANDED surface, main@c174240, source of truth)
 
 - Two exported classes: `MachOInfo` (2 getters) and `WasmSigner`. Surface used/available
-  to this demo: `new WasmSigner(p12, password, profile)` (throws `Error` with Rust
-  `Display` text — bad password surfaces here), `team_id()`,
-  `set_main_executable(name)`, `hash_file(path, data) -> bool` (false = excluded),
-  `hash_file_chunk`, **`add_symlink(path, target) -> bool`**,
-  **`reset_resources()`**, `build_code_resources() -> Uint8Array` (idempotent, does not
-  consume state; throws on unfinished streaming hashes), static
-  `parse_info_plist(data) -> {bundle_id, executable}` (handles XML **and** binary
-  plists), static `parse_macho`, static `extract_entitlements`, `entitlements()`,
-  `sign_macho(data, id, infoPlist, codeResources)` + `sign_macho_fat` alias, `free()`.
-- `sign_macho` treats `info_plist` as opaque bytes that are **hashed** (`lib.rs:195` →
-  `signer.rs:111 dual_hash`) — no rewrite happens inside wasm. Whatever JS passes must
-  be byte-identical to what JS writes into the IPA.
-- Hash state: accumulated per instance; `set_main_executable` must precede hashing
-  (exclusion is evaluated at insert time, `code_resources.rs:333-336`); `reset_resources()`
-  clears the per-instance builder → one signer instance can seal many bundle levels
-  sequentially. Instances are fully independent; multiple `WasmSigner`s can coexist.
+  to this demo: `new WasmSigner(p12, password, profileOrNull)` (throws; size limits
+  **p12 ≤ 4 MiB, profile ≤ 16 MiB**, code `ZSIGN_INPUT_TOO_LARGE`), `team_id()`,
+  `set_main_executable(name)`, `hash_file(path, data) -> bool` (**throws**:
+  `ZSIGN_INPUT_TOO_LARGE` above 128 MiB per buffer, `ZSIGN_PATH_IN_PROGRESS` /
+  `ZSIGN_PATH_ALREADY_FINALIZED` on per-round state misuse — each path hashed at most
+  once per resources round), `hash_file_chunk(path, chunk, isFinal)` (≤128 MiB per
+  chunk; the routing target for oversized files), **`add_symlink(path, target) -> bool`**
+  (outside the file-path sealing state machine), **`reset_resources()`** (clears
+  builder + streams + finalized seals and **preserves the main-executable exclusion** —
+  one signer instance seals many bundle levels sequentially), `build_code_resources()`
+  (throws `ZSIGN_UNFINISHED_HASHES` if a stream is open), static
+  `parse_info_plist(data) -> {bundle_id, executable}` (XML and binary; ≤16 MiB; throws
+  `ZSIGN_INVALID_PLIST`), static `parse_macho` (≤512 MiB), static
+  `extract_entitlements`, `entitlements()`, `set_entitlements(Option<Vec<u8>>)`
+  (override; `None` falls back to **profile** entitlements — the landed doc states:
+  "To sign with no entitlements while holding a profile, construct the signer without
+  profile bytes", which is exactly the two-signer split of §2.3), `sign_macho`,
+  `sign_macho_fat`, `free()`.
+- **Signing entry points:** `sign_macho` is thin-only with a SHA-256-only code
+  directory and throws `ZSIGN_FAT_UNSUPPORTED` on FAT/Universal input;
+  `sign_macho_fat(data, identifier, infoPlist, codeResources)` is the explicit dual
+  SHA-1+SHA-256 opt-in accepting thin **or** FAT (≤512 MiB, plist args ≤16 MiB).
+  **The demo routes every sign through `sign_macho_fat`** (plan Tasks 2/3/4 — no
+  `sign_macho(` call exists anywhere in the plan), so FAT IPAs keep working and no
+  `ZSIGN_FAT_UNSUPPORTED` path is reachable.
+- **Error contract:** every throw is a JS `Error` carrying a stable string
+  `error.code` (`ZSIGN_INVALID_PASSWORD`, `ZSIGN_INVALID_MACHO`, `ZSIGN_INPUT_TOO_LARGE`,
+  `ZSIGN_FAT_UNSUPPORTED`, … — table in the crate docs). `error.message` is
+  human-facing and may change: the demo **displays** both but **never matches on
+  message text** (codes are the only stable surfacing channel).
+- `info_plist` remains opaque bytes hashed into the signature context — whatever the
+  demo passes must be byte-identical to what it writes into the IPA (the §2.4
+  byte-identity contract, unchanged by the SHA-256-only switch).
 - `zsign-core`'s `should_exclude` is shared with the native flow: root-anchored
   `_CodeSignature` exclusion, own-main-executable exact-match exclusion, `files2`
   omission of top-level `Info.plist`/`PkgInfo`/`.DS_Store`. The demo does **not** need
   to re-implement these predicates.
-- No plist-writing API exists (item 4 is JS-owned). No error codes/warnings/size guards
-  today; ZSN-40 may add additive fields — JS must not assume `Error.message` strings are
-  stable (substring matching forbidden as a control-flow mechanism).
-- `info_plist`/entitlements asymmetry: wasm applies the instance's profile-derived
-  entitlements to **every** `sign_macho` call (`lib.rs:180-201`); native passes the
-  root bundle's entitlements to its main executable and immediate non-main Mach-Os
-  (`mod.rs:668-680`) and `None` for nested bundles (`mod.rs:394-395`). JS controls
-  this by choosing the instance: a second `WasmSigner(p12, password, null)` extracts
-  no entitlements (`lib.rs:59-77`) — the two-signer split adopted in §2.3.
-- Locked deps: `@zip.js/zip.js` 2.8.23, vite 6.4.1; `zsign-wasm` is
-  `file:../../crates/zsign-wasm/pkg` (must exist before `npm ci`).
-- Generated glue is idempotent on init (`pkg/zsign_wasm.js:505` early-returns), so the
-  demo's second `initWasm` call in `signIpa` is safe.
+- No plist-writing API exists (item 4 is JS-owned).
+- Path dependency: `zsign-wasm` is `file:../../crates/zsign-wasm/pkg` (must exist
+  before `npm ci`). The lockfile records stale link metadata (0.1.0 vs pkg 0.1.1) —
+  empirically harmless (`npm ci` green against exactly this lock) and out of lane
+  scope to update; the gate always rebuilds the pkg first anyway.
+- Generated glue is idempotent on init (early-returns when already initialized —
+  re-verified on this worktree's built pkg), so the demo's second `initWasm` call in
+  `signIpa` is safe.
 - CI workflow (verbatim order): `wasm-pack build crates/zsign-wasm --target web --release`
   → `npm ci` (in `examples/web`) → `npm run build`.
 
@@ -142,7 +154,7 @@ Correctness contract the demo mirrors:
 - **zip.js 2.8.23 symlink contract:** reader exposes `versionMadeBy`
   (`zip-reader.js:302`) and `externalFileAttributes` (`:311`) on every entry;
   `entry.unixExternalUpper` is NOT copied onto `Entry` (absent from
-  `zip-entry.js PROPERTY_NAMES:77-121`) — derive `(entry.externalFileAttributes >>> 16)`
+  `zip-entry.js PROPERTY_NAMES:77-124`) — derive `(entry.externalFileAttributes >>> 16)`
   (which `isSymlinkEntry` does). Writer options read by `addFile`: `versionMadeBy`
   (`zip-writer.js:403`, actual default 768 = `0x0300`, pass `(3<<8)|20`),
   `externalFileAttributes` (`:444`, default 0), `unixMode` (`:407`), `directory`
@@ -155,8 +167,10 @@ Correctness contract the demo mirrors:
   destroyer is passing `msdosAttributes*` without unix metadata (forces `msDosCompatible`,
   zeroes the host byte, skips Unix recomposition — `:431-433`): the demo never passes
   those. Writing a symlink = payload target bytes + `externalFileAttributes = mode << 16`
-  + `versionMadeBy = 0x0314` + name NOT ending in `/` — exactly what the Task 6 branch
-  and the §2.6 probe exercise.
+  + `versionMadeBy = 0x0314` + name NOT ending in `/` — the Task 6 branch. (The
+  recorded §2.6 probe exercised the earlier fallback-options shape; Task 6 Step 5
+  re-runs it with the final branch options — recomposed attributes plus
+  `compressionMethod: 0`.)
 - **innerHTML vs textContent (MDN):** "Node.textContent should be used when you know
   that the user-provided content should be plain text. This prevents it being parsed as
   HTML"; `createTextNode` "can be used to escape HTML characters"; `Node.textContent`
@@ -310,8 +324,13 @@ Correctness contract the demo mirrors:
 - **Decision: A.** The real defect is on the **sealing** side plus implicitness:
   1. CR: symlinks are currently `hash_file`d by target text → `files2` gets a regular
      file hash; native emits `{"symlink": target}` via the builder's symlink path.
-     Fix: detect symlink entries and call `signer.add_symlink(relPath, target)`
-     (same path namespace as `hash_file`).
+     Fix: detect symlink entries and call `signer.add_symlink(relPath, targetText)`
+     (same path namespace as `hash_file`). The target is decoded **strictly**
+     (`TextDecoder` with `fatal: true`; non-UTF-8 targets throw — native extraction is
+     strict too, `extract.rs:529-533`), and the sealed bytes are the
+     `TextEncoder` re-encode of that same text, which is byte-identical for valid
+     UTF-8 — so what the write pass emits and what CodeResources seals can never
+     diverge.
   2. Write: add an explicit `isSymlinkEntry(entry)` branch that emits the target
      bytes with Unix made-by and `compressionMethod: 0` (Stored — matching native
      `add_symlink`; zip.js would otherwise deflate), instead of relying on
@@ -329,10 +348,12 @@ Correctness contract the demo mirrors:
      would emit a regular file — detect and emit must never disagree. The
      `|| UNIX_FILE_0644` fallback stays for genuine regular files with zero
      attributes. The branch runs **after** directory handling and the reserved-path
-     skips (a symlink planted at `_CodeSignature/…` or `embedded.mobileprovision` must
-     stay excluded with those paths), and the scan rejects targets > 4096 bytes
-     before `add_symlink` (native's cap, `extract.rs:103-109`; zip.js enforces
-     nothing).
+     skips (a symlink planted at `_CodeSignature/…` or `embedded.mobileprovision`
+     must stay excluded with those paths). The 4096-byte cap (native's bound,
+     `extract.rs:103-109`; zip.js enforces nothing) is checked **before reading**
+     from `entry.uncompressedSize`, and the read itself goes through a capped
+     chunk reader that aborts the moment accumulated bytes exceed 4096 — a lying
+     central directory cannot force a multi-gigabyte allocation first.
   3. Hashing symlink targets as file content is removed (replaced by 1); the write of
      target bytes continues (that *is* a symlink's content).
 - **Rejected:** B — unnecessary, probe proves pass-through works; C — leaves CR
@@ -426,6 +447,12 @@ Single file `main.js`, keeping the existing two-phase UX (load → configure →
   `Path::file_stem` semantics on that component (strip after a non-leading dot;
   leading-dot names unchanged): `Frameworks/Foo.bar.framework/Foo` → `Foo`,
   `Payload/A.app/Frameworks/F.framework/` → `F`, `libFoo.dylib` → `libFoo`.
+- `hashEntry(signer, relPath, bytes)` — routes one file into the signer's current
+  resources round: `bytes.length <= 128 MiB` → `signer.hash_file(relPath, bytes)`;
+  larger → `signer.hash_file_chunk` in 64 MiB slices with `isFinal` on the last slice
+  (the landed `hash_file` throws `ZSIGN_INPUT_TOO_LARGE` above 128 MiB; the bytes are
+  already in hand, so chunking needs no extra retention). Errors propagate —
+  fail-closed.
 - `isSymlinkEntry(entry) -> boolean` — §2.6.
 - `assertArchiveWithinLimits(entries, file)` — §2.9 guards.
 - `tryExtractBundleId/tryExtractExecutableName(plist, wasmReady)` — existing, all call
@@ -434,23 +461,39 @@ Single file `main.js`, keeping the existing two-phase UX (load → configure →
 ### 3.2 Sign pipeline (replaces steps 3-9 of the current `signIpa`)
 
 ```
-init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, profile)
-    and nestedSigner = new WasmSigner(p12, password, null)   // entitlements parity, §2.3
+FIRST (synchronously, before any await): snapshot the run inputs —
+    `run = { ipaFile, p12Bytes, password, profileBytes, bundleId }` captured from
+    state/DOM at entry; every later step reads ONLY `run.*` (never live globals or
+    DOM values), so a mid-run control change cannot split one run across two inputs
+    (the corruption proof: profile A-derived entitlements embedded with profile-B
+    bytes read at the late root scan). The credential/ID inputs and pickers are also
+    disabled for the run and re-enabled in `finally` — belt; the snapshot is the fix.
+→ init wasm (idempotent) → signers: rootSigner = new WasmSigner(run.p12Bytes, run.password, run.profile)
+    and nestedSigner = new WasmSigner(run.p12Bytes, run.password, null)   // entitlements parity, §2.3
 → open ZipReader (one reader for scan + write passes, closed in finally)
 → getEntries → findAppRoot (file-derived) → assertArchiveWithinLimits
+    (the limits helper is introduced by plan Task 9; Tasks 3/7 defer this call until
+    it exists — see the plan's explicit deferral notes)
 → metadata pass: reject any entry whose filename differs from its trim() (the zip.js
     writer trims names — sealing and output must share one canonical name, FIX 17);
-    collect source directory names (for later dir-entry synthesis)
+    collect source directory names EXCLUDING the reserved root `_CodeSignature`
+    subtree (those dirs are skipped on write — counting them would defeat append-time
+    directory synthesis)
 → read root Info.plist → wasmReady? parse_info_plist : XML fallback
     → executable name: missing/empty → THROW (item 5, before any resource work)
-    → bundleId input is the root identifier (UI field)
+    → run.bundleId is the root identifier
 → build bundle set {prefix → depth}: root + ancestor dirs with ext
   app/framework/appex (case-insensitive); sort deepest-first
-→ classify: for each file entry under root, resolve executable membership
-    (root main exec must match a Mach-O by relative path → else THROW, item 2/5)
+→ classify: for each file entry under root **excluding symlink entries**
+  (isSymlinkEntry first — a target beginning with Mach-O magic must be sealed as a
+  symlink, never signed), resolve executable membership for EVERY bundle: read each
+  bundle's Info.plist (bytes retained for its signing step), extract
+  CFBundleExecutable (wasmReady flag), and require a matching Mach-O path in that
+  bundle's subtree — any bundle failing → THROW before any hashing/signing (item 5
+  generalized; mirrors native get_main_executable, `mod.rs:838-894`)
 → per bundle B, deepest-first, using signer = (B is root ? rootSigner : nestedSigner):
     1. read B's Info.plist. ROOT ONLY, ALWAYS call
-       infoPlistData = rewriteBundleIdentifier(infoPlistData, bundleIdInput.value)
+       infoPlistData = rewriteBundleIdentifier(infoPlistData, run.bundleId)
        (validates unconditionally, identity-fast-paths, §2.4) and ALWAYS
        signedFiles[rootPrefix + "Info.plist"] = infoPlistData  (BLOCKER 2)
     2. sign immediate non-main Mach-Os of B (subtree minus deeper bundles minus
@@ -462,16 +505,19 @@ init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, p
        plus every signedFiles key under B's prefix that has NO source file entry
        (virtual entries — generated nested CodeResources of already-sealed children,
        BLOCKER 1):
-         - root embedded.mobileprovision: hash profileBytes (source bytes skipped)
+         - root embedded.mobileprovision: hash run.profileBytes (source bytes skipped)
            AND set signedFiles[rootPrefix + "embedded.mobileprovision"] =
-           profileBytes — the write pass skips the source entry and emits this key
+           run.profileBytes — the write pass skips the source entry and emits this key
            through the append-unmatched rule; without the insert the output would
            lose the profile entirely
-         - symlink entry → signer.add_symlink(relPath, targetText) (target ≤ 4096 B)
-         - else → signer.hash_file(relPath, signedFiles[fullPath] ?? fresh source bytes)
-           — a path EXPECTED to carry an override (bundle main execs, generated CRs,
-             root plist, root profile) missing from signedFiles at this point throws
-             (namespace invariant, FIX 11: signedFiles keys are ALWAYS full zip paths)
+         - symlink entry → signer.add_symlink(relPath, targetText) (strict UTF-8
+           decode; declared and actual size ≤ 4096 B enforced around the read — §2.6)
+         - else → hashEntry(signer, relPath, signedFiles[fullPath] ?? fresh source bytes)
+           — chunk-routes buffers > 128 MiB (§3.1). NO in-scan existence expectation:
+           B's own main executable is excluded from B's round by the builder and only
+           signed at step 6, and B's CR does not exist yet — completeness is enforced
+           solely by the step-6 post-loop assertion (FIX 11: signedFiles keys are
+           ALWAYS full zip paths)
        (builder's should_exclude auto-skips B's _CodeSignature + B's main exec;
         deeper bundles' current signed bytes + their _CodeSignature are included —
         native parity)
@@ -596,17 +642,14 @@ Notes:
     `<pre id="plist-output">`. None fixed here — queue discipline (the summary-counter
     item formerly listed here IS fixed — Task 3 supplies `processedFiles`/`machoSigned`).
 
-## 6. Cross-lane requests (ZSN-40, wasm)
+## 6. Cross-lane requests (ZSN-40, wasm) — ALL RESOLVED, none open
 
-1. ~~Entitlements suppression~~ — **resolved in-lane**: the demo's second, profile-less
-   `WasmSigner` (`lib.rs:59-77`) achieves native entitlement parity without any wasm
-   change (§2.3). What remains is ergonomics: an explicit entitlements setter would
-   avoid the second credential parse.
-2. Stable error identity (code field) would let the demo distinguish e.g.
-   `InvalidPassword` from other cert failures without substring matching — currently
-   the raw `Display` text is shown to the user (acceptable for a demo).
-3. ~~Argument-buffer freeing~~ — **resolved with evidence (no change needed)**: the
-   glue frees no arguments (`pkg/zsign_wasm.js:120-127`) yet a metric-validated probe
-   showed zero accumulation across 100 × 4 MB borrowed-arg calls (§2.9) — the
-   generated Rust shim deallocates. Wasm heap is bounded by live data; the §2.9 guard
-   values stand.
+1. Entitlements suppression — **resolved two ways**: the landed `set_entitlements`
+   setter exists, but its own docs state that "no entitlements while holding a
+   profile" requires constructing without profile bytes — which is exactly the
+   two-signer split adopted in §2.3 (no wasm change needed).
+2. Stable error identity — **landed**: every throw carries `error.code`
+   (`ZSIGN_*`, table in §1.2); the demo displays codes, never parses messages.
+3. Argument-buffer freeing — **resolved with evidence**: the glue frees no arguments
+   yet a metric-validated probe showed zero accumulation (§2.9); Rust-shim side
+   deallocates. Wasm heap is bounded by live data; guard values stand.
