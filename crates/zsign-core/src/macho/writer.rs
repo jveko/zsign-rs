@@ -397,43 +397,73 @@ fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) 
         slice_data_vec.push(&signed.signed_data);
     }
 
-    let header_size = 8 + arches.len() * 20;
-    let mut new_offsets: Vec<(u32, u32)> = Vec::with_capacity(arches.len());
-    let mut current_offset = align_to(header_size, 0x4000) as u32;
+    let header_size = 8usize
+        .checked_add(
+            arches
+                .len()
+                .checked_mul(20)
+                .ok_or_else(|| Error::MachO("FAT arch table size overflow".into()))?,
+        )
+        .ok_or_else(|| Error::MachO("FAT arch table size overflow".into()))?;
 
-    for slice_data in &slice_data_vec {
-        let size = slice_data.len() as u32;
-        new_offsets.push((current_offset, size));
-        current_offset = align_to((current_offset + size) as usize, 0x4000) as u32;
+    let mut new_offsets: Vec<(u32, u32)> = Vec::with_capacity(arches.len());
+    let mut cursor = header_size;
+
+    for (arch, slice) in arches.iter().zip(&slice_data_vec) {
+        if arch.align >= 32 {
+            return Err(Error::MachO(format!(
+                "FAT arch align exponent {} exceeds the 32-bit FAT offset space",
+                arch.align
+            )));
+        }
+        let align = 1usize << arch.align;
+        cursor = cursor
+            .checked_add(align - 1)
+            .ok_or_else(|| Error::MachO("FAT offset overflow while aligning".into()))?
+            & !(align - 1);
+        let offset = u32::try_from(cursor)
+            .map_err(|_| Error::MachO("FAT slice offset exceeds 32-bit FAT limit".into()))?;
+        let size = u32::try_from(slice.len())
+            .map_err(|_| Error::MachO("FAT slice size exceeds 32-bit FAT limit".into()))?;
+        new_offsets.push((offset, size));
+        cursor = cursor
+            .checked_add(slice.len())
+            .ok_or_else(|| Error::MachO("FAT offset overflow".into()))?;
     }
 
-    let total_size = new_offsets.last().map(|(o, s)| *o + *s).unwrap_or(0) as usize;
+    let total_size = cursor;
     let mut output = vec![0u8; total_size];
 
     output[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
-    output[4..8].copy_from_slice(&(arches.len() as u32).to_be_bytes());
+    write_u32(
+        &mut output,
+        4,
+        u32::try_from(arches.len())
+            .map_err(|_| Error::MachO("FAT arch count exceeds u32".into()))?,
+        true,
+    )?;
 
     for (i, arch) in arches.iter().enumerate() {
         let entry_offset = 8 + (i * 20);
         let (new_offset, new_size) = new_offsets[i];
 
-        write_u32_be(&mut output, entry_offset, arch.cputype);
-        write_u32_be(&mut output, entry_offset + 4, arch.cpusubtype);
-        write_u32_be(&mut output, entry_offset + 8, new_offset);
-        write_u32_be(&mut output, entry_offset + 12, new_size);
-        write_u32_be(&mut output, entry_offset + 16, arch.align);
+        write_u32(&mut output, entry_offset, arch.cputype, true)?;
+        write_u32(&mut output, entry_offset + 4, arch.cpusubtype, true)?;
+        write_u32(&mut output, entry_offset + 8, new_offset, true)?;
+        write_u32(&mut output, entry_offset + 12, new_size, true)?;
+        write_u32(&mut output, entry_offset + 16, arch.align, true)?;
     }
 
     for (i, slice_data) in slice_data_vec.iter().enumerate() {
         let (offset, _) = new_offsets[i];
-        output[offset as usize..offset as usize + slice_data.len()].copy_from_slice(slice_data);
+        let start = offset as usize;
+        let dst = output
+            .get_mut(start..start + slice_data.len())
+            .ok_or_else(|| Error::MachO("FAT slice range exceeds output buffer".into()))?;
+        dst.copy_from_slice(slice_data);
     }
 
     Ok(output)
-}
-
-fn write_u32_be(data: &mut [u8], offset: usize, value: u32) {
-    data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
 
 fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Result<Vec<u8>> {
@@ -2152,6 +2182,68 @@ mod tests {
         assert!(
             err.to_string().contains("exactly one signed slice"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn test_embed_fat_aligns_each_slice_to_its_declared_exponent() {
+        let mut b = crate::macho::fixtures::make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        // align 15 on the first arch: 16 KiB placement (today's hardcode) violates 2^15.
+        let fat = crate::macho::fixtures::make_fat_macho(
+            &[crate::macho::fixtures::make_minimal_macho(), b],
+            &[15, 12],
+        );
+        let macho = crate::macho::MachOFile::parse(fat).unwrap();
+        let creds = crate::macho::fixtures::test_signing_credentials();
+        let signed = crate::macho::sign_any_macho(
+            &macho,
+            "com.zsign.align",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            &signed[0..4],
+            &[0xca, 0xfe, 0xba, 0xbe],
+            "output must be FAT"
+        );
+        let n = u32::from_be_bytes(signed[4..8].try_into().unwrap());
+        let header_size = 8 + n as usize * 20;
+        let mut prev_end = header_size; // probe zone (8+20n .. first slice) must be zero-filled
+        for i in 0..n {
+            let e = 8 + i as usize * 20;
+            let off = u32::from_be_bytes(signed[e + 8..e + 12].try_into().unwrap()) as usize;
+            let size = u32::from_be_bytes(signed[e + 12..e + 16].try_into().unwrap()) as usize;
+            let align = u32::from_be_bytes(signed[e + 16..e + 20].try_into().unwrap());
+            assert_eq!(
+                off % (1usize << align),
+                0,
+                "slice {i} offset {off:#x} must be a multiple of 2^{align}"
+            );
+            assert!(
+                off >= prev_end,
+                "slice {i} must not overlap the header or previous slice"
+            );
+            let gap = off - prev_end;
+            assert!(
+                gap < (1usize << align),
+                "gap {gap:#x} before slice {i} must be < 2^{align} (codesign strict rule)"
+            );
+            assert!(
+                signed[prev_end..off].iter().all(|&byte| byte == 0),
+                "gap bytes before slice {i} must be zero"
+            );
+            prev_end = off + size;
+        }
+        assert_eq!(
+            signed.len(),
+            prev_end,
+            "output must end exactly at the last slice"
         );
     }
 }
