@@ -106,6 +106,9 @@ pub struct SigningCredentials {
 }
 
 /// A PKCS#8 private key decoded to a form that can be SPKI-matched against certificates.
+// Load-path-only decode result: boxing the Rsa arm would churn every match site for a
+// transient value; the long-lived SigningKeyType carries the same allow.
+#[allow(clippy::large_enum_variant)]
 enum DecodedKey {
     Rsa(RsaPrivateKey),
     Ecdsa(EcdsaSigningKey),
@@ -294,7 +297,7 @@ fn build_chain_from_leaf(leaf: &Certificate, mut rest: Vec<Certificate>) -> Vec<
     let has_wwdr = chain.iter().any(|c| {
         extract_subject_cn(c).is_some_and(|cn| cn.contains("Apple Worldwide Developer Relations"))
     });
-    if has_wwdr && !chain.iter().any(|c| is_apple_root(c)) {
+    if has_wwdr && !chain.iter().any(is_apple_root) {
         if let Ok(root) = Certificate::from_pem(super::assets::APPLE_ROOT_CA_CERT.as_bytes()) {
             chain.push(root);
         }
