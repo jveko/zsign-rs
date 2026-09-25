@@ -12,7 +12,7 @@
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 use zsign_core::bundle::CodeResourcesBuilder;
 use zsign_core::crypto::SigningCredentials;
@@ -72,6 +72,7 @@ pub struct WasmSigner {
     entitlements_override: Option<Vec<u8>>,
     resource_builder: CodeResourcesBuilder,
     streaming_hashes: HashMap<String, StreamingHashState>,
+    finalized_paths: HashSet<String>,
 }
 
 #[wasm_bindgen]
@@ -114,6 +115,7 @@ impl WasmSigner {
             entitlements_override: None,
             resource_builder: CodeResourcesBuilder::new(),
             streaming_hashes: HashMap::new(),
+            finalized_paths: HashSet::new(),
         })
     }
 
@@ -179,8 +181,8 @@ impl WasmSigner {
     ///
     /// Returns `true` if the file was added, `false` if it was excluded.
     /// Throws when the buffer exceeds 128 MiB; stream large files with
-    /// `hash_file_chunk` instead.
-    ///
+    /// `hash_file_chunk` instead. Throws when the path has an unfinished
+    /// streaming hash or was already finalized in this resources round.
     pub fn hash_file(&mut self, relative_path: &str, data: &[u8]) -> Result<bool, JsError> {
         ensure_size(
             data.len(),
@@ -188,12 +190,33 @@ impl WasmSigner {
             "hash_file",
             "stream large files with hash_file_chunk(...)",
         )?;
+        if self.streaming_hashes.contains_key(relative_path) {
+            return Err(JsError::new(&format!(
+                "path \"{relative_path}\" has an unfinished streaming hash; finalize it with hash_file_chunk(..., true) before hashing it directly"
+            )));
+        }
+        if self.finalized_paths.contains(relative_path) {
+            return Err(JsError::new(&format!(
+                "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
+            )));
+        }
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(data);
-        Ok(self.resource_builder.add_file(relative_path, sha1, sha256))
+        let added = self.resource_builder.add_file(relative_path, sha1, sha256);
+        if added {
+            self.finalized_paths.insert(relative_path.to_string());
+        }
+        Ok(added)
     }
 
     /// Start or continue streaming hash for a large file.
-    /// Throws when a chunk exceeds 128 MiB; send smaller chunks instead.
+    ///
+    /// There may be one stream per path in each resources round. A final call
+    /// seals a stored path, after which all further calls for it throw until
+    /// `reset_resources()` starts a new round. Setting `is_final` on the first
+    /// call is a legal single-chunk stream. Excluded paths are never stored or
+    /// sealed and remain re-callable. Two non-final streams for the same path
+    /// cannot be distinguished and merge, so callers must use one stream per
+    /// path. Throws when a chunk exceeds 128 MiB; send smaller chunks instead.
     ///
     pub fn hash_file_chunk(
         &mut self,
@@ -207,6 +230,11 @@ impl WasmSigner {
             "hash_file_chunk",
             "send smaller chunks",
         )?;
+        if self.finalized_paths.contains(relative_path) {
+            return Err(JsError::new(&format!(
+                "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
+            )));
+        }
         let state = self
             .streaming_hashes
             .entry(relative_path.to_string())
@@ -228,7 +256,9 @@ impl WasmSigner {
                 sha1.copy_from_slice(&sha1_result);
                 sha256.copy_from_slice(&sha256_result);
 
-                self.resource_builder.add_file(relative_path, sha1, sha256);
+                if self.resource_builder.add_file(relative_path, sha1, sha256) {
+                    self.finalized_paths.insert(relative_path.to_string());
+                }
             }
         }
         Ok(())
@@ -237,6 +267,8 @@ impl WasmSigner {
     /// Register a symlink in CodeResources.
     ///
     /// Returns `true` if the symlink was added, `false` if it was excluded.
+    /// Duplicate symlink paths retain last-wins semantics; symlink registration
+    /// is outside the file-path sealing state machine.
     pub fn add_symlink(&mut self, relative_path: &str, target: &str) -> bool {
         let target_bytes = target.as_bytes();
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(target_bytes);
@@ -259,10 +291,12 @@ impl WasmSigner {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Reset the CodeResources builder for signing the next bundle.
+    /// Start a new resources round, clearing the builder, active streams, and
+    /// finalized-path seals.
     pub fn reset_resources(&mut self) {
         self.resource_builder = CodeResourcesBuilder::new();
         self.streaming_hashes.clear();
+        self.finalized_paths.clear();
     }
 
     /// Extract entitlements from a provisioning profile.
@@ -952,5 +986,171 @@ pub mod tests {
         let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1])
             .expect_err("profile guard");
         assert!(err_message(e).contains("too large"));
+    }
+    /// Reads the stored digests for `rel` from built CodeResources:
+    /// legacy `files` maps ordinary paths to raw SHA-1 Data; `files2` maps
+    /// them to a dict with `hash` (SHA-1) and `hash2` (SHA-256) Data
+    /// (code_resources.rs:412-452). Returns (sha1, sha256) bytes.
+    fn resource_digests(built: &[u8], rel: &str) -> (Vec<u8>, Vec<u8>) {
+        let root: plist::Value = plist::from_bytes(built).expect("CodeResources is a plist");
+        let dict = root.as_dictionary().expect("root dict");
+        let files = dict
+            .get("files")
+            .and_then(|v| v.as_dictionary())
+            .expect("files dict");
+        let legacy = files
+            .get(rel)
+            .and_then(|v| v.as_data())
+            .expect("legacy files maps ordinary paths to SHA-1 Data")
+            .to_vec();
+        let files2 = dict
+            .get("files2")
+            .and_then(|v| v.as_dictionary())
+            .expect("files2 dict");
+        let entry = files2
+            .get(rel)
+            .and_then(|v| v.as_dictionary())
+            .expect("files2 entry dict");
+        let modern = entry
+            .get("hash2")
+            .and_then(|v| v.as_data())
+            .expect("files2 entry carries hash2 Data")
+            .to_vec();
+        (legacy, modern)
+    }
+
+    const CHUNK_A: &[u8] = b"first chunk of a large file ";
+    const CHUNK_B: &[u8] = b"second chunk of a large file";
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn chunked_stream_hashes_full_content_once_finalized() {
+        let mut signer = new_signer();
+        signer
+            .hash_file_chunk("stream.bin", CHUNK_A, false)
+            .expect("first chunk");
+        signer
+            .hash_file_chunk("stream.bin", CHUNK_B, true)
+            .expect("final chunk");
+        let built = signer
+            .build_code_resources()
+            .expect("build with no pending streams");
+        let mut full = CHUNK_A.to_vec();
+        full.extend_from_slice(CHUNK_B);
+        let (h1, h2) = resource_digests(&built, "stream.bin");
+        assert_eq!(h1, Sha1::digest(&full).to_vec());
+        assert_eq!(h2, Sha256::digest(&full).to_vec());
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn single_call_finalize_and_interleaved_paths_stay_correct() {
+        let mut signer = new_signer();
+        // single-call stream (is_final on the first call) stays legal
+        signer
+            .hash_file_chunk("one.bin", b"whole file", true)
+            .expect("single finalize");
+        // two paths interleaved across their streams
+        signer.hash_file_chunk("a.bin", b"A1", false).expect("a1");
+        signer.hash_file_chunk("b.bin", b"B1", false).expect("b1");
+        signer
+            .hash_file_chunk("a.bin", b"A2", true)
+            .expect("a2 final");
+        signer
+            .hash_file_chunk("b.bin", b"B2", true)
+            .expect("b2 final");
+        let built = signer.build_code_resources().expect("build");
+        let (a1, a2) = resource_digests(&built, "a.bin");
+        assert_eq!(a1, Sha1::digest(b"A1A2").to_vec());
+        assert_eq!(a2, Sha256::digest(b"A1A2").to_vec());
+        let (b1, b2) = resource_digests(&built, "b.bin");
+        assert_eq!(b1, Sha1::digest(b"B1B2").to_vec());
+        assert_eq!(b2, Sha256::digest(b"B1B2").to_vec());
+    }
+
+    #[wasm_bindgen_test]
+    fn double_finalize_and_post_finalize_chunks_are_rejected() {
+        let mut signer = new_signer();
+        signer
+            .hash_file_chunk("x.bin", b"data", true)
+            .expect("first finalize");
+
+        // double finalize (previously silently re-hashed just the 2nd call)
+        let e = signer
+            .hash_file_chunk("x.bin", b"more", true)
+            .expect_err("double finalize");
+        assert!(err_message(e).contains("reset_resources"));
+
+        // post-finalize chunk (previously seeded a fresh digest = silent partial hash)
+        let e = signer
+            .hash_file_chunk("x.bin", b"more", false)
+            .expect_err("post-finalize chunk");
+        let msg = err_message(e);
+        assert!(
+            msg.contains("already finalized") && msg.contains("reset_resources"),
+            "{msg}"
+        );
+
+        // build must not contain the corrupted partial content: only "data" was sealed
+        let built = signer
+            .build_code_resources()
+            .expect("sealed state still builds");
+        let (h1, _) = resource_digests(&built, "x.bin");
+        assert_eq!(h1, Sha1::digest(b"data").to_vec());
+    }
+
+    #[wasm_bindgen_test]
+    fn hash_file_conflicts_with_active_or_sealed_paths() {
+        let mut signer = new_signer();
+        signer
+            .hash_file_chunk("y.bin", b"part", false)
+            .expect("stream open");
+        let e = signer
+            .hash_file("y.bin", b"direct")
+            .expect_err("active stream conflict");
+        assert!(err_message(e).contains("unfinished streaming hash"));
+
+        signer
+            .hash_file_chunk("y.bin", b" rest", true)
+            .expect("finalize");
+        let e = signer
+            .hash_file("y.bin", b"direct")
+            .expect_err("sealed conflict");
+        let msg = err_message(e);
+        assert!(
+            msg.contains("already finalized") && msg.contains("reset_resources"),
+            "{msg}"
+        );
+
+        // unfinished-stream guard on build stays (stream z.bin never finalized)
+        signer
+            .hash_file_chunk("z.bin", b"open", false)
+            .expect("open");
+        let e = signer
+            .build_code_resources()
+            .expect_err("pending streams block build");
+        assert!(err_message(e).contains("unfinished streaming hashes"));
+
+        // reset_resources is the documented round boundary
+        signer.reset_resources();
+        signer
+            .hash_file("y.bin", b"direct")
+            .expect("sealed path reusable after reset");
+        let built = signer.build_code_resources().expect("clean build");
+        let (h1, _) = resource_digests(&built, "y.bin");
+        assert_eq!(h1, Sha1::digest(b"direct").to_vec());
+    }
+
+    /// Excluded paths (the main executable) are never stored and never
+    /// sealed: repeated `hash_file` calls keep returning `false` without
+    /// throwing — the pre-lane no-op behavior is preserved.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn excluded_paths_stay_recallable_noops() {
+        let mut signer = new_signer();
+        signer.set_main_executable("App");
+        assert!(!signer
+            .hash_file("App", b"binary bytes")
+            .expect("first call ok"));
+        assert!(!signer
+            .hash_file("App", b"binary bytes")
+            .expect("second call ok, not sealed"));
     }
 }
