@@ -83,17 +83,6 @@ fn encode_length(output: &mut Vec<u8>, length: usize) {
     }
 }
 
-/// Encode a plist Value to DER format.
-///
-/// Converts plist values to their corresponding ASN.1 DER representation:
-/// - Bool -> BOOLEAN
-/// - Integer -> INTEGER
-/// - String -> UTF8String
-/// - Array -> SEQUENCE
-/// - Dictionary -> [16] (0xb0) IMPLICIT SET OF key-value pairs
-/// - Data -> OCTET STRING
-/// - Date -> GeneralizedTime
-
 /// Convert a plist date to a DER GeneralizedTime value (X.690 clause 11.7).
 ///
 /// Output is `YYYYMMDDHHMMSSZ` in UTC; a fractional part is appended only when
@@ -198,6 +187,16 @@ fn encode_dictionary(dict: &plist::Dictionary) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Encode a plist Value to DER format.
+///
+/// Converts plist values to their corresponding ASN.1 DER representation:
+/// - Bool -> BOOLEAN
+/// - Integer -> INTEGER
+/// - String -> UTF8String
+/// - Array -> SEQUENCE
+/// - Dictionary -> [16] (0xb0) IMPLICIT SET OF key-value pairs
+/// - Data -> OCTET STRING
+/// - Date -> GeneralizedTime
 fn encode_value(value: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
