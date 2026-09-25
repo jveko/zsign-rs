@@ -17,6 +17,27 @@ use wasm_bindgen::prelude::*;
 use zsign_core::bundle::CodeResourcesBuilder;
 use zsign_core::crypto::SigningCredentials;
 use zsign_core::provisioning::extract_entitlements_from_profile;
+/// Maximum size of a single Mach-O input (parse/sign): the wasm32 address
+/// space is 4 GiB and signing peaks at roughly 2-3x the input.
+const MAX_MACHO_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum size of one `hash_file` buffer or one `hash_file_chunk` chunk.
+/// Larger content must be streamed chunk-wise.
+const MAX_HASH_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum size of plist inputs (Info.plist, CodeResources, entitlements).
+const MAX_PLIST_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum size of a provisioning profile.
+const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum size of a PKCS#12 file.
+const MAX_P12_BYTES: usize = 4 * 1024 * 1024;
+
+fn ensure_size(len: usize, max: usize, surface: &str, remedy: &str) -> Result<(), JsError> {
+    if len <= max {
+        return Ok(());
+    }
+    Err(JsError::new(&format!(
+        "{surface} input too large: {len} bytes exceeds the {max}-byte limit; {remedy}"
+    )))
+}
 
 /// In-progress streaming hash state for a single file.
 struct StreamingHashState {
@@ -62,6 +83,21 @@ impl WasmSigner {
         p12_password: &str,
         profile_bytes: Option<Vec<u8>>,
     ) -> Result<WasmSigner, JsError> {
+        ensure_size(
+            p12_bytes.len(),
+            MAX_P12_BYTES,
+            "WasmSigner constructor (p12_bytes)",
+            "supply a smaller PKCS#12",
+        )?;
+        if let Some(profile) = &profile_bytes {
+            ensure_size(
+                profile.len(),
+                MAX_PROFILE_BYTES,
+                "WasmSigner constructor (profile_bytes)",
+                "supply a smaller provisioning profile",
+            )?;
+        }
+
         let credentials = SigningCredentials::from_p12(p12_bytes, p12_password)
             .map_err(|e| JsError::new(&e.to_string()))?;
 
@@ -99,6 +135,13 @@ impl WasmSigner {
     pub fn set_entitlements(&mut self, data: Option<Vec<u8>>) -> Result<(), JsError> {
         match data {
             Some(bytes) => {
+                ensure_size(
+                    bytes.len(),
+                    MAX_PLIST_BYTES,
+                    "set_entitlements",
+                    "entitlements must be a compact plist dictionary",
+                )?;
+
                 let value: plist::Value = plist::from_bytes(&bytes).map_err(|e| {
                     JsError::new(&format!(
                         "entitlements must be a valid XML or binary plist dictionary: {e}"
@@ -135,13 +178,35 @@ impl WasmSigner {
     /// Hash a complete file for CodeResources (small files).
     ///
     /// Returns `true` if the file was added, `false` if it was excluded.
-    pub fn hash_file(&mut self, relative_path: &str, data: &[u8]) -> bool {
+    /// Throws when the buffer exceeds 128 MiB; stream large files with
+    /// `hash_file_chunk` instead.
+    ///
+    pub fn hash_file(&mut self, relative_path: &str, data: &[u8]) -> Result<bool, JsError> {
+        ensure_size(
+            data.len(),
+            MAX_HASH_BYTES,
+            "hash_file",
+            "stream large files with hash_file_chunk(...)",
+        )?;
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(data);
-        self.resource_builder.add_file(relative_path, sha1, sha256)
+        Ok(self.resource_builder.add_file(relative_path, sha1, sha256))
     }
 
     /// Start or continue streaming hash for a large file.
-    pub fn hash_file_chunk(&mut self, relative_path: &str, chunk: &[u8], is_final: bool) {
+    /// Throws when a chunk exceeds 128 MiB; send smaller chunks instead.
+    ///
+    pub fn hash_file_chunk(
+        &mut self,
+        relative_path: &str,
+        chunk: &[u8],
+        is_final: bool,
+    ) -> Result<(), JsError> {
+        ensure_size(
+            chunk.len(),
+            MAX_HASH_BYTES,
+            "hash_file_chunk",
+            "send smaller chunks",
+        )?;
         let state = self
             .streaming_hashes
             .entry(relative_path.to_string())
@@ -166,6 +231,7 @@ impl WasmSigner {
                 self.resource_builder.add_file(relative_path, sha1, sha256);
             }
         }
+        Ok(())
     }
 
     /// Register a symlink in CodeResources.
@@ -201,11 +267,25 @@ impl WasmSigner {
 
     /// Extract entitlements from a provisioning profile.
     pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsError> {
+        ensure_size(
+            profile_data.len(),
+            MAX_PROFILE_BYTES,
+            "extract_entitlements",
+            "supply a smaller provisioning profile",
+        )?;
+
         extract_entitlements_from_profile(profile_data).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Parse a Mach-O binary and return metadata.
     pub fn parse_macho(data: Vec<u8>) -> Result<MachOInfo, JsError> {
+        ensure_size(
+            data.len(),
+            MAX_MACHO_BYTES,
+            "parse_macho",
+            "use the native zsign CLI for larger binaries",
+        )?;
+
         let macho =
             zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
         Ok(MachOInfo {
@@ -227,6 +307,29 @@ impl WasmSigner {
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, JsError> {
+        ensure_size(
+            data.len(),
+            MAX_MACHO_BYTES,
+            "sign_macho",
+            "use the native zsign CLI for larger binaries",
+        )?;
+        if let Some(pl) = &info_plist {
+            ensure_size(
+                pl.len(),
+                MAX_PLIST_BYTES,
+                "sign_macho (info_plist)",
+                "supply a smaller Info.plist",
+            )?;
+        }
+        if let Some(cr) = &code_resources {
+            ensure_size(
+                cr.len(),
+                MAX_PLIST_BYTES,
+                "sign_macho (code_resources)",
+                "supply smaller CodeResources",
+            )?;
+        }
+
         let macho =
             zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
         if macho.slices().len() > 1 {
@@ -264,6 +367,29 @@ impl WasmSigner {
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, JsError> {
+        ensure_size(
+            data.len(),
+            MAX_MACHO_BYTES,
+            "sign_macho_fat",
+            "use the native zsign CLI for larger binaries",
+        )?;
+        if let Some(pl) = &info_plist {
+            ensure_size(
+                pl.len(),
+                MAX_PLIST_BYTES,
+                "sign_macho_fat (info_plist)",
+                "supply a smaller Info.plist",
+            )?;
+        }
+        if let Some(cr) = &code_resources {
+            ensure_size(
+                cr.len(),
+                MAX_PLIST_BYTES,
+                "sign_macho_fat (code_resources)",
+                "supply smaller CodeResources",
+            )?;
+        }
+
         let macho =
             zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
         zsign_core::macho::sign_any_macho(
@@ -282,6 +408,13 @@ impl WasmSigner {
     ///
     /// Returns a JS object with `bundle_id` and `executable` fields (both optional strings).
     pub fn parse_info_plist(data: &[u8]) -> Result<JsValue, JsError> {
+        ensure_size(
+            data.len(),
+            MAX_PLIST_BYTES,
+            "parse_info_plist",
+            "supply a smaller Info.plist",
+        )?;
+
         let plist_value: plist::Value = plist::from_bytes(data)
             .map_err(|e| JsError::new(&format!("Failed to parse Info.plist: {}", e)))?;
 
@@ -729,5 +862,95 @@ pub mod tests {
             .expect_err("DER-unsupported value rejected");
         let m3 = err_message(e3);
         assert!(m3.contains("cannot encode"), "got: {m3}");
+    }
+
+    // ensure_size boundaries: `len` is a plain parameter, so every constant
+    // is pinned without large allocations (the 513 MiB Mach-O case is never
+    // allocated in CI by design — design doc item 3).
+    #[wasm_bindgen_test(unsupported = test)]
+    fn ensure_size_accepts_exactly_at_limit() {
+        for max in [
+            MAX_P12_BYTES,
+            MAX_HASH_BYTES,
+            MAX_PLIST_BYTES,
+            MAX_PROFILE_BYTES,
+            MAX_MACHO_BYTES,
+        ] {
+            assert!(
+                ensure_size(max, max, "surface", "remedy").is_ok(),
+                "at limit {max}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn ensure_size_rejects_one_byte_over_every_limit() {
+        for max in [
+            MAX_P12_BYTES,
+            MAX_HASH_BYTES,
+            MAX_PLIST_BYTES,
+            MAX_PROFILE_BYTES,
+            MAX_MACHO_BYTES,
+        ] {
+            let e = ensure_size(max + 1, max, "surface", "remedy").expect_err("over limit");
+            let msg = err_message(e);
+            assert!(
+                msg.contains("too large") && msg.contains("surface"),
+                "{msg}"
+            );
+        }
+    }
+
+    // Wiring: exactly at the limit passes the guard (and fails later at p12
+    // parsing); one byte over fails with the size error. 4 MiB allocations.
+    #[wasm_bindgen_test]
+    fn p12_size_boundary_is_enforced() {
+        let at_limit = vec![0u8; MAX_P12_BYTES];
+        let e = match WasmSigner::new(&at_limit, "test", None) {
+            Err(e) => e,
+            Ok(_) => panic!("garbage still fails parsing"),
+        };
+        let m = err_message(e);
+        assert!(
+            !m.contains("too large"),
+            "exactly-at-limit input must pass the size guard: {m}"
+        );
+
+        let over = vec![0u8; MAX_P12_BYTES + 1];
+        let e = match WasmSigner::new(&over, "test", None) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize rejected"),
+        };
+        let msg = err_message(e);
+        assert!(
+            msg.contains("too large") && msg.contains("4194304"),
+            "{msg}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn hash_and_plist_surfaces_reject_oversize_input() {
+        let mut signer = new_signer();
+        // 129 MiB — the largest allocation kept in CI (one transient chunk)
+        let e = signer
+            .hash_file("big.bin", &vec![0u8; MAX_HASH_BYTES + 1])
+            .expect_err("hash guard");
+        assert!(
+            err_message(e).contains("hash_file_chunk"),
+            "remedy must name the streaming API"
+        );
+
+        let e = signer
+            .hash_file_chunk("big.bin", &vec![0u8; MAX_HASH_BYTES + 1], true)
+            .expect_err("chunk guard");
+        assert!(err_message(e).contains("too large"));
+
+        let e =
+            WasmSigner::parse_info_plist(&vec![0u8; MAX_PLIST_BYTES + 1]).expect_err("plist guard");
+        assert!(err_message(e).contains("16777216"));
+
+        let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1])
+            .expect_err("profile guard");
+        assert!(err_message(e).contains("too large"));
     }
 }
