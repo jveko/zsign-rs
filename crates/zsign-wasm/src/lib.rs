@@ -9,6 +9,33 @@
 //!
 //! All cryptographic operations use pure-Rust RustCrypto implementations,
 //! making this crate fully compatible with `wasm32-unknown-unknown`.
+//!
+//! ## Error codes
+//!
+//! Every thrown error is a real JavaScript `Error` carrying a stable string
+//! `error.code` property. Match on `error.code`; `error.message` is human-facing
+//! and may change.
+//!
+//! | Code | When it occurs |
+//! | --- | --- |
+//! | `ZSIGN_INVALID_MACHO` | Mach-O parsing or binary-format validation fails. |
+//! | `ZSIGN_ENCRYPTED_BINARY` | FairPlay-encrypted binaries are rejected. |
+//! | `ZSIGN_SIGNING_FAILED` | Signing cannot be completed. |
+//! | `ZSIGN_INVALID_CERTIFICATE` | The signing certificate is invalid. |
+//! | `ZSIGN_INVALID_PASSWORD` | A PKCS#12 or private-key password is incorrect. |
+//! | `ZSIGN_MISSING_CREDENTIALS` | Required signing credentials are missing. |
+//! | `ZSIGN_CONFIG` | Signing configuration is invalid. |
+//! | `ZSIGN_INVALID_PROFILE` | The provisioning profile is invalid. |
+//! | `ZSIGN_INVALID_PLIST` | An Info.plist is malformed or is not a dictionary. |
+//! | `ZSIGN_DER_ENCODING` | A value cannot be DER-encoded. |
+//! | `ZSIGN_VERIFICATION` | Signature verification fails. |
+//! | `ZSIGN_INPUT_TOO_LARGE` | An input exceeds its surface-specific size limit. |
+//! | `ZSIGN_INVALID_ENTITLEMENTS` | Entitlements are malformed or unsupported. |
+//! | `ZSIGN_UNFINISHED_HASHES` | CodeResources are built with unfinished streams. |
+//! | `ZSIGN_PATH_ALREADY_FINALIZED` | A finalized resource path is reused before reset. |
+//! | `ZSIGN_PATH_IN_PROGRESS` | A streamed resource path is hashed directly. |
+//! | `ZSIGN_FAT_UNSUPPORTED` | FAT input is passed to thin signing. |
+//! | `ZSIGN_INTERNAL` | An internal JavaScript object operation fails. |
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -30,13 +57,114 @@ const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum size of a PKCS#12 file.
 const MAX_P12_BYTES: usize = 4 * 1024 * 1024;
 
-fn ensure_size(len: usize, max: usize, surface: &str, remedy: &str) -> Result<(), JsError> {
+/// Stable, machine-readable error categories exposed as `Error.code`.
+/// This is a public contract and changes only across major versions; message
+/// text is intended for humans and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WasmErrorCode {
+    InvalidMachO,
+    EncryptedBinary,
+    SigningFailed,
+    InvalidCertificate,
+    InvalidPassword,
+    MissingCredentials,
+    Config,
+    InvalidProfile,
+    InvalidPlist,
+    DerEncoding,
+    Verification,
+    InputTooLarge,
+    InvalidEntitlements,
+    UnfinishedHashes,
+    PathAlreadyFinalized,
+    PathInProgress,
+    FatUnsupported,
+    Internal,
+}
+
+impl WasmErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidMachO => "ZSIGN_INVALID_MACHO",
+            Self::EncryptedBinary => "ZSIGN_ENCRYPTED_BINARY",
+            Self::SigningFailed => "ZSIGN_SIGNING_FAILED",
+            Self::InvalidCertificate => "ZSIGN_INVALID_CERTIFICATE",
+            Self::InvalidPassword => "ZSIGN_INVALID_PASSWORD",
+            Self::MissingCredentials => "ZSIGN_MISSING_CREDENTIALS",
+            Self::Config => "ZSIGN_CONFIG",
+            Self::InvalidProfile => "ZSIGN_INVALID_PROFILE",
+            Self::InvalidPlist => "ZSIGN_INVALID_PLIST",
+            Self::DerEncoding => "ZSIGN_DER_ENCODING",
+            Self::Verification => "ZSIGN_VERIFICATION",
+            Self::InputTooLarge => "ZSIGN_INPUT_TOO_LARGE",
+            Self::InvalidEntitlements => "ZSIGN_INVALID_ENTITLEMENTS",
+            Self::UnfinishedHashes => "ZSIGN_UNFINISHED_HASHES",
+            Self::PathAlreadyFinalized => "ZSIGN_PATH_ALREADY_FINALIZED",
+            Self::PathInProgress => "ZSIGN_PATH_IN_PROGRESS",
+            Self::FatUnsupported => "ZSIGN_FAT_UNSUPPORTED",
+            Self::Internal => "ZSIGN_INTERNAL",
+        }
+    }
+}
+
+/// Categorizes core errors exhaustively by design: a new
+/// `zsign_core::Error` variant must fail to compile until it is assigned a
+/// stable public code.
+fn code_for_core_error(e: &zsign_core::Error) -> WasmErrorCode {
+    match e {
+        zsign_core::Error::MachO(_) | zsign_core::Error::Goblin(_) => WasmErrorCode::InvalidMachO,
+        zsign_core::Error::EncryptedBinary(_) => WasmErrorCode::EncryptedBinary,
+        zsign_core::Error::Signing(_) => WasmErrorCode::SigningFailed,
+        zsign_core::Error::Certificate(_) => WasmErrorCode::InvalidCertificate,
+        zsign_core::Error::InvalidPassword => WasmErrorCode::InvalidPassword,
+        zsign_core::Error::MissingCredentials(_) => WasmErrorCode::MissingCredentials,
+        zsign_core::Error::Config(_) => WasmErrorCode::Config,
+        zsign_core::Error::ProvisioningProfile(_) => WasmErrorCode::InvalidProfile,
+        zsign_core::Error::Plist(_) => WasmErrorCode::InvalidPlist,
+        zsign_core::Error::DerEncoding(_) => WasmErrorCode::DerEncoding,
+        zsign_core::Error::Verification(_) => WasmErrorCode::Verification,
+    }
+}
+
+fn js_err(code: WasmErrorCode, message: impl std::fmt::Display) -> JsValue {
+    let err = js_sys::Error::new(&message.to_string());
+    let _ = js_sys::Reflect::set(
+        &err,
+        &JsValue::from_str("code"),
+        &JsValue::from_str(code.as_str()),
+    );
+    err.into()
+}
+
+fn core_err(e: zsign_core::Error) -> JsValue {
+    let code = code_for_core_error(&e);
+    js_err(code, e)
+}
+
+/// `from_p12` wraps every PKCS#12 failure, including the wrong-password MAC
+/// failure, as `Error::Certificate`. The MAC mismatch display text is the only
+/// surviving wrong-password signal, and wrong passwords fail that check for
+/// every supported variant. All other failures keep their generic core code.
+fn p12_err(e: zsign_core::Error) -> JsValue {
+    let code = if e
+        .to_string()
+        .contains("invalid PKCS#12 password (MAC mismatch)")
+    {
+        WasmErrorCode::InvalidPassword
+    } else {
+        code_for_core_error(&e)
+    };
+    js_err(code, e)
+}
+
+fn ensure_size(len: usize, max: usize, surface: &str, remedy: &str) -> Result<(), JsValue> {
     if len <= max {
         return Ok(());
     }
-    Err(JsError::new(&format!(
-        "{surface} input too large: {len} bytes exceeds the {max}-byte limit; {remedy}"
-    )))
+    Err(js_err(
+        WasmErrorCode::InputTooLarge,
+        format!("{surface} input too large: {len} bytes exceeds the {max}-byte limit; {remedy}"),
+    ))
 }
 
 /// In-progress streaming hash state for a single file.
@@ -83,7 +211,7 @@ impl WasmSigner {
         p12_bytes: &[u8],
         p12_password: &str,
         profile_bytes: Option<Vec<u8>>,
-    ) -> Result<WasmSigner, JsError> {
+    ) -> Result<WasmSigner, JsValue> {
         ensure_size(
             p12_bytes.len(),
             MAX_P12_BYTES,
@@ -99,13 +227,10 @@ impl WasmSigner {
             )?;
         }
 
-        let credentials = SigningCredentials::from_p12(p12_bytes, p12_password)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let credentials = SigningCredentials::from_p12(p12_bytes, p12_password).map_err(p12_err)?;
 
         let entitlements = match profile_bytes.as_deref() {
-            Some(data) => {
-                extract_entitlements_from_profile(data).map_err(|e| JsError::new(&e.to_string()))?
-            }
+            Some(data) => extract_entitlements_from_profile(data).map_err(core_err)?,
             None => None,
         };
 
@@ -134,7 +259,7 @@ impl WasmSigner {
     /// `None` clears the override, falling back to the profile-derived
     /// entitlements. To sign with no entitlements while holding a profile,
     /// construct the signer without profile bytes instead.
-    pub fn set_entitlements(&mut self, data: Option<Vec<u8>>) -> Result<(), JsError> {
+    pub fn set_entitlements(&mut self, data: Option<Vec<u8>>) -> Result<(), JsValue> {
         match data {
             Some(bytes) => {
                 ensure_size(
@@ -145,19 +270,22 @@ impl WasmSigner {
                 )?;
 
                 let value: plist::Value = plist::from_bytes(&bytes).map_err(|e| {
-                    JsError::new(&format!(
-                        "entitlements must be a valid XML or binary plist dictionary: {e}"
-                    ))
+                    js_err(
+                        WasmErrorCode::InvalidEntitlements,
+                        format!("entitlements must be a valid XML or binary plist dictionary: {e}"),
+                    )
                 })?;
                 if value.as_dictionary().is_none() {
-                    return Err(JsError::new(
+                    return Err(js_err(
+                        WasmErrorCode::InvalidEntitlements,
                         "entitlements plist must contain a top-level dictionary",
                     ));
                 }
                 zsign_core::codesign::der::plist_to_der(&bytes).map_err(|e| {
-                    JsError::new(&format!(
-                        "entitlements contain types the signer cannot encode: {e}"
-                    ))
+                    js_err(
+                        WasmErrorCode::InvalidEntitlements,
+                        format!("entitlements contain types the signer cannot encode: {e}"),
+                    )
                 })?;
                 self.entitlements_override = Some(bytes);
             }
@@ -183,7 +311,7 @@ impl WasmSigner {
     /// Throws when the buffer exceeds 128 MiB; stream large files with
     /// `hash_file_chunk` instead. Throws when the path has an unfinished
     /// streaming hash or was already finalized in this resources round.
-    pub fn hash_file(&mut self, relative_path: &str, data: &[u8]) -> Result<bool, JsError> {
+    pub fn hash_file(&mut self, relative_path: &str, data: &[u8]) -> Result<bool, JsValue> {
         ensure_size(
             data.len(),
             MAX_HASH_BYTES,
@@ -191,14 +319,20 @@ impl WasmSigner {
             "stream large files with hash_file_chunk(...)",
         )?;
         if self.streaming_hashes.contains_key(relative_path) {
-            return Err(JsError::new(&format!(
-                "path \"{relative_path}\" has an unfinished streaming hash; finalize it with hash_file_chunk(..., true) before hashing it directly"
-            )));
+            return Err(js_err(
+                WasmErrorCode::PathInProgress,
+                format!(
+                    "path \"{relative_path}\" has an unfinished streaming hash; finalize it with hash_file_chunk(..., true) before hashing it directly"
+                ),
+            ));
         }
         if self.finalized_paths.contains(relative_path) {
-            return Err(JsError::new(&format!(
-                "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
-            )));
+            return Err(js_err(
+                WasmErrorCode::PathAlreadyFinalized,
+                format!(
+                    "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
+                ),
+            ));
         }
         let (sha1, sha256) = CodeResourcesBuilder::hash_data(data);
         let added = self.resource_builder.add_file(relative_path, sha1, sha256);
@@ -223,7 +357,7 @@ impl WasmSigner {
         relative_path: &str,
         chunk: &[u8],
         is_final: bool,
-    ) -> Result<(), JsError> {
+    ) -> Result<(), JsValue> {
         ensure_size(
             chunk.len(),
             MAX_HASH_BYTES,
@@ -231,9 +365,12 @@ impl WasmSigner {
             "send smaller chunks",
         )?;
         if self.finalized_paths.contains(relative_path) {
-            return Err(JsError::new(&format!(
-                "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
-            )));
+            return Err(js_err(
+                WasmErrorCode::PathAlreadyFinalized,
+                format!(
+                    "path \"{relative_path}\" was already finalized in this resources round; call reset_resources() before hashing it again"
+                ),
+            ));
         }
         let state = self
             .streaming_hashes
@@ -277,18 +414,19 @@ impl WasmSigner {
     }
 
     /// Build and return the CodeResources plist bytes.
-    pub fn build_code_resources(&self) -> Result<Vec<u8>, JsError> {
+    pub fn build_code_resources(&self) -> Result<Vec<u8>, JsValue> {
         if !self.streaming_hashes.is_empty() {
             let pending: Vec<_> = self.streaming_hashes.keys().collect();
-            return Err(JsError::new(&format!(
-                "Cannot build CodeResources: {} unfinished streaming hashes: {:?}",
-                pending.len(),
-                pending
-            )));
+            return Err(js_err(
+                WasmErrorCode::UnfinishedHashes,
+                format!(
+                    "Cannot build CodeResources: {} unfinished streaming hashes: {:?}",
+                    pending.len(),
+                    pending
+                ),
+            ));
         }
-        self.resource_builder
-            .build()
-            .map_err(|e| JsError::new(&e.to_string()))
+        self.resource_builder.build().map_err(core_err)
     }
 
     /// Start a new resources round, clearing the builder, active streams, and
@@ -300,7 +438,7 @@ impl WasmSigner {
     }
 
     /// Extract entitlements from a provisioning profile.
-    pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsError> {
+    pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
         ensure_size(
             profile_data.len(),
             MAX_PROFILE_BYTES,
@@ -308,11 +446,11 @@ impl WasmSigner {
             "supply a smaller provisioning profile",
         )?;
 
-        extract_entitlements_from_profile(profile_data).map_err(|e| JsError::new(&e.to_string()))
+        extract_entitlements_from_profile(profile_data).map_err(core_err)
     }
 
     /// Parse a Mach-O binary and return metadata.
-    pub fn parse_macho(data: Vec<u8>) -> Result<MachOInfo, JsError> {
+    pub fn parse_macho(data: Vec<u8>) -> Result<MachOInfo, JsValue> {
         ensure_size(
             data.len(),
             MAX_MACHO_BYTES,
@@ -320,8 +458,7 @@ impl WasmSigner {
             "use the native zsign CLI for larger binaries",
         )?;
 
-        let macho =
-            zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
+        let macho = zsign_core::macho::MachOFile::parse(data).map_err(core_err)?;
         Ok(MachOInfo {
             is_fat: macho.is_fat(),
             slices_count: macho.slices().len(),
@@ -340,7 +477,7 @@ impl WasmSigner {
         identifier: &str,
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, JsError> {
+    ) -> Result<Vec<u8>, JsValue> {
         ensure_size(
             data.len(),
             MAX_MACHO_BYTES,
@@ -364,10 +501,10 @@ impl WasmSigner {
             )?;
         }
 
-        let macho =
-            zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
+        let macho = zsign_core::macho::MachOFile::parse(data).map_err(core_err)?;
         if macho.slices().len() > 1 {
-            return Err(JsError::new(
+            return Err(js_err(
+                WasmErrorCode::FatUnsupported,
                 "FAT/Universal input is not supported by SHA-256-only signing; call sign_macho_fat() to opt into dual SHA-1+SHA-256 signing explicitly",
             ));
         }
@@ -390,7 +527,7 @@ impl WasmSigner {
             code_resources.as_deref(),
             false,
         )
-        .map_err(|e| JsError::new(&e.to_string()))
+        .map_err(core_err)
     }
 
     /// Sign a Mach-O binary (thin or FAT/Universal) with dual SHA-1+SHA-256 code directories. Returns the signed binary bytes.
@@ -400,7 +537,7 @@ impl WasmSigner {
         identifier: &str,
         info_plist: Option<Vec<u8>>,
         code_resources: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, JsError> {
+    ) -> Result<Vec<u8>, JsValue> {
         ensure_size(
             data.len(),
             MAX_MACHO_BYTES,
@@ -424,8 +561,7 @@ impl WasmSigner {
             )?;
         }
 
-        let macho =
-            zsign_core::macho::MachOFile::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
+        let macho = zsign_core::macho::MachOFile::parse(data).map_err(core_err)?;
         zsign_core::macho::sign_any_macho(
             &macho,
             identifier,
@@ -435,13 +571,13 @@ impl WasmSigner {
             code_resources.as_deref(),
             false,
         )
-        .map_err(|e| JsError::new(&e.to_string()))
+        .map_err(core_err)
     }
 
     /// Parse an Info.plist (XML or binary) and return bundle ID and executable name.
     ///
     /// Returns a JS object with `bundle_id` and `executable` fields (both optional strings).
-    pub fn parse_info_plist(data: &[u8]) -> Result<JsValue, JsError> {
+    pub fn parse_info_plist(data: &[u8]) -> Result<JsValue, JsValue> {
         ensure_size(
             data.len(),
             MAX_PLIST_BYTES,
@@ -449,12 +585,19 @@ impl WasmSigner {
             "supply a smaller Info.plist",
         )?;
 
-        let plist_value: plist::Value = plist::from_bytes(data)
-            .map_err(|e| JsError::new(&format!("Failed to parse Info.plist: {}", e)))?;
+        let plist_value: plist::Value = plist::from_bytes(data).map_err(|e| {
+            js_err(
+                WasmErrorCode::InvalidPlist,
+                format!("Failed to parse Info.plist: {}", e),
+            )
+        })?;
 
-        let dict = plist_value
-            .as_dictionary()
-            .ok_or_else(|| JsError::new("Info.plist is not a dictionary"))?;
+        let dict = plist_value.as_dictionary().ok_or_else(|| {
+            js_err(
+                WasmErrorCode::InvalidPlist,
+                "Info.plist is not a dictionary",
+            )
+        })?;
 
         let bundle_id = dict
             .get("CFBundleIdentifier")
@@ -468,9 +611,9 @@ impl WasmSigner {
 
         let js_obj = js_sys::Object::new();
         js_sys::Reflect::set(&js_obj, &"bundle_id".into(), &bundle_id.into())
-            .map_err(|_| JsError::new("Failed to set bundle_id"))?;
+            .map_err(|_| js_err(WasmErrorCode::Internal, "Failed to set bundle_id"))?;
         js_sys::Reflect::set(&js_obj, &"executable".into(), &executable.into())
-            .map_err(|_| JsError::new("Failed to set executable"))?;
+            .map_err(|_| js_err(WasmErrorCode::Internal, "Failed to set executable"))?;
 
         Ok(js_obj.into())
     }
@@ -758,6 +901,7 @@ pub mod tests {
         let err = new_signer()
             .sign_macho(fat, "com.zsign.test", None, None)
             .expect_err("FAT rejected by default");
+        assert_eq!(error_code(&err), Some("ZSIGN_FAT_UNSUPPORTED".into()));
         let msg = err_message(err);
         assert!(
             msg.contains("sign_macho_fat"),
@@ -878,6 +1022,7 @@ pub mod tests {
         let e1 = signer
             .set_entitlements(Some(b"not a plist".to_vec()))
             .expect_err("garbage rejected");
+        assert_eq!(error_code(&e1), Some("ZSIGN_INVALID_ENTITLEMENTS".into()));
         assert!(err_message(e1).contains("plist dictionary"));
 
         let arr = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -927,6 +1072,7 @@ pub mod tests {
             MAX_MACHO_BYTES,
         ] {
             let e = ensure_size(max + 1, max, "surface", "remedy").expect_err("over limit");
+            assert_eq!(error_code(&e), Some("ZSIGN_INPUT_TOO_LARGE".into()));
             let msg = err_message(e);
             assert!(
                 msg.contains("too large") && msg.contains("surface"),
@@ -1077,6 +1223,7 @@ pub mod tests {
         let e = signer
             .hash_file_chunk("x.bin", b"more", true)
             .expect_err("double finalize");
+        assert_eq!(error_code(&e), Some("ZSIGN_PATH_ALREADY_FINALIZED".into()));
         assert!(err_message(e).contains("reset_resources"));
 
         // post-finalize chunk (previously seeded a fresh digest = silent partial hash)
@@ -1106,6 +1253,7 @@ pub mod tests {
         let e = signer
             .hash_file("y.bin", b"direct")
             .expect_err("active stream conflict");
+        assert_eq!(error_code(&e), Some("ZSIGN_PATH_IN_PROGRESS".into()));
         assert!(err_message(e).contains("unfinished streaming hash"));
 
         signer
@@ -1152,5 +1300,51 @@ pub mod tests {
         assert!(!signer
             .hash_file("App", b"binary bytes")
             .expect("second call ok, not sealed"));
+    }
+
+    fn error_code(err: &JsValue) -> Option<String> {
+        js_sys::Reflect::get(err, &JsValue::from_str("code"))
+            .ok()
+            .and_then(|v| v.as_string())
+    }
+
+    #[wasm_bindgen_test]
+    fn errors_carry_stable_zsign_codes_and_real_error_instances() {
+        let e = match WasmSigner::new(&decode_base64(LEAF_P12_B64), "wrong-password", None) {
+            Err(e) => e,
+            Ok(_) => panic!("bad password"),
+        };
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PASSWORD".into()));
+
+        let e = new_signer()
+            .sign_macho(build_fat_macho(), "com.zsign.test", None, None)
+            .expect_err("fat input");
+        assert_eq!(error_code(&e), Some("ZSIGN_FAT_UNSUPPORTED".into()));
+
+        let e = match WasmSigner::new(&vec![0u8; MAX_P12_BYTES + 1], "test", None) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize"),
+        };
+        assert_eq!(error_code(&e), Some("ZSIGN_INPUT_TOO_LARGE".into()));
+
+        let mut signer = new_signer();
+        signer.hash_file_chunk("c.bin", b"x", true).unwrap();
+        let e = signer
+            .hash_file_chunk("c.bin", b"y", true)
+            .expect_err("sealed path");
+        assert_eq!(error_code(&e), Some("ZSIGN_PATH_ALREADY_FINALIZED".into()));
+
+        let mut signer = new_signer();
+        let e = signer
+            .set_entitlements(Some(b"junk".to_vec()))
+            .expect_err("invalid entitlements");
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_ENTITLEMENTS".into()));
+
+        let e = WasmSigner::parse_info_plist(b"not a plist").expect_err("bad plist");
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PLIST".into()));
+
+        // the thrown value is a real Error with a non-empty message
+        assert!(e.is_instance_of::<js_sys::Error>());
+        assert!(!err_message(e).is_empty());
     }
 }
