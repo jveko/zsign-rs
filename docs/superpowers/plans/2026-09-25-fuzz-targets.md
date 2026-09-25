@@ -490,7 +490,7 @@ rm -rf .tmptmp/gen
 - [ ] **Step 6: Corpus hygiene gates (verbatim for the final report)**
 
 ```sh
-git check-ignore fuzz/corpus/sb_none_should_match; echo "ignore-exit=$?"   # expect exit 1
+git check-ignore fuzz/corpus/superblob/sb_empty.bin; echo "ignore-exit=$?"    # expect exit 1 (a real corpus path)
 du -sk fuzz/corpus/*                                                        # every dir < 256
 find fuzz/corpus -type f | wc -l                                            # expect exactly 33
 git status --short                                                          # exactly fuzz/corpus/** (plus .tmptmp/ which must be EMPTY/removed)
