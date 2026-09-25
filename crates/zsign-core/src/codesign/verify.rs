@@ -154,12 +154,18 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     for entry in &entries {
         match entry.slot {
             CSSLOT_CODEDIRECTORY if code_directory.is_none() => {
-                code_directory = CodeDirectory::parse(entry.blob).ok();
+                code_directory = Some(CodeDirectory::parse(entry.blob).map_err(|e| {
+                    crate::Error::Verification(format!("primary CodeDirectory: {e}"))
+                })?);
             }
             CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
-                if let Ok(cd) = CodeDirectory::parse(entry.blob) {
-                    alternate_code_directories.push(cd);
-                }
+                let cd = CodeDirectory::parse(entry.blob).map_err(|e| {
+                    crate::Error::Verification(format!(
+                        "alternate CodeDirectory (slot 0x{:08x}): {e}",
+                        entry.slot
+                    ))
+                })?;
+                alternate_code_directories.push(cd);
             }
             CSSLOT_SIGNATURESLOT => cms = Some(entry.blob),
             _ => {}

@@ -91,6 +91,21 @@ pub fn verify_macho(data: &[u8], inputs: &SignatureInputs<'_>) -> Result<MachOVe
     Ok(MachOVerifyReport { fat, slices })
 }
 
+fn push_page_errors(report: &mut SliceVerifyReport, label: &str, pages: &PageCheck) {
+    match pages {
+        PageCheck::Empty => report
+            .errors
+            .push(format!("{label}code directory covers zero code bytes")),
+        PageCheck::Mismatch { page_index } => report.errors.push(format!(
+            "{label}code page {page_index} hash mismatch (code region modified?)"
+        )),
+        PageCheck::CountMismatch { stored, computed } => report.errors.push(format!(
+            "{label}code slot count mismatch: {stored} stored vs {computed} pages computed"
+        )),
+        PageCheck::Matched => {}
+    }
+}
+
 fn verify_slice(
     data: &[u8],
     slice: &crate::macho::ArchSlice,
@@ -121,11 +136,14 @@ fn verify_slice(
         return Ok(report);
     };
 
-    let Ok(superblob) = parse_superblob(sig) else {
-        report
-            .errors
-            .push("embedded code signature is not a valid SuperBlob".into());
-        return Ok(report);
+    let superblob = match parse_superblob(sig) {
+        Ok(superblob) => superblob,
+        Err(e) => {
+            report.errors.push(format!(
+                "embedded code signature is not a valid SuperBlob: {e}"
+            ));
+            return Ok(report);
+        }
     };
 
     let Some(primary) = superblob.code_directory.as_ref() else {
@@ -136,43 +154,62 @@ fn verify_slice(
     };
 
     let cds = emitted_cds(&superblob);
+    let strongest = cds
+        .iter()
+        .copied()
+        .max_by_key(|cd| cd.hash_size)
+        .unwrap_or(primary);
 
     report.signed = true;
     report.adhoc = primary.is_adhoc();
     report.identifier = primary.identifier().map(str::to_owned);
 
-    // Code pages: hash the declared code region.
-    report.pages = check_code_pages_in_file(primary, data, slice);
-    match &report.pages {
-        PageCheck::Matched => {}
-        PageCheck::Empty => {
-            report
-                .errors
-                .push("code directory covers zero code bytes".into());
-        }
-        PageCheck::Mismatch { page_index } => {
-            report.errors.push(format!(
-                "code page {page_index} hash mismatch (code region modified?)"
-            ));
-        }
-        PageCheck::CountMismatch { stored, computed } => {
-            report.errors.push(format!(
-                "code slot count mismatch: {stored} stored vs {computed} pages computed"
-            ));
-        }
+    for cd in &cds {
+        let pages = check_code_pages_in_file(cd, data, slice);
+        let label = if std::ptr::eq(*cd, primary) {
+            String::new()
+        } else {
+            format!(
+                "alternate {} ",
+                if cd.is_sha1() { "SHA-1" } else { "SHA-256" }
+            )
+        };
+        push_page_errors(&mut report, &label, &pages);
     }
 
-    // Special slots: self-consistent blobs + caller-supplied file contents.
-    let (req_blob, ent_blob, der_blob) = self_consistent_blobs(&superblob, primary);
-    let slot_checks = check_special_slots(primary, inputs, req_blob, ent_blob, der_blob);
-    report.special_slots = slot_checks.clone();
-    for (i, check) in slot_checks.iter().enumerate() {
-        if *check == SpecialSlotCheck::Mismatch {
-            report
-                .errors
-                .push(format!("special slot -{} hash mismatch", i + 1));
+    let mut pairs: Vec<(String, Vec<SpecialSlotCheck>)> = Vec::with_capacity(cds.len());
+    let mut strongest_slots = None;
+    for cd in &cds {
+        let (req_blob, ent_blob, der_blob) = self_consistent_blobs(&superblob, cd);
+        let checks = check_special_slots(cd, inputs, req_blob, ent_blob, der_blob);
+        let is_primary = std::ptr::eq(*cd, primary);
+        if std::ptr::eq(*cd, strongest) {
+            strongest_slots = Some(checks.clone());
+        }
+        pairs.push((
+            if is_primary {
+                String::new()
+            } else {
+                format!(
+                    "alternate {} ",
+                    if cd.is_sha1() { "SHA-1" } else { "SHA-256" }
+                )
+            },
+            checks,
+        ));
+    }
+    // A follow-up will elevate NotChecked across every collected pair here.
+    for (label, checks) in &pairs {
+        for (i, check) in checks.iter().enumerate() {
+            if *check == SpecialSlotCheck::Mismatch {
+                report
+                    .errors
+                    .push(format!("{label}special slot -{} hash mismatch", i + 1));
+            }
         }
     }
+    report.pages = check_code_pages_in_file(strongest, data, slice);
+    report.special_slots = strongest_slots.unwrap_or_default();
 
     // CMS signature. An exact 8-byte CSMAGIC_BLOBWRAPPER header is what
     // codesign emits for ad-hoc output; the shortcut also requires CS_ADHOC.
@@ -313,7 +350,8 @@ mod tests {
 
     use super::*;
     use crate::codesign::constants::{
-        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_CODEDIRECTORY, CSSLOT_SIGNATURESLOT,
+        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY,
+        CSSLOT_SIGNATURESLOT,
     };
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
@@ -459,13 +497,16 @@ mod tests {
         // never reached and expected_slots = ceil(C'/page) mismatches the
         // stored count. Post-fix the slice-bounded region makes
         // code_limit > len fire the guard, which reports ceil(slice_size/page).
-        // Assert the post-fix contract: the page count is measured against
-        // the slice, not the tail.
-        let expected = PageCheck::CountMismatch {
-            stored: n_slots,
-            computed: slice_size.div_ceil(page_size),
-        };
-        assert_eq!(report.slices[1].pages, expected);
+        // Metadata now reports the strongest (unpatched SHA-256 alternate) CD;
+        // the patched primary's exact numbers are pinned through the error string.
+        assert!(
+            report.slices[1].errors.iter().any(|e| e.contains(&format!(
+                "code slot count mismatch: {n_slots} stored vs {} pages computed",
+                slice_size.div_ceil(page_size)
+            ))),
+            "errors: {:?}",
+            report.slices[1].errors
+        );
         assert!(
             report.slices[1]
                 .errors
@@ -744,5 +785,68 @@ mod tests {
         let injected = cms_report_with_test_anchor(&signed, &creds);
         assert!(injected.valid, "cms errors: {:?}", injected.errors);
         assert!(injected.anchored);
+    }
+    #[test]
+    fn corrupt_alternate_cd_is_rejected_with_detail() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.alt", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let cd = sig_off
+            + entry_offset(
+                &signed[sig_off..sig_off + sig_len],
+                CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            )
+            .unwrap();
+        // Corrupt the child's hashType (byte 37) — the magic at [0..4) stays intact so
+        // task 4's slot-magic table does not change this assertion's message.
+        signed[cd + 37] = 0x07;
+        // Pre-fix: the parse failure is silently dropped and this binary verifies.
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid());
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("unsupported CodeDirectory hash type 7")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn tampered_alternate_page_hash_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.alt2", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let cd = sig_off
+            + entry_offset(
+                &signed[sig_off..sig_off + sig_len],
+                CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            )
+            .unwrap();
+        let hash_offset = u32::from_be_bytes(signed[cd + 16..cd + 20].try_into().unwrap()) as usize;
+        signed[cd + hash_offset] ^= 0xFF; // first stored code hash of the SHA-256 alternate
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid());
+        assert!(
+            report.slices[0].errors.iter().any(|e| e
+                .contains("alternate SHA-256 code page 0 hash mismatch (code region modified?)")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+        // Metadata = strongest CD (the tampered SHA-256 alternate), so the field
+        // itself now reflects the tamper:
+        assert_eq!(
+            report.slices[0].pages,
+            PageCheck::Mismatch { page_index: 0 }
+        );
     }
 }
