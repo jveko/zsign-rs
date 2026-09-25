@@ -202,9 +202,75 @@ pub fn create_ipa(
     let file = File::create(output_path)?;
     let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
 
-    // Configure compression options. A fixed timestamp keeps the archive
-    // reproducible: outputs are byte-identical across runs.
-    let options = if compression_level.level() == 0 {
+    let options = archive_options(compression_level);
+
+    // Add Payload/ directory
+    zip.add_directory("Payload/", options).map_err(Error::Zip)?;
+
+    // Walk the app bundle and add all files - don't follow symlinks
+    let name_prefix = format!("Payload/{}", app_name);
+    write_tree(&mut zip, app_bundle_path, options, &|relative_path| {
+        if relative_path.as_os_str().is_empty() {
+            Some(name_prefix.clone())
+        } else {
+            Some(format!("{}/{}", name_prefix, relative_path.display()))
+        }
+    })?;
+
+    // Finalize the archive
+    zip.finish().map_err(Error::Zip)?;
+
+    Ok(())
+}
+
+/// Creates an IPA from a whole extraction root: every top-level entry of the
+/// root (`Payload/…` plus any siblings such as `SwiftSupport/` or
+/// `iTunesMetadata.plist`) is archived verbatim under its relative name.
+///
+/// This is the repack half of [`extract_ipa`](crate::ipa::extract_ipa); unlike
+/// [`create_ipa`] it does not synthesize a `Payload/` structure.
+pub(crate) fn create_ipa_from_root(
+    extraction_root: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    compression_level: CompressionLevel,
+) -> Result<()> {
+    let extraction_root = extraction_root.as_ref();
+    let output_path = output_path.as_ref();
+
+    if !extraction_root.is_dir() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Not a directory: {}", extraction_root.display()),
+        )));
+    }
+
+    if let Some(parent) = output_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let file = File::create(output_path)?;
+    let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
+    let options = archive_options(compression_level);
+
+    write_tree(&mut zip, extraction_root, options, &|relative_path| {
+        if relative_path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(zip_entry_name(relative_path))
+        }
+    })?;
+
+    zip.finish().map_err(Error::Zip)?;
+
+    Ok(())
+}
+
+/// Configures compression options. A fixed timestamp keeps the archive
+/// reproducible: outputs are byte-identical across runs.
+fn archive_options(compression_level: CompressionLevel) -> SimpleFileOptions {
+    if compression_level.level() == 0 {
         // For stored (no compression), don't set compression level
         SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -215,42 +281,41 @@ pub fn create_ipa(
             .compression_method(CompressionMethod::Deflated)
             .compression_level(Some(compression_level.level() as i64))
             .last_modified_time(zip::DateTime::default())
-    };
+    }
+}
 
-    // Add Payload/ directory
-    zip.add_directory("Payload/", options).map_err(Error::Zip)?;
-
-    // Walk the app bundle and add all files - don't follow symlinks
-    for entry in WalkDir::new(app_bundle_path).follow_links(false) {
+/// Walks `walk_root` and writes every entry into `zip`, mapping each
+/// strip-prefix-relative path to an archive name through `name_of`
+/// (`None` skips the entry). Directories get their trailing separator here.
+fn write_tree(
+    zip: &mut ZipWriter<std::io::BufWriter<File>>,
+    walk_root: &Path,
+    options: SimpleFileOptions,
+    name_of: &dyn Fn(&Path) -> Option<String>,
+) -> Result<()> {
+    for entry in WalkDir::new(walk_root).follow_links(false) {
         let entry = entry
             .map_err(|e| Error::Io(io::Error::other(format!("Failed to walk directory: {}", e))))?;
 
         let path = entry.path();
-        let relative_path = path.strip_prefix(app_bundle_path).map_err(|_| {
+        let relative_path = path.strip_prefix(walk_root).map_err(|_| {
             Error::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Failed to compute relative path",
             ))
         })?;
 
-        // Build archive path: Payload/AppName.app/relative_path
-        let archive_path = if relative_path.as_os_str().is_empty() {
-            format!("Payload/{}/", app_name)
-        } else {
-            format!("Payload/{}/{}", app_name, relative_path.display())
+        let Some(mut archive_path) = name_of(relative_path) else {
+            continue;
         };
 
         // Use symlink_metadata to check the entry type without following links
         let metadata = fs::symlink_metadata(path)?;
 
         if metadata.is_dir() {
-            // Add directory entry
-            let dir_path = if archive_path.ends_with('/') {
-                archive_path
-            } else {
-                format!("{}/", archive_path)
-            };
-            zip.add_directory(&dir_path, options).map_err(Error::Zip)?;
+            archive_path.push('/');
+            zip.add_directory(&archive_path, options)
+                .map_err(Error::Zip)?;
         } else if metadata.file_type().is_symlink() {
             // Handle symlink using the zip crate's add_symlink method
             let target = fs::read_link(path)?;
@@ -280,14 +345,23 @@ pub fn create_ipa(
 
             // Stream file directly without loading into memory
             let mut file = File::open(path)?;
-            io::copy(&mut file, &mut zip)?;
+            io::copy(&mut file, &mut *zip)?;
         }
     }
 
-    // Finalize the archive
-    zip.finish().map_err(Error::Zip)?;
-
     Ok(())
+}
+
+/// Builds a ZIP entry name by joining `relative`'s path components with `/`.
+///
+/// `Path::components()` splits on both separators on Windows, so the result
+/// never carries the platform separator into the archive.
+fn zip_entry_name(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

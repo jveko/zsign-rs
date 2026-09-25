@@ -54,6 +54,7 @@
 pub mod archive;
 pub mod extract;
 
+use archive::create_ipa_from_root;
 pub use archive::{create_ipa, CompressionLevel};
 pub use extract::{extract_ipa, validate_ipa};
 
@@ -101,7 +102,8 @@ use walkdir::WalkDir;
 /// 2. Sign all Mach-O binaries in the `.app` bundle
 /// 3. Embed provisioning profile (if provided)
 /// 4. Generate `_CodeSignature/CodeResources`
-/// 5. Repack via [`create_ipa`]
+/// 5. Repack the extraction root via `create_ipa_from_root` (keeps
+///    non-`Payload` entries such as `SwiftSupport/` and `iTunesMetadata.plist`)
 ///
 /// For manual control over extraction/repacking, use [`extract_ipa`] and
 /// [`create_ipa`] directly.
@@ -249,7 +251,8 @@ impl<'a> IpaSigner<'a> {
     /// 3. Sign all Mach-O binaries in-place
     /// 4. Copy provisioning profile to bundle (if set via [`Self::provisioning_profile`])
     /// 5. Generate `CodeResources` (hashes include signed binaries and profile)
-    /// 6. Repack into a new IPA via [`create_ipa`]
+    /// 6. Repack the extraction root via `create_ipa_from_root` (keeps
+    ///    non-`Payload` entries such as `SwiftSupport/` and `iTunesMetadata.plist`)
     ///
     /// # Arguments
     ///
@@ -281,7 +284,7 @@ impl<'a> IpaSigner<'a> {
         Self::ensure_single_app_bundle(&temp_dir.path().join("Payload"))?;
         self.sign_bundle_from_options(&app_bundle)?;
 
-        create_ipa(&app_bundle, output_ipa, self.compression_level)?;
+        create_ipa_from_root(temp_dir.path(), output_ipa, self.compression_level)?;
 
         Ok(())
     }
@@ -1108,7 +1111,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
-    use zip::ZipWriter;
+    use zip::{ZipArchive, ZipWriter};
 
     #[test]
     fn test_ipa_signing_is_deterministic() {
@@ -1132,9 +1135,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sign_preserves_non_payload_entries() {
+        let temp = TempDir::new().unwrap();
+        let ipa_path = write_test_ipa(
+            &temp.path().join("test.ipa"),
+            &[
+                (
+                    "SwiftSupport/iphoneos/libswiftCore.dylib",
+                    b"swift-support-bytes".as_slice(),
+                ),
+                ("iTunesMetadata.plist", b"<plist></plist>".as_slice()),
+                (
+                    "META-INF/com.apple.ZipMetadata.plist",
+                    b"<plist></plist>".as_slice(),
+                ),
+            ],
+        );
+        let output = temp.path().join("signed.ipa");
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign(&ipa_path, &output)
+            .expect("signing must succeed");
+
+        let file = fs::File::open(&output).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        for expected in [
+            "Payload/Test.app/Info.plist",
+            "Payload/Test.app/data.bin",
+            "SwiftSupport/iphoneos/libswiftCore.dylib",
+            "iTunesMetadata.plist",
+            "META-INF/com.apple.ZipMetadata.plist",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "entry {expected} must survive re-signing; got {names:?}"
+            );
+        }
+
+        let extracted = temp.path().join("extracted");
+        extract_ipa(&output, &extracted).unwrap();
+        assert!(
+            extracted
+                .join("SwiftSupport/iphoneos/libswiftCore.dylib")
+                .exists(),
+            "carried entries must re-extract"
+        );
+    }
+
     /// Create a minimal test IPA file.
     fn create_test_ipa(dir: &Path) -> PathBuf {
-        let ipa_path = dir.join("test.ipa");
+        write_test_ipa(&dir.join("test.ipa"), &[])
+    }
+
+    /// Write a minimal test IPA to `ipa_path`, appending `extras` as extra
+    /// root-level entries after the bundle payload.
+    fn write_test_ipa(ipa_path: &Path, extras: &[(&str, &[u8])]) -> PathBuf {
         let file = fs::File::create(&ipa_path).unwrap();
         let mut zip = ZipWriter::new(file);
 
@@ -1167,9 +1225,14 @@ mod tests {
             .unwrap();
         zip.write_all(&[0xAB; 4096]).unwrap();
 
+        for (name, bytes) in extras {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+
         zip.finish().unwrap();
 
-        ipa_path
+        ipa_path.to_path_buf()
     }
 
     /// XML for an Info.plist declaring `cf_bundle_executable_entry`
