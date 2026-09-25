@@ -21,6 +21,7 @@ let appName = "";
 let p12Bytes = null;
 let profileBytes = null;
 let signingInProgress = false;
+let wasmReady = false;
 
 // --- DOM refs ---
 const dropZone = $("#drop-zone");
@@ -79,6 +80,38 @@ function isMachO(data) {
     0xcefaedfe, 0xcffaedfe, // little-endian (MH_CIGAM, MH_CIGAM_64)
     0xcafebabe, 0xbebafeca, // FAT (big-endian, little-endian)
   ].includes(magic >>> 0);
+}
+
+// --- Bundle layout helpers ---
+
+// Last path component without its extension; the identifier for a binary
+// that is not a bundle's main executable.
+function fileStem(path) {
+  const parts = path.split("/").filter((part) => part.length > 0);
+  const name = parts.length > 0 ? parts[parts.length - 1] : path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+function isSymlinkEntry(entry) {
+  if ((entry.versionMadeBy >> 8) !== 3) return false;
+  const mode =
+    ((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0);
+  return (mode & 0xf000) === 0xa000;
+}
+
+const HASH_FILE_MAX = 128 * 1024 * 1024; // landed wasm hash_file buffer limit
+const HASH_CHUNK = 64 * 1024 * 1024;
+
+function hashEntry(signer, relPath, bytes) {
+  if (bytes.length <= HASH_FILE_MAX) {
+    signer.hash_file(relPath, bytes);
+    return;
+  }
+  for (let off = 0; off < bytes.length; off += HASH_CHUNK) {
+    const end = Math.min(off + HASH_CHUNK, bytes.length);
+    signer.hash_file_chunk(relPath, bytes.subarray(off, end), end >= bytes.length);
+  }
 }
 
 // --- Info.plist parsing via WASM ---
@@ -265,8 +298,10 @@ async function signIpa() {
   downloadBtn.classList.remove("visible");
   signBtn.disabled = true;
 
-  let signer = null;
+  let rootSigner = null;
+  let nestedSigner = null;
   let zipReader = null;
+  let machoSigned = 0;
   try {
     // 1. Init WASM
     section("▸ Initializing WASM module");
@@ -277,8 +312,9 @@ async function signIpa() {
 
     // 2. Create signer with credentials
     section("▸ Loading signing credentials");
-    signer = new WasmSigner(run.p12Bytes, run.password, run.profileBytes);
-    const teamId = signer.team_id();
+    rootSigner = new WasmSigner(run.p12Bytes, run.password, run.profileBytes);
+    nestedSigner = new WasmSigner(run.p12Bytes, run.password, null);
+    const teamId = rootSigner.team_id();
     if (teamId) {
       log(`Team ID: ${teamId}`, "ok");
     }
@@ -306,72 +342,147 @@ async function signIpa() {
     )[1];
     log(`Bundle: ${currentAppName}.app`, "ok");
 
-    // Determine main executable name from Info.plist
-    let mainExecName = currentAppName;
-    const infoPlistEntry = entries.find(
-      (e) => e.filename === `${currentAppPrefix}Info.plist`,
-    );
-    let infoPlistData = null;
-    if (infoPlistEntry) {
-      infoPlistData = await infoPlistEntry.getData(new Uint8ArrayWriter());
-      const execName = tryExtractExecutableName(infoPlistData);
-      if (execName) mainExecName = execName;
-    }
+    // Every bundle's Info.plist, including the root's, is read once in the
+    // resolution pass below. The root's bytes are then the single authority:
+    // the signedFiles key, the plist embedded in the signature, and the
+    // emitted archive all come from that one read.
 
-    // 4. Read all bundle files, classify them
-    section("▸ Reading bundle files");
-    const bundleEntries = entries.filter(
-      (e) => e.filename.startsWith(currentAppPrefix) && !e.directory,
-    );
+    // Full zip path -> bytes that replace the source entry in the output.
+    const signedFiles = new Map();
+    signedFiles.set(`${currentAppPrefix}embedded.mobileprovision`, run.profileBytes);
 
-    const fileMap = new Map(); // relativePath -> Uint8Array
-    const machoFiles = []; // relativePaths of Mach-O files
-    let mainExecPath = null;
+    // 4. Walk the entry table: validate names, record source directories, and
+    // discover every nested bundle by its ancestor path.
+    section("▸ Inspecting archive layout");
+    const rootSignatureDir = `${currentAppPrefix}_CodeSignature/`;
+    const isRootSignaturePath = (p) => p.startsWith(rootSignatureDir);
 
-    for (const entry of bundleEntries) {
-      const relativePath = entry.filename.slice(currentAppPrefix.length);
-      if (!relativePath) continue;
+    const sourceDirs = new Set(); // zip directory entry paths, trailing slash
+    const bundleDepths = new Map(); // bundle prefix -> bundle components below root
+    bundleDepths.set(currentAppPrefix, 0);
+    let processedFiles = 0;
 
-      const data = await entry.getData(new Uint8ArrayWriter());
-      fileMap.set(relativePath, data);
-
-      if (isMachO(data)) {
-        machoFiles.push(relativePath);
-        if (relativePath === mainExecName) {
-          mainExecPath = relativePath;
+    const BUNDLE_DIR = /^(.+)\.(app|framework|appex)$/i;
+    for (const entry of entries) {
+      if (entry.filename !== entry.filename.trim()) {
+        throw new Error(`entry name has leading or trailing whitespace: ${JSON.stringify(entry.filename)}`);
+      }
+      if (entry.directory) {
+        // The root _CodeSignature subtree is reserved for regenerated output.
+        if (!isRootSignaturePath(entry.filename)) sourceDirs.add(entry.filename);
+        continue;
+      }
+      if (!entry.filename.startsWith(currentAppPrefix)) continue;
+      processedFiles++;
+      let dir = entry.filename.slice(0, entry.filename.lastIndexOf("/") + 1);
+      for (;;) {
+        const leaf = dir.slice(dir.lastIndexOf("/", currentAppPrefix.length - 1) + 1, -1);
+        const component = dir.slice(currentAppPrefix.length);
+        if (
+          component.length > 0 &&
+          !isRootSignaturePath(dir) &&
+          BUNDLE_DIR.test(leaf)
+        ) {
+          bundleDepths.set(dir, component.split("/").filter(Boolean).length);
         }
+        if (dir.length <= currentAppPrefix.length) break;
+        dir = dir.slice(0, dir.lastIndexOf("/", currentAppPrefix.length - 1) + 1);
       }
     }
+
+    const bundleOrder = [...bundleDepths].sort((a, b) => b[1] - a[1]);
     log(
-      `Read ${fileMap.size} files, ${machoFiles.length} Mach-O binaries`,
+      `${processedFiles} files, ${bundleOrder.length} bundles (${bundleOrder.length - 1} nested)`,
       "ok",
     );
-    if (mainExecPath) {
-      log(`Main executable: ${mainExecPath}`, "ok");
-    } else {
-      throw new Error(
-        `Main executable "${mainExecName}" not found as Mach-O in the bundle`,
-      );
+
+    // 5. Reject a symlink anywhere a generated output must land.
+    const generatedPaths = new Set([
+      `${currentAppPrefix}Info.plist`,
+      `${currentAppPrefix}embedded.mobileprovision`,
+    ]);
+    for (const [prefix] of bundleOrder) {
+      generatedPaths.add(`${prefix}_CodeSignature/CodeResources`);
+    }
+    for (const entry of entries) {
+      if (!entry.directory && isSymlinkEntry(entry) && generatedPaths.has(entry.filename)) {
+        throw new Error(`generated output path is a symlink: ${entry.filename}`);
+      }
     }
 
-    // 5. Sign dylibs/frameworks first (everything except main executable)
-    const signedFiles = new Map(); // relativePath -> signed Uint8Array
-    const dylibsToSign = machoFiles.filter((p) => p !== mainExecPath);
+    // 6. Resolve every bundle's main executable before any signing: the
+    // executables are what the child CodeResources files are scoped against.
+    const bundles = [];
+    for (const [prefix] of bundleOrder) {
+      const isRoot = prefix === currentAppPrefix;
+      const plistPath = `${prefix}Info.plist`;
+      const plistEntry = entries.find((e) => e.filename === plistPath);
+      if (!plistEntry) {
+        throw new Error(`bundle ${prefix} has no Info.plist`);
+      }
+      const plistData = await plistEntry.getData(new Uint8ArrayWriter());
+      const execName = tryExtractExecutableName(plistData, wasmReady);
+      if (!execName) {
+        throw new Error(`bundle ${prefix} has no CFBundleExecutable`);
+      }
+      const execRel = execName;
+      const execFull = `${prefix}${execRel}`;
+      let found = false;
+      for (const entry of entries) {
+        if (entry.directory || entry.filename !== execFull || isSymlinkEntry(entry)) continue;
+        if (isMachO(await entry.getData(new Uint8ArrayWriter()))) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        throw new Error(
+          `main executable "${execFull}" of bundle ${prefix} is missing or is not a Mach-O file`,
+        );
+      }
+      const identifier = isRoot
+        ? run.bundleId
+        : (tryExtractBundleId(plistData, wasmReady) || fileStem(prefix));
+      bundles.push({ prefix, isRoot, execRel, execFull, identifier });
+      // One authority per bundle: the map key, the plist embedded in the main
+      // executable's signature, and the emitted bytes all read from here.
+      signedFiles.set(`${prefix}Info.plist`, plistData);
+    }
+    log(
+      `Sealing ${bundles.length} bundles innermost-first: ${bundles.map((b) => b.prefix).join(", ")}`,
+      "ok",
+    );
 
-    if (dylibsToSign.length > 0) {
-      section(`▸ Signing ${dylibsToSign.length} dylibs/frameworks`);
+    // 7. Seal each bundle innermost-first so a parent's CodeResources covers
+    // already-signed child binaries and freshly built child signatures.
+    for (const bundle of bundles) {
+      const { prefix, isRoot, execRel, execFull } = bundle;
+      const signer = isRoot ? rootSigner : nestedSigner;
+
+      // a. Sign this bundle's own non-main Mach-O files, before any hashing.
       const signFailures = [];
-      for (const relPath of dylibsToSign) {
-        const data = fileMap.get(relPath);
-        // Use filename as identifier for dylibs
-        const identifier = relPath.split("/").pop().replace(/\.dylib$/, "");
+      let signedHere = 0;
+      for (const entry of entries) {
+        if (entry.directory || !entry.filename.startsWith(prefix)) continue;
+        if (isSymlinkEntry(entry) || entry.filename === execFull) continue;
+        // Descendant bundles own their own subtree.
+        if (bundles.some((b) => b !== bundle && b.prefix.length > prefix.length && entry.filename.startsWith(b.prefix))) {
+          continue;
+        }
+        const name = entry.filename.slice(prefix.length);
+        if (name.startsWith("_CodeSignature/")) continue;
+        // One decompression serves both the Mach-O test and the sign call.
+        const data = await entry.getData(new Uint8ArrayWriter());
+        if (!isMachO(data)) continue;
         try {
-          const signed = signer.sign_macho_fat(data, identifier, null, null);
-          signedFiles.set(relPath, signed);
-          log(`  ✓ ${relPath} (${formatSize(data.length)} → ${formatSize(signed.length)})`);
+          const signed = signer.sign_macho_fat(data, fileStem(name), null, null);
+          signedFiles.set(entry.filename, signed);
+          machoSigned++;
+          signedHere++;
+          log(`  ✓ ${name} (${formatSize(data.length)} → ${formatSize(signed.length)})`);
         } catch (e) {
-          log(`  ✗ ${relPath}: ${fmtErr(e)}`, "err");
-          signFailures.push(`${relPath}: ${fmtErr(e)}`);
+          log(`  ✗ ${name}: ${fmtErr(e)}`, "err");
+          signFailures.push(`${name}: ${fmtErr(e)}`);
         }
       }
       if (signFailures.length > 0) {
@@ -380,64 +491,83 @@ async function signIpa() {
             signFailures.join("\n"),
         );
       }
-      log(`Signed ${dylibsToSign.length} dylibs/frameworks`, "ok");
-    }
+      if (signedHere > 0) log(`Signed ${signedHere} nested binaries in ${prefix}`, "ok");
 
-    // 6. Hash all files for CodeResources (using signed versions where available)
-    section("▸ Hashing bundle resources for CodeResources");
-    signer.set_main_executable(mainExecName);
+      // b. Start this bundle's resources round.
+      signer.reset_resources();
+      signer.set_main_executable(execRel);
 
-    let filesHashed = 0;
-    let totalBytes = 0;
-
-    for (const [relPath, data] of fileMap) {
-      // Skip _CodeSignature (will be regenerated) and old mobileprovision
-      if (relPath.startsWith("_CodeSignature/")) continue;
-      if (relPath === "embedded.mobileprovision") continue;
-
-      const fileData = signedFiles.get(relPath) || data;
-      totalBytes += fileData.length;
-      signer.hash_file(relPath, fileData);
-      filesHashed++;
-
-      if (filesHashed % 100 === 0) {
-        log(`  hashed ${filesHashed} files…`);
+      // c. Hash the bundle subtree, plus every generated child output that has
+      //    no source entry (child CodeResources plists).
+      let filesHashed = 0;
+      let totalBytes = 0;
+      const hashOne = (relPath, bytes) => {
+        hashEntry(signer, relPath, bytes);
+        filesHashed++;
+        totalBytes += bytes.length;
+        if (filesHashed % 100 === 0) log(`  hashed ${filesHashed} files…`);
+      };
+      for (const entry of entries) {
+        if (entry.directory || !entry.filename.startsWith(prefix)) continue;
+        if (entry.filename === execFull) continue;
+        const relPath = entry.filename.slice(prefix.length);
+        if (relPath === "" || relPath.startsWith("_CodeSignature/")) continue;
+        if (relPath === "embedded.mobileprovision") {
+          // The root's profile is replaced by the run's; a nested bundle keeps
+          // whatever profile it shipped, so its own round must seal those bytes.
+          if (isRoot) {
+            hashOne(relPath, run.profileBytes);
+          } else {
+            hashOne(relPath, signedFiles.get(entry.filename) || (await entry.getData(new Uint8ArrayWriter())));
+          }
+          continue;
+        }
+        hashOne(relPath, signedFiles.get(entry.filename) || (await entry.getData(new Uint8ArrayWriter())));
       }
-    }
-    // Hash the new provisioning profile
-    signer.hash_file("embedded.mobileprovision", run.profileBytes);
-    filesHashed++;
-    totalBytes += run.profileBytes.length;
-    log(`Hashed ${filesHashed} files (${formatSize(totalBytes)})`, "ok");
+      for (const [fullPath, bytes] of signedFiles) {
+        if (!fullPath.startsWith(prefix) || fullPath === execFull) continue;
+        if (entries.some((e) => !e.directory && e.filename === fullPath)) continue;
+        hashOne(fullPath.slice(prefix.length), bytes);
+      }
+      log(`Hashed ${filesHashed} files for ${prefix} (${formatSize(totalBytes)})`, "ok");
 
-    // 7. Build CodeResources
-    section("▸ Building CodeResources plist");
-    const codeResourcesBytes = signer.build_code_resources();
-    log(
-      `CodeResources generated: ${formatSize(codeResourcesBytes.length)}`,
-      "ok",
-    );
+      // d. Build and record this bundle's CodeResources.
+      const codeResourcesBytes = signer.build_code_resources();
+      signedFiles.set(`${prefix}_CodeSignature/CodeResources`, codeResourcesBytes);
+      log(`CodeResources for ${prefix}: ${formatSize(codeResourcesBytes.length)}`, "ok");
 
-    // 8. Sign main executable
-    if (mainExecPath) {
-      section("▸ Signing main executable");
-      const mainData = signedFiles.get(mainExecPath) || fileMap.get(mainExecPath);
-      const bundleId = run.bundleId;
+      // e. Sign this bundle's main executable last: it embeds the signature.
+      const mainData = signedFiles.get(execFull) || (await entries.find((e) => e.filename === execFull).getData(new Uint8ArrayWriter()));
       try {
         const signed = signer.sign_macho_fat(
           mainData,
-          bundleId,
-          infoPlistData,
+          bundle.identifier,
+          signedFiles.get(`${prefix}Info.plist`),
           codeResourcesBytes,
         );
-        signedFiles.set(mainExecPath, signed);
+        signedFiles.set(execFull, signed);
+        machoSigned++;
         log(
-          `Main executable signed (${formatSize(mainData.length)} → ${formatSize(signed.length)})`,
+          `Main executable signed for ${prefix} (${formatSize(mainData.length)} → ${formatSize(signed.length)})`,
           "ok",
         );
       } catch (e) {
-        log(`Main executable signing failed: ${fmtErr(e)}`, "err");
-        throw new Error(`Main executable signing failed: ${fmtErr(e)}`);
+        log(`Main executable signing failed for ${prefix}: ${fmtErr(e)}`, "err");
+        throw new Error(`Main executable signing failed for ${prefix}: ${fmtErr(e)}`);
+      }
+    }
+
+    // 8. Every generated output must exist before the archive is rewritten.
+    for (const bundle of bundles) {
+      for (const path of [bundle.execFull, `${bundle.prefix}_CodeSignature/CodeResources`]) {
+        if (!signedFiles.has(path)) {
+          throw new Error(`missing generated output for ${path}`);
+        }
+      }
+    }
+    for (const path of [`${currentAppPrefix}Info.plist`, `${currentAppPrefix}embedded.mobileprovision`]) {
+      if (!signedFiles.has(path)) {
+        throw new Error(`missing generated output for ${path}`);
       }
     }
 
@@ -454,94 +584,87 @@ async function signIpa() {
     const VERSION_UNIX_20 = (3 << 8) | 20;
 
     let filesWritten = 0;
+    const emitted = new Set();
     for (const entry of entries) {
       // Skip __MACOSX resource fork entries — iOS rejects these
       if (entry.filename.startsWith("__MACOSX/")) continue;
 
       if (entry.directory) {
-        // Skip old _CodeSignature directory (will be recreated)
-        if (entry.filename.startsWith(currentAppPrefix) &&
-            entry.filename.slice(currentAppPrefix.length).startsWith("_CodeSignature")) {
-          continue;
-        }
+        // The root _CodeSignature subtree is reserved; the write pass recreates it.
+        if (isRootSignaturePath(entry.filename)) continue;
         await zipWriter.add(entry.filename, undefined, {
           directory: true,
           externalFileAttributes: entry.externalFileAttributes || UNIX_DIR_0755,
           lastModDate: entry.lastModDate,
           versionMadeBy: VERSION_UNIX_20,
         });
+        emitted.add(entry.filename);
         continue;
       }
 
-      const isInBundle = entry.filename.startsWith(currentAppPrefix);
-      const relativePath = isInBundle
-        ? entry.filename.slice(currentAppPrefix.length)
-        : null;
+      // Stale signature subtree and the old profile are replaced, not copied.
+      if (isRootSignaturePath(entry.filename)) continue;
+      if (entry.filename === `${currentAppPrefix}embedded.mobileprovision`) continue;
 
-      if (isInBundle && relativePath) {
-        // Skip old _CodeSignature (dir + files) and embedded.mobileprovision
-        if (relativePath === "_CodeSignature" || relativePath.startsWith("_CodeSignature/")) continue;
-        if (relativePath === "embedded.mobileprovision") continue;
-
-        // Use signed version if available
-        const data = signedFiles.get(relativePath) || fileMap.get(relativePath);
-        if (data) {
-          await zipWriter.add(
-            entry.filename,
-            new Uint8ArrayReader(data),
-            {
-              externalFileAttributes: entry.externalFileAttributes || UNIX_FILE_0644,
-              lastModDate: entry.lastModDate,
-              versionMadeBy: VERSION_UNIX_20,
-            },
-          );
-          filesWritten++;
-          continue;
-        }
+      const override = signedFiles.get(entry.filename);
+      if (override !== undefined) {
+        await zipWriter.add(
+          entry.filename,
+          new Uint8ArrayReader(override),
+          {
+            externalFileAttributes: entry.externalFileAttributes || UNIX_FILE_0644,
+            lastModDate: entry.lastModDate,
+            versionMadeBy: VERSION_UNIX_20,
+          },
+        );
+        emitted.add(entry.filename);
+        filesWritten++;
+        continue;
       }
 
-      // Non-bundle files: copy as-is
+      // Symlinks keep their own payload and attributes. The read and the write
+      // options here are transitional; they are finalized separately.
+      if (isSymlinkEntry(entry)) {
+        const target = await entry.getData(new Uint8ArrayWriter());
+        await zipWriter.add(entry.filename, new Uint8ArrayReader(target), {
+          externalFileAttributes: entry.externalFileAttributes,
+          lastModDate: entry.lastModDate,
+          versionMadeBy: VERSION_UNIX_20,
+        });
+        emitted.add(entry.filename);
+        filesWritten++;
+        continue;
+      }
+
       const data = await entry.getData(new Uint8ArrayWriter());
       await zipWriter.add(entry.filename, new Uint8ArrayReader(data), {
         externalFileAttributes: entry.externalFileAttributes || UNIX_FILE_0644,
         lastModDate: entry.lastModDate,
         versionMadeBy: VERSION_UNIX_20,
       });
+      emitted.add(entry.filename);
       filesWritten++;
     }
 
-    // Add _CodeSignature/ directory entry
-    await zipWriter.add(
-      `${currentAppPrefix}_CodeSignature/`,
-      undefined,
-      {
-        directory: true,
-        externalFileAttributes: UNIX_DIR_0755,
-        versionMadeBy: VERSION_UNIX_20,
-      },
-    );
-
-    // Add new CodeResources
-    await zipWriter.add(
-      `${currentAppPrefix}_CodeSignature/CodeResources`,
-      new Uint8ArrayReader(codeResourcesBytes),
-      {
+    // Append generated outputs the archive never carried, creating their
+    // signature directory when the source archive had none.
+    for (const name of [...signedFiles.keys()].filter((k) => !emitted.has(k)).sort()) {
+      const dir = name.slice(0, name.lastIndexOf("/") + 1);
+      if (!sourceDirs.has(dir) && !emitted.has(dir)) {
+        await zipWriter.add(dir, undefined, {
+          directory: true,
+          externalFileAttributes: UNIX_DIR_0755,
+          versionMadeBy: VERSION_UNIX_20,
+        });
+        emitted.add(dir);
+      }
+      await zipWriter.add(name, new Uint8ArrayReader(signedFiles.get(name)), {
         externalFileAttributes: UNIX_FILE_0644,
         versionMadeBy: VERSION_UNIX_20,
-      },
-    );
-    filesWritten++;
-
-    // Add provisioning profile
-    await zipWriter.add(
-      `${currentAppPrefix}embedded.mobileprovision`,
-      new Uint8ArrayReader(run.profileBytes),
-      {
-        externalFileAttributes: UNIX_FILE_0644,
-        versionMadeBy: VERSION_UNIX_20,
-      },
-    );
-    filesWritten++;
+      });
+      emitted.add(name);
+      filesWritten++;
+    }
 
     const blob = await zipWriter.close();
     log(`Wrote ${filesWritten} files (${formatSize(blob.size)})`, "ok");
@@ -554,8 +677,8 @@ async function signIpa() {
     summaryEl.classList.remove("hidden");
     summaryEl.replaceChildren(
       ...[
-        [String(fileMap.size), "Files Processed"],
-        [String(machoFiles.length), "Mach-O Signed"],
+        [String(processedFiles), "Files Processed"],
+        [String(machoSigned), "Mach-O Signed"],
         [formatSize(blob.size), "Output Size"],
         [`${elapsed}s`, "Elapsed"],
       ].map(([value, label]) => {
@@ -582,9 +705,13 @@ async function signIpa() {
     log(`Error: ${fmtErr(e)}`, "err");
     console.error(e);
   } finally {
-    if (signer) {
-      signer.free();
-      signer = null;
+    if (rootSigner) {
+      rootSigner.free();
+      rootSigner = null;
+    }
+    if (nestedSigner) {
+      nestedSigner.free();
+      nestedSigner = null;
     }
     if (zipReader) {
       await zipReader.close();
