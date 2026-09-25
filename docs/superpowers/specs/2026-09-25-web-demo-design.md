@@ -71,8 +71,11 @@
   today; ZSN-40 may add additive fields — JS must not assume `Error.message` strings are
   stable (substring matching forbidden as a control-flow mechanism).
 - `info_plist`/entitlements asymmetry: wasm applies the instance's profile-derived
-  entitlements to **every** `sign_macho` call; native passes entitlements only for the
-  main-bundle executable. JS cannot suppress this (no setter) → cross-lane note (§6).
+  entitlements to **every** `sign_macho` call (`lib.rs:180-201`); native passes the
+  root bundle's entitlements to its main executable and immediate non-main Mach-Os
+  (`mod.rs:668-680`) and `None` for nested bundles (`mod.rs:394-395`). JS controls
+  this by choosing the instance: a second `WasmSigner(p12, password, null)` extracts
+  no entitlements (`lib.rs:59-77`) — the two-signer split adopted in §2.3.
 - Locked deps: `@zip.js/zip.js` 2.8.23, vite 6.4.1; `zsign-wasm` is
   `file:../../crates/zsign-wasm/pkg` (must exist before `npm ci`).
 - Generated glue is idempotent on init (`pkg/zsign_wasm.js:505` early-returns), so the
@@ -310,12 +313,20 @@ Correctness contract the demo mirrors:
      Fix: detect symlink entries and call `signer.add_symlink(relPath, target)`
      (same path namespace as `hash_file`).
   2. Write: add an explicit `isSymlinkEntry(entry)` branch that emits the target
-     bytes with the original attributes, Unix made-by, and `compressionMethod: 0`
-     (Stored — matching native `add_symlink`; zip.js would otherwise deflate), instead
-     of relying on `|| fallback` pass-through. Detection (cold-review FIX 7):
+     bytes with Unix made-by and `compressionMethod: 0` (Stored — matching native
+     `add_symlink`; zip.js would otherwise deflate), instead of relying on
+     `|| fallback` pass-through. Detection (cold-review FIX 7):
      `((entry.versionMadeBy >> 8) === 3) && ((((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0)) & 0xF000) === 0xA000` —
      the made-by gate plus either the central-directory mode or the mode zip.js
-     derives from a `0x7855` Unix extra field (`zip-reader.js:808-838`). The
+     derives from a `0x7855` Unix extra field (`zip-reader.js:808-838`).
+     **Emit uses the SAME mode expression, written into `externalFileAttributes`** —
+     the single authoritative field (zip.js `index.d.ts:1000-1014`: "treat
+     `externalFileAttributes` as authoritative… set it explicitly"):
+     `externalFileAttributes: ((mode & 0xffff) << 16) | (entry.externalFileAttributes & 0xff)`.
+     The detection gate guarantees `mode` carries `0xa000`, so the value is never 0
+     and the writer's regular-file default (`zip-writer.js:459-465`) cannot fire;
+     recomposition at `:488` preserves it. Passing a raw zero/extra-field-only value
+     would emit a regular file — detect and emit must never disagree. The
      `|| UNIX_FILE_0644` fallback stays for genuine regular files with zero
      attributes. The branch runs **after** directory handling and the reserved-path
      skips (a symlink planted at `_CodeSignature/…` or `embedded.mobileprovision` must
@@ -410,7 +421,11 @@ Single file `main.js`, keeping the existing two-phase UX (load → configure →
 - `findAppRoot(entries) -> { prefix, name }` — §2.7; throws on 0 or >1 apps.
 - `rewriteBundleIdentifier(plistBytes, newId) -> Uint8Array` — §2.4; throws on
   unsupported format / missing key / non-ASCII id; identity fast path.
-- `fileStem(path) -> string` — Rust `Path::file_stem` semantics (strip after last dot).
+- `fileStem(path) -> string` — final path component first (split on `/`, drop empty
+  parts — a trailing-slash bundle prefix yields its bundle component), then Rust
+  `Path::file_stem` semantics on that component (strip after a non-leading dot;
+  leading-dot names unchanged): `Frameworks/Foo.bar.framework/Foo` → `Foo`,
+  `Payload/A.app/Frameworks/F.framework/` → `F`, `libFoo.dylib` → `libFoo`.
 - `isSymlinkEntry(entry) -> boolean` — §2.6.
 - `assertArchiveWithinLimits(entries, file)` — §2.9 guards.
 - `tryExtractBundleId/tryExtractExecutableName(plist, wasmReady)` — existing, all call
@@ -448,6 +463,10 @@ init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, p
        (virtual entries — generated nested CodeResources of already-sealed children,
        BLOCKER 1):
          - root embedded.mobileprovision: hash profileBytes (source bytes skipped)
+           AND set signedFiles[rootPrefix + "embedded.mobileprovision"] =
+           profileBytes — the write pass skips the source entry and emits this key
+           through the append-unmatched rule; without the insert the output would
+           lose the profile entirely
          - symlink entry → signer.add_symlink(relPath, targetText) (target ≤ 4096 B)
          - else → signer.hash_file(relPath, signedFiles[fullPath] ?? fresh source bytes)
            — a path EXPECTED to carry an override (bundle main execs, generated CRs,
@@ -462,8 +481,9 @@ init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, p
        identifier_B, plistBytes_B, CR_B)   // identifier_B = root: validated UI id
                                            // (== rewritten plist id); nested:
                                            // own CFBundleIdentifier || fileStem(prefix)
-       // BEFORE the write pass: assert every bundle's execFullPath and CR path is
-       // present in signedFiles, else THROW (FIX 11)
+       // BEFORE the write pass: assert every bundle's execFullPath, every CR path,
+       // the root Info.plist key, and the root embedded.mobileprovision key are in
+       // signedFiles, else THROW (FIX 11)
 → counters for the summary UI (BLOCKER 6): machoSigned += successful sign calls;
   processedFiles = non-directory source entries under root (set in metadata pass)
 → output write pass — one uniform rule, in this exact order (FIX 12):
@@ -477,8 +497,10 @@ init wasm (idempotent) → signers: rootSigner = new WasmSigner(p12, password, p
          rootPrefix + "embedded.mobileprovision" (source bytes replaced below)
       4. if signedFiles.has(name): emit signedFiles bytes (original attrs/made-by/
          lastModDate where the entry existed; generated attrs otherwise); mark emitted
-      5. else if isSymlinkEntry(entry): emit target bytes, externalFileAttributes
-         unchanged, versionMadeBy Unix, compressionMethod 0 (Stored)
+      5. else if isSymlinkEntry(entry): emit target bytes, mode from the SAME
+         detection expression written into externalFileAttributes
+         (`((mode & 0xffff) << 16) | (entry.externalFileAttributes & 0xff)` —
+         §2.6; never zero), versionMadeBy Unix, compressionMethod 0 (Stored)
       6. else: fresh-read source bytes (per-entry actual ≤ declared check) → emit
     then append unmatched output (BLOCKER 1): for key of [...signedFiles.keys()
       .filter(k => !emitted.has(k)).sort()]:
