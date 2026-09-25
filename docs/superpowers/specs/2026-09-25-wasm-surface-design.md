@@ -212,17 +212,26 @@ Shape:
 
 Candidates:
 
-- **A (picked): per-surface byte-limit constants, checked before any parse or
-  copy, throwing `ZSIGN_INPUT_TOO_LARGE` with surface, actual size, limit, and
-  remedy in the message.**
+- **A (picked): per-surface byte-limit constants, checked as the first
+  statement of each method body — before any parse or processing —
+  throwing `ZSIGN_INPUT_TOO_LARGE` with surface, actual size, limit, and
+  remedy in the message.** Honest boundary note (known items): wasm-bindgen
+  copies `Vec<u8>`/`&[u8]` arguments into linear memory *before* the body
+  runs, so the guard bounds all processing/retention but not the initial 1×
+  boundary copy; an adversarial JS caller handing over a buffer large
+  enough to exhaust memory at the boundary still hits a generic allocation
+  failure rather than this error. Closing that gap would require accepting
+  `Uint8Array`-typed parameters (length check before `.to_vec()`) — a
+  public-signature redesign deliberately not taken in this lane.
 - B: one global limit for everything. Rejected: cannot justify a Mach-O-sized
   ceiling for plists or a plist-sized ceiling for binaries; the error cannot
   name a remedy.
 - C: warnings without refusal. Rejected: the brief requires actionable errors,
   and a warning still lets memory exhaustion happen.
 
-Limits and their justification (checked on every byte-buffer input; the check
-runs before parsing/copying):
+Limits and their justification (checked on every byte-buffer input at the
+top of its method body, before parsing/processing — see the boundary note
+above for the wasm-bindgen copy caveat):
 
 | Constant | Value | Surfaces | Justification |
 |---|---|---|---|
@@ -464,6 +473,15 @@ determinism skip therefore irrelevant to this lane's scoped gates).
 - Deferred core API: `sign_any_macho` has no hash-algorithm parameter; this
   design routes around it from the wasm layer rather than changing core
   (out of scope).
+- **Boundary-copy residual (final-review finding, doc-narrowed):** the size
+  guards run at the top of each method body, but wasm-bindgen has already
+  copied byte arguments into linear memory by then — a hostile oversized JS
+  buffer can still exhaust memory at the boundary before
+  `ZSIGN_INPUT_TOO_LARGE` is produced. Full pre-copy enforcement requires
+  `Uint8Array`-typed parameters (length check before copy), which changes
+  every byte-input signature and the native-runnable test harness; recorded
+  as possible future work, reported to the supervisor, not taken in this
+  lane. All in-body processing/retention is guarded.
 - Cold-review adjudication record (round 2, NOT-READY): the single residual
   finding was the plan's `err_message` helper spelled as
   `JsValue::from(err)` under an `impl Into<JsValue>` bound — `From<T>` is
@@ -501,7 +519,8 @@ Behavioral changes:
    128 MiB and `ZSIGN_PATH_ALREADY_FINALIZED` after finalize (previously
    silently re-seeded a fresh digest). Return stays undefined.
 7. NEW size guards `ZSIGN_INPUT_TOO_LARGE` on every byte input, checked
-   before any parse: constructor `p12_bytes` (4 MiB) and `profile_bytes`
+   at the top of each method body before parsing/processing: constructor
+   `p12_bytes` (4 MiB) and `profile_bytes`
    (16 MiB), `extract_entitlements` (16 MiB), `parse_info_plist` (16 MiB),
    `set_entitlements` (16 MiB), `parse_macho`/`sign_macho`/`sign_macho_fat`
    data (512 MiB) plus `sign_macho`/`sign_macho_fat` `info_plist` and

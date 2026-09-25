@@ -27,10 +27,12 @@ PATH="$HOME/.local/bin:$PATH" TMPDIR=$PWD/.tmptmp wasm-pack test --node crates/z
 - **Commit per task**, conventional subject, ticket ID in subject only (never in code comments), imperative lowercase, no trailing period:
 
 ```
-feat(zsign-wasm): <subject> (ZSN-40)
-fix(zsign-wasm): <subject> (ZSN-40)
-test(zsign-wasm): <subject> (ZSN-40)
+feat(zsign-wasm): default sign_macho to sha256-only and reject fat (ZSN-40)
+fix(zsign-wasm): seal code-resources paths against stream interleaving (ZSN-40)
+test(zsign-wasm): add wasm-bindgen-test suite for signing surface (ZSN-40)
 ```
+
+(Imperative, lowercase, no trailing period; each task uses its own concrete subject of this shape.)
 
 - **Error style per task:** tasks 1–4 keep the existing `JsError::new(&msg)` style (the file's current convention). Task 5 migrates EVERY error site — including any added by tasks 1–4 — to the coded helper. Do not introduce `js_err` early.
 - **Test module:** one inline module in lib.rs, declared `#[cfg(test)] pub mod tests` (the `pub` is required by wasm-bindgen-test: tests must sit at crate root or in a `pub mod`; `#[cfg(test)]` keeps it out of production builds). Dual-target tests use `#[wasm_bindgen_test(unsupported = test)]`; wasm-only tests use `#[wasm_bindgen_test]`.
@@ -108,9 +110,9 @@ pub mod tests {
     use sha2::{Digest as _, Sha256};
     use wasm_bindgen_test::*;
 
-    // TEMPLATE — replace with the Step 1 `base64 -w0` output (the committed
-    // lib.rs carries the real fixture; this line is not meant to compile as-is):
-    const LEAF_P12_B64: &str = "<paste the generated fixture from Step 1 here>";
+    // The Step 1 base64 output is declared here in the real module as
+    // `const LEAF_P12_B64: &str` (concatenated 76-char quoted lines);
+    // the committed lib.rs carries the real fixture value.
 
     fn decode_base64(s: &str) -> Vec<u8> {
         const ALPHA: &[u8; 64] =
@@ -567,7 +569,7 @@ fn ensure_size(
 }
 ```
 
-Insert guards as the FIRST statement of each entry point (before any parse/copy):
+Insert guards as the FIRST statement of each entry point (before any parse or processing — the wasm-bindgen boundary copy precedes the body, see the design's boundary note):
 
 | Entry point | Call |
 |---|---|
@@ -577,7 +579,8 @@ Insert guards as the FIRST statement of each entry point (before any parse/copy)
 | `hash_file_chunk` | signature `-> Result<(), JsError>` (state guards come in Task 4); first line `ensure_size(chunk.len(), MAX_HASH_BYTES, "hash_file_chunk", "send smaller chunks")?;` |
 | `extract_entitlements` | `ensure_size(profile_data.len(), MAX_PROFILE_BYTES, "extract_entitlements", "supply a smaller provisioning profile")?;` |
 | `parse_macho` | `ensure_size(data.len(), MAX_MACHO_BYTES, "parse_macho", "use the native zsign CLI for larger binaries")?;` |
-| `sign_macho` / `sign_macho_fat` | `ensure_size(data.len(), MAX_MACHO_BYTES, "<method name>", "use the native zsign CLI for larger binaries")?;` first, then for each optional param: `if let Some(pl) = &info_plist { ensure_size(pl.len(), MAX_PLIST_BYTES, "<method name> (info_plist)", "supply a smaller Info.plist")?; }` and `if let Some(cr) = &code_resources { ensure_size(cr.len(), MAX_PLIST_BYTES, "<method name> (code_resources)", "supply smaller CodeResources")?; }` (design § item 3 covers these two params) |
+| `sign_macho` | `ensure_size(data.len(), MAX_MACHO_BYTES, "sign_macho", "use the native zsign CLI for larger binaries")?;` first, then `if let Some(pl) = &info_plist { ensure_size(pl.len(), MAX_PLIST_BYTES, "sign_macho (info_plist)", "supply a smaller Info.plist")?; }` and `if let Some(cr) = &code_resources { ensure_size(cr.len(), MAX_PLIST_BYTES, "sign_macho (code_resources)", "supply smaller CodeResources")?; }` |
+| `sign_macho_fat` | same three guards as `sign_macho`, with surface strings `sign_macho_fat`, `sign_macho_fat (info_plist)`, `sign_macho_fat (code_resources)` (design § item 3 covers the plist params) |
 | `parse_info_plist` | `ensure_size(data.len(), MAX_PLIST_BYTES, "parse_info_plist", "supply a smaller Info.plist")?;` |
 
 No size check on string inputs (`identifier`, paths, symlink targets, password) — deliberate, recorded in the design doc § item 3.
