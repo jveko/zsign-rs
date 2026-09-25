@@ -681,7 +681,7 @@ fn verify_code_resource_entry(
         }
         match std::fs::read_link(&file_path) {
             Ok(actual) => {
-                if actual.to_string_lossy().to_string() == sealed_target {
+                if actual.to_string_lossy() == sealed_target {
                     out.matched += 1;
                 } else {
                     out.mismatched.push(rel.to_string());
