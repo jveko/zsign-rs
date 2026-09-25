@@ -7,6 +7,7 @@ import {
   BlobWriter,
   Uint8ArrayReader,
   Uint8ArrayWriter,
+  Writer,
 } from "@zip.js/zip.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -98,6 +99,64 @@ function isSymlinkEntry(entry) {
   const mode =
     ((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0);
   return (mode & 0xf000) === 0xa000;
+}
+
+class CappedWriter extends Writer {
+  constructor(max) {
+    super();
+    this.max = max;
+    this.parts = [];
+    this.total = 0;
+    this.capError = null;
+  }
+
+  init(initSize) {
+    this.parts = [];
+    this.total = 0;
+    this.capError = null;
+    super.init(initSize);
+  }
+
+  writeUint8Array(array) {
+    this.total += array.length;
+    if (this.total > this.max) {
+      this.capError = new Error(`entry expands past ${this.max} bytes`);
+      throw this.capError;
+    }
+    this.parts.push(array.slice());
+  }
+
+  getData() {
+    const out = new Uint8Array(this.total);
+    let off = 0;
+    for (const part of this.parts) {
+      out.set(part, off);
+      off += part.length;
+    }
+    return out;
+  }
+}
+
+async function readCapped(entry, max) {
+  const writer = new CappedWriter(max);
+  try {
+    return await entry.getData(writer);
+  } catch (e) {
+    // the reader's teardown can mask the cap error — surface ours
+    if (writer.capError) throw writer.capError;
+    throw e;
+  }
+}
+
+function decodeStrict(bytes, what) {
+  try {
+    // ignoreBOM keeps a leading U+FEFF in the string, so re-encoding yields the
+    // exact input bytes; the default would strip it and the sealed text would
+    // no longer match the bytes the write pass emits.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (_) {
+    throw new Error(`${what} is not valid UTF-8`);
+  }
 }
 
 const HASH_FILE_MAX = 128 * 1024 * 1024; // landed wasm hash_file buffer limit
@@ -688,6 +747,7 @@ async function signIpa() {
       `${currentAppPrefix}embedded.mobileprovision`,
     ]);
     for (const [prefix] of bundleOrder) {
+      generatedPaths.add(`${prefix}Info.plist`);
       generatedPaths.add(`${prefix}_CodeSignature/CodeResources`);
     }
     for (const entry of entries) {
@@ -811,6 +871,27 @@ async function signIpa() {
         if (entry.filename === execFull) continue;
         const relPath = entry.filename.slice(prefix.length);
         if (relPath === "" || relPath.startsWith("_CodeSignature/")) continue;
+        // A symlink seals the link itself, not the bytes it points at: the
+        // builder records {"symlink": target} instead of a resource hash, so
+        // the target never reaches hashEntry. This branch precedes every
+        // generic read so no symlink is ever sealed as a file. The declared
+        // size is the cap gate — a hostile archive cannot make us decompress
+        // an unbounded target — and the capped read bounds the real one.
+        // Every path this pipeline regenerates (each bundle's Info.plist, the
+        // root's profile, each bundle's CodeResources) is rejected as a symlink
+        // before this loop, so no such entry reaches here as a link.
+        if (isSymlinkEntry(entry)) {
+          if (entry.uncompressedSize > 4096) {
+            throw new Error(`Symlink target too long: ${entry.filename}`);
+          }
+          const target = await readCapped(entry, 4096);
+          const targetText = decodeStrict(target, "Symlink target");
+          // The sealed text is strict-decoded from these exact bytes, so the
+          // form the builder hashes is byte-identical to the target the write
+          // pass re-emits: seal and archive cannot diverge.
+          signer.add_symlink(relPath, targetText);
+          continue;
+        }
         if (relPath === "embedded.mobileprovision") {
           // The root's profile is replaced by the run's; a nested bundle keeps
           // whatever profile it shipped, so its own round must seal those bytes.
@@ -921,14 +1002,25 @@ async function signIpa() {
         continue;
       }
 
-      // Symlinks keep their own payload and attributes. The read and the write
-      // options here are transitional; they are finalized separately.
       if (isSymlinkEntry(entry)) {
-        const target = await entry.getData(new Uint8ArrayWriter());
+        if (entry.uncompressedSize > 4096) {
+          throw new Error(`Symlink target too long: ${entry.filename}`);
+        }
+        const target = await readCapped(entry, 4096);
+        decodeStrict(target, `Symlink target for ${entry.filename}`);
+        // Single representation end-to-end: the mode that made detection succeed, written
+        // into externalFileAttributes (zip.js treats that field as authoritative —
+        // index.d.ts:1000-1014). On every input where detection matched, this expression
+        // equals the detector's; the 0o120777 tail only covers the unreachable
+        // both-sources-zero case so the value is never 0 and zip-writer.js:459-465's
+        // regular-file default cannot fire (recomposition at :488 preserves it).
+        const mode =
+          ((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0o120777);
         await zipWriter.add(entry.filename, new Uint8ArrayReader(target), {
-          externalFileAttributes: entry.externalFileAttributes,
+          externalFileAttributes: ((mode & 0xffff) << 16) | (entry.externalFileAttributes & 0xff),
           lastModDate: entry.lastModDate,
           versionMadeBy: VERSION_UNIX_20,
+          compressionMethod: 0, // Stored — matches native symlink output
         });
         emitted.add(entry.filename);
         filesWritten++;
