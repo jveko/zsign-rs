@@ -288,15 +288,25 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
     match mach {
         Mach::Binary(macho) => embed_signature_single(data, &macho, signature),
         Mach::Fat(fat) => {
-            let first_arch = fat
+            let arches: Vec<FatArch> = fat
                 .iter_arches()
-                .next()
-                .ok_or_else(|| Error::MachO("Empty FAT binary".into()))?
-                .map_err(|e| Error::MachO(format!("Failed to read FAT arch: {}", e)))?;
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::MachO(format!("Failed to read FAT arches: {}", e)))?;
 
-            let offset = first_arch.offset as usize;
-            let size = first_arch.size as usize;
-            let slice_data = &data[offset..offset + size];
+            if arches.is_empty() {
+                return Err(Error::MachO("Empty FAT binary".into()));
+            }
+
+            validate_fat_arches(&arches, data)?;
+
+            let first_arch = arches[0];
+            let start = first_arch.offset as usize;
+            let end = start
+                .checked_add(first_arch.size as usize)
+                .ok_or_else(|| Error::MachO("first FAT slice range overflows".into()))?;
+            let slice_data = data
+                .get(start..end)
+                .ok_or_else(|| Error::MachO("first FAT slice range exceeds the file".into()))?;
 
             let first_macho = MachO::parse(slice_data, 0)
                 .map_err(|e| Error::MachO(format!("Failed to parse first slice: {}", e)))?;
@@ -347,8 +357,49 @@ pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result
             }
             Ok(signed.signed_data.clone())
         }
-        Mach::Fat(fat) => embed_fat_from_signed_slices(&fat, signed_slices),
+        Mach::Fat(fat) => {
+            let arches: Vec<FatArch> = fat
+                .iter_arches()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::MachO(format!("Failed to read FAT arches: {}", e)))?;
+            if arches.is_empty() {
+                return Err(Error::MachO("Empty FAT binary".into()));
+            }
+            validate_fat_arches(&arches, data)?;
+            embed_fat_from_signed_slices(&fat, signed_slices)
+        }
     }
+}
+
+/// Validates a FAT arch table against the container bytes: every arch's
+/// `[offset, offset + size)` range must lie inside `data`, must not overflow,
+/// and ranges must be pairwise disjoint. Reused by every writer entry point
+/// that consumes a container.
+fn validate_fat_arches(arches: &[FatArch], data: &[u8]) -> Result<()> {
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(arches.len());
+    for (i, arch) in arches.iter().enumerate() {
+        let start = arch.offset as usize;
+        let end = start
+            .checked_add(arch.size as usize)
+            .ok_or_else(|| Error::MachO(format!("FAT slice {i}: offset + size overflow")))?;
+        if data.get(start..end).is_none() {
+            return Err(Error::MachO(format!(
+                "FAT slice {i}: range {start}..{end} exceeds file of {} bytes",
+                data.len()
+            )));
+        }
+        ranges.push((start, end, i));
+    }
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(Error::MachO(format!(
+                "FAT slices {} and {} overlap",
+                pair[0].2, pair[1].2
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) -> Result<Vec<u8>> {
@@ -498,6 +549,11 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
     } else {
         find_code_end(macho, data.len())
     };
+    if code_length > data.len() {
+        return Err(Error::MachO(
+            "LC_CODE_SIGNATURE dataoff exceeds file length".into(),
+        ));
+    }
 
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(signature.len(), "sig_size")?;
@@ -994,6 +1050,11 @@ fn prepare_code_single(
     } else {
         find_code_end(macho, data.len())
     };
+    if code_length > data.len() {
+        return Err(Error::MachO(
+            "LC_CODE_SIGNATURE dataoff exceeds file length".into(),
+        ));
+    }
 
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
@@ -1018,7 +1079,13 @@ fn prepare_code_single(
     }
 
     if let Some((offset, seg)) = linkedit_cmd {
-        let new_filesize = (sig_offset + estimated_signature_size) as u64 - seg.fileoff;
+        let sig_end = sig_offset
+            .checked_add(estimated_signature_size)
+            .ok_or_else(|| Error::MachO("signature end overflow".into()))?
+            as u64;
+        let new_filesize = sig_end.checked_sub(seg.fileoff).ok_or_else(|| {
+            Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
+        })?;
         update_linkedit_segment(&mut prepared, offset, new_filesize)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
@@ -1190,6 +1257,11 @@ pub fn prepare_code_with_metadata(
     } else {
         data.len()
     };
+    if code_length > data.len() {
+        return Err(Error::MachO(
+            "LC_CODE_SIGNATURE dataoff exceeds file length".into(),
+        ));
+    }
 
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
@@ -1222,7 +1294,13 @@ pub fn prepare_code_with_metadata(
     }
 
     if let Some((offset, fileoff, _vmsize, _filesize)) = metadata.linkedit_cmd {
-        let new_filesize = (sig_offset + estimated_signature_size) as u64 - fileoff;
+        let sig_end = sig_offset
+            .checked_add(estimated_signature_size)
+            .ok_or_else(|| Error::MachO("signature end overflow".into()))?
+            as u64;
+        let new_filesize = sig_end.checked_sub(fileoff).ok_or_else(|| {
+            Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
+        })?;
         update_linkedit_segment(&mut prepared, offset, new_filesize)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
@@ -1324,7 +1402,13 @@ pub fn prepare_code_in_place(
     }
 
     if let Some((offset, fileoff, _vmsize, _filesize)) = metadata.linkedit_cmd {
-        let new_filesize = (sig_offset + estimated_signature_size) as u64 - fileoff;
+        let sig_end = sig_offset
+            .checked_add(estimated_signature_size)
+            .ok_or_else(|| Error::MachO("signature end overflow".into()))?
+            as u64;
+        let new_filesize = sig_end.checked_sub(fileoff).ok_or_else(|| {
+            Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
+        })?;
         update_linkedit_segment(buf, offset, new_filesize)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
@@ -1422,6 +1506,7 @@ fn write_u64(data: &mut [u8], offset: usize, value: u64, big_endian: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macho::fixtures::{make_fat_macho, make_minimal_macho, test_signing_credentials};
 
     #[test]
     fn test_align_to() {
@@ -2245,5 +2330,117 @@ mod tests {
             prev_end,
             "output must end exactly at the last slice"
         );
+    }
+
+    #[test]
+    fn test_embed_signature_rejects_truncated_fat_slice() {
+        let fat = make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12]);
+        // align-12 fixture places arch0 at [0x1000, 0x3000); cutting to 0x2000
+        // puts that declared range past EOF, which pre-fix panics at the raw index.
+        let cut = &fat[..0x2000];
+        let err = embed_signature(cut, &signature_bytes())
+            .expect_err("truncated FAT must be a clean error");
+        assert!(err.to_string().contains("exceeds"), "{err}"); // pre-fix: PANIC at data[offset..offset+size]
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_arch_range_beyond_file() {
+        let fat = make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12]);
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.trunc",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let cut = fat[..fat.len() - 0x800].to_vec();
+        let err = embed_signature_fat(&cut, &full)
+            .expect_err("container whose arch ranges exceed it must be rejected");
+        assert!(err.to_string().contains("exceeds"), "{err}"); // pre-fix: Ok (range never validated)
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_overflowing_arch_range() {
+        let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
+        let mut bad = fat.clone();
+        // arch[0].offset = 0xFFFF_FFF0, size = 0x100 => offset+size = 0x1_0000_00F0
+        let e = 8;
+        bad[e + 8..e + 12].copy_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+        bad[e + 12..e + 16].copy_from_slice(&0x100u32.to_be_bytes());
+        let err = embed_signature(&bad, &signature_bytes())
+            .expect_err("overflowing arch range must be a clean error");
+        assert!(err.to_string().contains("exceeds"), "{err}"); // pre-fix: PANIC (index out of bounds)
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_overlapping_slices() {
+        // arch[0] = [0x1000, 0x3000), arch[1] = [0x2000, 0x4000): both regions
+        // parse as Mach-O (slice 0's header + LCs live below 0x2000, where slice
+        // 1 begins) and the ranges overlap by 0x1000 bytes. The fat_arch table
+        // starts at offset 8 (right after the 8-byte fat_header) where goblin
+        // reads it; slice placement at 0x1000+ clears the 48-byte table.
+        const HEADER: usize = 8;
+        let mut fat = vec![0u8; 0x4000];
+        fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
+        fat[4..8].copy_from_slice(&2u32.to_be_bytes());
+        for (i, (off, size)) in [(0x1000u32, 0x2000u32), (0x2000u32, 0x2000u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let e = HEADER + i * 20;
+            fat[e..e + 4].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+            fat[e + 4..e + 8].copy_from_slice(&0u32.to_be_bytes());
+            fat[e + 8..e + 12].copy_from_slice(&off.to_be_bytes());
+            fat[e + 12..e + 16].copy_from_slice(&size.to_be_bytes());
+            fat[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
+        }
+        fat[0x1000..0x3000].copy_from_slice(&make_minimal_macho());
+        fat[0x2000..0x4000].copy_from_slice(&make_minimal_macho());
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap(); // both slices parse
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.overlap",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err =
+            embed_signature_fat(&fat, &full).expect_err("overlapping slices must be rejected");
+        assert!(err.to_string().contains("overlap"), "{err}"); // pre-fix: Ok
+    }
+
+    #[test]
+    fn test_prepare_rejects_hostile_linkedit_fileoff() {
+        // minimal thin Mach-O whose __LINKEDIT.fileoff points past the file:
+        let mut data = make_minimal_macho();
+        let macho = match Mach::parse(&data).expect("fixture parses") {
+            Mach::Binary(m) => m,
+            _ => panic!("thin fixture"),
+        };
+        let lc = macho.load_commands.iter()
+            .find(|lc| matches!(lc.command, CommandVariant::Segment64(s) if s.segname.starts_with(b"__LINKEDIT")))
+            .expect("__LINKEDIT present");
+        let off = lc.offset + 40; // segment_command_64.fileoff field within the LC
+        data[off..off + 8].copy_from_slice(&0x9000u64.to_le_bytes());
+        let result = std::panic::catch_unwind(|| prepare_code_for_signing(&data, 0x4000));
+        match result {
+            Ok(inner) => assert!(
+                inner.is_err(),
+                "prepare must reject hostile __LINKEDIT.fileoff, got Ok: {:?}",
+                inner.map(|r| r.2)
+            ),
+            Err(_) => {
+                panic!("prepare must not panic on hostile __LINKEDIT.fileoff (u64 underflow)")
+            }
+        }
     }
 }
