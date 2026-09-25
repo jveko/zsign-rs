@@ -482,7 +482,8 @@ pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>> {
 /// A parsed CodeDirectory (`CSMAGIC_CODEDIRECTORY`).
 ///
 /// All multi-byte header fields are big-endian per the Apple format.
-/// Version 0x20400 (exec segment) is the header size this parser requires.
+/// Versions 0x20001 through 0x20600 use 44-, 48-, 52-, 64-, 88-, 96-, or 108-byte
+/// headers according to their format gates.
 #[derive(Debug, Clone)]
 pub struct CodeDirectory<'a> {
     /// Raw CodeDirectory bytes (what the cdhash is computed over).
@@ -493,6 +494,8 @@ pub struct CodeDirectory<'a> {
     pub flags: u32,
     /// `execSegBase` header field (version >= 0x20400); 0 when unset/older.
     pub exec_seg_base: u64,
+    /// `runtime` header field (version >= 0x20500); 0 when unset/older.
+    pub runtime: u32,
     /// `execSegLimit` header field (version >= 0x20400); 0 when unset/older.
     pub exec_seg_limit: u64,
     /// `execSegFlags` header field (version >= 0x20400); 0 when unset/older.
@@ -507,6 +510,8 @@ pub struct CodeDirectory<'a> {
     pub n_code_slots: u32,
     /// `codeLimit` header field: number of code bytes hashed (u32).
     pub code_limit: u32,
+    /// `codeLimit64` header field (version >= 0x20300); 0 when unset/older.
+    code_limit64: u64,
     /// `hashSize` header field (e.g. 32 for SHA-256).
     pub hash_size: usize,
     /// `hashType` header field ([`CS_HASHTYPE_SHA256`] etc.).
@@ -550,16 +555,28 @@ impl<'a> CodeDirectory<'a> {
                 "unsupported CodeDirectory version 0x{version:08x}"
             )));
         }
+        if version > CODEDIRECTORY_VERSION_LINKAGE {
+            return Err(crate::Error::Verification(format!(
+                "unsupported CodeDirectory version 0x{version:08x} (newer than 0x20600)"
+            )));
+        }
 
-        let header_size = if version >= CODEDIRECTORY_VERSION_EXECSEG {
+        let header_size = if version >= CODEDIRECTORY_VERSION_LINKAGE {
+            108
+        } else if version >= CODEDIRECTORY_VERSION_PREENCRYPT {
+            96
+        } else if version >= CODEDIRECTORY_VERSION_EXECSEG {
             88
         } else if version >= CODEDIRECTORY_VERSION_CODELIMIT64 {
-            80
+            64
         } else if version >= CODEDIRECTORY_VERSION_TEAMID {
-            76
-        } else {
             52
+        } else if version >= CODEDIRECTORY_VERSION_SCATTER {
+            48
+        } else {
+            44
         };
+
         if data.len() < header_size {
             return Err(crate::Error::Verification(format!(
                 "CodeDirectory header ({header_size} bytes for version 0x{version:08x}) overruns blob"
@@ -577,6 +594,16 @@ impl<'a> CodeDirectory<'a> {
         let code_limit = rd_u32(32);
         let hash_size = data[36] as usize;
         let hash_type = data[37];
+        if version >= CODEDIRECTORY_VERSION_SCATTER && rd_u32(44) != 0 {
+            return Err(crate::Error::Verification(
+                "scatter CodeDirectories are not supported".into(),
+            ));
+        }
+        let code_limit64 = if version >= CODEDIRECTORY_VERSION_CODELIMIT64 {
+            rd_u64(56)
+        } else {
+            0
+        };
         let page_size_log2 = data[39];
         let team_offset_raw = if version >= CODEDIRECTORY_VERSION_TEAMID {
             rd_u32(48)
@@ -589,6 +616,49 @@ impl<'a> CodeDirectory<'a> {
             } else {
                 (0, 0, 0)
             };
+        let runtime = if version >= CODEDIRECTORY_VERSION_PREENCRYPT {
+            rd_u32(88)
+        } else {
+            0
+        };
+        let pre_encrypt_offset = if version >= CODEDIRECTORY_VERSION_PREENCRYPT {
+            rd_u32(92)
+        } else {
+            0
+        };
+        if pre_encrypt_offset != 0 {
+            return Err(crate::Error::Verification(
+                "pre-encrypted CodeDirectory hashes are not supported".into(),
+            ));
+        }
+        if runtime != 0 && flags & CS_RUNTIME == 0 {
+            return Err(crate::Error::Verification(
+                "runtime version recorded without the CS_RUNTIME flag".into(),
+            ));
+        }
+        let (
+            _linkage_hash_type,
+            _linkage_application_type,
+            _linkage_application_subtype,
+            linkage_offset,
+            linkage_size,
+        ) = if version >= CODEDIRECTORY_VERSION_LINKAGE {
+            (
+                data[96],
+                data[97],
+                u16::from_be_bytes(data[98..100].try_into().unwrap()),
+                rd_u32(100),
+                rd_u32(104),
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        if linkage_size != 0 && (linkage_size != 20 || linkage_offset as u64 + 20 > declared as u64)
+        {
+            return Err(crate::Error::Verification(
+                "invalid CodeDirectory linkage hash bounds".into(),
+            ));
+        }
 
         if hash_type != CS_HASHTYPE_SHA1 && hash_type != CS_HASHTYPE_SHA256 {
             return Err(crate::Error::Verification(format!(
@@ -634,6 +704,7 @@ impl<'a> CodeDirectory<'a> {
         Ok(CodeDirectory {
             data,
             version,
+            runtime,
             flags,
             exec_seg_base,
             exec_seg_limit,
@@ -643,6 +714,7 @@ impl<'a> CodeDirectory<'a> {
             n_special_slots,
             n_code_slots,
             code_limit,
+            code_limit64,
             hash_size,
             hash_type,
             page_size_log2,
@@ -673,6 +745,14 @@ impl<'a> CodeDirectory<'a> {
         match self.hash_type {
             CS_HASHTYPE_SHA1 => Sha1::digest(self.data).to_vec(),
             _ => Sha256::digest(self.data).to_vec(),
+        }
+    }
+    /// The effective code byte limit, preferring `codeLimit64` when present.
+    pub fn effective_code_limit(&self) -> u64 {
+        if self.version >= CODEDIRECTORY_VERSION_CODELIMIT64 && self.code_limit64 != 0 {
+            self.code_limit64
+        } else {
+            self.code_limit as u64
         }
     }
 
@@ -772,14 +852,17 @@ pub fn check_code_pages(cd: &CodeDirectory<'_>, code: &[u8]) -> PageCheck {
     // modern macOS system binaries.
     let page_size = 1usize << cd.page_size_log2;
 
-    let region_len = (cd.code_limit as usize).min(code.len());
+    let limit = cd.effective_code_limit();
+    let code_len = code.len() as u64;
+    let region_len_u64 = limit.min(code_len);
     // Guard against a CodeDirectory claiming more code than exists.
-    if cd.code_limit as usize > code.len() {
+    if limit > code_len {
         return PageCheck::CountMismatch {
             stored: cd.n_code_slots as usize,
-            computed: region_len.div_ceil(page_size),
+            computed: region_len_u64.div_ceil(page_size as u64) as usize,
         };
     }
+    let region_len = region_len_u64 as usize; // safe: <= code.len()
 
     let stored = cd.code_hashes();
     let expected_slots = region_len.div_ceil(page_size);
@@ -1556,5 +1639,136 @@ mod tests {
         let parsed_empty = parse_superblob(&empty).unwrap();
         let checks2 = check_special_slots(&cd, &SignatureInputs::none(), &parsed_empty);
         assert_eq!(checks2[7], SpecialSlotCheck::NotChecked);
+    }
+    /// Minimal CodeDirectory: 44-byte base header + version-gated tail + ident "x",
+    /// no special/code slots. `tail` occupies bytes [44, 44+len) — exactly where the
+    /// version-gated fields live — so each version's blob is EXACTLY its header size
+    /// plus ident, making the header-size check the discriminator.
+    fn synth_cd(version: u32, tail: &[u8]) -> Vec<u8> {
+        let ident = b"x\0";
+        let hash_offset = 44 + tail.len() + ident.len();
+        let mut cd = vec![0u8; hash_offset];
+        cd[0..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+        cd[4..8].copy_from_slice(&(hash_offset as u32).to_be_bytes());
+        cd[8..12].copy_from_slice(&version.to_be_bytes());
+        cd[16..20].copy_from_slice(&(hash_offset as u32).to_be_bytes()); // hashOffset
+        cd[20..24].copy_from_slice(&((44 + tail.len()) as u32).to_be_bytes()); // identOffset
+        cd[36] = 32; // hashSize
+        cd[37] = CS_HASHTYPE_SHA256;
+        cd[39] = 12; // pageSize log2
+        cd[44..44 + tail.len()].copy_from_slice(tail);
+        cd[44 + tail.len()..].copy_from_slice(ident);
+        cd
+    }
+
+    #[test]
+    fn version_header_sizes_are_correct() {
+        // header sizes: 44/48/52/64/88/96/108 at gates 0x20001..0x20600
+        for (version, tail_len) in [
+            (0x20001u32, 0usize),
+            (0x20100, 4),
+            (0x20200, 8),
+            (0x20300, 20),
+            (0x20400, 44),
+            (0x20500, 52),
+            (0x20600, 64),
+        ] {
+            let cd = synth_cd(version, &vec![0u8; tail_len]);
+            assert!(
+                CodeDirectory::parse(&cd).is_ok(),
+                "version 0x{version:05x} (tail {tail_len}) must parse"
+            );
+        }
+        let too_new = synth_cd(0x20601, &vec![0u8; 64]);
+        let err = CodeDirectory::parse(&too_new).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported CodeDirectory version"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scatter_is_rejected() {
+        let mut tail = vec![0u8; 4];
+        tail[3] = 4; // scatterOffset @44 = 4 (nonzero)
+        let err = CodeDirectory::parse(&synth_cd(0x20100, &tail)).unwrap_err();
+        assert!(err.to_string().contains("scatter"), "{err}");
+    }
+
+    #[test]
+    fn preencrypted_hashes_are_rejected() {
+        let mut tail = vec![0u8; 52]; // 0x20500: runtime@88 = tail[44..48], preEncrypt@92 = tail[48..52]
+        tail[48..52].copy_from_slice(&0x100u32.to_be_bytes());
+        let err = CodeDirectory::parse(&synth_cd(0x20500, &tail)).unwrap_err();
+        assert!(err.to_string().contains("pre-encrypted"), "{err}");
+    }
+
+    #[test]
+    fn runtime_without_flag_is_rejected() {
+        let mut tail = vec![0u8; 52];
+        tail[44..48].copy_from_slice(&0x0D_0000u32.to_be_bytes()); // runtime, flags = 0
+        let err = CodeDirectory::parse(&synth_cd(0x20500, &tail)).unwrap_err();
+        assert!(err.to_string().contains("CS_RUNTIME"), "{err}");
+    }
+
+    #[test]
+    fn code_limit_64_drives_page_check() {
+        // 0x20300 tail: scatter4 + team4 + spare3 4 + codeLimit64 8 = 20 bytes;
+        // codeLimit64 @56 = tail[12..20].
+        let mut tail = vec![0u8; 20];
+        tail[12..20].copy_from_slice(&0x1000_0000u64.to_be_bytes());
+        let mut cd = synth_cd(0x20300, &tail);
+        cd[32..36].copy_from_slice(&32u32.to_be_bytes()); // codeLimit = 32 (u32)
+        cd[28..32].copy_from_slice(&1u32.to_be_bytes()); // nCodeSlots = 1
+        cd.resize(cd.len() + 32, 0); // room for the one code hash
+        let new_len = cd.len() as u32;
+        cd[4..8].copy_from_slice(&new_len.to_be_bytes()); // keep declared length honest
+        let parsed = CodeDirectory::parse(&cd).unwrap();
+        // Without honoring codeLimit64 the region (32 bytes) is one page -> Matched.
+        // With it, codeLimit64 (256 MiB) overruns any real region -> guard fires.
+        assert_eq!(
+            check_code_pages(&parsed, &[0u8; 4096]),
+            PageCheck::CountMismatch {
+                stored: 1,
+                computed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn linkage_fields_are_bounds_checked() {
+        // 0x20600 tail[52..64) = u8 hashType, u8 appType, u16 appSub, u32 offset, u32 size
+        let mut t = vec![0u8; 64];
+        t[56..60].copy_from_slice(&200u32.to_be_bytes()); // offset 200 + 20 > declared
+        t[60..64].copy_from_slice(&20u32.to_be_bytes());
+        assert!(CodeDirectory::parse(&synth_cd(0x20600, &t)).is_err());
+
+        let mut t2 = vec![0u8; 64];
+        t2[56..60].copy_from_slice(&40u32.to_be_bytes()); // 40 + 20 <= declared (110)
+        t2[60..64].copy_from_slice(&20u32.to_be_bytes());
+        assert!(CodeDirectory::parse(&synth_cd(0x20600, &t2)).is_ok());
+
+        let mut t3 = vec![0u8; 64];
+        t3[60..64].copy_from_slice(&7u32.to_be_bytes()); // size must be 0 or 20
+        assert!(CodeDirectory::parse(&synth_cd(0x20600, &t3)).is_err());
+
+        // u32::MAX offset must NOT overflow the bounds arithmetic (debug panic /
+        // release wrap) - it is simply out of range:
+        let mut t4 = vec![0u8; 64];
+        t4[56..60].copy_from_slice(&u32::MAX.to_be_bytes());
+        t4[60..64].copy_from_slice(&20u32.to_be_bytes());
+        assert!(CodeDirectory::parse(&synth_cd(0x20600, &t4)).is_err());
+    }
+
+    #[test]
+    fn cdhash_binds_declared_length() {
+        let mut cd = synth_cd(0x20400, &[0u8; 44]);
+        let declared = cd.len();
+        cd.extend_from_slice(&[0xAA; 64]); // trailing bytes beyond the declared length
+        let parsed = CodeDirectory::parse(&cd).unwrap();
+        assert_eq!(parsed.data.len(), declared);
+        let expected: [u8; 32] = Sha256::digest(&cd[..declared]).into();
+        assert_eq!(parsed.cdhash_sha256(), expected);
     }
 }

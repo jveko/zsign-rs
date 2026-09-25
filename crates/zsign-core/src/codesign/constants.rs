@@ -256,14 +256,14 @@ pub const CODEDIRECTORY_VERSION_CODELIMIT64: u32 = 0x20300;
 /// Version with exec segment support (current/latest)
 pub const CODEDIRECTORY_VERSION_EXECSEG: u32 = 0x20400;
 
-/// Version with pre-encrypt hashes
+/// `supportsPreEncrypt` gate for both the runtime and pre-encryption fields.
 pub const CODEDIRECTORY_VERSION_PREENCRYPT: u32 = 0x20500;
 
-/// Version with runtime version
-pub const CODEDIRECTORY_VERSION_RUNTIME: u32 = 0x20600;
+/// `CS_SUPPORTSRUNTIME` gate for both the runtime and pre-encryption fields.
+pub const CODEDIRECTORY_VERSION_RUNTIME: u32 = 0x20500;
 
-/// Version with linkage hashes
-pub const CODEDIRECTORY_VERSION_LINKAGE: u32 = 0x20700;
+/// `CS_SUPPORTSLINKAGE`; the newest CodeDirectory version supported here.
+pub const CODEDIRECTORY_VERSION_LINKAGE: u32 = 0x20600;
 
 /// Current/latest version we generate (exec segment support)
 pub const CODEDIRECTORY_VERSION: u32 = CODEDIRECTORY_VERSION_EXECSEG;
