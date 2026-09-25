@@ -40,6 +40,7 @@ fn expected_magic(slot: u32) -> Option<u32> {
         CSSLOT_REQUIREMENTS => CSMAGIC_REQUIREMENTS,
         CSSLOT_ENTITLEMENTS => CSMAGIC_EMBEDDED_ENTITLEMENTS,
         CSSLOT_DER_ENTITLEMENTS => CSMAGIC_EMBEDDED_DER_ENTITLEMENTS,
+        CSSLOT_LAUNCH_CONSTRAINT_SELF..=CSSLOT_LIBRARY_CONSTRAINT => CSMAGIC_LAUNCH_CONSTRAINT,
         _ => return None,
     })
 }
@@ -87,6 +88,11 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     if blob.len() < 12 {
         return Err(crate::Error::Verification(
             "code signature blob too short for SuperBlob header".into(),
+        ));
+    }
+    if blob[0..4] == CSMAGIC_EMBEDDED_SIGNATURE_OLD.to_be_bytes() {
+        return Err(crate::Error::Verification(
+            "old embedded signature format (magic 0xfade0b02) is not supported".into(),
         ));
     }
     if blob[0..4] != CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes() {
@@ -232,20 +238,18 @@ enum Expr {
 }
 
 #[derive(Debug, Clone)]
-pub struct Requirement<'a> {
+pub struct Requirement {
     expr: Expr,
-    #[allow(dead_code)]
-    raw: &'a [u8],
 }
 
 /// All requirement entries stored in a requirements SuperBlob.
 #[derive(Debug, Clone)]
-pub struct RequirementsSet<'a> {
-    entries: Vec<(u32, Requirement<'a>)>,
+pub struct RequirementsSet {
+    entries: Vec<(u32, Requirement)>,
 }
 
-impl RequirementsSet<'_> {
-    pub fn designated(&self) -> Option<&Requirement<'_>> {
+impl RequirementsSet {
+    pub fn designated(&self) -> Option<&Requirement> {
         self.entries
             .iter()
             .find(|(kind, _)| *kind == CSREQ_DESIGNATED)
@@ -266,7 +270,7 @@ pub struct RequirementContext<'a> {
     pub anchored: Option<bool>,
 }
 
-impl Requirement<'_> {
+impl Requirement {
     pub fn evaluate(&self, ctx: &RequirementContext<'_>) -> RequirementVerdict {
         match evaluate_expr(&self.expr, ctx) {
             Tri::True => RequirementVerdict::Satisfied,
@@ -414,7 +418,7 @@ fn parse_requirement_expr(bytes: &[u8], offset: &mut usize, depth: u32) -> Resul
 }
 
 /// Parses the requirements SuperBlob stored in `CSSLOT_REQUIREMENTS`.
-pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>> {
+pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet> {
     if blob.len() < 12 {
         return Err(requirement_error(
             "requirements blob too short for SuperBlob header",
@@ -474,7 +478,7 @@ pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>> {
         }
         let mut expression_offset = 12;
         let expr = parse_requirement_expr(child, &mut expression_offset, 0)?;
-        entries.push((kind, Requirement { expr, raw: child }));
+        entries.push((kind, Requirement { expr }));
     }
     Ok(RequirementsSet { entries })
 }
@@ -520,6 +524,8 @@ pub struct CodeDirectory<'a> {
     pub page_size_log2: u8,
     /// `teamOffset` into `data` for the null-terminated team ID, if any.
     team_offset: Option<usize>,
+    // The pre-encryption and linkage fields remain parse-time locals: the
+    // parser validates them, but the verifier has no need to retain them.
 }
 
 impl<'a> CodeDirectory<'a> {
@@ -1619,7 +1625,7 @@ mod tests {
     #[test]
     fn launch_constraint_content_comes_from_superblob_slot_8() {
         let child: Vec<u8> = [
-            0xfade8181u32.to_be_bytes(), // CSMAGIC_LAUNCH_CONSTRAINT
+            CSMAGIC_LAUNCH_CONSTRAINT.to_be_bytes(),
             12u32.to_be_bytes(),
             [0u8; 4],
         ]
@@ -1770,5 +1776,36 @@ mod tests {
         assert_eq!(parsed.data.len(), declared);
         let expected: [u8; 32] = Sha256::digest(&cd[..declared]).into();
         assert_eq!(parsed.cdhash_sha256(), expected);
+    }
+
+    #[test]
+    fn old_embedded_signature_magic_is_diagnosed() {
+        let mut b = build_blob(true);
+        b[0..4].copy_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE_OLD.to_be_bytes());
+        let err = parse_superblob(&b).unwrap_err();
+        assert!(err.to_string().contains("old embedded signature"), "{err}");
+    }
+
+    #[test]
+    fn launch_constraint_slot_magic_is_validated() {
+        // child at slot 0x0008 with the WRONG magic -> parse error after this task
+        let child = [0u32.to_be_bytes(), 12u32.to_be_bytes(), [0u8; 4]].concat();
+        let total = (12 + 8 + child.len()) as u32;
+        let mut b = synth_superblob(total, &[(CSSLOT_LAUNCH_CONSTRAINT_SELF, 20)]);
+        b[20..20 + child.len()].copy_from_slice(&child);
+        assert!(
+            parse_superblob(&b).is_err(),
+            "wrong constraint magic must be rejected"
+        );
+        // ...and the correct magic parses (routing ignores it until a CD binds -8):
+        let mut ok = synth_superblob(total, &[(CSSLOT_LAUNCH_CONSTRAINT_SELF, 20)]);
+        let good: Vec<u8> = [
+            CSMAGIC_LAUNCH_CONSTRAINT.to_be_bytes(),
+            12u32.to_be_bytes(),
+            [0u8; 4],
+        ]
+        .concat();
+        ok[20..20 + good.len()].copy_from_slice(&good);
+        assert!(parse_superblob(&ok).is_ok(), "0xfade8181 child must parse");
     }
 }

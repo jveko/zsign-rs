@@ -13,6 +13,8 @@
 //! - [`CSMAGIC_REQUIREMENTS`] (`0xfade0c01`): Requirements blob
 //! - [`CSMAGIC_EMBEDDED_ENTITLEMENTS`] (`0xfade7171`): XML entitlements
 //! - [`CSMAGIC_EMBEDDED_DER_ENTITLEMENTS`] (`0xfade7172`): DER entitlements
+//! - [`CSMAGIC_EMBEDDED_SIGNATURE_OLD`] (`0xfade0b02`): Legacy embedded signature magic
+//! - [`CSMAGIC_LAUNCH_CONSTRAINT`] (`0xfade8181`): All launch-constraint blobs
 //!
 //! # Slot Types
 //!
@@ -22,8 +24,14 @@
 //! - [`CSSLOT_REQUIREMENTS`] (`0x0002`): Code requirements
 //! - [`CSSLOT_ENTITLEMENTS`] (`0x0005`): XML entitlements
 //! - [`CSSLOT_DER_ENTITLEMENTS`] (`0x0007`): DER entitlements
+//! - [`CSSLOT_LAUNCH_CONSTRAINT_SELF`] (`0x0008`) through [`CSSLOT_LIBRARY_CONSTRAINT`]
+//!   (`0x000b`): Self, parent, responsible, and library launch constraints
 //! - [`CSSLOT_ALTERNATE_CODEDIRECTORIES`] (`0x1000`): SHA-256 CodeDirectory
 //! - [`CSSLOT_SIGNATURESLOT`] (`0x10000`): CMS signature
+//! - [`CSSLOT_TICKETSLOT`] (`0x10002`): Ticket/notarization slot
+//! - [`CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF`] (`-8`) through
+//!   [`CSSLOT_SPECIAL_LIBRARY_CONSTRAINT`] (`-11`): corresponding CodeDirectory
+//!   special slots for launch constraints
 
 // =============================================================================
 // SuperBlob Magic Numbers
@@ -31,6 +39,14 @@
 
 /// SuperBlob containing all signature components (embedded signature)
 pub const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
+
+/// Legacy embedded signature magic from Apple's headers. Its purpose is
+/// undocumented there; this is used only to distinguish the diagnostic case.
+pub const CSMAGIC_EMBEDDED_SIGNATURE_OLD: u32 = 0xfade0b02;
+
+/// Magic shared by all four launch-constraint blobs: self, parent,
+/// responsible, and library constraints.
+pub const CSMAGIC_LAUNCH_CONSTRAINT: u32 = 0xfade8181;
 
 /// CodeDirectory blob magic
 pub const CSMAGIC_CODEDIRECTORY: u32 = 0xfade0c02;
@@ -106,8 +122,9 @@ pub const CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT: u32 =
 /// CMS signature slot
 pub const CSSLOT_SIGNATURESLOT: u32 = 0x10000;
 
-/// Ticket/notarization slot
-pub const CSSLOT_TICKETSLOT: u32 = 0x10001;
+/// Ticket/notarization slot. `0x10001` is the CodeDirectory-identification
+/// slot used only by detached signatures.
+pub const CSSLOT_TICKETSLOT: u32 = 0x10002;
 
 // =============================================================================
 // Special Slot Indices (negative, for CodeDirectory)
@@ -133,6 +150,18 @@ pub const CSSLOT_SPECIAL_REP_SPECIFIC: i32 = -6;
 
 /// DER entitlements special slot index
 pub const CSSLOT_SPECIAL_DER_ENTITLEMENTS: i32 = -7;
+
+/// Launch-constraint (self) special slot index
+pub const CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF: i32 = -8;
+
+/// Launch-constraint (parent) special slot index
+pub const CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_PARENT: i32 = -9;
+
+/// Launch-constraint (responsible) special slot index
+pub const CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_RESPONSIBLE: i32 = -10;
+
+/// Library-constraint special slot index
+pub const CSSLOT_SPECIAL_LIBRARY_CONSTRAINT: i32 = -11;
 
 // =============================================================================
 // Hash Types
@@ -465,5 +494,21 @@ mod tests {
         assert_eq!(CSSLOT_DER_ENTITLEMENTS, 0x0007);
         assert_eq!(CSSLOT_ALTERNATE_CODEDIRECTORIES, 0x1000);
         assert_eq!(CSSLOT_SIGNATURESLOT, 0x10000);
+    }
+
+    #[test]
+    fn ticket_slot_is_the_notarization_slot() {
+        assert_eq!(CSSLOT_TICKETSLOT, 0x10002); // Apple blob.h: 0x10001 is the cd-identification slot
+    }
+
+    #[test]
+    fn version_gate_values_match_apple() {
+        assert_eq!(CODEDIRECTORY_VERSION_SCATTER, 0x20100);
+        assert_eq!(CODEDIRECTORY_VERSION_TEAMID, 0x20200);
+        assert_eq!(CODEDIRECTORY_VERSION_CODELIMIT64, 0x20300);
+        assert_eq!(CODEDIRECTORY_VERSION_EXECSEG, 0x20400);
+        assert_eq!(CODEDIRECTORY_VERSION_RUNTIME, 0x20500);
+        assert_eq!(CODEDIRECTORY_VERSION_LINKAGE, 0x20600);
+        assert_eq!(CODEDIRECTORY_VERSION, 0x20400); // unchanged alias target
     }
 }
