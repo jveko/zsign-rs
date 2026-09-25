@@ -72,9 +72,23 @@ fn whole_file_page_size_hashes_region_as_one_slot() {
     // guard; with whole-file page size the computed count is 1 (region_len /
     // region_len), pre-fix it was 1000 (page_size = 1). Either way: no panic,
     // CountMismatch — pin the post-fix exact values.
+assert_eq!(
+    check_code_pages(&cd, short),
+    PageCheck::CountMismatch { stored: 1, computed: 1 }
+);
+}
+
+#[test]
+fn check_code_pages_rejects_mutated_page_size_without_panic() {
+    // Post-fix, parse rejects every illegal page size, so the only way the
+    // consumer's fallback arm is reached is a consumer mutating the pub
+    // field — which must fail closed, not shift blindly (pre-fix: 1 << 33
+    // succeeds on x86_64 and the check proceeds with a bogus page size).
+    let mut cd = CodeDirectory::parse(&cd_bytes_with_page_size(12)).unwrap();
+    cd.page_size_log2 = 33;
     assert_eq!(
-        check_code_pages(&cd, short),
-        PageCheck::CountMismatch { stored: 1, computed: 1 }
+        check_code_pages(&cd, &[0x5au8; 4096]),
+        PageCheck::CountMismatch { stored: 1, computed: 0 }
     );
 }
 ```
@@ -157,7 +171,9 @@ if stored.len() != stored_len {
 }
 ```
 
-Everything from `if expected_slots == 0 { return PageCheck::Empty; }` down through the digest loop stays byte-for-byte identical EXCEPT the loop's chunk size becomes `page_size_u64 as usize` (whole-file: one chunk of `region_len`; region empty never reaches the loop because `expected_slots == 0` returns `Empty` first).
+Everything from `if expected_slots == 0 { return PageCheck::Empty; }` down through the digest loop stays byte-for-byte identical, **including the ORDER**: the stored-length guard runs first and is *inert* when `expected_slots == 0` (`stored_len == 0`, passes only when the stored region is also empty), then `Empty` returns for empty regions, then the loop. Do NOT move the `Empty` return ahead of the stored-length guard — `macho/verify.rs:113-116` (out of scope) matches on `PageCheck::Empty` and that contract must keep working. The loop's chunk size becomes `page_size_u64 as usize` (whole-file: one chunk of `region_len`; `page_size_u64` is ≥ 1 on every path, so no division or `chunks` can see 0; an empty region never reaches the loop because `expected_slots == 0` returns `Empty` first).
+
+Post-fix evaluation of T4's two assertions (sanity pin for the implementer): full region → `expected_slots = 4096.div_ceil(4096) = 1`, `stored_len = 32`, one 4096-byte chunk hashed and compared → `Matched`. Short region → `limit(4096) > code_len(1000)` early branch → `CountMismatch { stored: 1, computed: 1 }`.
 
 - [ ] **Step 5: Run scoped gate**
 
@@ -237,12 +253,31 @@ fn parse_checked_mul_rejects_wrapping_hash_region() {
 }
 ```
 
+Also add the regression pin for the ALREADY-FIXED index-extent guard (audit (a)/(i-2) — no existing test exercised it; review round 1):
+
+```rust
+#[test]
+fn parse_superblob_rejects_hostile_count() {
+    // count = u32::MAX would make 12 + count*8 wrap on 32-bit; the guard
+    // must reject via the checked product before any bounds comparison.
+    let mut b = build_blob(true);
+    b[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+    let err = parse_superblob(&b).unwrap_err();
+    assert!(
+        matches!(err, crate::Error::Verification(ref m) if m.contains("index extent")),
+        "{err:?}"
+    );
+}
+```
+
 - [ ] **Step 2: Run tests, confirm failures**
 
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core code_hashes_is_panic_free special_slot_hash_is_panic_free -- --nocapture`
-Expected: FAIL pre-fix with slice/underflow panic (`range end index out of range` / `attempt to subtract with overflow` in debug).
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core code_hashes_is_panic_free -- --nocapture`
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core special_slot_hash_is_panic_free -- --nocapture`
+(cargo accepts exactly one positional filter per invocation — one command per filter.)
+Expected: both FAIL pre-fix with slice/underflow panic (`range end index out of range` / `attempt to subtract with overflow` in debug).
 
-(`parse_rejects_hash_region_product_overflow` passes pre-fix on 64-bit via the bounds path — by design; its 32-bit distinguishing sibling is cfg-gated, and the wasm32 `cargo check` in Task 6 is the width evidence the brief allows.)
+(`parse_rejects_hash_region_product_overflow` passes pre-fix on 64-bit via the bounds path — by design; its 32-bit distinguishing sibling is cfg-gated, and the wasm32 `cargo check` in Task 6 is the width evidence the brief allows. `parse_superblob_rejects_hostile_count` also passes at base — it is a regression *pin* for the already-landed guard, not a fix.)
 
 - [ ] **Step 3: Implement the checked product at parse**
 
@@ -491,12 +526,17 @@ for slot in &slots[start..] {
 }
 ```
 
+Notes (review round 1): the always-present `-6`/`-4` placeholder slots are pushed as `&empty` where `empty = vec![0u8; hash_size]` — correctly sized, they pass. The assert is a **hard panic on the public builder API** for any caller that mixes hash sizes (documented trusted-path contract, same class as `panic!("Unsupported hash type")` at `:589`); `build_special_slots` itself is a private method (`fn`, `code_directory.rs:545`), so out-of-scope files can only reach it through `build_sha1/256(_from_hashes)`. The sole production caller, `macho/signer.rs:793-843`, selects algorithm-matched digests via `is_sha1` from `DualHash { sha1, sha256 }` (`:852-874`), so no in-repo signing flow trips it.
+
 - [ ] **Step 6: Run scoped gate (debug + release evidence)**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core codesign`
 Expected: green — all pre-existing digest tests already pass 32-byte digests into SHA-256 builds (verified by grep: `code_directory.rs:785/:797/:812/:945-949`, `verify.rs:1532-1533`), so the new asserts change no existing expectation.
 
-Run: `TMPDIR=$PWD/.tmptmp cargo test --release -p zsign-core build_from_hashes_panics build_rejects_special_slot_digest u32_len`
+Run (one positional filter per cargo invocation):
+`TMPDIR=$PWD/.tmptmp cargo test --release -p zsign-core build_from_hashes_panics -- --nocapture`
+`TMPDIR=$PWD/.tmptmp cargo test --release -p zsign-core build_rejects_special_slot_digest -- --nocapture`
+`TMPDIR=$PWD/.tmptmp cargo test --release -p zsign-core u32_len -- --nocapture`
 Expected: all 4 pass (post-fix release behavior = pre-fix debug behavior).
 
 - [ ] **Step 7: Commit**
