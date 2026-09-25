@@ -401,7 +401,7 @@ impl<'a> IpaSigner<'a> {
         {
             let path = entry.path();
 
-            if path.is_dir() && Self::is_bundle_directory(path) {
+            if entry.file_type().is_dir() && Self::is_bundle_directory(path) {
                 let depth = self.calculate_bundle_depth(path, bundle_path);
                 bundles.push((path.to_path_buf(), depth));
             }
@@ -563,7 +563,7 @@ impl<'a> IpaSigner<'a> {
         {
             let path = entry.path();
 
-            if !path.is_file() {
+            if !entry.file_type().is_file() {
                 continue;
             }
 
@@ -708,7 +708,8 @@ impl<'a> IpaSigner<'a> {
             .into_iter()
             .filter_entry(|e| {
                 let path = e.path();
-                if path != bundle_path && path.is_dir() && Self::is_bundle_directory(path) {
+                if path != bundle_path && e.file_type().is_dir() && Self::is_bundle_directory(path)
+                {
                     return false;
                 }
                 true
@@ -717,7 +718,7 @@ impl<'a> IpaSigner<'a> {
         {
             let path = entry.path();
 
-            if !path.is_file() {
+            if !entry.file_type().is_file() {
                 continue;
             }
 
@@ -1546,6 +1547,99 @@ mod tests {
         assert!(
             app.join("_CodeSignature/CodeResources").exists(),
             "signing must complete through the fallback path"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_dylib_is_skipped_and_target_untouched() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside.dylib");
+        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        std::fs::write(app.join("real.dylib"), crate::test_util::minimal_macho()).unwrap();
+        let link = app.join("lib.dylib");
+        symlink(&outside, &link).unwrap();
+        let before = std::fs::read(&outside).unwrap();
+
+        let signer = IpaSigner::new_adhoc();
+        let dylibs = signer.find_standalone_dylibs(&app).unwrap();
+        assert!(
+            dylibs.contains(&app.join("real.dylib")),
+            "a real dylib must still be discovered: {dylibs:?}"
+        );
+        assert!(
+            !dylibs.contains(&link),
+            "a symlinked dylib must not be discovered: {dylibs:?}"
+        );
+        let binaries = signer.find_immediate_macho_binaries(&app).unwrap();
+        assert!(
+            !binaries.contains(&link),
+            "a symlinked dylib must not be a signing target: {binaries:?}"
+        );
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_folder_in_place(&app)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            before,
+            "external dylib target must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_framework_is_not_collected_and_target_untouched() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let evil = temp.path().join("EvilTarget.framework");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(
+            evil.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.evil</string>
+    <key>CFBundleExecutable</key>
+    <string>Evil</string>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        std::fs::write(evil.join("Evil"), crate::test_util::minimal_macho()).unwrap();
+
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        symlink(&evil, app.join("Evil.framework")).unwrap();
+        let before = std::fs::read(evil.join("Evil")).unwrap();
+
+        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        assert!(
+            bundles
+                .iter()
+                .all(|(path, _)| path != &app.join("Evil.framework")),
+            "a symlinked framework must not be collected: {bundles:?}"
+        );
+        assert!(
+            bundles.iter().any(|(path, _)| path == &app),
+            "the root bundle must still be collected: {bundles:?}"
+        );
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_folder_in_place(&app)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(evil.join("Evil")).unwrap(),
+            before,
+            "external framework binary must stay untouched"
+        );
+        assert!(
+            !evil.join("_CodeSignature").exists(),
+            "no signature may be written outside the bundle"
         );
     }
 }
