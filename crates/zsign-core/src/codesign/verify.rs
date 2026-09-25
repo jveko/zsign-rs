@@ -30,6 +30,20 @@ use crate::Result;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
+fn expected_magic(slot: u32) -> Option<u32> {
+    Some(match slot {
+        CSSLOT_CODEDIRECTORY
+        | CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
+            CSMAGIC_CODEDIRECTORY
+        }
+        CSSLOT_SIGNATURESLOT => CSMAGIC_BLOBWRAPPER,
+        CSSLOT_REQUIREMENTS => CSMAGIC_REQUIREMENTS,
+        CSSLOT_ENTITLEMENTS => CSMAGIC_EMBEDDED_ENTITLEMENTS,
+        CSSLOT_DER_ENTITLEMENTS => CSMAGIC_EMBEDDED_DER_ENTITLEMENTS,
+        _ => return None,
+    })
+}
+
 /// A parsed entry in the SuperBlob index: a slot type and the blob bytes it points to.
 #[derive(Debug, Clone)]
 pub struct SlotEntry<'a> {
@@ -99,6 +113,7 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
 
     let mut entries = Vec::with_capacity(count.min(declared / 8));
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(count.min(declared / 8));
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for i in 0..count {
         let entry_off = 12 + i * 8;
         let slot = u32::from_be_bytes(sb[entry_off..entry_off + 4].try_into().unwrap());
@@ -130,6 +145,19 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
                     "SuperBlob entry {i} (slot 0x{slot:08x}) length overruns blob"
                 ))
             })?;
+        if let Some(want) = expected_magic(slot) {
+            let magic = u32::from_be_bytes(item[0..4].try_into().unwrap());
+            if magic != want {
+                return Err(crate::Error::Verification(format!(
+                    "SuperBlob entry {i} (slot 0x{slot:08x}): blob magic 0x{magic:08x}, expected 0x{want:08x}"
+                )));
+            }
+            if !seen.insert(slot) {
+                return Err(crate::Error::Verification(format!(
+                    "duplicate SuperBlob slot 0x{slot:08x}"
+                )));
+            }
+        }
         ranges.push((offset, end));
         entries.push(SlotEntry {
             slot,
@@ -679,6 +707,59 @@ mod tests {
         b[36..40].copy_from_slice(&0xfade0c01u32.to_be_bytes());
         b[40..44].copy_from_slice(&8u32.to_be_bytes());
         assert!(parse_superblob(&b).is_err(), "overlapping children");
+    }
+
+    #[test]
+    fn slot_magic_mismatch_is_rejected() {
+        let mut b = build_blob(true);
+        // locate the requirements child (slot 0x0002) via its index entry
+        let count = u32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+        let mut off = 0usize;
+        for i in 0..count {
+            let e = 12 + i * 8;
+            if u32::from_be_bytes(b[e..e + 4].try_into().unwrap()) == CSSLOT_REQUIREMENTS {
+                off = u32::from_be_bytes(b[e + 4..e + 8].try_into().unwrap()) as usize;
+            }
+        }
+        assert!(off > 0, "fixture must carry a requirements child");
+        b[off..off + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(parse_superblob(&b).is_err(), "wrong magic must be rejected");
+    }
+
+    #[test]
+    fn distinct_duplicate_slot_is_rejected() {
+        // Two DIFFERENT children both claiming slot 0x0002 (distinct ranges, so the
+        // pairwise-overlap check passes): today last-wins Ok.
+        let mut b = synth_superblob(60, &[(CSSLOT_REQUIREMENTS, 28), (CSSLOT_REQUIREMENTS, 44)]);
+        b[28..32].copy_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b[32..36].copy_from_slice(&16u32.to_be_bytes());
+        b[44..48].copy_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b[48..52].copy_from_slice(&16u32.to_be_bytes());
+        assert!(
+            parse_superblob(&b).is_err(),
+            "duplicate slot must be rejected"
+        );
+    }
+
+    #[test]
+    fn duplicate_code_directory_slot_is_rejected() {
+        // Two DIFFERENT valid CodeDirectory children both claiming slot 0x0000:
+        // today the second is silently ignored by the is_none() guard.
+        let a = CodeDirectoryBuilder::new("com.example.a", TEST_CODE).build_sha256();
+        let c = CodeDirectoryBuilder::new("com.example.bbbb", TEST_CODE).build_sha256();
+        let a_off = 28u32; // index = 12 + 2*8
+        let c_off = a_off + a.len() as u32;
+        let total = c_off + c.len() as u32;
+        let mut b = synth_superblob(
+            total,
+            &[(CSSLOT_CODEDIRECTORY, a_off), (CSSLOT_CODEDIRECTORY, c_off)],
+        );
+        b[a_off as usize..a_off as usize + a.len()].copy_from_slice(&a);
+        b[c_off as usize..c_off as usize + c.len()].copy_from_slice(&c);
+        assert!(
+            parse_superblob(&b).is_err(),
+            "duplicate slot 0 must be rejected"
+        );
     }
 
     #[test]
