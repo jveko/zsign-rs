@@ -26,10 +26,13 @@ read-back) and the user-supplied endpoints (`provisioning_profile_path`,
 output IPA via `create_ipa`) — those inputs are configured by the
 operator, not derived from bundle content.
 
-**Architecture:** One private guard `resolve_within(root, path)` (repo
-idiom: `strip_prefix` + component check + downward symlink walk, mirroring
-`ipa/extract.rs::validate_output_path`) validates every **write target**
-and the raw `CFBundleExecutable` value before use; discovery walks
+**Architecture:** A two-validator helper family — `Self::resolve_relative`
+(root-relative raw plist values/literals; never strips) and
+`Self::resolve_within` (root-prefixed walk/write targets; strip-required;
+repo idiom `strip_prefix` + component check + downward symlink walk,
+mirroring `ipa/extract.rs::validate_output_path`) sharing one symlink
+walk — validates every **write target** and the raw `CFBundleExecutable`
+value before use; discovery walks
 classify with walkdir's no-follow `entry.file_type()`;
 `get_main_executable` hard-errors on any value that is not a relative
 path to an existing regular file inside the bundle (non-string and
@@ -54,7 +57,9 @@ cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic
 mandatory. Never run project-wide.)
 
 Line numbers below are pre-fix anchors on branch `zsn-27-path-contain`
-(base ee42c12); re-locate by symbol if they drift.
+(base ee42c12; the branch has since merged `main` @ `6daa1a6` —
+`ipa/mod.rs` anchors unchanged, `extract.rs` citations post-ZSN-28);
+re-locate by symbol if they drift.
 
 ---
 
@@ -63,9 +68,9 @@ Line numbers below are pre-fix anchors on branch `zsn-27-path-contain`
 **Files:**
 - Modify: `crates/zsign/src/ipa/mod.rs`
   - imports at `:66`
-  - new free fn after `type ProfilePayload` (`:109`)
+  - new associated helpers after `Self::is_bundle_directory` (`:414-422`)
   - `get_main_executable` at `:700-733`
-- Test: inline tests module (`:904+`), new helper + 7 tests
+- Test: inline tests module (`:904+`), new helpers + 10 tests
 
 - [ ] **Step 1.1: Write the failing tests**
 
@@ -262,6 +267,86 @@ fixture helper they use:
             "error must surface the metadata failure: {message}"
         );
     }
+
+    #[test]
+    fn test_sign_rejects_root_shaped_value_with_relative_root() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "App.app/Test", true);
+        let before = std::fs::read(app.join("Test")).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let result = IpaSigner::new_adhoc().sign_folder_in_place("App.app");
+        std::env::set_current_dir(previous).unwrap();
+
+        let error = result
+            .expect_err("a root-relative CFBundleExecutable must not strip the root prefix");
+        let message = error.to_string();
+        assert!(
+            message.contains("App.app/Test") && message.contains("not an existing regular file"),
+            "error must name the misresolved target: {message}"
+        );
+        assert_eq!(
+            std::fs::read(app.join("Test")).unwrap(),
+            before,
+            "nothing may be signed when the declared target does not resolve"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_nonplain_value_under_dot_root() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("Info.plist"),
+            info_plist_xml("<string>./Test</string>"),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("Test"), crate::test_util::minimal_macho()).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let result = IpaSigner::new_adhoc().sign_folder_in_place(".");
+        std::env::set_current_dir(previous).unwrap();
+
+        let error = result.expect_err("a '.'-spelled CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a plain relative path"),
+            "error must name the spelling problem: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_tolerates_missing_executable_key() {
+        let temp = TempDir::new().unwrap();
+        let app = temp.path().join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_folder_in_place(&app)
+            .expect("key-absent bundle must still sign via the file-stem fallback");
+        assert!(
+            app.join("_CodeSignature/CodeResources").exists(),
+            "signing must complete through the fallback path"
+        );
+    }
 ```
 
 Notes: `new_adhoc()` is deliberate — every Task 1 test fails before any
@@ -272,103 +357,127 @@ fixture helper's value parameter is a `&str`.
 - [ ] **Step 1.2: Run the gate, expect RED**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: **7 failed** on Unix (this machine): six at `expect_err` —
+Expected: **9 failed** on Unix (this machine): eight at `expect_err` —
 tests 1-6 (`outside_bundle`, both absolute cases, non-string, non-plain,
-`symlinked_main_executable` all currently sign successfully) — plus
+`symlinked_main_executable` all currently sign successfully) plus the
+two relative-root tests 14-15 (the dual-shape helper strips the root and
+signs) — and
 `test_sign_errors_on_unreadable_path_component` at its
 message assertion (the walk error is swallowed, so `scan` fails first
 with `"Failed to walk directory"` — `code_resources.rs:154-159` — and the
-`"Failed to inspect signing path"` assertion cannot hold). Variants:
-**6 failed** where DAC checks are bypassed (root — the probe-guarded
-unreadable test returns early and passes), **5 failed** on non-Unix
-(tests 6-7 are `#[cfg(unix)]`). The 4 other tests pass (1 filtered out).
-Record the output.
+`"Failed to inspect signing path"` assertion cannot hold). Test 16
+passes already — it is a preservation pin, not a regression. Variants:
+**8 failed** where DAC checks are bypassed (root — the probe-guarded
+unreadable test returns early and passes), **7 failed** on non-Unix
+(tests 6-7 are `#[cfg(unix)]`; 14-16 are portable). The 4 other tests
+pass (1 filtered out). Record the output.
 
-- [ ] **Step 1.3: Add the `resolve_within` helper**
+- [ ] **Step 1.3: Add the `resolve_relative` + `resolve_within` helpers**
 
 Change the import at `:66` from
 `use std::path::{Path, PathBuf};` to
 `use std::path::{Component, Path, PathBuf};`.
 
-Insert after `type ProfilePayload = ...` (`:109`), before
-`pub struct IpaSigner`:
+Insert inside the `impl<'a> IpaSigner<'a>` block, directly after
+`Self::is_bundle_directory` (`:414-422`) — associated functions, matching
+this file's convention for stateless helpers:
 
 ```rust
-/// Resolve `path` for use under `root`, rejecting anything that escapes it.
-///
-/// `path` is either already prefixed by `root` (as produced by the
-/// discovery walks) or relative to `root` (literal names, plist values).
-/// The part below `root` must consist of normal components only, in
-/// plain spelling — no `..`, no absolute prefix, no `.`, no redundant
-/// separators — and no existing component may be a symlink. Returns the
-/// path re-joined onto `root`, lexically identical to what WalkDir
-/// produces.
-fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
-    let relative: PathBuf = match path.strip_prefix(root) {
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) if !path.is_absolute() => path.to_path_buf(),
-        Err(_) => {
+    /// Resolve `rel` — a root-relative name (raw plist value or literal) —
+    /// under `root`.
+    ///
+    /// Never reinterprets `rel` as already root-prefixed: a value that
+    /// starts with the root's own name still joins below the root. The
+    /// spelling must be plain — no `..`, no absolute prefix, no `.`, no
+    /// redundant separators — and no existing component may be a symlink.
+    /// Returns `root.join(rel)`, the lexical shape WalkDir produces.
+    fn resolve_relative(root: &Path, rel: &str) -> Result<PathBuf> {
+        let rel_path = Path::new(rel);
+        if rel_path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} escapes the bundle root {}",
+                rel,
+                root.display()
+            ))));
+        }
+        let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+        if rel.split(separator).any(|s| s.is_empty() || s == ".") {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} is not a plain relative path under {}",
+                rel,
+                root.display()
+            ))));
+        }
+        Self::check_no_symlink_components(root, rel_path)?;
+        Ok(root.join(rel))
+    }
+
+    /// Resolve `path` — already root-prefixed (discovery-walk output or a
+    /// previously joined target) — under `root`.
+    ///
+    /// `strip_prefix` must succeed; the remainder must be plain; no
+    /// existing component may be a symlink. Returns `root.join(relative)`,
+    /// the lexical shape WalkDir produces.
+    fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            Error::Core(zsign_core::Error::Signing(format!(
                 "Path {} is not under root {}",
                 path.display(),
                 root.display()
-            ))))
+            )))
+        })?;
+        // The remainder must contain no empty segments (redundant or
+        // trailing separators) and no "." segments — a PathBuf rebuild
+        // would join with the native separator and reject plain
+        // '/'-spelled values on Windows. CodeResources' main-executable
+        // exclusion compares the raw CFBundleExecutable string against
+        // WalkDir-relative paths, so only plain raw values keep that
+        // invariant intact.
+        let raw = relative.to_string_lossy();
+        let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+        if raw.split(separator).any(|s| s.is_empty() || s == ".") {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} is not a plain relative path under {}",
+                relative.display(),
+                root.display()
+            ))));
         }
-    };
-
-    if relative.components().any(|c| {
-        matches!(
-            c,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err(Error::Core(zsign_core::Error::Signing(format!(
-            "Path {} escapes the bundle root {}",
-            relative.display(),
-            root.display()
-        ))));
+        Self::check_no_symlink_components(root, relative)?;
+        Ok(root.join(relative))
     }
 
-    // The raw spelling must contain no empty segments (redundant or
-    // trailing separators) and no "." segments — a PathBuf rebuild would
-    // join with the native separator and reject plain '/'-spelled values
-    // on Windows. CodeResources' main-executable exclusion compares the
-    // raw CFBundleExecutable string against WalkDir-relative paths, so
-    // only plain raw values keep that invariant intact.
-    let raw = relative.to_string_lossy();
-    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
-    if raw.split(separator).any(|s| s.is_empty() || s == ".") {
-        return Err(Error::Core(zsign_core::Error::Signing(format!(
-            "Path {} is not a plain relative path under {}",
-            relative.display(),
-            root.display()
-        ))));
-    }
-
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::Core(zsign_core::Error::Signing(format!(
-                    "Pre-existing symlink in signing path: {}",
-                    current.display()
-                ))));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => {
-                return Err(Error::Core(zsign_core::Error::Signing(format!(
-                    "Failed to inspect signing path {}: {}",
-                    current.display(),
-                    e
-                ))))
+    /// Walk `relative` below `root`: reject symlink components, stop at the
+    /// first missing component (a fresh tail is safe), and turn any other
+    /// metadata failure into a hard error instead of treating it as absence.
+    fn check_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "Pre-existing symlink in signing path: {}",
+                        current.display()
+                    ))));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "Failed to inspect signing path {}: {}",
+                        current.display(),
+                        e
+                    ))))
+                }
             }
         }
+        Ok(())
     }
-
-    Ok(root.join(relative))
-}
 ```
 
 - [ ] **Step 1.4: Harden `get_main_executable`**
@@ -424,7 +533,7 @@ Replace the whole body of `fn get_main_executable` (`:700-733`) with:
                         bundle_path.display()
                     ))));
                 }
-                let executable = resolve_within(bundle_path, Path::new(value))?;
+                let executable = Self::resolve_relative(bundle_path, value)?;
                 match fs::symlink_metadata(&executable) {
                     Ok(metadata) if metadata.is_file() => return Ok(executable),
                     Ok(_) => {
@@ -446,7 +555,7 @@ Replace the whole body of `fn get_main_executable` (`:700-733`) with:
             }
         };
 
-        resolve_within(bundle_path, Path::new(&executable_value))
+        Self::resolve_relative(bundle_path, &executable_value)
     }
 ```
 
@@ -463,14 +572,14 @@ Behavior changes (intended, recorded in the design doc):
   the value (previously: silent skip via `.exists()` guards at
   `:575`/`:594`, or write-through escape);
 - key absent → file-stem fallback preserved, now routed through
-  `resolve_within`, still without an existence requirement (the
-  `.exists()` guards stay).
+  `resolve_relative` (never-strip), still without an existence
+  requirement (the `.exists()` guards stay).
 
 - [ ] **Step 1.5: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass — Unix (this machine): 7 new + 4 existing
-(1 filtered out); non-Unix: 5 new + 4 existing (tests 6-7 are
+Expected: all tests pass — Unix (this machine): 10 new + 4 existing
+(1 filtered out); non-Unix: 8 new + 4 existing (tests 6-7 are
 `#[cfg(unix)]`; test 7 also passes without asserting under DAC bypass).
 
 - [ ] **Step 1.6: Commit**
@@ -648,8 +757,8 @@ exact idiom (`bundle/code_resources.rs:166-171`).
 - [ ] **Step 2.4: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass — Unix (this machine): 9 new + 4 existing
-(1 filtered out); non-Unix: 5 new + 4 existing (tests 8-9 are
+Expected: all tests pass — Unix (this machine): 12 new + 4 existing
+(1 filtered out); non-Unix: 8 new + 4 existing (tests 8-9 are
 `#[cfg(unix)]`).
 
 - [ ] **Step 2.5: Commit**
@@ -822,7 +931,7 @@ Record the output.
 In `rewrite_plist_string` (`:630`) replace the path binding:
 
 ```rust
-        let info_plist_path = resolve_within(bundle_path, Path::new("Info.plist"))?;
+        let info_plist_path = Self::resolve_relative(bundle_path, "Info.plist")?;
 ```
 
 (The existing `info_plist_path.exists()` not-found check stays; the guard
@@ -834,7 +943,7 @@ At `:555` replace:
 
 ```rust
                 let embedded_path =
-                    resolve_within(bundle_path, Path::new("embedded.mobileprovision"))?;
+                    Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
 ```
 
 - [ ] **Step 3.5: Guard `generate_code_resources`**
@@ -842,11 +951,11 @@ At `:555` replace:
 Replace the tail of `generate_code_resources` (`:892-899`):
 
 ```rust
-        let codesig_dir = resolve_within(bundle_path, Path::new("_CodeSignature"))?;
+        let codesig_dir = Self::resolve_relative(bundle_path, "_CodeSignature")?;
         fs::create_dir_all(&codesig_dir)?;
 
         let resources_path =
-            resolve_within(bundle_path, Path::new("_CodeSignature/CodeResources"))?;
+            Self::resolve_relative(bundle_path, "_CodeSignature/CodeResources")?;
         fs::write(&resources_path, &code_resources)?;
 ```
 
@@ -859,7 +968,7 @@ Signature (`:476`):
 
 ```rust
     fn sign_standalone_dylib(&self, root: &Path, dylib_path: &Path) -> Result<()> {
-        let validated = resolve_within(root, dylib_path)?;
+        let validated = Self::resolve_within(root, dylib_path)?;
         let dylib_path = validated.as_path();
 ```
 
@@ -888,7 +997,7 @@ Signature (`:770`):
         code_resources: Option<&[u8]>,
         entitlements: Option<&[u8]>,
     ) -> Result<()> {
-        let validated = resolve_within(root, binary_path)?;
+        let validated = Self::resolve_within(root, binary_path)?;
         let binary_path = validated.as_path();
 ```
 
@@ -931,7 +1040,7 @@ from the archive, not the operator:
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
         // Components between the extraction root and the bundle root come
         // from the archive: none of them may be a symlink.
-        resolve_within(temp_dir.path(), &app_bundle)?;
+        Self::resolve_within(temp_dir.path(), &app_bundle)?;
         self.sign_bundle_from_options(&app_bundle)?;
 ```
 
@@ -960,8 +1069,8 @@ header's Goal).
 - [ ] **Step 3.9: Run the gate, expect GREEN**
 
 Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_deterministic`
-Expected: all tests pass — Unix (this machine): 13 new + 4 existing
-(1 filtered out); non-Unix: 5 new + 4 existing (tests 10-13 are
+Expected: all tests pass — Unix (this machine): 16 new + 4 existing
+(1 filtered out); non-Unix: 8 new + 4 existing (tests 10-13 are
 `#[cfg(unix)]`).
 
 - [ ] **Step 3.10: Commit**
@@ -979,20 +1088,23 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
 
 ## Self-review
 
-- **Spec coverage:** item 1 → Task 1 (helper + hardening + tests 1-7);
-  item 2 → Task 2 (four predicates + tests 8-9); item 3 → Task 3 (guard
-  at all seven write/mkdir sites, symlinked-root rejection, sign()
-  archive-zone validation, trust pin + tests 10-13); design doc's
-  invariants are restated as constraints in each task (lexical returns,
-  no flow restructure, `.exists()` guards kept).
+- **Spec coverage:** item 1 → Task 1 (helpers + hardening + tests 1-7
+  and 14-16); item 2 → Task 2 (four predicates + tests 8-9); item 3 →
+  Task 3 (guard at all seven write/mkdir sites, symlinked-root
+  rejection, sign() archive-zone validation, trust pin + tests 10-13);
+  design doc's Brief coverage map records the full brief → design →
+  plan → tests trace; invariants are restated as constraints in each
+  task (lexical returns, no flow restructure, `.exists()` guards kept).
 - **Placeholders:** none — every step carries complete code, exact
   commands, and expected outcomes.
-- **Type consistency:** `resolve_within(root: &Path, path: &Path) ->
-  Result<PathBuf>` used identically in Tasks 1 and 3;
+- **Type consistency:** `resolve_relative(root: &Path, rel: &str) ->
+  Result<PathBuf>` and `resolve_within(root: &Path, path: &Path) ->
+  Result<PathBuf>` used as `Self::…` across Tasks 1 and 3;
   `sign_binary(&self, root, binary_path, identifier, code_resources,
   entitlements)` and `sign_standalone_dylib(&self, root, dylib_path)`
   match their single call sites; `create_folder_bundle(dir, executable_value,
-  write_executable)` matches all eleven tests that use it (the
-  non-string test builds its plist inline).
+  write_executable)` matches all twelve tests that use it and
+  `info_plist_xml(entry)` all three of its callers (tests 4, 15 and the
+  helper itself; tests 16 and 13 build fixtures inline).
 - **Verification:** per-task scoped gate only; full-suite claim reserved
   for the orchestrator's merge gates (with the ZSN-15 skip).

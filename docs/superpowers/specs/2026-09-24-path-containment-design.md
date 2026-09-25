@@ -2,6 +2,9 @@
 
 **Date:** 2026-09-24
 **Scope:** `crates/zsign/src/ipa/mod.rs` + its inline `#[cfg(test)] mod tests` only.
+**Base:** branch merged `main` @ `6daa1a6` (merge commit `a1d7e35`,
+ZSN-23/24/26/28/31 included); `ipa/mod.rs` anchors below are unchanged
+from `ee42c12`; `extract.rs` citations are post-ZSN-28 (hardened).
 **Status:** decisions final; reviewed by cold review before implementation.
 
 ## Problem
@@ -54,10 +57,12 @@ callers `:538` / `:593` untouched):
 4. Key present as a string → the value must be **relative**; an absolute
    value — whether it points outside or *inside* the root — is rejected
    up front with an actionable error naming the value and the bundle.
-   Then `resolve_within(bundle_path, Path::new(value))?` (item 3 helper)
-   rejects `RootDir`/`ParentDir`/`Prefix` components, non-plain spellings
-   (`./Test`, `foo//Test`, `Test/`), and any pre-existing symlink
-   component (`..` fails the component check).
+   Then `Self::resolve_relative(bundle_path, value)?` (item 3's
+   never-strips validator) rejects `RootDir`/`ParentDir`/`Prefix`
+   components, non-plain spellings (`./Test`, `foo//Test`, `Test/`), and
+   any pre-existing symlink component (`..` fails the component check).
+   The value is NEVER reinterpreted as already root-prefixed: a value
+   starting with the root's own name still joins below the root.
    `fs::symlink_metadata` must report a **regular file**; otherwise a
    hard `Error::Core(Signing(...))` naming the offending value and the
    bundle. This fires for missing files, directories, and (final or
@@ -67,9 +72,9 @@ callers `:538` / `:593` untouched):
    Item 2).
 5. Key absent — or an Info.plist whose root is not a dictionary, which
    carries no value to validate — → keep the file-stem fallback, still
-   passed through `resolve_within`, with **no** existence requirement
-   (callers' `.exists()` guards at `:575`/`:594` stay load-bearing only
-   for this branch).
+   passed through `Self::resolve_relative`, with **no** existence
+   requirement (callers' `.exists()` guards at `:575`/`:594` stay
+   load-bearing only for this branch).
 
 The returned path is `root.join(relative)` — the same lexical shape
 WalkDir produces. It is **never canonicalized** (see Invariants).
@@ -106,60 +111,73 @@ symlinks as symlinks.
 
 ### Item 3 — `resolve_within` guard for every write
 
-One private free function in `mod.rs` (mirrors `validate_output_path` in
-`crates/zsign/src/ipa/extract.rs:61-92`, adapted for this file's inputs).
-It is introduced by item 1's change (which needs it) and wired to the
-remaining write sites in this item:
+A family of three private **associated** functions in `mod.rs` — the
+file's convention for stateless helpers is `Self::…` (e.g.
+`Self::is_bundle_directory`), and they mirror `validate_output_path` in
+`crates/zsign/src/ipa/extract.rs:190-221`. `Self::resolve_relative` is
+introduced by item 1's change (which needs it); both validators are
+wired to the remaining write sites in this item:
 
 ```rust
-/// Resolve `path` for writing, rejecting anything that escapes `root`.
-///
-/// `path` is either already prefixed by `root` (as produced by the
-/// discovery walks) or relative to it (literal names, plist values).
-/// The part below `root` must contain only normal components — no `..`,
-/// no absolute prefix — and no existing component may be a symlink.
-/// Returns the path re-joined onto `root`, keeping it lexically identical
-/// to what WalkDir produces.
+/// Resolve `rel` — a root-relative name (raw plist value or literal) —
+/// under `root`. NEVER reinterprets `rel` as already root-prefixed:
+/// a value that starts with the root's own name still joins below the
+/// root. Plain spelling required; no existing symlink component.
+/// Returns `root.join(rel)` — the lexical shape WalkDir produces.
+fn resolve_relative(root: &Path, rel: &str) -> Result<PathBuf>
+
+/// Resolve `path` — already root-prefixed (discovery-walk output or a
+/// previously joined target) — under `root`. `strip_prefix` must
+/// succeed; the remainder must be plain; no existing symlink component.
+/// Returns `root.join(relative)` — the lexical shape WalkDir produces.
 fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf>
 ```
+
+plus one shared `check_no_symlink_components(root, relative)` performing
+the downward walk. The split by input shape is the cycle-3 fix for the
+round-2 dual-shape ambiguity (see Design decisions).
 
 Mechanism (repo idiom, not canonicalize — the workspace uses no
 `canonicalize` anywhere):
 
-1. `path.strip_prefix(root)` → `relative`; on failure, a path that is
-   relative-and-not-`..` is taken as root-relative and joined; an absolute
-   path that is not under `root` errors `"Path {} is not under root {}"`
-   (verbatim `extract.rs:62-71` idiom).
-2. Reject `Component::ParentDir | RootDir | Prefix(_)` in `relative`
-   with `"Path {} escapes the bundle root {}"`.
-3. Require plain spelling: split `relative`'s raw text on `/` (on
-   Windows also `\`, where both are accepted separators) and reject any
-   empty segment (redundant or trailing separator) or `.` segment
-   (`./Test`, `foo//Test`, `Test/`), with
-   `"Path {} is not a plain relative path under {}"`. The check is
-   segment-based rather than a `PathBuf`-rebuild comparison because a
-   rebuild joins with the *native* separator and would reject ordinary
-   `/`-spelled values on Windows — including the literal
-   `"_CodeSignature/CodeResources"` passed by Task 3's writers.
-   CodeResources' main-executable exclusion compares the *raw*
-   `CFBundleExecutable` string against WalkDir-relative paths
+1. **Shape selection is by caller, never guessed.** Raw plist values and
+   literals go through `resolve_relative`, which never strips a root
+   prefix — a relative root `App.app` plus value `App.app/Test` must
+   resolve to `App.app/App.app/Test`, not `App.app/Test`. Walk-derived
+   write targets and `sign()`'s `app_bundle` go through `resolve_within`,
+   whose `strip_prefix(root)` is **required** and errors
+   `"Path {} is not under root {}"` on failure (verbatim
+   `extract.rs:191-199` idiom).
+2. Both validators reject `Component::ParentDir | RootDir | Prefix(_)`
+   below the root with `"Path {} escapes the bundle root {}"` —
+   `../outside_macho` keeps this message (order matters: test 1 asserts
+   it), and an absolute value is rejected even earlier by
+   `get_main_executable` with its `CFBundleExecutable`-specific message.
+3. Both require plain spelling: split the raw text on `/` (on Windows
+   also `\`, where both are accepted separators — segment-based, never a
+   `PathBuf` rebuild, which would join with the *native* separator and
+   reject ordinary `/`-spelled values on Windows, including the literal
+   `"_CodeSignature/CodeResources"`) and reject any empty segment
+   (redundant or trailing separator) or `.` segment (`./Test`,
+   `foo//Test`, `Test/`) with
+   `"Path {} is not a plain relative path under {}"`. CodeResources'
+   main-executable exclusion compares the *raw* `CFBundleExecutable`
+   string against WalkDir-relative paths
    (`zsign-core/src/bundle/code_resources.rs:264-267`), so only a plain
-   raw value can keep that invariant. The check applies to BOTH input
-   shapes: `strip_prefix` trims only the separators leading/trailing
-   the remainder — walkdir-produced remainders are plain because file
-   names cannot contain separators, while a manually constructed
-   `root/foo//bar` keeps its interior `//` and is (correctly) rejected
-   here as well; relative inputs (the raw plist value, the literals)
-   are checked in full.
-4. Downward walk: push each component onto a `current` buffer starting at
-   root; if `fs::symlink_metadata(&current)` says symlink →
-   `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:79-86`).
+   raw value can keep that invariant. In `resolve_within` the check runs
+   on the `strip_prefix` remainder, which trims only the separators
+   leading/trailing it — walkdir-produced remainders are plain because
+   file names cannot contain separators, while a manually constructed
+   `root/foo//bar` keeps its interior `//` and is (correctly) rejected.
+4. Shared downward walk: push each component onto a `current` buffer
+   starting at root; if `fs::symlink_metadata(&current)` says symlink →
+   `"Pre-existing symlink in signing path: {}"` (cf. `extract.rs:206-214`).
    The first `ErrorKind::NotFound` stops the walk (fresh tail is safe);
    any *other* metadata failure (permission, I/O) becomes a hard
    `Error::Core(Signing("Failed to inspect signing path {}: {}"))` — it
    is never treated as proof of absence. The walk starts *below* `root`;
    the root itself is validated once at signing entry (next paragraph).
-5. Return `root.join(relative)` — lexical, never canonicalized.
+5. Both return `root.join(relative)` — lexical, never canonicalized.
 
 All errors are `Error::Core(zsign_core::Error::Signing(format!(...)))`,
 the established idiom of this file for signing-flow complaints.
@@ -175,8 +193,9 @@ the root-descent branch at :861-871), and `resolve_within` deliberately
 starts below the root, so this single entry check covers `sign()`,
 `sign_folder_in_place`, and `sign_folder_to_ipa` through their common
 funnel. This also covers a symlinked `Payload/*.app` returned by
-extraction (in-tree redirect targets pass `is_safe_symlink_target`, so
-the redirect is only blocked here). Because `lstat("link/")` follows a
+extraction (in-tree redirect targets pass `is_safe_symlink_target`
+(`extract.rs:96-102`), so the redirect is only blocked here). Because
+`lstat("link/")` follows a
 final symlink when a trailing separator is present (verified against
 `fs::symlink_metadata` on this toolchain), the check lstats the
 component-rebuilt path — trailing separators stripped. Ancestor path
@@ -188,8 +207,9 @@ ancestors would break standard layouts (macOS `/var` → `/private/var`,
 tempdir roots). That trust applies to operator-supplied roots only. In
 `sign()`, the components below the extraction TempDir are archive-created
 — extraction permits relative, `..`-free targets like
-`Payload → Payload2` — so `sign()` validates them with
-`resolve_within(temp_dir.path(), app_bundle)` immediately after
+`Payload → Payload2` (created at `extract.rs:588`; `find_app_bundle`
+(`extract.rs:599-626`) reads through them) — so `sign()` validates them
+with `resolve_within(temp_dir.path(), app_bundle)` immediately after
 extraction; a symlink among them is a hard error
 (`test_sign_rejects_aliased_payload_root`). Only the TempDir path itself
 and its system-level ancestors remain trusted there.
@@ -211,7 +231,10 @@ may run after earlier in-bundle writes):
 
 The validated value shadows the parameter, so every downstream use of
 `binary_path` (open, read, both writes) operates on the contained path.
-The `parent()`-derived Info.plist read at `:821` is thereby lexically
+Literal rows are validated with `Self::resolve_relative` (never-strip);
+walker-derived rows (`dylib_path`, `binary_path`) and the `sign()` guard
+with `Self::resolve_within` (strip-required). The `parent()`-derived
+Info.plist read at `:821` is thereby lexically
 contained (no `..` can appear below a validated path) but is *not*
 symlink-checked — see "What is and is not guarded" under Design
 decisions.
@@ -221,8 +244,8 @@ decisions.
 1. **Lexical path equality.** Three `PathBuf` equality checks partition
    work: root identity in `sign_bundle :377` (chooses profile/entitlements
    pass-through), main-exec dedup in `find_immediate_macho_binaries :620`,
-   and dedup in `sign_single_bundle :543`. `resolve_within` therefore
-   returns `root.join(relative)` and **never** a canonicalized/normalized
+   and dedup in `sign_single_bundle :543`. The validators therefore
+   return `root.join(relative)` and **never** a canonicalized/normalized
    path; `get_main_executable` likewise returns the lexical join.
 2. **Signing order.** Non-main binaries (`:545-551`) → profile (`:553-564`)
    → `generate_code_resources` (`:566`) → main executable signed with the
@@ -237,8 +260,8 @@ decisions.
    or before the parallel closures. No shared mutable state introduced.
 5. **Error surfacing.** `is_macho_binary` keeps swallowing open failures
    into `Ok(false)` (resource files depend on it); the new hard errors
-   come from `get_main_executable`, `resolve_within`, and the
-   bundle-root check in `sign_bundle_from_options`.
+   come from `get_main_executable`, `resolve_relative`/`resolve_within`,
+   and the bundle-root check in `sign_bundle_from_options`.
 6. **Scope.** Only `crates/zsign/src/ipa/mod.rs` changes. `extract.rs`,
    `archive.rs`, `builder.rs`, `verify.rs`, `.github/**`, nested
    profile/entitlement semantics are other lanes' (see brief DEFERRED).
@@ -250,11 +273,11 @@ built inline exactly like `test_ipa_signer_refuses_encrypted_bundle`
 (`:1068-1105`): `create_dir_all`, `fs::write` Info.plist XML,
 `fs::write` executable from `crate::test_util::minimal_macho()`. Symlink
 tests are `#[cfg(unix)]` + `std::os::unix::fs::symlink` (precedent:
-`ipa/extract.rs:470`, `ipa/archive.rs:426`,
+`ipa/extract.rs:1200`, `ipa/archive.rs:426`,
 `bundle/code_resources.rs:441`). Each containment test fails before its
 fix; where an external or target file exists, its bytes must be
 byte-identical afterwards. Platform note: tests 6-13 are
-`#[cfg(unix)]` (off-Unix only tests 1-5 exist), and test 7's probe
+`#[cfg(unix)]` (off-Unix tests 1-5 and 14-16 exist), and test 7's probe
 returns early — passing without asserting — where DAC permission checks
 are bypassed (e.g. running as root). Test 12 is an explicit
 trust-boundary pin: it passes before and after the fix and fails only if
@@ -300,7 +323,7 @@ builder is another lane's file).
    bundle subdirectory is chmod'd unreadable and `CFBundleExecutable`
    points through it; sign must fail with
    `"Failed to inspect signing path"` — the metadata-error hard-error arm
-   of `resolve_within`. Probe-guarded: environments that bypass DAC
+   of the shared symlink walk. Probe-guarded: environments that bypass DAC
    permission checks skip the assertions.
 8. `test_symlinked_dylib_is_skipped_and_target_untouched`
    (`#[cfg(unix)]`) — bundle with real executable plus `lib.dylib` →
@@ -318,8 +341,9 @@ builder is another lane's file).
     `Info.plist` is a symlink to a valid external plist;
     `.bundle_id("com.x")` triggers `rewrite_plist_string` first; sign
     must `Err` and the external plist bytes must be unchanged. This is
-    the failing-first test for the `resolve_within` write guard (items
-    3); without the guard the rewrite writes through the symlink and the
+    the failing-first test for the literal-path write guard
+    (`Self::resolve_relative`, item 3); without the guard the rewrite
+    writes through the symlink and the
     bytes change.
 11. `test_sign_rejects_symlinked_bundle_root` (`#[cfg(unix)]`) — the
     fixture's real `App.app` is renamed to `Outside.app` and `App.app`
@@ -341,6 +365,23 @@ builder is another lane's file).
     the archive-created component above the bundle root is validated
     against the extraction root. Covers item 3's `sign()` ancestry
     validation.
+14. `test_sign_rejects_root_shaped_value_with_relative_root` — cwd is
+    switched to the tempdir (guarded by a static mutex shared with test
+    15) and `sign_folder_in_place("App.app")` runs with
+    `CFBundleExecutable = "App.app/Test"`; must fail with
+    `"not an existing regular file"` because the value joins BELOW the
+    root (`App.app/App.app/Test`) instead of stripping it, and `Test`
+    bytes stay unchanged. Pre-fix the dual-shape helper strips the root
+    and signs successfully. Covers item 1 × item 3 (never-strip).
+15. `test_sign_rejects_nonplain_value_under_dot_root` — cwd inside the
+    bundle, root `.`, value `./Test`; must fail with
+    `"not a plain relative path"`. Pre-fix the dual-shape helper strips
+    `.` and accepts the spelling. Covers item 1 × item 3.
+16. `test_sign_tolerates_missing_executable_key` — Info.plist without
+    `CFBundleExecutable`; `sign_folder_in_place` must **succeed** via
+    the file-stem fallback (no existence requirement) and
+    `_CodeSignature/CodeResources` must exist. Preservation pin for the
+    brief's "fallback ONLY for a missing key" — passes before and after.
 
 Existing `ipa::tests` (4 non-skipped) plus the cross-crate signer tests
 (`builder::tests :562`, `verify::tests :536/:572/:583/:596`, CLI
@@ -356,8 +397,8 @@ failure, ZSN-15).
 **Item 1**
 - *Chosen:* non-string values rejected; absolute values (inside or
   outside the root) rejected; then component rejection via
-  `resolve_within` + `symlink_metadata` regular-file requirement; hard
-  errors with the offending value in the message.
+  `Self::resolve_relative` + `symlink_metadata` regular-file requirement;
+  hard errors with the offending value in the message.
 - *Rejected — canonicalize-only:* no component pre-check gives poor
   messages ("No such file" instead of naming the bad value) and cannot
   validate nonexistent targets; also inconsistent with the workspace,
@@ -390,9 +431,22 @@ failure, ZSN-15).
   a partial, broken pass; the brief mandates "not collected".
 
 **Item 3**
-- *Chosen:* one dual-shape `resolve_within(root, path)` (root-prefixed or
-  root-relative), guard at each writer's entry, `root` threaded into
+- *Chosen:* a two-validator family — `Self::resolve_relative`
+  (never-strips: raw plist values + literals) and `Self::resolve_within`
+  (strip-required: walk-derived write targets and `sign()`'s
+  `app_bundle`) — sharing one downward symlink walk, guarded at each
+  writer's entry, with `root` threaded into
   `sign_binary`/`sign_standalone_dylib` as a parameter.
+- *Decision — validator split by input shape (cycle 3):* the round-2
+  dual-shape helper (`strip_prefix` succeeds → treat as root-prefixed)
+  mis-resolved raw plist values that began with the root's own name
+  (`App.app/Test` under relative root `App.app` resolved to
+  `App.app/Test` instead of `App.app/App.app/Test`, breaking the
+  CodeResources raw-string exclusion) and accepted `./Test` under root
+  `.` — a spelling the design promised to reject. Splitting by caller
+  shape removes the ambiguity without guessing. Pinned by tests 14-15.
+  The helpers are associated functions (`Self::…`), matching `mod.rs`'s
+  convention for stateless helpers.
 - *Rejected — guard only at discovery boundaries:* the brief mandates a
   guard before every write; boundary-only checks give no protection once a
   new caller appears, and cannot catch a pre-planted symlink at a literal
@@ -437,16 +491,33 @@ failure, ZSN-15).
   the extraction root (`resolve_within(temp_dir.path(), app_bundle)`),
   closing the `Payload → Payload2` alias — pinned by
   `test_sign_rejects_aliased_payload_root`.
-- *Decision — plain spelling enforced in `resolve_within`, not
+- *Decision — plain spelling enforced in the validators, not
   normalized:* the raw `CFBundleExecutable` string must equal its
   WalkDir-relative form for CodeResources' exclusion invariant, and
   `CodeResourcesBuilder` (out of lane scope) re-reads the raw string —
   so normalization inside this file could not restore the invariant.
   Reject instead: validate, don't guess.
 
+## Brief coverage map (cycle-3 self-audit)
+
+| Brief requirement | Design | Plan | Tests |
+|---|---|---|---|
+| 1 — reject absolute/`..`/prefix; contain under bundle | Item 1 steps 3-4 | Task 1 steps 1.3-1.4 | 1, 2, 3 |
+| 1 — regular file via `symlink_metadata`; hard error | Item 1 step 4 | Task 1 step 1.4 | 6 (symlink), 14 (never-strip join misses → hard error) |
+| 1 — fallback ONLY for a missing key | Item 1 steps 3/5 | Task 1 step 1.4 | 4 (non-string errors), 16 (absent key tolerated) |
+| 1 — plain spellings (CodeResources raw invariant) | Item 3 step 3 | Task 1 step 1.3 | 5, 15 |
+| 2 — `entry.file_type()` in all three walks | Item 2 | Task 2 step 2.3 | 8, 9 |
+| 2 — symlinked framework not collected | Item 2 | Task 2 | 9 |
+| 3 — one helper family before every write (7 sites) | Item 3 wiring table | Task 3 steps 3.3-3.8 | 10, 11 |
+| 3 — root zones (final component + archive ancestry) | Root handling | Task 3 step 3.8 | 11, 13 |
+| Regressions: traversal / absolute / dylib / framework; existing tests green | Test strategy | Tasks 1-3 | 1, 2, 8, 9 + gate |
+| Cycle-3: never-strip split (dual-shape ambiguity) | Item 3 step 1 + decisions | Task 1 step 1.3 | 14, 15 |
+
 ## Non-goals
 
-- `extract.rs` extraction policy (lane 28), `archive.rs` repack fidelity
+- `extract.rs` extraction policy (lane 28 — ZSN-28 landed on `main` and
+  is merged into this branch; its hardening is out of this lane's edit
+  scope, citations above are post-hardening), `archive.rs` repack fidelity
   (ZSN-39), `builder.rs` option forwarding (ZSN-35), nested
   profile/entitlement semantics (ZSN-11/12), `.github/**` (lane 31),
   `cms`/`macho`/`codesign` verification (lanes 23/24).
