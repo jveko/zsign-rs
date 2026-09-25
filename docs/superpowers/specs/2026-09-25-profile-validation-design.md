@@ -262,6 +262,26 @@ Gate commands (per brief): mid-flight
 `cms_verify` is touched), final full-suite runs with
 `--skip test_ipa_signing_is_deterministic` (ZSN-15 pre-existing failure).
 
+## 5.1 Cross-lane-sourced item: ECDSA signature parsing (reported by ZSN-40)
+
+ZSN-40 observed live that ECDSA verification in `crypto/cms_verify.rs` is
+broken: SignerInfo signatures are parsed as fixed 64-byte raw ECDSA via
+`p256::ecdsa::Signature::from_slice` (`cms_verify.rs:986`) and the
+certificate-chain path repeats this at `:1250`, while `crypto/cms.rs` signs
+DER-encoded ECDSA (`build_cms_signed_data::<_, p256::ecdsa::DerSignature>`),
+so **every** ECDSA CMS/cert verification fails at signature parse (RSA
+unaffected; reproduced with a P-256 fixture). Supplied to this lane by the
+supervisor as in-scope because `cms_verify.rs` is this wave's file:
+
+- Fix: parse ECDSA signatures as DER, with a raw fixed-length fallback if the
+  source-verified CMS convention allows it; keep RSA behavior byte-identical.
+- Regression coverage: an end-to-end DER-encoded ECDSA signature verified
+  through **both** the generic envelope entry and the existing code-signature
+  path, signing via `crypto/cms.rs`'s ECDSA path.
+- Delivery: alongside queue item 4 (both are `cms_verify` correctness) as plan
+  Task 4b; encoding conventions source-verified by librarian (citations in the
+  plan).
+
 ## 6. Known items / evidence gaps
 
 **Round-3 cold-review finding (recorded verbatim per the adjudication rule;

@@ -1555,6 +1555,36 @@ Then the tests:
     }
 
     #[test]
+    fn empty_target_bundle_id_is_rejected() {
+        let sp = signed_profile(&plist_xml(""));
+        let mut req = request(&sp, T_2026_APR);
+        req.target_bundle_id = Some(String::new());
+        let err = validate_and_extract_profile(&sp.data, &req).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn malformed_device_and_team_arrays_fail_closed() {
+        let bad_devices = signed_profile(&plist_xml(
+            "  <key>ProvisionedDevices</key>\n  <string>not-an-array</string>\n",
+        ));
+        let err = validate_and_extract_profile(&bad_devices.data, &request(&bad_devices, T_2026_APR))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ProvisionedDevices is not an array"),
+            "{err}"
+        );
+
+        let bad_team = signed_profile(&plist_xml("").replace(
+            "    <string>TESTTEAM</string>\n  </array>",
+            "    <string>TESTTEAM</string>\n    <integer>7</integer>\n  </array>",
+        ));
+        let err = validate_and_extract_profile(&bad_team.data, &request(&bad_team, T_2026_APR))
+            .unwrap_err();
+        assert!(err.to_string().contains("non-string entry"), "{err}");
+    }
+
+    #[test]
     fn device_registration_checks_follow_provisions_all_devices_precedence() {
         let devices_only = signed_profile(&plist_xml(
             "  <key>ProvisionedDevices</key>\n  <array>\n    <string>UDID-ONE</string>\n  </array>\n",
@@ -1628,6 +1658,10 @@ Expected: FAIL to compile — `ProfileRequest`, `validate_and_extract_profile`,
 
 - [ ] **Step 4: Implement** in `crates/zsign-core/src/provisioning.rs`
 
+> Formatting constraint (merge gate runs `cargo fmt --check`, but this lane must
+> not run `cargo fmt`): keep every new line ≤ 100 columns — split long
+> signatures and chained calls by hand exactly as the snippets show.
+
 1. Module header and imports (replace the current `use crate::{Error, Result};`
    block; keep the existing module doc, extending it):
 
@@ -1681,7 +1715,8 @@ pub struct ProfileRequest {
     /// Target app's `CFBundleIdentifier`; the profile App ID must cover it.
     pub target_bundle_id: Option<String>,
     /// Target device UDID; must be listed in `ProvisionedDevices` unless the
-    /// profile carries `ProvisionsAllDevices`.
+    /// profile carries `ProvisionsAllDevices`. A profile carrying neither key
+    /// (App Store distribution) has no device list, so the check is skipped.
     pub target_device_udid: Option<String>,
 }
 ```
@@ -1729,9 +1764,11 @@ pub struct ProfileInfo {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Verification`] for a malformed CMS envelope,
-/// [`Error::ProvisioningProfile`] for every failed check — messages name the
-/// profile, the offending value, and the remedy.
+/// Returns [`Error::Verification`] for a malformed CMS envelope and
+/// [`Error::ProvisioningProfile`] for every failed check. Window, team,
+/// App-ID-coverage, and device failures name the profile, the offending
+/// value, and the remedy; structural malformations (missing/non-conforming
+/// keys) name the offending key or value.
 pub fn validate_and_extract_profile(
     profile_data: &[u8],
     request: &ProfileRequest,
@@ -1821,6 +1858,11 @@ pub fn validate_and_extract_profile(
     }
 
     if let Some(target) = &request.target_bundle_id {
+        if target.is_empty() {
+            return Err(Error::ProvisioningProfile(
+                "Target bundle identifier must not be empty".into(),
+            ));
+        }
         if target.contains('*') {
             return Err(Error::ProvisioningProfile(format!(
                 "Target bundle identifier \"{target}\" must not contain a wildcard"
@@ -1897,7 +1939,11 @@ fn required_date(dict: &plist::Dictionary, key: &str, name: &str) -> Result<Offs
     })
 }
 
-fn optional_date(dict: &plist::Dictionary, key: &str, name: &str) -> Result<Option<OffsetDateTime>> {
+fn optional_date(
+    dict: &plist::Dictionary,
+    key: &str,
+    name: &str,
+) -> Result<Option<OffsetDateTime>> {
     match dict.get(key) {
         None => Ok(None),
         Some(v) => {
