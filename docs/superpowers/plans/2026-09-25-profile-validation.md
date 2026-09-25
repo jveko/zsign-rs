@@ -349,9 +349,12 @@ fn leaf_ku_bc_reason(leaf: &x509_cert::Certificate) -> Option<String> {
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic`
 Expected: all `crypto` tests pass including the three new ones.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: No separate commit (recorded deviation).**
 
-`git add -u crates/zsign-core/src/crypto/cms_verify.rs && git commit -m "refactor(zsign-core): thread verification time and signer purpose through chain (ZSN-3)"`
+`SignerPurpose::ProvisioningProfile` gains its first production constructor in
+Task 2 (the envelope entry); committing this substrate alone would carry a
+dead-code warning under `-D warnings`. This substrate and Task 2 therefore land
+in Task 2's single commit, gated on the final tree.
 
 ---
 
