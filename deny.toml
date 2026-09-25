@@ -22,6 +22,8 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "Zlib",
+    # libfuzzer-sys (fuzz crate) carries (MIT OR Apache-2.0) AND NCSA.
+    "NCSA",
 ]
 
 [bans]
