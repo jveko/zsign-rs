@@ -95,6 +95,9 @@ fixture helper they use:
         )
     }
 
+    /// Serializes the tests that mutate the process working directory.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a minimal `.app` folder whose Info.plist declares
     /// `executable_value` as CFBundleExecutable.
     fn create_folder_bundle(dir: &Path, executable_value: &str, write_executable: bool) -> PathBuf {
@@ -270,7 +273,6 @@ fixture helper they use:
 
     #[test]
     fn test_sign_rejects_root_shaped_value_with_relative_root() {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let temp = TempDir::new().unwrap();
@@ -297,7 +299,6 @@ fixture helper they use:
 
     #[test]
     fn test_sign_rejects_nonplain_value_under_dot_root() {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let temp = TempDir::new().unwrap();
@@ -337,7 +338,9 @@ fixture helper they use:
 </plist>"#,
         )
         .unwrap();
-        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        // Named after the bundle's file stem so the fallback target is the
+        // file that actually gets signed.
+        std::fs::write(app.join("App"), crate::test_util::minimal_macho()).unwrap();
 
         IpaSigner::new(&crate::test_util::test_credentials())
             .sign_folder_in_place(&app)
@@ -360,8 +363,10 @@ Run: `cargo test -p zsign-rs ipa::tests -- --skip test_ipa_signing_is_determinis
 Expected: **9 failed** on Unix (this machine): eight at `expect_err` —
 tests 1-6 (`outside_bundle`, both absolute cases, non-string, non-plain,
 `symlinked_main_executable` all currently sign successfully) plus the
-two relative-root tests 14-15 (the dual-shape helper strips the root and
-signs) — and
+two relative-root tests 14-15 (test 14's declared target does not
+exist, the `.exists()` guards silently skip the main executable, and
+the sign returns Ok; test 15's verbatim join lands on an existing file
+and signs) — and
 `test_sign_errors_on_unreadable_path_component` at its
 message assertion (the walk error is swallowed, so `scan` fails first
 with `"Failed to walk directory"` — `code_resources.rs:154-159` — and the
@@ -431,6 +436,18 @@ this file's convention for stateless helpers:
                 root.display()
             )))
         })?;
+        if relative.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} escapes the bundle root {}",
+                relative.display(),
+                root.display()
+            ))));
+        }
         // The remainder must contain no empty segments (redundant or
         // trailing separators) and no "." segments — a PathBuf rebuild
         // would join with the native separator and reject plain
@@ -1104,7 +1121,7 @@ Let the pre-commit hook run; do not invoke fmt/clippy/hk manually.
   entitlements)` and `sign_standalone_dylib(&self, root, dylib_path)`
   match their single call sites; `create_folder_bundle(dir, executable_value,
   write_executable)` matches all twelve tests that use it and
-  `info_plist_xml(entry)` all three of its callers (tests 4, 15 and the
-  helper itself; tests 16 and 13 build fixtures inline).
+  `info_plist_xml(entry)` its four callers (the helper itself and tests
+  4, 13, 15); test 16 builds its key-absent plist inline.
 - **Verification:** per-task scoped gate only; full-suite claim reserved
   for the orchestrator's merge gates (with the ZSN-15 skip).

@@ -137,8 +137,8 @@ plus one shared `check_no_symlink_components(root, relative)` performing
 the downward walk. The split by input shape is the cycle-3 fix for the
 round-2 dual-shape ambiguity (see Design decisions).
 
-Mechanism (repo idiom, not canonicalize — the workspace uses no
-`canonicalize` anywhere):
+Mechanism (repo idiom; `canonicalize` was considered and rejected — see
+Design decisions):
 
 1. **Shape selection is by caller, never guessed.** Raw plist values and
    literals go through `resolve_relative`, which never strips a root
@@ -188,8 +188,9 @@ component-rebuilt `bundle_path` (trailing separators stripped) must not
 report a symlink, otherwise hard error
 (`"Bundle root must not be a symlink: {}"`). walkdir 2.5 follows a
 symlinked walk root even with `follow_links(false)`
-(`follow_root_links` defaults to true — walkdir 2.5.0 lib.rs:853, and
-the root-descent branch at :861-871), and `resolve_within` deliberately
+(`follow_root_links` defaults to true — walkdir 2.5.0
+`lib.rs:292-293`, documented `By default, this is enabled` at
+`lib.rs:351-352`), and `resolve_within` deliberately
 starts below the root, so this single entry check covers `sign()`,
 `sign_folder_in_place`, and `sign_folder_to_ipa` through their common
 funnel. This also covers a symlinked `Payload/*.app` returned by
@@ -371,17 +372,22 @@ builder is another lane's file).
     `CFBundleExecutable = "App.app/Test"`; must fail with
     `"not an existing regular file"` because the value joins BELOW the
     root (`App.app/App.app/Test`) instead of stripping it, and `Test`
-    bytes stay unchanged. Pre-fix the dual-shape helper strips the root
-    and signs successfully. Covers item 1 × item 3 (never-strip).
+    bytes stay unchanged. Pre-fix, `get_main_executable` joins the value
+    verbatim, the declared target does not exist, the `.exists()` guards
+    silently skip the main executable, and the sign returns `Ok`.
+    Covers item 1 × item 3 (never-strip).
 15. `test_sign_rejects_nonplain_value_under_dot_root` — cwd inside the
     bundle, root `.`, value `./Test`; must fail with
-    `"not a plain relative path"`. Pre-fix the dual-shape helper strips
-    `.` and accepts the spelling. Covers item 1 × item 3.
+    `"not a plain relative path"`. Pre-fix, the verbatim join resolves to
+    an existing file (`././Test`) and the sign succeeds. Covers
+    item 1 × item 3.
 16. `test_sign_tolerates_missing_executable_key` — Info.plist without
-    `CFBundleExecutable`; `sign_folder_in_place` must **succeed** via
-    the file-stem fallback (no existence requirement) and
-    `_CodeSignature/CodeResources` must exist. Preservation pin for the
-    brief's "fallback ONLY for a missing key" — passes before and after.
+    `CFBundleExecutable`; the on-disk executable is named `App`, the file
+    stem of `App.app`, so the fallback target is the file that actually
+    gets signed. `sign_folder_in_place` must **succeed** via the
+    fallback (no existence requirement) and `_CodeSignature/CodeResources`
+    must exist. Preservation pin for the brief's "fallback ONLY for a
+    missing key" — passes before and after.
 
 Existing `ipa::tests` (4 non-skipped) plus the cross-crate signer tests
 (`builder::tests :562`, `verify::tests :536/:572/:583/:596`, CLI
@@ -401,8 +407,8 @@ failure, ZSN-15).
   hard errors with the offending value in the message.
 - *Rejected — canonicalize-only:* no component pre-check gives poor
   messages ("No such file" instead of naming the bad value) and cannot
-  validate nonexistent targets; also inconsistent with the workspace,
-  which contains no `canonicalize`-based containment at all.
+  validate nonexistent targets; a canonicalized return value would also
+  break Invariants #1 (the three lexical `PathBuf` equality checks).
 - *Rejected — coerce to `file_name()`:* silently rewrites malformed input
   to a plausible name; guesses intent, hides the attack (violates the
   validate-don't-guess rule).
