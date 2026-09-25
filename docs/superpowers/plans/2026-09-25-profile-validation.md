@@ -422,7 +422,6 @@ pub(crate) fn sign_attached_content(
     });
 
     fn build<S, Sig>(
-        content: &[u8],
         encap: &EncapsulatedContentInfo,
         sid: SignerIdentifier,
         digest_algorithm: AlgorithmIdentifierOwned,
@@ -434,7 +433,7 @@ pub(crate) fn sign_attached_content(
         S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
         Sig: spki::SignatureBitStringEncoding,
     {
-        let mut sib = SignerInfoBuilder::new(signer, sid, digest_algorithm.clone(), encap, None)
+        let sib = SignerInfoBuilder::new(signer, sid, digest_algorithm.clone(), encap, None)
             .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
         let mut builder = SignedDataBuilder::new(encap);
         builder
@@ -461,22 +460,20 @@ pub(crate) fn sign_attached_content(
     match digest {
         AttachedDigest::Sha256 => {
             let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(private_key.clone());
-            build(content, &encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
+            build(&encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
         }
         AttachedDigest::Sha1 => {
             let signer = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(private_key.clone());
-            build(content, &encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
+            build(&encap, sid, digest_algorithm, signing_cert, cert_chain, &signer)
         }
     }
 }
 ```
 
-Notes for the implementer: `content` is captured by the inner `build` through
-the `encap` reference — drop the unused `content` parameter from `build` if the
-compiler flags it (the eContent already carries the bytes; the builder computes
-`messageDigest` from `encap.eContent`, cms-0.2.3 `builder.rs:195-213`).
-`sha1::Sha1` needs `use sha1::Digest;` for `SigningKey`'s trait bounds only if
-the compiler asks; `SigningKey::<sha1::Sha1>` itself needs no trait import.
+Notes for the implementer: the builder computes `messageDigest` from
+`encap.eContent` (cms-0.2.3 `builder.rs:195-213`) and auto-adds `contentType`,
+so no explicit digest argument is needed. `SigningKey::<sha1::Sha1>` requires no
+trait import beyond what `build`'s bounds demand.
 
 - [ ] **Step 2: wasm sha1 OID feature** in `crates/zsign-core/Cargo.toml`
 
