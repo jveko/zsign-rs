@@ -273,6 +273,11 @@ impl ZSign {
     /// Loads signing assets, parses the Mach-O binary, generates a code signature,
     /// and writes a complete signed binary to the output path.
     ///
+    /// FAT/Universal containers are supported in both credentialed modes: the
+    /// default dual-digest mode and `sha256_only` route containers through
+    /// [`crate::macho::sign_any_macho`], which signs every slice. Adhoc mode
+    /// rejects containers and fails closed.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -318,6 +323,16 @@ impl ZSign {
             let entitlements = self.load_entitlements_from_profile()?;
             if self.sha256_only {
                 crate::macho::sign_macho_sha256_only(
+                    &macho,
+                    identifier,
+                    entitlements.as_deref(),
+                    credentials,
+                    None,
+                    None,
+                    self.allow_encrypted,
+                )?
+            } else if macho.is_fat() {
+                crate::macho::sign_any_macho(
                     &macho,
                     identifier,
                     entitlements.as_deref(),
@@ -618,5 +633,109 @@ mod tests {
             .sign_bundle(&app, Some(&ipa))
             .expect("folder to ipa must succeed");
         assert!(ipa.exists());
+    }
+
+    /// Assembles thin Mach-O slices into a big-endian FAT container using
+    /// lipo's alignment rule (each slice start aligned to 2^12).
+    fn make_fat_for_test(slices: &[Vec<u8>]) -> Vec<u8> {
+        assert!(!slices.is_empty());
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xcafebabeu32.to_be_bytes());
+        out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        let header_size = 8 + slices.len() * 20;
+        let mut offsets = Vec::with_capacity(slices.len());
+        let mut cursor = header_size;
+        for slice in slices {
+            cursor = cursor.checked_add(4095).unwrap() & !4095;
+            offsets.push(cursor);
+            cursor += slice.len();
+        }
+        for (slice, offset) in slices.iter().zip(&offsets) {
+            let cpu = u32::from_le_bytes(slice[4..8].try_into().expect("cputype"));
+            let sub = u32::from_le_bytes(slice[8..12].try_into().expect("cpusubtype"));
+            out.extend_from_slice(&cpu.to_be_bytes());
+            out.extend_from_slice(&sub.to_be_bytes());
+            out.extend_from_slice(&(*offset as u32).to_be_bytes());
+            out.extend_from_slice(&(slice.len() as u32).to_be_bytes());
+            out.extend_from_slice(&12u32.to_be_bytes());
+        }
+        for (slice, offset) in slices.iter().zip(&offsets) {
+            out.resize(*offset, 0);
+            out.extend_from_slice(slice);
+        }
+        out
+    }
+
+    /// Writes a two-architecture (arm64 + x86_64) universal binary into `dir`.
+    fn write_two_arch_fat_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut x86 = crate::test_util::minimal_macho();
+        x86[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        let input = dir.join("universal_bin");
+        std::fs::write(
+            &input,
+            make_fat_for_test(&[crate::test_util::minimal_macho(), x86]),
+        )
+        .expect("write fixture");
+        input
+    }
+
+    #[test]
+    fn test_sign_macho_fat_default_sha256_only_routes_through_fat_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_two_arch_fat_fixture(dir.path());
+        let output = dir.path().join("universal_signed");
+
+        ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .sign_macho(&input, &output)
+            .expect("default direct-sign (sha256_only=true) must handle FAT");
+
+        let signed = std::fs::read(&output).unwrap();
+        assert_eq!(
+            &signed[0..4],
+            &[0xca, 0xfe, 0xba, 0xbe],
+            "signed output must stay FAT"
+        );
+        let m = crate::macho::MachOFile::parse(signed).unwrap();
+        assert!(m.is_fat() && m.slices().len() == 2);
+        assert!(
+            m.slices().iter().all(|s| s.code_sig_offset.is_some()),
+            "both slices must be signed"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_fat_dual_digest_routes_through_sign_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_two_arch_fat_fixture(dir.path());
+        let output = dir.path().join("universal_signed");
+
+        ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .sha256_only(false)
+            .sign_macho(&input, &output)
+            .expect("dual-digest direct-sign must route FAT through sign_any_macho");
+
+        let signed = std::fs::read(&output).unwrap();
+        assert_eq!(&signed[0..4], &[0xca, 0xfe, 0xba, 0xbe]);
+        let m = crate::macho::MachOFile::parse(signed).unwrap();
+        assert!(m.is_fat() && m.slices().len() == 2);
+        assert!(
+            m.slices().iter().all(|s| s.code_sig_offset.is_some()),
+            "both slices must be signed"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_adhoc_rejects_fat() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_two_arch_fat_fixture(dir.path());
+        let output = dir.path().join("universal_signed");
+
+        let err = ZSign::new()
+            .adhoc(true)
+            .sign_macho(&input, &output)
+            .expect_err("adhoc direct-sign must fail closed on FAT (documented limitation)");
+        assert!(err.to_string().contains("sign_any_macho"), "{err}");
     }
 }
