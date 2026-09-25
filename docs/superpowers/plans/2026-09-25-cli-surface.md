@@ -464,7 +464,7 @@ becomes one `ErrorDoc` line on stderr; no human-format line may mix into either 
   (0.22.1 already in the lock)
 - Modify: `scripts/verify-apple-interop.sh` — `-p "$WORK/cs.p12"` →
   `--pkcs12 "$WORK/cs.p12"` in every `sign_and_verify` invocation (grep `-p ` first;
-  expected: the two callsites around :272-273)
+  expected: the two callsites at :123-124 and :157-158)
 
 - [ ] **Step 3.1: Write the failing tests (Tester subagent)**
 
@@ -616,11 +616,17 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
         // flag-combination mistake, not a key file — detect before the cert
         // loader misdiagnoses the ASN.1 as a broken certificate
         Some(cert_path) => {
-            const P12_PKCS7_DATA_OID: &[u8] =
-                &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
-            if key_data
-                .windows(P12_PKCS7_DATA_OID.len())
-                .any(|w| w == P12_PKCS7_DATA_OID)
+        // PKCS#12 authSafe ContentInfo carries pkcs7-data (…1.7.1) or, for
+        // encrypted-shroud containers, pkcs7-encryptedData (…1.7.6) — the only
+        // two OIDs our parser accepts for authSafe; a PKCS#8 key has neither
+        const P12_PKCS7_DATA_OID: &[u8] =
+            &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+        const P12_PKCS7_ENCRYPTED_DATA_OID: &[u8] =
+            &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x06];
+            if key_data.windows(P12_PKCS7_DATA_OID.len()).any(|w| w == P12_PKCS7_DATA_OID)
+                || key_data
+                    .windows(P12_PKCS7_ENCRYPTED_DATA_OID.len())
+                    .any(|w| w == P12_PKCS7_ENCRYPTED_DATA_OID)
             {
                 return Err("--private-key contains a PKCS#12 file, which cannot be \
                     combined with --certificate; pass -k alone (password via -p) or \
@@ -659,10 +665,11 @@ fn pem_wrap_der(der: &[u8]) -> String {
    (verify with `grep -n 'cs.p12' scripts/verify-apple-interop.sh` — only the
    `sign_and_verify` argument lists change; `--password test` lines stay).
 
-- [ ] **Step 3.4: Green gate** — both scoped gates; additionally sanity-check that the
-  script migration left no `-p "` path usage:
-  `grep -n '`-p "' scripts/verify-apple-interop.sh` → no matches expected (grep via
-  the Grep tool).
+- [ ] **Step 3.4: Green gate** — both scoped gates; additionally sanity-check that no
+  `-p <p12-path>` callsite remains (narrow to the p12 argument — the bare pattern
+  `-p "` would false-match an unrelated `mkdir -p "$WORK/…"`):
+  via the Grep tool, pattern `-p "\$WORK/cs\.p12` over
+  `scripts/verify-apple-interop.sh` → no matches expected.
 
 - [ ] **Step 3.5: Commit**
   `git add crates/zsign-cli/src/main.rs crates/zsign-cli/Cargo.toml Cargo.lock scripts/verify-apple-interop.sh && git commit -m "feat(cli): restore upstream -p/-k password and key semantics (zsn-36)"`
@@ -997,7 +1004,7 @@ fn credential_io_errors_name_the_file() {
 
    and each of `pkcs12`/`certificate`/`private_key` gains
    `required_unless_present_any = ["adhoc", "verify", "credentials"]`.
-   (`required_unless_present*` implies required — clap arg.rs:3289-3292.)
+   (`required_unless_present*` implies required — clap arg.rs:3291-3296 (doc TIP).)
 
 2. `load_credentials` hardening:
    - Replace raw `std::fs::read` calls with a wrapper that labels the file:
@@ -1008,8 +1015,13 @@ fn read_credential_file(path: &std::path::Path, label: &str) -> Result<Vec<u8>, 
 }
 ```
 
-   - Key routes only (PEM branch and DER branch — never the p12 branches): immediately
-     after reading the key bytes and BEFORE the certificate-presence check, run
+   - Encrypted-marker/password rejection: run the block below at **both** key-route
+     insertion points — (a) at the top of the PEM arm, before its certificate
+     `let-else` (i.e. immediately after the `starts_with(b"-----BEGIN")` test), and
+     (b) at the top of the `Some(cert_path)` arm, after the OID check — and
+     **nowhere in the `None`/p12 arm**: the p12 route legitimately receives
+     non-empty passwords, and a single "after reading the key bytes" position would
+     sweep that arm too, breaking every `-k identity.p12 -p <pw>` invocation.
 
 ```rust
     let password = cli.password.clone().unwrap_or_default();
@@ -1075,7 +1087,8 @@ fn read_credential_file(path: &std::path::Path, label: &str) -> Result<Vec<u8>, 
 - [ ] `git log --oneline` shows exactly the 5 feature commits + 1 docs commit on
   `zsn5-cli-surface`; tree clean; no fmt/clippy/hk invoked manually
 - [ ] `grep`-audit: no `process::exit` left in `run_verify`; no `report.warnings`
-  printer; no `-p "` path usage in `scripts/verify-apple-interop.sh`; no ticket IDs
+  printer; no `-p "$WORK/cs.p12"` path usage left in `scripts/verify-apple-interop.sh`
+  (narrow pattern — `-p "` false-matches `mkdir -p`); no ticket IDs
   in `crates/zsign-cli/src/main.rs` comments; no `TODO`/`FIXME`/stubs
 - [ ] Manual TTY prompt smoke recorded (Task 4, Step 4.5)
 - [ ] Plan-vs-actual deviations + README-needs list carried into the final report

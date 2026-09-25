@@ -47,9 +47,10 @@ rule "migrate every caller" governs).
 - **Downstream pins (must stay green or migrate in the same change):**
   `scripts/verify-apple-interop.sh` — `agree_valid` requires `-V` exit 0 + `^verified: yes`
   (:255-262); cert-signed pins grep exact human printer lines (:276-299);
-  `sign_and_verify` fails on any non-zero sign exit and invokes `-p <path> --password test`
-  (:103-108, :272-273 region). Human stdout format without `--json` must therefore be
-  byte-stable; the `-p <path>` callsite must migrate to `--pkcs12` with item 3.
+  `sign_and_verify` (defined :103-108) fails on any non-zero sign exit and invokes
+  `-p <path> --password test` at :123-124 and :157-158. Human stdout format without
+  `--json` must therefore be
+  byte-stable; the `-p <path>` callsites must migrate to `--pkcs12` with item 3.
 - CI (`.github/workflows/ci.yml`): fmt check, `clippy -D warnings --all-targets`,
   `cargo test --workspace` (no `--locked`), cargo-deny (license allow-list
   MIT/Apache-2.0/BSD-2/3/ISC/Unicode-3.0/CC0/Unlicense/Zlib; `multiple-versions = "warn"`),
@@ -205,10 +206,14 @@ PEM → DER → PKCS#12 (src/openssl.cpp:876-907, no extension sniffing).
 | no PEM marker | absent | **p12 route** → `from_p12(bytes, password)` | flag → env → `""` trial → prompt (item 4) |
 
   PEM + no `-c` → error naming the missing `--certificate`. p12 content + `-c`
-  (misuse) → **detected before any parsing**: a PKCS#12 authSafe `ContentInfo` always
-  carries the pkcs7-data OID (`1.2.840.113549.1.7.2`, DER bytes
-  `06 09 2A 86 48 86 F7 0D 01 07 02`) which a PKCS#8 key never contains; when the
-  `-k` bytes contain that OID **and** `-c` is present, the CLI fails with
+  (misuse) → **detected before any parsing**: a PKCS#12 authSafe `ContentInfo`
+  carries pkcs7-data (`1.2.840.113549.1.7.1`, DER
+  `06 09 2A 86 48 86 F7 0D 01 07 01`) or, for encrypted-shroud containers whose
+  outer `ContentInfo` may carry no pkcs7-data, pkcs7-encryptedData
+  (`1.2.840.113549.1.7.6`, DER `06 09 2A 86 48 86 F7 0D 01 07 06`) — the only two
+  our parser accepts for authSafe (pkcs12.rs:35-37, :311-320); a PKCS#8 key never
+  contains either. When the
+  `-k` bytes contain either OID **and** `-c` is present, the CLI fails with
   `--private-key contains a PKCS#12 file, which cannot be combined with
   --certificate; pass -k alone (password via -p) or use --pkcs12` instead of letting
   the certificate loader misdiagnose ASN.1 as a broken certificate (a heuristic for a
@@ -235,7 +240,7 @@ PEM → DER → PKCS#12 (src/openssl.cpp:876-907, no extension sniffing).
   = minor bump). Version numbers are release management — **not edited in this lane.**
 - **Caller migration (hard rule "migrate every caller"):**
   `scripts/verify-apple-interop.sh` passes `-p "$WORK/cs.p12"` (sign_and_verify
-  invocations, :103-108/:272-273) — migrates to `--pkcs12 "$WORK/cs.p12"`; its
+  invocations, :123-124 and :157-158) — migrates to `--pkcs12 "$WORK/cs.p12"`; its
   `--password test` stays valid. README flag tables are deferred to the wave-4 docs
   lane (listed under "README needs").
 - Issues #116/#303/#401 (brief's conditional citation): verified via GitHub API —
@@ -316,11 +321,13 @@ from echoing the live env value.
   itself has no `required_unless*` and its validation ignores conflicts (L2:
   arg_group.rs:92-528, validator.rs:255-271), so a `required = true` group would
   reject `zsign -a file`. Group presence is recorded in the matcher
-  (parser.rs:1540-1544), so `--pkcs12 x` alone satisfies `certificate`'s and
+  (parser.rs:1539-1545 — group marked only for explicit occurrences; env/default
+  values do not count, matched_arg.rs:135-151), so `--pkcs12 x` alone satisfies
+  `certificate`'s and
   `private_key`'s requirement. `certificate` additionally gains
   `requires = "private_key"` (cert without key is never valid; key without cert may
   be a p12). Missing-everything is now a clap usage error (exit 2) naming the
-  credential flags; the runtime fallthrough error (main.rs:390) becomes unreachable
+  three missing flags; the runtime fallthrough error (main.rs:390) becomes unreachable
   and is **deleted**.
 - **`-k` runtime halves:** PEM/DER content with no `-c` → error naming
   `--certificate` (reachable only from the key routes; clap cannot know the content).
@@ -413,7 +420,7 @@ one valid + one invalid + one error run.
 | Crate | Where | Why | Lock impact | License (deny.toml) |
 |---|---|---|---|---|
 | `serde` (derive) + `serde_json` | `[dependencies]`, item 2 | `--json`; no workspace crate depends on serde (S2) | versions already resolved in the lock (1.0.229 / 1.0.151); the `zsign-cli` dependency list changes (a lock edit, committed with the task) | MIT/Apache-2.0 ✓ |
-| `base64` | `[dependencies]`, item 3 | DER key → PEM wrap for the `-k` route (no public DER loader exists, S3) | already resolved in the lock (0.22.1); adds `zsign-cli` to its dependents | MIT OR Apache-2.0 ✓ |
+| `base64` | `[dependencies]`, item 3 | DER key → PEM wrap for the `-k` route (no public DER loader exists, S3) | already in the lock (0.22.1; both locked versions are in the tree as transitives) → **zero new lock entries**; only `zsign-cli`'s dependency list changes | MIT OR Apache-2.0 ✓ |
 | `rpassword` | `[dependencies]`, item 4 | no-echo TTY prompt (see item 4) | +1 entry `rtoolbox 0.0.6` | Apache-2.0 ✓ both |
 | `clap` features `["derive", "env"]` | item 4 | `env = "ZSIGN_PASSWORD"` attribute is a hard compile error without it | zero (cfg switch in locked clap_builder) | — |
 | dev-deps | — | **none** (assert_cmd rejected: cannot locate-or-build from unit tests, ~6 lock entries, silent-stale-binary hazard — L2 source-cited) | — | — |
