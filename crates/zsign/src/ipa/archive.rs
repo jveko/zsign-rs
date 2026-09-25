@@ -226,7 +226,7 @@ pub fn create_ipa(
         if relative_path.as_os_str().is_empty() {
             Some(name_prefix.clone())
         } else {
-            Some(format!("{}/{}", name_prefix, relative_path.display()))
+            Some(format!("{}/{}", name_prefix, zip_entry_name(relative_path)))
         }
     })?;
 
@@ -452,6 +452,17 @@ mod tests {
             .expect("oversized member reads back");
     }
 
+    #[test]
+    fn test_zip_entry_name_joins_components_with_forward_slash() {
+        assert_eq!(
+            zip_entry_name(Path::new("dir/sub/file.bin")),
+            "dir/sub/file.bin",
+            "nested paths join with '/'"
+        );
+        assert_eq!(zip_entry_name(Path::new("file.bin")), "file.bin");
+        assert_eq!(zip_entry_name(Path::new("")), "", "root relative path");
+    }
+
     /// Create a test app bundle directory structure.
     fn create_test_app_bundle(dir: &Path) -> PathBuf {
         let app_dir = dir.join("Test.app");
@@ -502,8 +513,11 @@ mod tests {
         let mut found_info_plist = false;
         let mut found_executable = false;
 
+        let mut names: Vec<String> = Vec::new();
         for i in 0..archive.len() {
             let entry = archive.by_index(i).unwrap();
+            names.push(entry.name().to_string());
+
             let name = entry.name();
 
             if name == "Payload/" || name == "Payload" {
@@ -517,6 +531,12 @@ mod tests {
             }
         }
 
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "Payload/Test.app/Resources/icon.png"),
+            "nested entry names are '/'-joined, got {names:?}"
+        );
         assert!(found_payload, "Payload directory not found");
         assert!(found_info_plist, "Info.plist not found");
         assert!(found_executable, "Executable not found");
