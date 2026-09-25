@@ -1193,7 +1193,7 @@ mod tests {
     /// Write a minimal test IPA to `ipa_path`, appending `extras` as extra
     /// root-level entries after the bundle payload.
     fn write_test_ipa(ipa_path: &Path, extras: &[(&str, &[u8])]) -> PathBuf {
-        let file = fs::File::create(&ipa_path).unwrap();
+        let file = fs::File::create(ipa_path).unwrap();
         let mut zip = ZipWriter::new(file);
 
         let options = SimpleFileOptions::default();
