@@ -19,8 +19,9 @@ profile-entitlements load; one `map_err`). Conflicts live in
 existing ZSN-5 style. Design decisions and the item-0 evidence matrix:
 `docs/superpowers/specs/2026-09-26-option-forwarding-design.md`.
 
-**Tech Stack:** Rust 2021 workspace; clap 4.6.7 derive; zip 7.2.0;
-goblin 0.10; plist 1.7; tempfile 3.10 (all already dependencies of `zsign`).
+**Tech Stack:** Rust 2021 workspace; clap 4.6.7 derive; zip 7.2.0; goblin 0.10;
+plist 1.7 (resolves 1.10.1); tempfile 3.10 (resolves 3.27.0) — all already
+dependencies of `zsign`.
 
 **Shared conventions (apply to every task):**
 - Scoped gate only, always with the brief's env conventions:
@@ -66,6 +67,7 @@ fn write_ipa_fixture(path: &std::path::Path) {
 
 /// Read one entry's bytes back out of an IPA.
 fn ipa_entry(path: &std::path::Path, name: &str) -> Vec<u8> {
+    use std::io::Read;
     let f = std::fs::File::open(path).unwrap();
     let mut zip = zip::ZipArchive::new(f).unwrap();
     let mut buf = Vec::new();
@@ -74,20 +76,31 @@ fn ipa_entry(path: &std::path::Path, name: &str) -> Vec<u8> {
 }
 
 /// Locate the code signature of a thin Mach-O and parse its SuperBlob.
-fn thin_code_signature(bytes: &[u8]) -> zsign_rs::codesign::verify::SuperBlob<'_> {
+/// LC_CODE_SIGNATURE lookup follows the repo idiom at
+/// zsign-core/src/macho/signer.rs:1364-1376 (goblin 0.10 MachO has no
+/// `code_signature` field — only the `CommandVariant::CodeSignature` variant).
+fn thin_code_signature(bytes: &[u8]) -> crate::codesign::verify::SuperBlob<'_> {
+    use goblin::mach::load_command::CommandVariant;
     let mach = goblin::mach::Mach::parse(bytes).unwrap();
     let macho = match mach {
         goblin::mach::Mach::Binary(b) => b,
         goblin::mach::Mach::Fat(_) => panic!("thin binary expected"),
     };
-    let lc = macho.code_signature.expect("LC_CODE_SIGNATURE");
+    let lc = macho
+        .load_commands
+        .iter()
+        .find_map(|cmd| match cmd.command {
+            CommandVariant::CodeSignature(cs) => Some(cs),
+            _ => None,
+        })
+        .expect("LC_CODE_SIGNATURE");
     let start = lc.dataoff as usize;
     let end = start + lc.datasize as usize;
-    zsign_rs::codesign::verify::parse_superblob(&bytes[start..end]).unwrap()
+    crate::codesign::verify::parse_superblob(&bytes[start..end]).unwrap()
 }
 
-fn has_sha1_directory(sb: &zsign_rs::codesign::verify::SuperBlob<'_>) -> bool {
-    sb.code_directory.as_ref().map_or(false, |cd| cd.is_sha1())
+fn has_sha1_directory(sb: &crate::codesign::verify::SuperBlob<'_>) -> bool {
+    sb.code_directory.as_ref().is_some_and(|cd| cd.is_sha1())
         || sb.alternate_code_directories.iter().any(|cd| cd.is_sha1())
 }
 ```
@@ -451,7 +464,8 @@ unaffected).
         // Control: adhoc without a profile must not carry an entitlements slot.
         let control = dir.path().join("control.bin");
         ZSign::new().adhoc(true).sign_macho(&input, &control).expect("control");
-        let control_sb = thin_code_signature(&std::fs::read(&control).unwrap());
+        let control_bytes = std::fs::read(&control).unwrap();
+        let control_sb = thin_code_signature(&control_bytes);
         assert!(
             !control_sb.entries.iter().any(|e| e.slot == CSSLOT_ENTITLEMENTS),
             "control must not carry an entitlements slot"
@@ -464,7 +478,8 @@ unaffected).
             .provisioning_profile(&profile)
             .sign_macho(&input, &out)
             .expect("adhoc sign with profile");
-        let sb = thin_code_signature(&std::fs::read(&out).unwrap());
+        let signed_bytes = std::fs::read(&out).unwrap();
+        let sb = thin_code_signature(&signed_bytes);
         let ent = sb
             .entries
             .iter()
@@ -492,14 +507,23 @@ without profile already emits none).
 
 - [ ] **Step 3: Hoist the profile-entitlements load above the adhoc branch**
 
-Edit `sign_macho` so the profile is read once, before the `if self.adhoc`
-split, and both branches receive it (this is the same unconditional forwarding
-`sign_ipa`/`sign_bundle` already do):
+Keep the current branch shape (builder.rs:312-353) and make exactly three
+surgical edits — no other restructuring:
+
+1. Move `let entitlements = self.load_entitlements_from_profile()?;` from
+   inside the credentialed branch (builder.rs:323) to just before
+   `let signed_binary = if self.adhoc {` (builder.rs:312), so it runs once per
+   call, after `validate()` (which stays the first statement — invariant).
+2. In the adhoc call (builder.rs:313-320), replace the third argument `None`
+   with `entitlements.as_deref()`.
+3. Delete the now-duplicate `let entitlements = ...` line at builder.rs:323.
+   The credentialed branch already passes `entitlements.as_deref()` at
+   builder.rs:328/:338/:348 — those call sites do not change.
+
+Result (head of the function, showing only the changed region):
 
 ```rust
         let entitlements = self.load_entitlements_from_profile()?;
-        let credentials = if self.adhoc { None } else { Some(self.get_credentials()?) };
-
         let signed_binary = if self.adhoc {
             crate::macho::sign_macho_adhoc(
                 &macho,
@@ -510,7 +534,7 @@ split, and both branches receive it (this is the same unconditional forwarding
                 self.allow_encrypted,
             )?
         } else {
-            let credentials = credentials.expect("credentialed branch holds credentials");
+            let credentials = self.get_credentials()?;
             if self.sha256_only {
                 crate::macho::sign_macho_sha256_only(
                     &macho,
@@ -545,14 +569,8 @@ split, and both branches receive it (this is the same unconditional forwarding
         };
 ```
 
-Simpler variant preferred if it stays readable: keep the current branch
-structure and only (1) move `let entitlements = self.load_entitlements_from_profile()?;`
-to just before `let signed_binary = if self.adhoc {`, and (2) replace the adhoc
-call's third argument `None` with `entitlements.as_deref()`, leaving the
-credentialed branch as-is (it already uses `entitlements.as_deref()` and its
-`let entitlements = ...` line gets deleted as the duplicate). Either shape is
-acceptable; the observable contract is: one profile read per call, adhoc passes
-the loaded entitlements. `validate()` stays the first statement (invariant).
+Observable contract: one profile read per call; adhoc passes the loaded
+entitlements; credentialed behavior byte-identical to before.
 
 - [ ] **Step 4: Run the test to verify it PASSES**
 
@@ -626,7 +644,7 @@ with "must be rejected"); the existing conflict tests stay green.
 - [ ] **Step 3: Declare the conflicts (existing ZSN-5 style)**
 
 On the two fields (declaration is symmetric in clap 4.6.7; conflicts validate
-before `required_unless_present_any`, `validator.rs:57-60`):
+before `required_unless_present_any`, `clap_builder-4.6.7/src/parser/validator.rs:54-57`):
 
 ```rust
     /// Legacy SHA-1 + SHA-256 dual code directories (iOS <= 10 only).
@@ -669,7 +687,7 @@ ArgumentConflict), `credentials_group_required_unless_adhoc_or_verify`,
 
 **Files:**
 - Test: `crates/zsign-cli/src/main.rs` test module
-- Modify: `crates/zsign/src/builder.rs` `load_entitlements_from_profile` (:496-504)
+- Modify: `crates/zsign/src/builder.rs` `load_entitlements_from_profile` (:486-495)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -726,7 +744,8 @@ Expected: FAIL — stderr is `error: IO error: No such file or directory (os err
 
 - [ ] **Step 3: Wrap the read with path context**
 
-Edit `load_entitlements_from_profile` (builder.rs:496-504) — keep the existing
+Edit `load_entitlements_from_profile` (builder.rs:486-495; the bare read is at
+builder.rs:488) — keep the existing
 `Error::Io` variant and `?` conversion, wrap the io error so its Display names
 label + path (phrasing mirrors `read_credential_file`, main.rs:768-774; exit
 code stays 1 because `run()`'s `Err` arm maps to 1, main.rs:144-151):

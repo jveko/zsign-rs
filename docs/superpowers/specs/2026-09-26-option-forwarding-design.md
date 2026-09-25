@@ -21,12 +21,12 @@ re-audit against current source before scoping.
 |---|---|---|---|
 | a | `ZSign::sign_ipa` drops `sha256_only`/`bundle_name`/`bundle_version` | **STILL OPEN** | `crates/zsign/src/builder.rs:393-419` configures compression (397,403), dylibs (405-407), force (408), profile (410-412), bundle_id (414-416), then `signer.sign()` (418) — no `sha256_only`/`bundle_name`/`bundle_version` calls. `sign_bundle` forwards all three (builder.rs:443-446, 458-462). Setters exist: `ipa/mod.rs:204` (`bundle_name`), `:213` (`bundle_version`), `:223` (`sha256_only`); consumed at `ipa/mod.rs:377-382` (plist rewrites) and `:1038` (digest mode). |
 | b | `sign_bundle` omits `compression_level` so `-z` is ignored | **STILL OPEN** | builder.rs:440-463 never calls `.compression_level()`; `sign_ipa` does (builder.rs:397,403). `IpaSigner` defaults to 6 (`ipa/mod.rs:145,161`, `archive.rs:66`); the repack path would honor a configured level (`ipa/mod.rs:326-330` passes `self.compression_level` into `create_ipa`). Net: `-z` on a `.app`→`.ipa` repack always repacks at 6. |
-| c | `sign_macho` never applies configured dylibs/`bundle_id` | **STILL OPEN** | builder.rs:302-358 never reads `self.dylibs`/`self.weak_dylibs`/`self.bundle_id`; identifier is hardcoded to `input.file_stem()` (306-310). The two positional `None`s in credentialed calls are `info_plist: Option<&[u8]>` and `code_resources: Option<&[u8]>` (`macho/mod.rs:68-69,133-134,157-158`) — bundle-context blobs, structurally absent for a loose binary; they are not the dylib/bundle_id slots. |
-| d | ad-hoc `sign_macho` discards a configured profile's entitlements | **STILL OPEN** | builder.rs:313-320 passes `None` for entitlements (316) to `sign_macho_adhoc`; `load_entitlements_from_profile()` (496-504) runs only in the credentialed branch (323). Inconsistent with `sign_ipa` (410-412) and `sign_bundle` (452-454), which forward the profile even on ad-hoc signers (`ipa/mod.rs:296-304` applies profile entitlements regardless of credentials). |
+| c | `sign_macho` never applies configured dylibs/`bundle_id` | **STILL OPEN** | builder.rs:302-358 never reads `self.dylibs`/`self.weak_dylibs`/`self.bundle_id`; identifier is hardcoded to `input.file_stem()` (306-310). The two positional `None`s in credentialed calls are `info_plist: Option<&[u8]>` and `code_resources: Option<&[u8]>` (`macho/mod.rs:68-69,112-113,133-134,159-160`) — bundle-context blobs, structurally absent for a loose binary; they are not the dylib/bundle_id slots. |
+| d | ad-hoc `sign_macho` discards a configured profile's entitlements | **STILL OPEN** | builder.rs:313-320 passes `None` for entitlements (316) to `sign_macho_adhoc`; `load_entitlements_from_profile()` (486-495) runs only in the credentialed branch (323). Inconsistent with `sign_ipa` (410-412) and `sign_bundle` (452-454), which forward the profile even on ad-hoc signers (`ipa/mod.rs:296-304` applies profile entitlements regardless of credentials). |
 | e | clap conflicts: `-2` vs `-L`, `-a` vs `-m`, `-V` vs signing opts | **PARTIAL** | Exists: `--verify` conflicts_with_all (main.rs:117-133, tested main.rs:1574-1591) and `--pkcs12` vs cert/key (main.rs:42, tested :1610-1614). Missing: `-2` vs `-L` (main.rs:84-91, both bare bools; `run()` applies `-2` then `-L`, so `-L` silently wins at main.rs:183-188) and `-a` vs `-m` (main.rs:99-100 vs :49 — no conflict). |
 | f | `--zip-level` clamp vs 0-9 help | **ALREADY SATISFIED** | `value_parser = clap::value_parser!(u32).range(0..=9)` with help "ZIP compression level (0-9, default: 6)" (main.rs:58-67); parse-time rejection tested (`zip_level_range_is_enforced_at_parse`, main.rs:1617-1625). Library-side `CompressionLevel::new` clamps >9 to 9 (`archive.rs:77-79`). |
 | g | PEM branch ignores CLI password → generic error | **ALREADY SATISFIED** | `reject_encrypted_key` (main.rs:781-793) returns exactly `encrypted PEM keys are unsupported (see ZSN-18)` and is called on both PEM (main.rs:810) and DER-wrap (main.rs:845) branches; backstop in `zsign-core/src/crypto/cert.rs:476-483`. Tested: `password_with_key_route_fails_explicitly` (main.rs:1628-1676). |
-| h | credential errors don't name the missing file | **PARTIAL** | p12/cert/key landed: `read_credential_file` formats `failed to read {label} '{path}': {e}` (main.rs:768-774) with call sites :797/:808/:814/:846, tested `credential_io_errors_name_the_file` (main.rs:1679-1702). Still open **in my files**: `load_entitlements_from_profile` does a bare `std::fs::read(profile_path)?` (builder.rs:497) → `Error::Io` Displays as `IO error: {0}` (`error.rs:29-30`) with std's pathless message. Known seam (NOT mine): `ipa/mod.rs:299` `fs::read(path)?` in `load_profile` — reported to lane zsn34. |
+| h | credential errors don't name the missing file | **PARTIAL** | p12/cert/key landed: `read_credential_file` formats `failed to read {label} '{path}': {e}` (main.rs:768-774) with call sites :797/:808/:814/:846, tested `credential_io_errors_name_the_file` (main.rs:1679-1702). Still open **in my files**: `load_entitlements_from_profile` does a bare `std::fs::read(profile_path)?` (builder.rs:488) → `Error::Io` Displays as `IO error: {0}` (`error.rs:33-35`) with std's pathless message. Known seam (NOT mine): `ipa/mod.rs:296` `fs::read(path)?` in `load_profile` — reported to lane zsn34. |
 | i | `validate()` runs after credential/file work | **ALREADY SATISFIED** | `validate()` is the first statement of every public entry: `sign_macho` builder.rs:303 (before `MachOFile::open` :304), `sign_ipa` :394, `sign_bundle` :440; `validate()` itself (254-261) is pure state checking. `sign_bundle` rejects a non-`.ipa` output before any folder mutation (465-483); downstream guards precede mutation (`ipa/mod.rs:310-315`, `:988-995`). CLI nuance: `run()` loads credential files (main.rs:165) before builder validate can run — unavoidable, since credential presence is what validate checks; credential reads themselves never touch the input tree. |
 
 **Still-open list (drives queue items 1-3):** (a), (b), (c), (d), (e ×2 conflicts), (h profile site). (f)(g)(i) and the `-V` conflict are recorded as already satisfied and are not re-implemented.
@@ -36,9 +36,9 @@ re-audit against current source before scoping.
 - **Hard fence:** zero edits under `crates/zsign/src/ipa/*` (lane zsn34). Every fix below lives in
   `crates/zsign/src/builder.rs` or `crates/zsign-cli/src/main.rs`. The re-audit confirmed all
   required `IpaSigner` setters already exist, so no `ipa/` edit is needed.
-- **Seam 1 (report-only, zsn34):** profile-read error naming at `ipa/mod.rs:299` (bare `fs::read(path)?`)
+- **Seam 1 (report-only, zsn34):** profile-read error naming at `ipa/mod.rs:296` (bare `fs::read(path)?`, fn `load_profile` at :293-302)
   — the IPA/app entry points keep the pathless `IO error:` message until that lane fixes it.
-  The builder-side sibling `builder.rs:497` is fixed here.
+  The builder-side sibling `builder.rs:488` is fixed here.
 - **Seam 2 (report-only, zsn34):** `IpaSigner::sign_standalone_dylib` (`ipa/mod.rs:652`) always signs
   dual-digest, ignoring `self.sha256_only` — observed while mapping flows; `ipa/`-owned.
 - **Docs lane notes:** no `-e/--entitlements` flag exists locally (upstream has one, `zsign.cpp:24-59`);
@@ -77,13 +77,13 @@ All fixes are forwarding corrections — no new public API, no `ipa/` edits.
    on `legacy_sha1`: `conflicts_with_all = ["sha256_only"]`; on `adhoc`:
    `conflicts_with_all = ["profile"]`. clap 4.6.7 conflicts are symmetric
    (one declaration covers both orders) and are validated before
-   `required_unless_present_any` (`clap_builder-4.6.7/src/parser/validator.rs:57-60`),
+   `required_unless_present_any` (`clap_builder-4.6.7/src/parser/validator.rs:54-57`),
    so `-2 -L` is rejected even when credentials are also missing.
 7. **Profile read naming (h):** in `load_entitlements_from_profile`
-   (builder.rs:497), `map_err` the `std::fs::read` failure into an error whose
+   (builder.rs:486-495; the bare read is at :488), `map_err` the `std::fs::read` failure into an error whose
    message names label + path — `failed to read provisioning profile '{path}': {e}` —
    matching `read_credential_file`'s phrasing (main.rs:768-774). Only this one
-   site changes; `ipa/mod.rs:299` stays as the reported seam.
+   site changes; `ipa/mod.rs:296` stays as the reported seam.
 8. **Validate-before-mutation (i):** already satisfied (matrix above). No
    production change; one regression test pins the invariant.
 
@@ -117,7 +117,7 @@ produce a signature that fails verification — rejected outright; (iii) churns
 (zsn34-adjacent) for no observable gain — rejected. (i) is the exact primitive
 `IpaSigner` already uses (`ipa/mod.rs:1005-1013`) and is builder.rs-only.
 FAT containers are handled: `inject_dylib_command` reassembles every slice
-(`writer.rs:906-909`); the adhoc FAT rejection path is unchanged.
+(`writer.rs:906`, FAT loop at :917-938); the adhoc FAT rejection path is unchanged.
 
 **D4 — `bundle_id` on the macho path.**
 (i) use it as the code-signing identifier overriding `file_stem`; (ii) document
@@ -207,7 +207,7 @@ incidental behavior.
 | 4 | `test_sign_macho_adhoc_applies_profile_entitlements` (builder.rs tests) | profile fixture file = XML plist with a top-level `Entitlements` dict (`extract_entitlements_from_profile` is pub and CMS-unverified by design — `provisioning.rs:379-385`); `.adhoc(true).provisioning_profile(path)` | superblob contains the entitlements special slot (CSSLOT_ENTITLEMENTS) whose bytes carry a key from the fixture; control sign without profile → slot absent | adhoc branch passes `None` → slot absent |
 | 5 | `sha256_only_and_legacy_conflict_at_parse` (main.rs tests) | none | `parse_err(["zsign","-2","-L","in.ipa"]).kind() == ArgumentConflict` (both orders) + positives: `-a -2` and `-a -L` parse | no conflict declared |
 | 6 | `adhoc_conflicts_with_profile_at_parse` (main.rs tests) | none | `parse_err(["zsign","-a","-m","p.mobileprovision","in.ipa"]).kind() == ArgumentConflict` + positive: `--pkcs12 x.p12 -p pw -m p.mobileprovision in.ipa` parses | no conflict declared |
-| 7 | `missing_profile_error_names_the_file` (main.rs tests) | `IDENTITY_P12` recipe from `key_route_pkcs12_content_loads_with_password` (main.rs:1329) + bare-macho input | `run_cli(["-k", IDENTITY_P12, "-p", "testpassword", "-m", "<dir>/absent.mobileprovision", "-o", out, input])` → code 1, stderr contains `absent.mobileprovision` (mirrors main.rs:1679). **Must use a bare-macho input**: `.ipa`/`.app` inputs read the profile at the `ipa/mod.rs:299` seam, which stays unfixed. | bare `IO error:` has no path |
+| 7 | `missing_profile_error_names_the_file` (main.rs tests) | `IDENTITY_P12` recipe from `key_route_pkcs12_content_loads_with_password` (main.rs:1329) + bare-macho input | `run_cli(["-k", IDENTITY_P12, "-p", "testpassword", "-m", "<dir>/absent.mobileprovision", "-o", out, input])` → code 1, stderr contains `absent.mobileprovision` (mirrors main.rs:1679). **Must use a bare-macho input**: `.ipa`/`.app` inputs read the profile at the `ipa/mod.rs:296` seam, which stays unfixed. | bare `IO error:` has no path |
 | 8 | `validate_failure_leaves_input_tree_untouched` (builder.rs tests) | `.app` fixture; `ZSign::new()` (no credentials, not adhoc) | `sign_bundle` → `Err(MissingCredentials)` and no `_CodeSignature/` created, `Info.plist` bytes identical to a pre-read copy; likewise `sign_ipa` → output path never created, input bytes unchanged | would only fail if a future change moves work before `validate()` — pins queue item 3 |
 
 Scoped verification (every task, per brief hard rules):
