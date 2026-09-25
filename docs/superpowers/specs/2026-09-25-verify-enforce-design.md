@@ -108,15 +108,24 @@ Cross-cutting decisions (brainstorm picks, refined by research):
   slot findings, exec-seg policy, entitlements comparison, designated requirement) are
   `report.errors.push(...)`; unverifiable-but-not-false conditions are
   `report.warnings.push(...)`.
-- **All CDs verified, primary reports.** `parse_superblob` errors on any CodeDirectory
-  slot child that fails to parse (primary and alternates). `verify_slice` collects the
-  emitted-CD list ONCE, immediately after `primary` is established (so the CMS branch
-  and the post-CMS designated-requirement step both see it), and runs
-  page-check + special-slot-check for *every* emitted CD; `report.pages`,
-  `report.special_slots`, `report.identifier`, `report.adhoc` keep reflecting the
-  primary CD (C-3; existing tests pin primary-patched fixtures). Alternate-CD findings
-  are error strings tagged with the CD's hash type, e.g.
-  `alternate SHA-256 code page 3 hash mismatch (code region modified?)`.
+- **All CDs verified; strongest governs metadata; primary anchors CMS and
+  identity.** `parse_superblob` errors on any CodeDirectory slot child that fails to
+  parse (primary and alternates). `verify_slice` collects the emitted-CD list ONCE,
+  immediately after `primary` is established (so the CMS branch and the
+  post-CMS designated-requirement step both see it), and runs
+  page-check + special-slot-check for *every* emitted CD. Split of authority:
+  - **CMS `content`** = `primary.raw()` — the CMS signs slot 0 (librarian: detached
+    over the primary; signer `signer.rs:515`). "Strongest" must NEVER be applied to
+    the `content` argument or `messageDigest`/`signature_ok` break on dual output.
+  - **Report metadata** (`report.pages`, `report.special_slots`) = the **strongest
+    viable CD** (`max_by_key(hash_size)` — the SHA-256 CD in dual output), per queue
+    item 2's "choose the strongest viable CD"; these are what consumers read and
+    `is_valid` gates on (all CDs' failures land in `report.errors` either way).
+  - **Identity** (`report.identifier`, `report.adhoc`) stays primary (CMS content
+    anchor; identical across CDs in honest output).
+  - Alternate-CD findings are error strings tagged with the CD's hash type, e.g.
+    `alternate SHA-256 code page 3 hash mismatch (code region modified?)`; the
+    primary's message texts stay byte-identical (unlabeled) for pinned tests.
 - **Special-slot content map** moves into `codesign/verify.rs` as one lookup used by
   `check_special_slots(cd, inputs, superblob)`:
   - `k = 1` (Info.plist): caller input only (`inputs.info_plist`); superblob fallback is
@@ -135,20 +144,28 @@ Cross-cutting decisions (brainstorm picks, refined by research):
   header, so passing it straight to `plist::from_bytes`/
   `der_entitlements_to_plist` would parse `fade7171/fade7172 + length` as data.
 - **Elevation rule (item 3)** lives in `macho/verify.rs` where errors are owned (C-4):
-  after `check_special_slots`, ONE loop walks `(label, checks)` pairs — the primary
-  (label `""`) plus every alternate (label `alternate {SHA-1|SHA-256} `) — pushing
+  ONE loop walks `(label, checks)` pairs — the primary (label `""`) plus every
+  alternate (label `alternate {SHA-1|SHA-256} `) — pushing
   `{label}special slot -{k} hash mismatch` on `Mismatch` (primary text byte-identical
-  to the pinned string) and, when `NotChecked` and `k` is in the required set,
+  to the pinned string) and, when `NotChecked` and the slot is *required*,
   `{label}special slot -{k} is bound but its content was not supplied`. Alternate
-  `NotChecked` IS elevated (a tampered alternate can diverge from the primary). The
-  required set is the single constant list
-  `[CSSLOT_SPECIAL_INFOSLOT, CSSLOT_SPECIAL_REQUIREMENTS, CSSLOT_SPECIAL_RESOURCEDIR,
-  CSSLOT_SPECIAL_ENTITLEMENTS, CSSLOT_SPECIAL_DER_ENTITLEMENTS,
-  CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF..RESPONSIBLE,
-  CSSLOT_SPECIAL_LIBRARY_CONSTRAINT]` (= −1,−2,−3,−5,−7,−8,−9,−10,−11), matched as
-  `-k` — this gives the new negative constants their consumer and excludes −4/−6
-  (task 3 writes the −8..−11 membership numerically; task 10 replaces the literals
-  with the new constants).
+  `NotChecked` IS elevated (a tampered alternate can diverge from the primary).
+  **Requiredness is context-split (read-only-caller constraint):**
+  - `k ∈ {1, 3}` (Info.plist / CodeResources — caller-supplied): required ONLY when
+    bundle context is actually supplied, i.e. `inputs.info_plist.is_some() ||
+    inputs.code_resources.is_some()`. `SignatureInputs::none()` means "standalone:
+    caller cannot supply these" — the read-only facade
+    (`zsign/src/verify.rs:344-368`) owns that message, and core stays silent so the
+    standalone contract and its test survive (bound-nonzero + no-context stays
+    `NotChecked`).
+  - `k ∈ {2, 5, 7}` and `k ∈ {8..=11}` (SuperBlob-sourced): required UNCONDITIONALLY —
+    their content comes from the signature itself, so `NotChecked` there is always a
+    core failure regardless of caller context.
+  Membership is expressed as two `i32` arrays matched against `-k`
+  (`CSSLOT_SPECIAL_INFOSLOT`, `CSSLOT_SPECIAL_RESOURCEDIR` for the context pair;
+  `CSSLOT_SPECIAL_REQUIREMENTS/_ENTITLEMENTS/_DER_ENTITLEMENTS` plus the new
+  `CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_*`/`CSSLOT_SPECIAL_LIBRARY_CONSTRAINT` for the
+  SuperBlob set) — no offset arithmetic anywhere.
   `Missing` (stored hash all-zero = not bound) stays silent — how the rule self-scopes
   to "what the signer actually binds" (dylibs never bind −1/−3; bare signing
   zero-fills −1).
@@ -377,8 +394,12 @@ Version-gated reads and policies:
   format feature, not tampering).
 - `≥0x20200`: `team_offset @48` (unchanged).
 - `≥0x20300`: `code_limit64 @56`; nonzero overrides `codeLimit` — exposed as
-  `effective_code_limit() -> u64`; `check_code_pages`/`check_code_pages_in_file` switch
-  to it (`signingLimit()` semantics: `version ≥ 0x20300 && codeLimit64 != 0`).
+  `effective_code_limit() -> u64`; `check_code_pages`/`check_code_pages_in_file`
+  switch to it (`signingLimit()` semantics: `version ≥ 0x20300 && codeLimit64 != 0`).
+  **All guard arithmetic runs in `u64` first; `usize` casts only after the value is
+  proven ≤ `code.len()`** — on 32-bit targets (`wasm32` ships `zsign-core`) a
+  `u64 as usize` cast truncates ≥ 4 GiB values and can route around the oversize
+  guard (post-adjudication reviewer finding, disposition: plan task 9 amended).
   `code_limit: u32` field type unchanged (C-6).
 - `≥0x20400`: exec seg fields (item 7).
 - `≥0x20500`: `runtime @88` (pub field), `pre_encrypt_offset @92` (private);
@@ -389,8 +410,10 @@ Version-gated reads and policies:
   the reverse direction is allowed because older SDKs legitimately record 0).
 - `≥0x20600`: linkage fields `u8 hash_type @96, u8 application_type @97,
   u16 application_subtype @98, u32 linkage_offset @100, u32 linkage_size @104`;
-  `linkage_size == 0` → absent; `linkage_size == 20 && linkage_offset + 20 <= data.len()`
-  → structural OK (linkage is a single truncated cdhash pointing outside this
+  `linkage_size == 0` → absent; `linkage_size == 20 && (linkage_offset as u64) + 20
+  <= data.len() as u64` → structural OK (u64 comparison — `linkage_offset ==
+  u32::MAX` must not overflow/panic; linkage is a single truncated cdhash pointing
+  outside this
   signature's verifiable scope — metadata, not a verification input); any other size
   or out-of-bounds offset → `Err`. Not exposed (no consumer).
 - `data = &blob[..declared_length]` inside `parse` (declared = `blob[4..8]`;
@@ -428,8 +451,8 @@ Version-gated reads and policies:
    findings are strings in `report.errors` (C-4). Parsers (`parse_superblob`,
    `CodeDirectory::parse`, requirements parse) may `Err`; `verify_slice` converts.
 2. `special_slots` vector: length == `n_special_slots`, positional, `NotChecked`
-   constructible (C-1..C-3). Primary CD drives `pages`/`special_slots`/`identifier`/
-   `adhoc`.
+   constructible (C-1..C-3). Strongest CD drives `pages`/`special_slots`; primary CD
+   drives `identifier`/`adhoc` and is the sole CMS `content`.
 3. Existing pinned strings stay byte-identical: `code page {i} hash mismatch (code
    region modified?)`, `code slot count mismatch`, `zero code bytes`,
    `special slot -{k} hash mismatch`, `empty CMS wrapper but not ad-hoc flagged`,
@@ -462,12 +485,20 @@ inline in the scope files per repo convention:
 2. corrupt alternate CD *hashType byte* (magic left intact so task 4's magic table
    stays out of the way — the assertion must remain stable after task 4 lands) →
    error carries the parse detail (`unsupported CodeDirectory hash type`); tampered
-   alternate page hash → `alternate SHA-256 code page …` error; primary messages
-   unchanged.
-3. ad-hoc fixture signed with `info_plist`, verified with `SignatureInputs::none()` →
-   `special slot -1 is bound but its content was not supplied`; zero-hash (unbound)
-   slots stay silent (existing bare fixtures); alternate `NotChecked` elevation
-   asserted via the same fixture (dual output carries an alternate).
+   alternate page hash → `alternate SHA-256 code page …` error AND
+   `report.pages == Mismatch { page_index: 0 }` (metadata = strongest = the tampered
+   alternate); primary message texts unchanged. Existing
+   `fat_code_limit_beyond_slice_is_rejected` loses its exact `pages` equality (the
+   field now carries the strongest CD's verdict) and pins the exact stored/computed
+   numbers through the error string instead — documented deviation for queue item 2.
+3. context gating: sign with `code_resources` only, verify with
+   `info_plist: Some(_)` (context supplied, −3 content absent) →
+   `special slot -3 is bound but its content was not supplied` on primary AND
+   `alternate SHA-256`-tagged; the same binary with the right inputs → no findings;
+   `SignatureInputs::none()` on an info-bound fixture → SILENT (standalone contract,
+   facade owns that message); dropping the `0x0002` child (index rename) →
+   `special slot -2 …` fails UNCONDITIONALLY with `none()` (SuperBlob-sourced slots
+   need no caller context).
 4. requirements child magic patched → `parse_superblob` `Err`; distinct-content
    duplicate `0x0002` → `Err`; truncated-CMS fixture still reaches the
    `empty CMS wrapper` rule.
@@ -539,7 +570,7 @@ error-sensitive). Out of scope; escalated below. The lane's acceptance bar is th
 
 | Rule | Our output | `/bin/ls` / codesign ad-hoc |
 |---|---|---|
-| slot elevation (whitelist) | bound slots always have content in fixtures | −2 self-consistent; −1/−3 unbound for CLI tools (and if bound, `zsign`'s own standalone check already fails today — no delta); −4/−6 excluded from whitelist |
+| slot elevation (context-split) | bound slots always have content in fixtures | −2 self-consistent; −1/−3 NOT elevated when `SignatureInputs::none()` (standalone = facade's message, zero core delta — strictly safer than the original blanket rule); −4/−6 excluded |
 | execSeg range | exact vm-pair match (branch 1) | file-space plausibility fallback (branch 2, ≥0x1000 floor) — NOT sound enforcement; see BLOCKED note §7 |
 | unknown execSeg bits | `0x1`/`0x11` ⊂ mask | `/bin/ps` sample: `0x1` ⊂ mask |
 | MAIN_BINARY ⇔ executable | signer sets iff `MH_EXECUTE` | same per Apple source |
@@ -678,3 +709,36 @@ recorded verbatim below and were applied alongside this record before implementa
 
 Reviewer's overall verdict line: "Overall NOT-READY due F9/F13 + NEW logic issues; if
 adjudication treats only landed fixes, F9/F13 NOT-LANDED means not ready."
+
+**Post-adjudication steering (terminal — no round 3) — supervisor classified ALL
+remaining round-2 items doc/nit; applied with this revision. Verbatim findings and
+dispositions carried into the final report:**
+
+- wasm32 bounds (reviewer addendum, bounds-check class): "plan task 9's
+  `cd.effective_code_limit() as usize` truncates u64 >4GiB on 32-bit targets
+  (zsign-wasm is wasm32), which can route around the oversize guard; 64-bit tests can
+  never catch it." → **DISPOSITION:** plan task 9 amended to compare in `u64` before
+  any cast (`limit > code.len() as u64` guard, cast only after the value is proven to
+  fit); design §9 records the invariant; regression case added to
+  `linkage_fields_are_bounds_checked`.
+- linkage overflow (reviewer addendum, panic-path class): "`linkage_offset + 20 <=
+  declared` with u32 offset; `linkage_offset = u32::MAX` overflows (debug panic,
+  release wraparound possible acceptance). Use checked_add/u64 comparison." →
+  **DISPOSITION:** both design §9 and plan task 9 now compare in `u64`; `u32::MAX`
+  case added to the linkage test.
+- `Expr::Unsupported` marker (reviewer addendum, type-sketch class): the grammar
+  requires whole-DR `Unsupported` but the listed `Expr` variants carried no marker →
+  **DISPOSITION:** `Expr::Unsupported(String)` added with parser-storage and
+  evaluator-mapping semantics.
+- Supervisor advisories weighed (applied): strongest-CD metadata with CMS content
+  pinned to the primary (item-1/item-2 split); context-gated −1/−3 elevation with
+  unconditional SuperBlob-sourced slots (item-3 read-only-facade constraint:
+  `SignatureInputs::none()` keeps bound −1/−3 `NotChecked` and the facade message
+  alive); `-p zsign-rs` package id; task-10 Files list includes `macho/verify.rs`.
+- Supervisor advisories weighed (NOT adopted, rationale): "unsupported-opcode policy
+  as explicit reject" for the DR evaluator — the warning policy was reviewed and
+  blessed because the interop gate's `/bin/ls` DR carries certificate-chain ops whose
+  chain DER `crypto/cms_verify.rs` does not expose (design §8); "execSeg range
+  mismatch → WARNING, never error" — the design's file-space branch accepts the cited
+  Apple sample (`Base 0x0, Limit 0x8000`), error fires only when the range matches
+  NEITHER convention (design §7), and this was reviewed as F11.

@@ -35,14 +35,14 @@ findings ride `report.errors`/`report.warnings`. No signer/crypto/zsign edits.
   — baseline `5 passed`, after task 10 `7 passed` (the `verify` filter does NOT match
   `codesign::constants::tests::*`).
 - Caller-migration check (after any task that changes a `pub` signature — tasks 1, 2, 5, 6):
-  `TMPDIR=$PWD/.tmptmp cargo check -p zsign -p zsign-cli --all-targets`
+  `TMPDIR=$PWD/.tmptmp cargo check -p zsign-rs -p zsign-cli --all-targets`
 - Final (task 11 only): scoped gate + constants gate +
   `TMPDIR=$PWD/.tmptmp cargo check --workspace --all-targets`.
 - Expected scoped-gate count chain (54 baseline + new tests; each task's count is
   derived from ITS OWN test list below — if any actual number differs, stop and
   report the drift in plan-vs-actual instead of adjusting silently):
-  T1 +1 → 55 · T2 +2 → 57 · T3 +2 → 59 · T4 +3 → 62 · T5 +5 → 67 · T6 +2 → 69 ·
-  T7 +5 → 74 · T8 +5 → 79 · T9 +7 → 86 · T10 +2 → 88 in the `verify` filter, plus
+  T1 +1 → 55 · T2 +2 → 57 · T3 +3 → 60 · T4 +3 → 63 · T5 +5 → 68 · T6 +2 → 70 ·
+  T7 +5 → 75 · T8 +5 → 80 · T9 +7 → 87 · T10 +2 → 89 in the `verify` filter, plus
   2 task-10 tests under the `constants` filter (5 → 7 there).
 - Commits trigger the pre-commit hook; let it run and react to its output (do not
   manually invoke `cargo fmt`/`cargo clippy`/`hk`).
@@ -203,7 +203,7 @@ For sha256-only fixtures this yields exactly the old behavior (`cd_sha1 = None`,
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
 Expected: `55 passed; 0 failed` (54 baseline + 1 new).
-Run: `TMPDIR=$PWD/.tmptmp cargo check -p zsign -p zsign-cli --all-targets` → OK.
+Run: `TMPDIR=$PWD/.tmptmp cargo check -p zsign-rs -p zsign-cli --all-targets` → OK.
 
 - [ ] **Step 5: Commit**
 
@@ -264,7 +264,9 @@ fn tampered_alternate_page_hash_is_rejected() {
     assert!(report.slices[0].errors.iter().any(|e| e.contains(
         "alternate SHA-256 code page 0 hash mismatch (code region modified?)")),
         "errors: {:?}", report.slices[0].errors);
-    assert_eq!(report.slices[0].pages, PageCheck::Matched); // primary untouched
+    // Metadata = strongest CD (the tampered SHA-256 alternate), so the field
+    // itself now reflects the tamper:
+    assert_eq!(report.slices[0].pages, PageCheck::Mismatch { page_index: 0 });
 }
 ```
 
@@ -289,26 +291,48 @@ CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
 }
 ```
 
-`verify_slice`:
+`verify_slice` (design §2 + architecture: CMS content stays the primary; report
+METADATA is governed by the strongest viable CD):
 - error site: `Err(e) => { report.errors.push(format!("embedded code signature is not a valid SuperBlob: {e}")); return Ok(report); }`
-- pages: keep `report.pages = check_code_pages_in_file(primary, …)` and its existing
-  four message arms verbatim; then for each alternate run `check_code_pages_in_file`
-  and push failures as `alternate {SHA-1|SHA-256} ` + the same message texts —
-  reuse a small local `fn push_page_errors(report: &mut SliceVerifyReport,
-  label: &str, pages: &PageCheck)` so the primary keeps byte-identical strings with an
-  empty label.
-- special slots: keep the primary flow writing `report.special_slots`; for each
-  alternate run `check_special_slots(cd, inputs, req, ent, der)` (the pre-task-6
-  signature) and collect `(label, checks)` pairs in a local
-  `Vec<(String, Vec<SpecialSlotCheck>)>` where label = `alternate {SHA-1|SHA-256} `.
-  In THIS task only push `Mismatch` findings from those pairs as
-  `{label}special slot -{k} hash mismatch`. `NotChecked` elevation for BOTH the
-  primary and the alternates lands in task 3, which replaces this push site with the
-  unified elevation loop — the pairs collection is the hand-off.
-  Label: `if cd.is_sha1() { "SHA-1" } else { "SHA-256" }`.
+- emit `let strongest = cds.iter().max_by_key(|cd| cd.hash_size)` (SHA-256 beats
+  SHA-1; own output emits at most one of each, so the maximum is unique). Pages: run `check_code_pages_in_file`
+  for EVERY emitted CD; push failures through the local
+  `fn push_page_errors(report: &mut SliceVerifyReport, label: &str, pages: &PageCheck)`
+  — empty label for the PRIMARY (byte-identical pinned strings), `alternate
+  {SHA-1|SHA-256} ` for alternates. Then set
+  `report.pages = check_code_pages_in_file(strongest, data, slice)` (recomputed for
+  the strongest CD — its result IS the metadata verdict that `is_valid` gates on via
+  errors).
+- special slots: run `check_special_slots(cd, inputs, req, ent, der)` for every
+  emitted CD (pre-task-6 signature), collect `(label, checks)` pairs where label =
+  `""` for primary and `alternate {SHA-1|SHA-256} ` (label from
+  `if cd.is_sha1() { "SHA-1" } else { "SHA-256" }`) — the pairs are task 3's
+  elevation hand-off. Push `Mismatch` findings from all pairs NOW (tagged);
+  `report.special_slots = check_special_slots(strongest, …)` — the strongest CD's
+  vector is the metadata. `NotChecked` elevation for BOTH primary and alternates
+  lands in task 3.
+- identity (`identifier`, `adhoc`) and the CMS `content` argument stay the PRIMARY
+  (the CMS signs slot 0; strongest must NEVER be applied to `content`).
+
+**Existing-test adjustment (intentional, queue item 2):**
+`fat_code_limit_beyond_slice_is_rejected` asserts an EXACT
+`report.slices[1].pages == CountMismatch { stored, computed }` on the PRIMARY it
+patched. Under strongest-metadata the field now carries the unpatched SHA-256
+alternate's verdict, so move the exact pin into the error channel (the test's second
+assert already checks the substring):
+
+```rust
+assert!(report.slices[1].errors.iter().any(|e| e.contains(&format!(
+    "code slot count mismatch: {n_slots} stored vs {} pages computed",
+    slice_size.div_ceil(page_size)))),
+    "errors: {:?}", report.slices[1].errors);
+```
+
+(drop the exact `pages` equality assert; keep every other line of that test). This is
+a documented deviation: queue item 2 makes the strongest CD's verdict authoritative.
 
 - [ ] **Step 4: Green + migration check** — scoped gate → `57 passed; 0 failed`;
-  `cargo check -p zsign -p zsign-cli --all-targets` → OK.
+  `cargo check -p zsign-rs -p zsign-cli --all-targets` → OK.
 
 - [ ] **Step 5: Commit** — `fix(verify): verify every emitted code directory and surface parse detail`
 
@@ -324,64 +348,106 @@ CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
 
 ```rust
 #[test]
-fn bound_info_plist_without_input_is_an_error() {
-    let info = b"<?xml version=\"1.0\"?><plist><dict><key>CFBundleIdentifier</key><string>com.example</string></dict></plist>";
+fn bound_slots_fail_when_context_is_supplied() {
+    let resources =
+        b"<?xml version=\"1.0\"?><plist><dict><key>files2</key><dict/></dict></plist>";
     let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-    let signed = sign_macho_adhoc(&macho, "com.example", None, Some(info), None, false).unwrap();
-    let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+    let signed = sign_macho_adhoc(&macho, "com.example", None, None, Some(resources), false).unwrap();
+    // Context supplied (any SignatureInputs field present) but the bound -3 content
+    // is not → core-level failure, on primary and alternate alike:
+    let inputs = SignatureInputs { info_plist: Some(b"not-the-fixture".as_slice()), code_resources: None };
+    let report = verify_macho(&signed, &inputs).unwrap();
     assert!(!report.is_valid());
     let errors = &report.slices[0].errors;
     assert!(errors.iter()
-        .any(|e| e.contains("special slot -1 is bound but its content was not supplied")),
+        .any(|e| e.contains("special slot -3 is bound but its content was not supplied")),
         "primary: {:?}", errors);
-    // Dual output's PRIMARY is the SHA-1 CD and its ALTERNATE is SHA-256
-    // (superblob.rs routes SHA-1 -> slot 0x0000, SHA-256 -> 0x1000), so the
-    // tagged label is "alternate SHA-256":
+    // Dual output's alternate is the SHA-256 CD; its unavailable slot elevates tagged:
     assert!(errors.iter().any(|e| e.contains(
-        "alternate SHA-256 special slot -1 is bound but its content was not supplied")),
+        "alternate SHA-256 special slot -3 is bound but its content was not supplied")),
         "alternate: {:?}", errors);
-    // With the real input the same binary has no slot finding:
+    // With BOTH contents supplied the same binary has no slot finding:
     let ok = verify_macho(&signed, &SignatureInputs {
-        info_plist: Some(info), code_resources: None }).unwrap();
+        info_plist: None, code_resources: Some(resources) }).unwrap();
     assert!(ok.slices[0].errors.is_empty(), "{:?}", ok.slices[0].errors);
 }
 
 #[test]
-fn unbound_special_slots_stay_silent() {
-    // ad-hoc, no info/resources/entitlements: slots -1/-3 zero-filled (not bound)
+fn standalone_without_context_stays_silent() {
+    // SignatureInputs::none() means "caller cannot supply -1/-3" (standalone
+    // verification): bound-but-unavailable -1 stays NotChecked, the facade
+    // (zsign verify_macho_file) reports it — core must not fail here.
+    let info = b"<?xml version=\"1.0\"?><plist><dict><key>CFBundleIdentifier</key><string>com.example</string></dict></plist>";
     let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-    let signed = sign_macho_adhoc(&macho, "com.example.bare", None, None, None, false).unwrap();
+    let signed = sign_macho_adhoc(&macho, "com.example", None, Some(info), None, false).unwrap();
     let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
     assert!(report.is_valid(), "{:?}", report.slices[0].errors);
+    assert!(report.slices[0].errors.iter().all(|e| !e.contains("bound but")));
+}
+
+#[test]
+fn requirements_slot_failure_needs_no_context() {
+    // SuperBlob-sourced slots (-2 here) need NO caller context: drop the 0x0002
+    // child by renaming its index entry to an unknown slot and keep the nonzero
+    // -2 hash → unconditional core failure, even with SignatureInputs::none().
+    let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+    let mut signed = sign_macho_adhoc(&macho, "com.example.bare", None, None, None, false).unwrap();
+    let m = MachOFile::parse(signed.clone()).unwrap();
+    let sl = &m.slices()[0];
+    let sig_off = sl.code_sig_offset.unwrap() as usize;
+    let sig_len = sl.code_sig_size.unwrap() as usize;
+    let count = u32::from_be_bytes(
+        signed[sig_off + 8..sig_off + 12].try_into().unwrap()) as usize;
+    for i in 0..count {
+        let e = sig_off + 12 + i * 8;
+        if u32::from_be_bytes(signed[e..e + 4].try_into().unwrap()) == CSSLOT_REQUIREMENTS {
+            signed[e..e + 4].copy_from_slice(&0x0040u32.to_be_bytes());
+        }
+    }
+    let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+    assert!(!report.is_valid());
+    assert!(report.slices[0].errors.iter().any(|e| e
+        .contains("special slot -2 is bound but its content was not supplied")),
+        "errors: {:?}", report.slices[0].errors);
 }
 ```
 
-- [ ] **Step 2: Confirm failure** — first test FAILS (no elevation), second PASSES
-  (keep it as the guard for the whitelist scoping).
+(Add `CSSLOT_REQUIREMENTS` to the test imports if absent.)
+
+- [ ] **Step 2: Confirm failure** — all three FAIL (no elevation exists yet; test 2
+  currently passes trivially and guards the gating rule once elevation lands).
 
 - [ ] **Step 3: Implement elevation** — REPLACE task 2's Mismatch-only push site with
 one unified loop over the primary plus every collected alternate pair:
 
 ```rust
-const REQUIRED_SPECIAL_SLOTS: [i32; 9] = [
-    CSSLOT_SPECIAL_INFOSLOT,             // -1
-    CSSLOT_SPECIAL_REQUIREMENTS,         // -2
-    CSSLOT_SPECIAL_RESOURCEDIR,          // -3
-    CSSLOT_SPECIAL_ENTITLEMENTS,         // -5
-    CSSLOT_SPECIAL_DER_ENTITLEMENTS,     // -7
-    // -8..-11 arrive as numeric literals here; task 10 swaps in the new constants
-    -8, -9, -10, -11,
+// -1/-3 need caller-supplied content: elevate ONLY when the caller demonstrated
+// bundle context (any SignatureInputs field present). SignatureInputs::none()
+// means "standalone: caller cannot supply these" — the zsign facade reports them.
+const CONTEXT_SLOTS: [i32; 2] = [CSSLOT_SPECIAL_INFOSLOT, CSSLOT_SPECIAL_RESOURCEDIR];
+// -2/-5/-7 and the launch-constraint slots are SuperBlob-sourced: their content
+// needs no caller context, so NotChecked there is ALWAYS a core failure.
+const SUPERBLOB_SLOTS: [i32; 7] = [
+    CSSLOT_SPECIAL_REQUIREMENTS,       // -2
+    CSSLOT_SPECIAL_ENTITLEMENTS,       // -5
+    CSSLOT_SPECIAL_DER_ENTITLEMENTS,   // -7
+    -8, -9, -10, -11,                  // launch constraints; task 10 swaps in the new constants
 ];
+let context_supplied =
+    inputs.info_plist.is_some() || inputs.code_resources.is_some();
 // pairs: Vec<(String /* label, "" for primary */, Vec<SpecialSlotCheck>)>,
-// built from ("".to_string(), report.special_slots.clone()) + task 2's alternates.
+// built from ("".to_string(), report.special_slots-from-strongest-CD...) — use the
+// PRIMARY's checks for the primary pair (task 2 collected them) plus the alternates.
 for (label, checks) in &pairs {
     for (i, check) in checks.iter().enumerate() {
         let k = i + 1;
+        let slot = -(k as i32);
         match check {
             SpecialSlotCheck::Mismatch => report.errors.push(format!(
                 "{label}special slot -{k} hash mismatch")),
             SpecialSlotCheck::NotChecked
-                if REQUIRED_SPECIAL_SLOTS.contains(&-(k as i32)) =>
+                if SUPERBLOB_SLOTS.contains(&slot)
+                    || (context_supplied && CONTEXT_SLOTS.contains(&slot)) =>
             {
                 report.errors.push(format!(
                     "{label}special slot -{k} is bound but its content was not supplied"));
@@ -392,12 +458,14 @@ for (label, checks) in &pairs {
 }
 ```
 
-`-4`/`-6` and `k ≥ 12` stay non-fatal `NotChecked` (design §special-slot content map:
-never in the brief's required list; blanketing them risks the interop gate on Apple
-output). With empty labels the primary's `Mismatch` string stays byte-identical to the
-pinned `special slot -{k} hash mismatch`.
+`-4`/`-6` and `k ≥ 12` stay non-fatal `NotChecked` (never in the brief's required
+list; blanketing them risks the interop gate on Apple output). With empty labels the
+primary's `Mismatch` string stays byte-identical to the pinned
+`special slot -{k} hash mismatch`. NOTE: task 2 stores `report.special_slots` from the
+strongest CD; the PRIMARY's own vector must also be retained for this loop (collect
+it in task 2 before overwriting — e.g. clone the primary checks into `pairs` first).
 
-- [ ] **Step 4: Green** — scoped gate → `59 passed; 0 failed`. No pub signature
+- [ ] **Step 4: Green** — scoped gate → `60 passed; 0 failed`. No pub signature
   change → no migration check needed.
 
 - [ ] **Step 5: Commit** — `fix(verify): fail on bound special slots whose content is unavailable`
@@ -494,7 +562,7 @@ table yet (their magic arrives with task 10). The truncated-CMS fixture keeps an
 8-byte child with intact `CSMAGIC_BLOBWRAPPER` magic → passes the table; the
 `empty CMS wrapper` rule still fires (design R5).
 
-- [ ] **Step 4: Green** — scoped gate → `62 passed; 0 failed` (59 + 3 new).
+- [ ] **Step 4: Green** — scoped gate → `63 passed; 0 failed` (60 + 3 new).
 
 - [ ] **Step 5: Commit** — `fix(verify): validate slot blob magics and reject duplicate slots`
 
@@ -742,9 +810,9 @@ Rationale for both conditions: a present-but-unbound DER child (hash zeroed) fai
 harmless (the binding rule is what rejects it). Non-executables and pre-0x20400 CDs
 never fire the rule (dylibs bind −5 without −7 by design).
 
-- [ ] **Step 4: Green + migration check** — scoped gate → `67 passed; 0 failed`
-  (62 + 5 new);
-  `cargo check -p zsign -p zsign-cli --all-targets` → OK (`SlotEntry::payload` is
+- [ ] **Step 4: Green + migration check** — scoped gate → `68 passed; 0 failed`
+  (63 + 5 new);
+  `cargo check -p zsign-rs -p zsign-cli --all-targets` → OK (`SlotEntry::payload` is
   additive; `self_consistent_blobs` untouched until task 6).
 
 - [ ] **Step 5: Commit** — `fix(verify): compare xml and der entitlements and require der for main executables`
@@ -838,12 +906,12 @@ fn bound_launch_constraint_without_blob_is_rejected() {
 ```
 
 (`child_off_in_signed` is task 5's helper. The fixture's PRIMARY is the SHA-1 CD
-(dual output, `hash_size` 20): `hashOffset = 88 + 14 + 7*20 = 242`, so the parse guard
-`n_special <= hashOffset/hash_size` gives `8 <= 12` ✓, and the grown −8 window
-`[242-160, 242-140) = [82, 102)` lands on the exec-segment header tail (nonzero flags
-word) plus the identifier bytes — deterministically nonzero "bound" storage. The
-alternate CD keeps `n = 7`, so only the primary contributes the −8 finding — tagged
-with the empty primary label.)
+(dual output, `hash_size` 20): ident `com.example.lc\0` = 15 bytes, so
+`hashOffset = 88 + 15 + 7*20 = 243`, the parse guard `n_special <= hashOffset/hash_size`
+gives `8 <= 12` ✓, and the grown −8 window `[243-160, 243-140) = [83, 103)` lands on
+the exec-segment header tail (nonzero flags word) plus the identifier bytes —
+deterministically nonzero "bound" storage. The alternate CD keeps `n = 7`, so only
+the primary contributes the −8 finding — tagged with the empty primary label.)
 
 - [ ] **Step 2: Confirm failure** — unit FAILS (old `check_special_slots` signature —
   compile error counts as the failing step; the `Matched` path does not exist yet).
@@ -890,8 +958,8 @@ children directly from `superblob.entries`, so nothing else consumed the deleted
 items). Note the alternate-CD slot checks from task 2 also migrate to the new
 signature in this task.
 
-- [ ] **Step 4: Green + migration check** — scoped gate → `69 passed; 0 failed`
-  (67 + 2 new); `cargo check -p zsign -p zsign-cli --all-targets` → OK.
+- [ ] **Step 4: Green + migration check** — scoped gate → `70 passed; 0 failed`
+  (68 + 2 new); `cargo check -p zsign-rs -p zsign-cli --all-targets` → OK.
 
 - [ ] **Step 5: Commit** — `fix(verify): verify launch constraint slots against their superblob blobs`
 
@@ -1069,7 +1137,7 @@ if flags & CROSS_CHECK_FLAGS != 0 {
 `CS_EXECSEG_DEBUGGER|CS_EXECSEG_JIT|CS_EXECSEG_SKIP_LV` already exist in constants (zero
 consumers today → first use here).
 
-- [ ] **Step 4: Green** — scoped gate → `74 passed; 0 failed` (69 + 5 new; any drift
+- [ ] **Step 4: Green** — scoped gate → `75 passed; 0 failed` (70 + 5 new; any drift
   must be explained in the final report; existing fixtures must stay green — the
   dual/sha256-only/ad-hoc fixtures all carry `(base,limit)` = vm pair, flags `0x1`).
 
@@ -1320,7 +1388,12 @@ pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>>;
 
 (`Expr` is the private tree enum: `True | False | Ident(Vec<u8>) | AppleAnchor |
 AppleGenericAnchor | Not(Box<Expr>) | And(Box<Expr>, Box<Expr>) | Or(Box<Expr>,
-Box<Expr>) | CdHash(Vec<u8>)`.)
+Box<Expr>) | CdHash(Vec<u8>) | Unsupported(String)`. The parser stores
+`Unsupported(reason)` — the opcode number/flags that stopped it — as the WHOLE tree
+at the first out-of-set opcode (it never builds a mixed tree), and
+`Requirement::evaluate` maps `Expr::Unsupported(reason)` to
+ `RequirementVerdict::Unsupported(reason)`; every other variant evaluates per the
+Kleene rules below.)
 
 Parser details — **one grammar rule (design §8), no contradictions**: SuperBlob
 `magic == CSMAGIC_REQUIREMENTS`, `count` bounded by the declared length (read from the
@@ -1385,9 +1458,9 @@ if let Some(req) = superblob.entries.iter().find(|e| e.slot == CSSLOT_REQUIREMEN
 }
 ```
 
-- [ ] **Step 4: Green + migration check** — scoped gate → `79 passed; 0 failed`
-  (74 + 5 new);
-  `cargo check -p zsign -p zsign-cli --all-targets` → OK.
+- [ ] **Step 4: Green + migration check** — scoped gate → `80 passed; 0 failed`
+  (75 + 5 new);
+  `cargo check -p zsign-rs -p zsign-cli --all-targets` → OK.
 
 - [ ] **Step 5: Commit** — `feat(verify): parse and evaluate the designated requirement`
 
@@ -1502,6 +1575,13 @@ fn linkage_fields_are_bounds_checked() {
     let mut t3 = vec![0u8; 64];
     t3[60..64].copy_from_slice(&7u32.to_be_bytes()); // size must be 0 or 20
     assert!(CodeDirectory::parse(&synth_cd(0x20600, &t3)).is_err());
+
+    // u32::MAX offset must NOT overflow the bounds arithmetic (debug panic /
+    // release wrap) — it is simply out of range:
+    let mut t4 = vec![0u8; 64];
+    t4[56..60].copy_from_slice(&u32::MAX.to_be_bytes());
+    t4[60..64].copy_from_slice(&20u32.to_be_bytes());
+    assert!(CodeDirectory::parse(&synth_cd(0x20600, &t4)).is_err());
 }
 
 #[test]
@@ -1552,12 +1632,36 @@ Gated reads (add `rd_u64`): `≥0x20100` `scatter_offset @44` (≠0 →
 `Err("runtime version recorded without the CS_RUNTIME flag")`) and
 `pre_encrypt_offset @92` (private; ≠0 → `Err("pre-encrypted CodeDirectory hashes are not supported")`);
 `≥0x20600` linkage quintet `@96..108` (private; `linkage_size == 0` ok;
-`== 20 && linkage_offset + 20 <= declared` ok; else `Err`).
+`== 20 && (linkage_offset as u64) + 20 <= declared as u64` ok — u64 comparison so
+`linkage_offset == u32::MAX` cannot overflow; else `Err`).
 
-`check_code_pages`: replace `cd.code_limit as usize` with
-`cd.effective_code_limit() as usize` (both the `region_len` computation and the
-oversize guard). `check_code_pages_in_file` (macho) inherits this through
-`check_code_pages` — no change there beyond keeping its slice-bound comment accurate.
+`check_code_pages`: honor `effective_code_limit()` with ALL arithmetic in `u64`
+FIRST — `usize` casts only after the value is proven to fit (post-adjudication
+reviewer findings: on 32-bit targets such as `wasm32`, `u64 as usize` truncates
+values ≥ 4 GiB and can route around the oversize guard):
+
+```rust
+let limit: u64 = cd.effective_code_limit();
+let code_len = code.len() as u64;
+let region_len_u64 = limit.min(code_len);
+if limit > code_len {
+    // proven: region_len_u64 == code_len <= usize::MAX, so this cast is safe
+    return PageCheck::CountMismatch {
+        stored: cd.n_code_slots as usize,
+        computed: region_len_u64.div_ceil(page_size as u64) as usize,
+    };
+}
+let region_len = region_len_u64 as usize; // safe: <= code.len()
+```
+
+(equivalent alternative: `usize::try_from(limit).unwrap_or(usize::MAX)` before the
+existing logic — either is acceptable, the invariant is "no `u64 → usize` cast before
+the comparison that the guard relies on".) The linkage bounds check gets the same
+treatment (u32 overflow): replace `linkage_offset + 20 <= declared` with
+`(linkage_offset as u64) + 20 <= declared as u64` (or
+`usize::try_from(linkage_offset).ok().and_then(|o| o.checked_add(20)).is_some_and(|end| end <= declared)`)
+so `linkage_offset == u32::MAX` cannot panic in debug or wrap in release.
+`check_code_pages_in_file` (macho) inherits this through `check_code_pages`.
 
 Update the constants (this task): `CODEDIRECTORY_VERSION_RUNTIME = 0x20500` and
 `CODEDIRECTORY_VERSION_LINKAGE = 0x20600`, doc comments fixed to the librarian's
@@ -1566,7 +1670,7 @@ keeps `0x20500` with a comment that `supportsPreEncrypt` gates *both* runtime an
 preEncryptOffset. Note: `CODEDIRECTORY_VERSION_LINKAGE` is now the table's top bucket —
 its old `0x20700` value exists in no authoritative source.
 
-- [ ] **Step 4: Green** — scoped gate → `86 passed; 0 failed` (79 + 7 new; baseline
+- [ ] **Step 4: Green** — scoped gate → `87 passed; 0 failed` (80 + 7 new; baseline
   fixtures all emit `0x20400` with zeroed gated fields → unchanged).
 
 - [ ] **Step 5: Commit** — `fix(verify): honor codedirectory version layout and code limit64`
@@ -1578,7 +1682,10 @@ its old `0x20700` value exists in no authoritative source.
 **Files:**
 - Modify: `crates/zsign-core/src/codesign/constants.rs`
 - Modify: `crates/zsign-core/src/codesign/verify.rs` — adopt the three new constants
-  (old-magic diagnostic, constraint-slot magic table entry, −8..−11 names).
+  (old-magic diagnostic, constraint-slot magic table entry).
+- Modify: `crates/zsign-core/src/macho/verify.rs` — swap the task-3/6 numeric
+  literals for the new constants (`SUPERBLOB_SLOTS` −8..−11 entries; the task-6 test's
+  `0xfade8181u32` literal → `CSMAGIC_LAUNCH_CONSTRAINT`).
 
 - [ ] **Step 1: Failing tests first** (Tester)
 
@@ -1677,13 +1784,20 @@ const REQUIRED_SPECIAL_SLOTS: [i32; 9] = [
   index; `-k` lands on the negative constants — valid i32 range −1..=−11, ascending
   constants irrelevant because `contains` on an array checks membership). Behavior
   identical to the numeric version.
+- `macho/verify.rs` elevation: the task-3 `SUPERBLOB_SLOTS` array literals
+  `-8, -9, -10, -11` become
+  `CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_SELF, CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_PARENT,
+  CSSLOT_SPECIAL_LAUNCH_CONSTRAINT_RESPONSIBLE, CSSLOT_SPECIAL_LIBRARY_CONSTRAINT`
+  (membership via `contains(&-(k as i32))` — no offset arithmetic anywhere; the task-6
+  content map already routes `8 => slot_child(CSSLOT_LAUNCH_CONSTRAINT_SELF)` etc.
+  with direct positive-constant match arms and needs no change).
 - `macho/verify.rs` task-6 test: swap its `0xfade8181u32` literal for
   `CSMAGIC_LAUNCH_CONSTRAINT`.
 
-- [ ] **Step 4: Green + final migration** — scoped gate → `88 passed; 0 failed`
-  (86 + 2 new) AND constants gate `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core
+- [ ] **Step 4: Green + final migration** — scoped gate → `89 passed; 0 failed`
+  (87 + 2 new) AND constants gate `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core
   constants` → `7 passed` (5 baseline + 2 new);
-  `cargo check -p zsign -p zsign-cli --all-targets` → OK.
+  `cargo check -p zsign-rs -p zsign-cli --all-targets` → OK.
 
 - [ ] **Step 5: Commit** — `fix(constants): correct ticket slot and version gates, add launch constraint magic`
 
@@ -1696,7 +1810,7 @@ const REQUIRED_SPECIAL_SLOTS: [i32; 9] = [
 - [ ] **Step 1: Full scoped gates**
 
 Run: `mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core verify -- --skip test_ipa_signing_is_deterministic`
-Expected: `88 passed; 0 failed` (54 baseline + 34 new across tasks 1-10; if the actual
+Expected: `89 passed; 0 failed` (54 baseline + 35 new across tasks 1-10; if the actual
 number differs, report the drift rather than adjusting the expectation).
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core constants`
 Expected: `7 passed; 0 failed`. Save both verbatim tails for the final report.
@@ -1739,11 +1853,20 @@ Expected: only the three scope files + the two force-added docs changed; 12-13 c
   all applied before this revision: header-payload stripping, repo-actual DER tags
   (`0x70`/`0xb0`), generalized injected-anchor helper, preserved empty-CMS guard,
   single unsupported-opcode rule, interop cert-line recorded as pre-existing red,
-  emitted-CD list hoisted, valid launch-constant arithmetic, alternate `NotChecked`
+  emitted-CD list hoisted, direct positive-constant mapping + membership-list
+  elevation (no offset arithmetic anywhere), alternate `NotChecked`
   elevation, binding-gated DER rule, honest execSeg fallback with 4 KiB floor,
   task-2/task-6 fixtures immune to later-task magic checks, complete helper code,
   constants-filter command + corrected count chain, bare-signing n-slot correction,
   C-7 USED list inlined.
+- **Post-adjudication amendments (this revision):** strongest-CD metadata with CMS
+  content pinned to the primary (task 2 + design); context-gated −1/−3 elevation with
+  unconditional SuperBlob-sourced slots (task 3 + design); `u64`-first
+  `effective_code_limit` bounds and `u64` linkage comparison (task 9, post-adjudication
+  reviewer findings); `Expr::Unsupported(String)` storage marker (task 8);
+  `-p zsign-rs` package id everywhere; task-10 Files list includes
+  `macho/verify.rs`; gate count chain recomputed (T3 +3 → 60 … final 89 + 2
+  constants-filter).
 - **Deviation handling:** any plan change discovered during implementation (e.g. a
   fixture whose pass-count differs, an existing test that must be adjusted) is recorded
   in the final report's plan-vs-actual section, per the brief.
