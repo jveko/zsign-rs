@@ -44,6 +44,29 @@ const LINKEDIT_DATA_COMMAND_SIZE: u32 = 16;
 const PAGE_SIZE: usize = 4096;
 const CODE_SIGN_PADDING: usize = 16384;
 
+/// End of the signature range currently declared by the LC_CODE_SIGNATURE
+/// command, read from the buffer's own bytes at the command offset.
+fn declared_signature_end(
+    data: &[u8],
+    lc_offset: usize,
+    is_big_endian: bool,
+) -> Result<Option<usize>> {
+    let cmd_end = lc_offset
+        .checked_add(16)
+        .ok_or_else(|| Error::MachO("LC_CODE_SIGNATURE offset overflow".into()))?;
+    if cmd_end > data.len() {
+        return Err(Error::MachO(format!(
+            "LC_CODE_SIGNATURE at {lc_offset} extends past the {}-byte buffer",
+            data.len()
+        )));
+    }
+    let dataoff = read_u32(data, lc_offset + 8, is_big_endian)? as usize;
+    let datasize = read_u32(data, lc_offset + 12, is_big_endian)? as usize;
+    Ok(Some(dataoff.checked_add(datasize).ok_or_else(|| {
+        Error::MachO("LC_CODE_SIGNATURE: offset + size overflow".into())
+    })?))
+}
+
 /// Calculates the binary length needed to accommodate a code signature.
 ///
 /// Computes space for code hashes (SHA-1 and SHA-256) plus padding.
@@ -104,14 +127,10 @@ fn realloc_code_sign_space_single(
     code_length: usize,
 ) -> Result<Vec<u8>> {
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
+
     if !is_64 {
         return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
-
-    let new_length = calculate_signature_space(code_length);
-
-    if new_length <= data.len() {
-        return Ok(data.to_vec());
     }
 
     let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
@@ -134,17 +153,39 @@ fn realloc_code_sign_space_single(
             _ => {}
         }
     }
+    if code_length > data.len() {
+        return Err(Error::MachO(format!(
+            "code_length {code_length} exceeds the {}-byte buffer",
+            data.len()
+        )));
+    }
+    let sig_offset = align_to(code_length, 16);
+    let reserve = calculate_signature_space(code_length)
+        .checked_sub(code_length)
+        .ok_or_else(|| Error::MachO("signature space smaller than code length".into()))?;
+    let formula_end = sig_offset
+        .checked_add(reserve)
+        .ok_or_else(|| Error::MachO("signature space overflow".into()))?;
+    let declared_end = match code_sig_cmd {
+        Some((lc_offset, _)) => declared_signature_end(data, lc_offset, is_big_endian)?,
+        None => None,
+    };
+    let required = declared_end.map_or(formula_end, |end| end.max(formula_end));
+    if required <= data.len() {
+        return Ok(data.to_vec());
+    }
 
     let mut output = data[..code_length].to_vec();
-
-    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
     if let Some((offset, seg)) = linkedit_cmd {
         let linkedit_fileoff = seg.fileoff as usize;
         let old_vmsize = seg.vmsize;
-        let size_increase = new_length - data.len();
+        let size_increase = required - data.len();
         let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;
-        let new_filesize = (new_length - linkedit_fileoff) as u64;
+        let new_filesize = required
+            .checked_sub(linkedit_fileoff)
+            .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
+            as u64;
 
         write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
         write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
@@ -152,7 +193,7 @@ fn realloc_code_sign_space_single(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
+    let sig_datasize = checked_u32(required - code_length, "sig_datasize")?;
 
     if let Some((offset, _)) = code_sig_cmd {
         write_u32(
@@ -213,7 +254,7 @@ fn realloc_code_sign_space_single(
         )?;
     }
 
-    output.resize(new_length, 0);
+    output.resize(required, 0);
 
     Ok(output)
 }
@@ -936,21 +977,41 @@ pub fn realloc_code_sign_space_with_metadata(
         return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
     }
 
-    let new_length = calculate_signature_space(code_length);
-
-    if new_length <= data.len() {
+    if code_length > data.len() {
+        return Err(Error::MachO(format!(
+            "code_length {code_length} exceeds the {}-byte buffer",
+            data.len()
+        )));
+    }
+    let is_big_endian = metadata.is_big_endian;
+    let sig_offset = align_to(code_length, 16);
+    let reserve = calculate_signature_space(code_length)
+        .checked_sub(code_length)
+        .ok_or_else(|| Error::MachO("signature space smaller than code length".into()))?;
+    let formula_end = sig_offset
+        .checked_add(reserve)
+        .ok_or_else(|| Error::MachO("signature space overflow".into()))?;
+    let declared_end = match metadata.code_sig_cmd {
+        Some((lc_offset, _, _)) => declared_signature_end(data, lc_offset, is_big_endian)?,
+        None => None,
+    };
+    let required = declared_end.map_or(formula_end, |end| end.max(formula_end));
+    if required <= data.len() {
         return Ok((data.to_vec(), metadata.clone()));
     }
 
     let mut output = data[..code_length].to_vec();
-    let is_big_endian = metadata.is_big_endian;
+
     let mut updated_metadata = metadata.clone();
 
     if let Some((offset, fileoff, vmsize, _filesize)) = metadata.linkedit_cmd {
         let linkedit_fileoff = fileoff as usize;
-        let size_increase = new_length - data.len();
+        let size_increase = required - data.len();
         let new_vmsize = align_to(vmsize as usize + size_increase, PAGE_SIZE) as u64;
-        let new_filesize = (new_length - linkedit_fileoff) as u64;
+        let new_filesize = required
+            .checked_sub(linkedit_fileoff)
+            .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
+            as u64;
 
         write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
         write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
@@ -960,7 +1021,7 @@ pub fn realloc_code_sign_space_with_metadata(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = checked_u32(new_length - code_length, "sig_datasize")?;
+    let sig_datasize = checked_u32(required - code_length, "sig_datasize")?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
         write_u32(
@@ -1025,7 +1086,7 @@ pub fn realloc_code_sign_space_with_metadata(
         updated_metadata.max_load_cmd_end = insert_end;
     }
 
-    output.resize(new_length, 0);
+    output.resize(required, 0);
 
     Ok((output, updated_metadata))
 }
@@ -1058,6 +1119,15 @@ pub fn prepare_code_with_metadata(
 
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
+    let declared_end = sig_offset
+        .checked_add(sig_size as usize)
+        .ok_or_else(|| Error::MachO("signature reserve overflows the buffer index".into()))?;
+    if declared_end > data.len() {
+        return Err(Error::MachO(format!(
+            "signature reserve of {sig_size} bytes at offset {sig_offset} exceeds the {}-byte buffer",
+            data.len()
+        )));
+    }
 
     let mut prepared = data[..code_length].to_vec();
 
@@ -1149,10 +1219,19 @@ pub fn prepare_code_in_place(
         return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
     }
 
-    buf.truncate(code_length);
-
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
+    let declared_end = sig_offset
+        .checked_add(sig_size as usize)
+        .ok_or_else(|| Error::MachO("signature reserve overflows the buffer index".into()))?;
+    if declared_end > buf.len() {
+        return Err(Error::MachO(format!(
+            "signature reserve of {sig_size} bytes at offset {sig_offset} exceeds the {}-byte buffer",
+            buf.len()
+        )));
+    }
+
+    buf.truncate(code_length);
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
         update_linkedit_data_command(
@@ -1653,5 +1732,134 @@ mod tests {
             0x1000,
             "CodeDirectory execSegLimit must round-trip for a big-endian image"
         );
+    }
+    fn big_signed_buffer() -> Vec<u8> {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data.resize(0x8000, 0);
+        let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let sizeofcmds = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        data[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+        data[20..24].copy_from_slice(&(sizeofcmds + 16).to_le_bytes());
+        let lc = 32 + sizeofcmds as usize; // 280
+        data[lc..lc + 4].copy_from_slice(&0x1du32.to_le_bytes()); // LC_CODE_SIGNATURE
+        data[lc + 4..lc + 8].copy_from_slice(&16u32.to_le_bytes()); // cmdsize
+        data[lc + 8..lc + 12].copy_from_slice(&0x3000u32.to_le_bytes()); // dataoff
+        data[lc + 12..lc + 16].copy_from_slice(&0x6000u32.to_le_bytes()); // datasize
+        data
+    }
+
+    #[test]
+    fn test_realloc_expands_to_cover_declared_reserve() {
+        let data = big_signed_buffer();
+        // goblin parses the input without bounds-checking the declared range;
+        // MachOFile::parse would (correctly) reject it, which is the bug's symptom.
+        let out = realloc_code_sign_space(&data, 0x3000).expect("expansion must succeed");
+        let reparsed = crate::macho::MachOFile::parse(out.clone())
+            .expect("expanded output must reparse: the declared reserve has to fit");
+        let slice = &reparsed.slices()[0];
+        let dataoff = slice
+            .code_sig_offset
+            .expect("output carries LC_CODE_SIGNATURE") as usize;
+        let datasize = slice
+            .code_sig_size
+            .expect("output carries LC_CODE_SIGNATURE") as usize;
+        assert!(
+            dataoff + datasize <= out.len(),
+            "declared signature range {dataoff:#x}+{datasize:#x} must fit in {:#x}-byte output",
+            out.len()
+        );
+        assert_eq!(
+            slice.code_length, 0x3000,
+            "code region must end at the existing dataoff"
+        );
+    }
+
+    #[test]
+    fn test_realloc_with_metadata_expands_to_cover_declared_reserve() {
+        use crate::macho::parser::MachOMetadata;
+        let data = big_signed_buffer();
+        let metadata = MachOMetadata {
+            code_sig_cmd: Some((280, 0x3000, 0x6000)),
+            linkedit_cmd: Some((184, 0x2000, 0x1000, 0)),
+            max_load_cmd_end: 296,
+            first_segment_offset: 0x1000,
+            is_big_endian: false,
+            is_64: true,
+        };
+        let (out, meta) = realloc_code_sign_space_with_metadata(&data, &metadata, 0x3000)
+            .expect("expansion must succeed");
+        let (_, dataoff, datasize) = meta.code_sig_cmd.expect("metadata echoes the command");
+        assert!(
+            (dataoff as usize) + (datasize as usize) <= out.len(),
+            "declared range {dataoff:#x}+{datasize:#x} must fit in {:#x}-byte output",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn test_prepare_rejects_reserve_exceeding_buffer_capacity() {
+        let data = crate::macho::fixtures::make_minimal_macho(); // 0x2000, unsigned
+        let macho = crate::macho::MachOFile::parse(data.clone()).expect("fixture must parse");
+        let meta = macho.slices()[0].metadata.clone();
+        let mut buf = data;
+        let err = prepare_code_in_place(&mut buf, &meta, 0x2000, 0x3000)
+            .expect_err("declaring 0x3000 bytes of reserve in a 0x2000 buffer must be refused");
+        let msg = match err {
+            crate::Error::MachO(m) => m,
+            other => panic!("expected MachO error, got {other:?}"),
+        };
+        assert!(
+            msg.contains("reserve"),
+            "message must name the reserve: {msg}"
+        );
+        assert_eq!(buf.len(), 0x2000, "buffer must be untouched on refusal");
+    }
+
+    #[test]
+    fn test_prepare_capacity_guard_counts_alignment_pad_for_odd_dataoff() {
+        // Odd dataoff 0x2001: the signature starts at 0x2010, so a 0x400 reserve
+        // ends at 0x2410 — 15 bytes past the 0x2401-byte input the caller passed.
+        let signed = crate::macho::fixtures::make_signed_minimal_macho_at(0x2001, 0x400);
+        let macho = crate::macho::MachOFile::parse(signed.clone()).expect("odd input must parse");
+        let slice = &macho.slices()[0];
+        assert_eq!(
+            slice.code_length, 0x2001,
+            "fixture precondition: odd dataoff"
+        );
+        let mut buf = signed;
+        let err = prepare_code_in_place(&mut buf, &slice.metadata, slice.code_length, 0x400)
+            .expect_err("reserve plus the 15-byte alignment pad exceeds the caller's buffer");
+        let msg = match err {
+            crate::Error::MachO(m) => m,
+            other => panic!("expected MachO error, got {other:?}"),
+        };
+        assert!(
+            msg.contains("exceeds"),
+            "message must explain the overflow: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_aligned_resign_roundtrip() {
+        let first = crate::macho::sign_macho_adhoc(
+            &crate::macho::MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+                .expect("fixture parses"),
+            "com.example.first",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("first sign");
+        let second = crate::macho::sign_macho_adhoc(
+            &crate::macho::MachOFile::parse(first).expect("first output parses"),
+            "com.example.second",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("aligned re-sign must succeed");
+        crate::macho::MachOFile::parse(second).expect("re-signed output parses");
     }
 }

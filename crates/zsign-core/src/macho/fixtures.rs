@@ -87,6 +87,35 @@ pub(crate) fn make_minimal_macho() -> Vec<u8> {
     b.resize(0x2000, 0);
     b
 }
+/// `make_minimal_macho` extended with an existing LC_CODE_SIGNATURE whose
+/// `slot_len`-byte slot begins at 0x2000 (inside `__LINKEDIT`, whose filesize
+/// covers the slot), filled with 0xAA. Builds a parseable already-signed image.
+pub(crate) fn make_signed_minimal_macho(slot_len: u32) -> Vec<u8> {
+    make_signed_minimal_macho_at(0x2000, slot_len)
+}
+
+/// As `make_signed_minimal_macho`, but the signature starts at an arbitrary
+/// (possibly unaligned) `dataoff`.
+pub(crate) fn make_signed_minimal_macho_at(dataoff: u32, slot_len: u32) -> Vec<u8> {
+    let mut b = make_minimal_macho();
+    let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
+    let sizeofcmds = u32::from_le_bytes(b[20..24].try_into().unwrap());
+    b[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+    b[20..24].copy_from_slice(&(sizeofcmds + 16).to_le_bytes());
+    let lc = 32 + sizeofcmds as usize; // 280
+    b[lc..lc + 4].copy_from_slice(&0x1du32.to_le_bytes());
+    b[lc + 4..lc + 8].copy_from_slice(&16u32.to_le_bytes());
+    b[lc + 8..lc + 12].copy_from_slice(&dataoff.to_le_bytes());
+    b[lc + 12..lc + 16].copy_from_slice(&slot_len.to_le_bytes());
+    // __LINKEDIT filesize (LC at 184, field at +48) covers the slot tail.
+    let linkedit_end = dataoff as u64 + slot_len as u64;
+    b[232..240].copy_from_slice(&(linkedit_end - 0x2000).to_le_bytes());
+    b.resize(linkedit_end as usize, 0);
+    for byte in &mut b[dataoff as usize..] {
+        *byte = 0xAA;
+    }
+    b
+}
 
 /// Byte-for-byte layout of [`make_minimal_macho`], with every integer encoded
 /// big-endian.
