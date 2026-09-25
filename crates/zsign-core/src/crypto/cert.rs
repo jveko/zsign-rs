@@ -26,10 +26,16 @@
 //! ```
 
 use crate::{Error, Result};
+use const_oid::ObjectIdentifier;
 use der::{Decode, DecodePem};
 use p256::ecdsa::SigningKey as EcdsaSigningKey;
 use rsa::RsaPrivateKey;
 use x509_cert::Certificate;
+
+const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
+const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
 
 /// Private key for code signing, supporting multiple key types.
 ///
@@ -304,6 +310,108 @@ fn is_apple_root(cert: &Certificate) -> bool {
     extract_subject_cn(cert).is_some_and(|cn| cn == "Apple Root CA")
 }
 
+/// The DER value of extension `id`, or `None` when the extension is absent.
+fn ext_value(cert: &Certificate, id: ObjectIdentifier) -> Option<&[u8]> {
+    let exts = cert.tbs_certificate.extensions.as_ref()?;
+    exts.iter()
+        .find(|e| e.extn_id == id)
+        .map(|e| e.extn_value.as_bytes())
+}
+
+/// Current time; wasm32 has no wall clock, so builds there check against a
+/// fixed reference (mirrors `cms_verify::time_now`).
+fn time_now() -> time::OffsetDateTime {
+    #[cfg(target_arch = "wasm32")]
+    {
+        time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        time::OffsetDateTime::now_utc()
+    }
+}
+
+/// Load-time code-signing policy for the signing leaf, mirroring the
+/// verify-side leaf purpose rules in the same check order: codeSigning EKU
+/// must be present; keyUsage, when present, must include digitalSignature;
+/// basicConstraints, when present, must assert CA=false; then the validity
+/// window must contain `now`. Returns the violation naming the subject and
+/// the failing property.
+fn code_signing_policy_violation(cert: &Certificate, now: time::OffsetDateTime) -> Option<String> {
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+
+    let subject = cert.tbs_certificate.subject.to_string();
+
+    // Purpose checks first, then validity — the same order `verify_chain`
+    // applies (`leaf_purpose_reason` runs before `in_validity`), so both sides
+    // name the same violation for a certificate that breaks several rules.
+    let Some(eku_bytes) = ext_value(cert, OID_EXT_KEY_USAGE) else {
+        return Some(format!(
+            "signing certificate \"{}\": extended key usage extension missing (codeSigning EKU required)",
+            subject
+        ));
+    };
+    let Ok(eku) = ExtendedKeyUsage::from_der(eku_bytes) else {
+        return Some(format!(
+            "signing certificate \"{}\": extended key usage extension is malformed",
+            subject
+        ));
+    };
+    if !eku.0.contains(&OID_CODE_SIGNING) {
+        return Some(format!(
+            "signing certificate \"{}\": extended key usage lacks codeSigning (1.3.6.1.5.5.7.3.3): {:?}",
+            subject, eku.0
+        ));
+    }
+    if let Some(ku_bytes) = ext_value(cert, OID_KEY_USAGE) {
+        let Ok(ku) = KeyUsage::from_der(ku_bytes) else {
+            return Some(format!(
+                "signing certificate \"{}\": keyUsage extension is malformed",
+                subject
+            ));
+        };
+        if !ku.digital_signature() {
+            return Some(format!(
+                "signing certificate \"{}\": keyUsage lacks digitalSignature",
+                subject
+            ));
+        }
+    }
+    if let Some(bc_bytes) = ext_value(cert, OID_BASIC_CONSTRAINTS) {
+        let Ok(bc) = BasicConstraints::from_der(bc_bytes) else {
+            return Some(format!(
+                "signing certificate \"{}\": basicConstraints extension is malformed",
+                subject
+            ));
+        };
+        if bc.ca {
+            return Some(format!("signing certificate \"{}\": basicConstraints asserts CA=true (leaf must be end-entity)", subject));
+        }
+    }
+
+    let v = &cert.tbs_certificate.validity;
+    let nb = v.not_before.to_date_time().unix_duration().as_secs() as i64;
+    let na = v.not_after.to_date_time().unix_duration().as_secs() as i64;
+    let now_ts = now.unix_timestamp();
+    if now_ts < nb {
+        return Some(format!(
+            "signing certificate \"{}\": not yet valid (notBefore={}, now={})",
+            subject,
+            v.not_before.to_date_time(),
+            now
+        ));
+    }
+    if now_ts > na {
+        return Some(format!(
+            "signing certificate \"{}\": expired (notAfter={}, now={})",
+            subject,
+            v.not_after.to_date_time(),
+            now
+        ));
+    }
+    None
+}
+
 impl SigningCredentials {
     /// Load credentials from PEM-encoded certificate and private key.
     ///
@@ -323,6 +431,10 @@ impl SigningCredentials {
     /// - The private key PEM is malformed or not valid PKCS#8
     /// - The private key is neither RSA nor ECDSA P-256
     /// - A password is provided (encrypted keys not yet supported)
+    /// - The certificate is expired or not yet valid
+    /// - The certificate is missing the codeSigning extended key usage
+    /// - The certificate's keyUsage lacks digitalSignature when present
+    /// - The certificate asserts CA=true
     ///
     /// # Examples
     ///
@@ -360,6 +472,10 @@ impl SigningCredentials {
 
         verify_key_matches_cert(&signing_key, &certificate)?;
 
+        if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
+            return Err(Error::Certificate(violation));
+        }
+
         Ok(Self {
             certificate,
             signing_key,
@@ -390,6 +506,10 @@ impl SigningCredentials {
     /// - The private key is neither RSA nor ECDSA P-256
     /// - No private key matches a certificate
     /// - More than one distinct key/certificate identity is present
+    /// - The certificate is expired or not yet valid
+    /// - The certificate is missing the codeSigning extended key usage
+    /// - The certificate's keyUsage lacks digitalSignature when present
+    /// - The certificate asserts CA=true
     ///
     /// # Security
     ///
@@ -420,6 +540,10 @@ impl SigningCredentials {
 
         let (decoded, certificate, rest) = select_identity(&keys, &certs)?;
         let signing_key = decoded.into_signing_key()?;
+
+        if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
+            return Err(Error::Certificate(violation));
+        }
         let cert_chain = build_chain_from_leaf(&certificate, rest);
         let team_id = extract_team_id(&certificate);
 
@@ -536,6 +660,7 @@ mod tests {
     use der::Decode;
     use spki::SubjectPublicKeyInfoOwned;
     use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::time::{Time, Validity};
 
@@ -636,6 +761,30 @@ mod tests {
                 .as_bytes()
                 .to_vec(),
         )
+    }
+
+    /// PEM-encoded load attempt through `from_pem`.
+    fn load(cert: &Certificate, key: &rsa::RsaPrivateKey) -> Result<SigningCredentials> {
+        let (cert_pem, key_pem) = leaf_pems(cert, key);
+        SigningCredentials::from_pem(&cert_pem, &key_pem, None)
+    }
+
+    fn code_signing_eku() -> ExtendedKeyUsage {
+        ExtendedKeyUsage(vec![OID_CODE_SIGNING])
+    }
+
+    /// Replaces (or appends) extension `id` on `cert` with `value`'s DER
+    /// (pattern from `cms_verify.rs` tests; mutation invalidates the cert's own
+    /// signature, which load-time policy never checks).
+    fn replace_extension(cert: &mut Certificate, id: ObjectIdentifier, value: &impl der::Encode) {
+        let bytes = value.to_der().unwrap();
+        let exts = cert.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+        exts.retain(|e| e.extn_id != id);
+        exts.push(x509_cert::ext::Extension {
+            extn_id: id,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(bytes).unwrap(),
+        });
     }
 
     #[test]
@@ -880,6 +1029,183 @@ mod tests {
         assert_eq!(
             chain[1].tbs_certificate.subject, root.tbs_certificate.subject,
             "walk continues to the provided root"
+        );
+    }
+
+    #[test]
+    fn from_pem_accepts_compliant_leaf() {
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsign policy ok",
+            "CN=zsign policy ok",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        load(&cert, &key).expect("policy-compliant leaf must load");
+    }
+
+    #[test]
+    fn from_pem_rejects_expired_leaf() {
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsign expired",
+            "CN=zsign expired",
+            &key,
+            &key,
+            window(1_500_000_000, 1_600_000_000),
+            Some(code_signing_eku()),
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("expired") && m.contains("CN=zsign expired")),
+            "expected expired rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_not_yet_valid_leaf() {
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsign future",
+            "CN=zsign future",
+            &key,
+            &key,
+            window(2_200_000_000, 2_300_000_000),
+            Some(code_signing_eku()),
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("not yet valid") && m.contains("CN=zsign future")),
+            "expected not-yet-valid rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_leaf_without_eku() {
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsign no eku",
+            "CN=zsign no eku",
+            &key,
+            &key,
+            present(),
+            None,
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning") && m.contains("CN=zsign no eku")),
+            "expected missing-EKU rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_leaf_with_wrong_purpose_eku() {
+        let key = fresh_2048();
+        let server_auth = ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1")]);
+        let cert = build_cert(
+            "CN=zsign tls leaf",
+            "CN=zsign tls leaf",
+            &key,
+            &key,
+            present(),
+            Some(server_auth),
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning")),
+            "expected wrong-purpose rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_leaf_without_digital_signature() {
+        let key = fresh_2048();
+        let mut cert = build_cert(
+            "CN=zsign weak ku",
+            "CN=zsign weak ku",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        replace_extension(
+            &mut cert,
+            OID_KEY_USAGE,
+            &KeyUsage(KeyUsages::KeyCertSign.into()),
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("digitalSignature") && m.contains("CN=zsign weak ku")),
+            "expected KU rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_ca_leaf() {
+        let key = fresh_2048();
+        let mut cert = build_cert(
+            "CN=zsign ca leaf",
+            "CN=zsign ca leaf",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        replace_extension(
+            &mut cert,
+            OID_BASIC_CONSTRAINTS,
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            },
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("CA") && m.contains("CN=zsign ca leaf")),
+            "expected CA=true rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_accepts_leaf_without_ku_and_bc() {
+        // Verify-side consistency: KU and BC are checked only when present.
+        let key = fresh_2048();
+        let mut cert = build_cert(
+            "CN=zsign bare leaf",
+            "CN=zsign bare leaf",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        for id in [OID_KEY_USAGE, OID_BASIC_CONSTRAINTS] {
+            if let Some(exts) = cert.tbs_certificate.extensions.as_mut() {
+                exts.retain(|e| e.extn_id != id);
+            }
+        }
+        load(&cert, &key).expect("absent KU/BC must be tolerated");
+    }
+
+    #[test]
+    fn from_p12_rejects_non_policy_fixture() {
+        // The committed extract-level fixtures are not policy-compliant (no EKU,
+        // basicConstraints CA:TRUE) — loading them must now fail loudly.
+        let res = SigningCredentials::from_p12(
+            include_bytes!("fixtures/modern_pbes2_aes256.p12"),
+            "testpassword",
+        );
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning") && m.contains("CN=zsign-test-fixture")),
+            "expected non-compliant fixture rejection, got {:?}",
+            res.as_ref().err()
         );
     }
 }
