@@ -39,8 +39,11 @@ struct Cli {
     #[arg(short = 'm', long)]
     profile: Option<PathBuf>,
 
-    /// Password for the PKCS#12 or key material (empty password is valid)
-    #[arg(short = 'p', long)]
+    /// Password for the PKCS#12 or key material (empty password is valid).
+    /// Precedence: this flag beats the ZSIGN_PASSWORD environment variable.
+    /// Values passed on the command line are visible to other users in
+    /// process listings; prefer ZSIGN_PASSWORD where possible.
+    #[arg(short = 'p', long, env = "ZSIGN_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
     /// ZIP compression level (0-9, default: 6)
@@ -728,8 +731,8 @@ impl From<&zsign_rs::verify::CodeResourcesVerification> for CrDto {
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
     if let Some(p12_path) = &cli.pkcs12 {
         let p12_data = std::fs::read(p12_path)?;
-        let password = cli.password.as_deref().unwrap_or("");
-        let creds = SigningCredentials::from_p12(&p12_data, password)?;
+        let password = resolve_p12_password(cli, &p12_data)?;
+        let creds = SigningCredentials::from_p12(&p12_data, &password)?;
         return Ok(creds);
     }
 
@@ -779,10 +782,44 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
         }
         // no PEM marker + no certificate => PKCS#12 content
         None => {
-            let password = cli.password.as_deref().unwrap_or("");
-            let creds = SigningCredentials::from_p12(&key_data, password)?;
+            let password = resolve_p12_password(cli, &key_data)?;
+            let creds = SigningCredentials::from_p12(&key_data, &password)?;
             Ok(creds)
         }
+    }
+}
+
+/// Resolves the PKCS#12 password: flag/env first; otherwise the historical
+/// empty-password attempt, and only a *password-shaped* trial failure may
+/// prompt (TTY) or name the password channels (non-TTY). Other failures
+/// (policy rejection, corruption) surface verbatim — they are not password
+/// problems and must not be reported as "no password supplied".
+fn resolve_p12_password(cli: &Cli, data: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(pw) = &cli.password {
+        return Ok(pw.clone());
+    }
+    let trial_err = match SigningCredentials::from_p12(data, "") {
+        Ok(_) => return Ok(String::new()), // empty-password containers never prompt
+        Err(e) => e.to_string(),
+    };
+    // Same two markers the wasm adapter sniffs for "wrong/needed password"
+    let password_shaped = trial_err.contains("invalid PKCS#12 password (MAC mismatch)")
+        || trial_err.contains("PKCS#12 decryption failed");
+    if !password_shaped {
+        return Err(trial_err.into());
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // one prompt, no pre-validation: the call site's from_p12 is the
+        // single retry (a wrong prompt surfaces its loader error there)
+        let prompted = rpassword::prompt_password("PKCS#12 password: ")
+            .map_err(|e| format!("password prompt failed: {e}"))?;
+        Ok(prompted)
+    } else {
+        Err(format!(
+            "{trial_err}; no password supplied: pass -p/--password or set \
+             ZSIGN_PASSWORD (stdin is not a terminal, cannot prompt)"
+        )
+        .into())
     }
 }
 
@@ -964,6 +1001,9 @@ mod tests {
 
     const IDENTITY_P12: &[u8] =
         include_bytes!("../../zsign-core/src/crypto/fixtures/identity_single.p12");
+
+    const EMPTY_PASSWORD_P12: &[u8] =
+        include_bytes!("../../zsign-core/src/crypto/fixtures/empty_password.p12");
 
     #[test]
     fn verify_valid_input_exits_zero() {
@@ -1295,6 +1335,159 @@ mod tests {
             !r.stderr.contains("--pkcs12 or both"),
             "error must name the missing flag, not the generic fallthrough: {}",
             r.stderr
+        );
+    }
+
+    #[test]
+    fn env_password_signs_p12_without_flag() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let out = dir.path().join("out.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[("ZSIGN_PASSWORD", "testpassword")],
+        );
+        assert_eq!(r.code, 0, "env password must work, stderr: {}", r.stderr);
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn argv_password_beats_env_password() {
+        // env-only wrong password must FAIL first (proves the env value is read
+        // at all), then flag+wrong-env must succeed (proves the flag wins) —
+        // either case alone cannot distinguish precedence from env being ignored
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+
+        let env_only = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o1.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[("ZSIGN_PASSWORD", "wrong-password")],
+        );
+        assert_eq!(
+            env_only.code, 1,
+            "env value must be read: {}",
+            env_only.stderr
+        );
+        assert!(
+            env_only.stderr.contains("MAC mismatch"),
+            "stderr: {}",
+            env_only.stderr
+        );
+
+        let out = dir.path().join("o2.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[("ZSIGN_PASSWORD", "wrong-password")],
+        );
+        assert_eq!(r.code, 0, "flag must win over env, stderr: {}", r.stderr);
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn missing_password_on_non_tty_degrades_to_clear_error() {
+        // no flag, no env, piped stdin: "" trial fails (MAC mismatch) and the
+        // error must name both password channels instead of prompting
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("--password"), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("ZSIGN_PASSWORD"), "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("MAC mismatch"),
+            "must surface the real cause: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn empty_password_container_is_never_treated_as_missing() {
+        // no flag, no env: this fixture's `""` trial fails at the certificate
+        // policy gate (not MAC), and a non-password failure must surface verbatim —
+        // never the "no password supplied" channel hint, and never a prompt
+        // (stdin is piped here, and a prompt would hang a CI job)
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("empty.p12");
+        std::fs::write(&key, EMPTY_PASSWORD_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert!(
+            !r.stderr.contains("MAC mismatch"),
+            "not a password failure: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("ZSIGN_PASSWORD"),
+            "must not demand a password: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("no password supplied"),
+            "verbatim surface: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn help_does_not_leak_env_password_value() {
+        let r = run_cli(
+            &[OsStr::new("--help")],
+            &[("ZSIGN_PASSWORD", "s3cret-value")],
+        );
+        assert_eq!(r.code, 0);
+        assert!(!r.stdout.contains("s3cret-value"), "leaked: {}", r.stdout);
+        assert!(
+            r.stdout.contains("[env: ZSIGN_PASSWORD]"),
+            "stdout: {}",
+            r.stdout
         );
     }
 }
