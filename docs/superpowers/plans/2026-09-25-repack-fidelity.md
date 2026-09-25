@@ -15,21 +15,21 @@ mkdir -p .tmptmp && TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs ipa -- --skip tes
 Task 5 also runs: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core code_resources`
 Baseline is established before Task 1 (both commands green at base, minus the skipped determinism test). Never run `cargo fmt`/`cargo clippy`/`hk`.
 
-**Shared conventions:** errors via existing `Error` variants (`Error::Io(io::Error::new(InvalidData, …))`, `Error::Zip(zip::ZipError::InvalidArchive(...))`); assertions carry reason messages; test names `test_*`; ticket ID in commit subjects only, never in code comments; scope: edit ONLY `crates/zsign/src/ipa/{archive.rs,mod.rs}` and `crates/zsign-core/src/bundle/code_resources.rs` (+ their inline test modules); each task ends with the controller committing.
+**Shared conventions:** errors via existing `Error` variants (`Error::Io(io::Error::new(InvalidData, …))`, `Error::Zip(zip::result::ZipError::InvalidArchive(...))`); assertions carry reason messages; test names `test_*`; ticket ID in commit subjects only, never in code comments; scope: edit ONLY `crates/zsign/src/ipa/{archive.rs,mod.rs}` and `crates/zsign-core/src/bundle/code_resources.rs` (+ their inline test modules); each task ends with the controller committing.
 
 **Reference facts (verified at base `0f07c30`):**
-- `IpaSigner::sign` = mod.rs:264-287; repack call `create_ipa(&app_bundle, output_ipa, self.compression_level)` at :283.
-- `find_app_bundle` first-match loop = extract.rs:599-627; its 0-app error construction (`Error::Zip(ZipError::InvalidArchive(Cow::Borrowed(...)))`) is the pattern to mirror at :622-624.
-- `create_ipa` = archive.rs:163-296; options at :207-218; `Payload/` dir entry :221; walk :222-224; name format! :237-241; dir trailing-slash :248-252; symlink branch :254-260; unix_permissions :271-276; `start_file` :278; `finish` :293.
-- Test fixtures: `create_test_ipa` mod.rs:1108, `create_test_app_bundle` archive.rs:301, `test_credentials()` test_util.rs:29, `minimal_macho()` test_util.rs:8.
-- `build()` = code_resources.rs:405-479; `standard_rules()` :83-113; `standard_rules2()` :119-188; `should_exclude` :252-275.
+- `IpaSigner::sign` = mod.rs:264-286; repack call `create_ipa(&app_bundle, output_ipa, self.compression_level)` at :283.
+- `find_app_bundle` first-match loop = extract.rs:599-625 (loop :609-620, `return Ok(path)` :616); its 0-app error construction (`Error::Zip(ZipError::InvalidArchive(Cow::Borrowed(...)))`) is the pattern to mirror at :622-624.
+- `create_ipa` = archive.rs:160-291; options at :207-218; `Payload/` dir entry :221; walk :222-224; name format! :237-241; dir trailing-slash :248-252; symlink branch :254-260; unix_permissions :271-276; `start_file` :278; `finish` :288.
+- Test fixtures: `create_test_ipa` mod.rs:1108, `create_test_app_bundle` archive.rs:301, `test_credentials()` test_util.rs:29, `minimal_macho()` test_util.rs:9.
+- `build()` = code_resources.rs:405-475; `standard_rules()` :83-113; `standard_rules2()` :119-188; `should_exclude` :252-281.
 
 ---
 
 ### Task 1 — Reject ambiguous multi-`.app` archives (commit 1)
 
 **Files:**
-- Modify: `crates/zsign/src/ipa/mod.rs` — new private helper next to `resolve_within` (~:476), call in `sign()` after :277; test module.
+- Modify: `crates/zsign/src/ipa/mod.rs` — new private helper next to `resolve_within` (~:476), call in `sign()` after `resolve_within` (:280); test module.
 - [ ] **Step 1: Write the failing test**
 
 Add to `crates/zsign/src/ipa/mod.rs` tests module:
@@ -39,7 +39,7 @@ Add to `crates/zsign/src/ipa/mod.rs` tests module:
 fn test_sign_rejects_multiple_app_bundles() {
     let temp = TempDir::new().unwrap();
     let ipa_path = temp.path().join("multi.ipa");
-    let file = File::create(&ipa_path).unwrap();
+    let file = fs::File::create(&ipa_path).unwrap();
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default();
     zip.add_directory("Payload/", options).unwrap();
@@ -88,7 +88,7 @@ In `crates/zsign/src/ipa/mod.rs`, add (near `resolve_within`, before `impl` test
         }
         candidates.sort();
         if candidates.len() > 1 {
-            return Err(Error::Zip(zip::ZipError::InvalidArchive(
+            return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
                 std::borrow::Cow::Owned(format!(
                     "multiple .app bundles in Payload/: {}",
                     candidates.join(", ")
@@ -99,9 +99,9 @@ In `crates/zsign/src/ipa/mod.rs`, add (near `resolve_within`, before `impl` test
     }
 ```
 
-(The `Error::Zip(ZipError::InvalidArchive(Cow::…))` construction mirrors extract.rs:622-624; `zip` is already a dependency of this crate. Place it as an associated fn in `impl IpaSigner` beside `resolve_within`.)
+(The `Error::Zip(ZipError::InvalidArchive(Cow::…))` construction mirrors extract.rs:622-624; the variant lives at `zip::result::ZipError` (zip 7.2.0 has no crate-root re-export) and `zip` is already a dependency of this crate. Place it as an associated fn in `impl IpaSigner` beside `resolve_within`.)
 
-In `sign()` after `let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;` (:277) and before `Self::resolve_within(...)` (:280):
+In `sign()`, **after** `Self::resolve_within(temp_dir.path(), &app_bundle)?;` (:280) — containment first, so the guard's `read_dir` never follows an unvalidated `Payload` component:
 
 ```rust
         Self::ensure_single_app_bundle(&temp_dir.path().join("Payload"))?;
@@ -137,7 +137,7 @@ Refactor the mod.rs fixture: rename the body of `create_test_ipa` (mod.rs:1108) 
         }
 ```
 
-and keep `create_test_ipa(dir) -> PathBuf` as `write_test_ipa(&dir.join("test.ipa"), &[])` (all existing callers unchanged).
+and keep `create_test_ipa(dir) -> PathBuf` as `write_test_ipa(&dir.join("test.ipa"), &[])` (all existing callers unchanged). Add `use zip::ZipArchive;` to the `mod tests` import block of `mod.rs` (the existing block imports `ZipWriter`/`SimpleFileOptions` only); the block already has `use std::fs;`.
 
 Add:
 
@@ -158,7 +158,7 @@ Add:
             .sign(&ipa_path, &output)
             .expect("signing must succeed");
 
-        let file = File::open(&output).unwrap();
+        let file = fs::File::open(&output).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
@@ -293,7 +293,7 @@ fn write_tree(
 /// root (`Payload/…` plus any siblings such as `SwiftSupport/` or
 /// `iTunesMetadata.plist`) is archived verbatim under its relative name.
 ///
-/// This is the repack half of [`extract_ipa`](super::extract_ipa); unlike
+/// This is the repack half of [`extract_ipa`](crate::ipa::extract_ipa); unlike
 /// [`create_ipa`] it does not synthesize a `Payload/` structure.
 pub(crate) fn create_ipa_from_root(
     extraction_root: impl AsRef<Path>,
@@ -332,7 +332,7 @@ pub(crate) fn create_ipa_from_root(
 
 - [ ] **Step 4: Wire `sign()`**
 
-In `crates/zsign/src/ipa/mod.rs`: import `create_ipa_from_root` alongside `create_ipa`, and replace :283:
+In `crates/zsign/src/ipa/mod.rs`: add a **separate private import** `use archive::create_ipa_from_root;` in the module's import block (next to the existing `use archive::…` imports) — do **not** extend the `pub use archive::{create_ipa, CompressionLevel};` re-export at :57 (re-exporting a `pub(crate)` item there is E0364 and would grow the `lib.rs` public surface). Then replace :283:
 
 ```rust
         self.sign_bundle_from_options(&app_bundle)?;
@@ -340,7 +340,7 @@ In `crates/zsign/src/ipa/mod.rs`: import `create_ipa_from_root` alongside `creat
         create_ipa_from_root(temp_dir.path(), output_ipa, self.compression_level)?;
 ```
 
-Doc updates in the same file: `sign()` workflow list step 6 ("Repack via [`create_ipa`]") → repack the extraction root via `create_ipa_from_root` (keeps non-`Payload` entries); module-level `## Manual extraction and repacking` example stays valid (`create_ipa` unchanged).
+Doc updates in the same file: `sign()` workflow list step 6 ("Repack via [`create_ipa`]") → repack the extraction root via `create_ipa_from_root` (keeps non-`Payload` entries), and the `IpaSigner` struct-level workflow doc at mod.rs:104 ("5. Repack via [`create_ipa`]") gets the same wording (it links the same flow). Module-level `## Manual extraction and repacking` example stays valid (`create_ipa` unchanged).
 
 - [ ] **Step 5: Run the scoped gate**
 
@@ -358,23 +358,58 @@ Expected: PASS — new round-trip test green; `test_extract_and_repack_ipa`, `te
 **Files:**
 - Modify: `crates/zsign/src/ipa/archive.rs` — gate constant + predicate + walker wiring; tests.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the pure-contract test**
 
 ```rust
     #[test]
     fn test_needs_zip64_boundaries() {
         assert!(!needs_zip64(0), "empty member is never zip64");
         assert!(!needs_zip64(4096), "typical member is never zip64");
-        assert!(!needs_zip64(ZIP64_SIZE_GATE), "the gate itself is still32-bit");
+        assert!(!needs_zip64(ZIP64_SIZE_GATE), "the gate itself is still 32-bit");
         assert!(needs_zip64(ZIP64_SIZE_GATE + 1), "one byte past the gate opts in");
         assert!(needs_zip64(u64::from(u32::MAX)), "u32::MAX is not reachable safely");
         assert!(needs_zip64(u64::from(u32::MAX) + 1), "beyond 32 bits");
     }
+```
 
-    /// End-to-end proof that an oversized member round-trips: a4 GiB+1 sparse
-    /// file of zeros compresses to a few MiB but crosses the size guard that
-    /// zip only clears with `large_file(true)`. Ignored so the routine suite
-    /// never streams four gigabytes through deflate; run explicitly with
+- [ ] **Step 2: Run, verify compile failure**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_needs_zip64` — Expected: FAIL to compile (`needs_zip64` / `ZIP64_SIZE_GATE` not found).
+
+- [ ] **Step 3: Add the gate constant and predicate (not yet wired)**
+
+In `crates/zsign/src/ipa/archive.rs`:
+
+```rust
+/// Uncompressed-size gate for opting a member into ZIP64 extended fields.
+///
+/// Sits 1 MiB below the 32-bit size ceiling, so no compressed size derived
+/// from a member at or below the gate can cross `0xFFFFFFFF`; members below
+/// the gate keep byte-identical headers.
+const ZIP64_SIZE_GATE: u64 = u32::MAX as u64 - (1 << 20);
+
+/// True when a member of `uncompressed_len` bytes must carry ZIP64
+/// extended information extra fields to be written without error.
+fn needs_zip64(uncompressed_len: u64) -> bool {
+    uncompressed_len > ZIP64_SIZE_GATE
+}
+```
+
+- [ ] **Step 4: Run the pure contract**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_needs_zip64`
+Expected: PASS.
+
+- [ ] **Step 5: Add the end-to-end proof (still red — not wired)**
+
+Add to the `archive.rs` tests module (imports: `std::io::Read` for the probe; `File`/`ZipArchive` are already in scope there):
+
+```rust
+    /// End-to-end proof that an oversized member is written instead of
+    /// aborting mid-copy: a 4 GiB+1 sparse file of zeros compresses to a
+    /// few MiB but crosses the size guard that zip only clears with
+    /// `large_file(true)`. Ignored so the routine suite never streams four
+    /// gigabytes through deflate; run explicitly with
     /// `cargo test -p zsign-rs zip64_oversized -- --ignored`.
     #[test]
     #[ignore = "streams more than 4 GiB through deflate"]
@@ -393,41 +428,32 @@ Expected: PASS — new round-trip test green; `test_extract_and_repack_ipa`, `te
 
         let reader = File::open(&out).unwrap();
         let mut archive = ZipArchive::new(reader).unwrap();
-        let entry = archive
+        let mut entry = archive
             .by_name("Payload/Big.app/big.bin")
             .expect("member present");
+        // zip 7.2.0 patches the local header with the true 64-bit length,
+        // then clamps the struct the central directory is derived from to
+        // the 0xFFFFFFFF sentinel, so the recorded size saturates at
+        // `ZIP64_BYTES_THR`. What this proves is that the write completed
+        // without the mid-write guard aborting the entry.
         assert!(
-            entry.size() > u64::from(u32::MAX),
-            "recorded size must be the full64-bit length, got {}",
+            entry.size() >= zip::ZIP64_BYTES_THR,
+            "recorded size must reach the zip64 threshold, got {}",
             entry.size()
         );
+        let mut probe = [0u8; 16];
+        entry
+            .read_exact(&mut probe)
+            .expect("oversized member reads back");
     }
 ```
 
-- [ ] **Step 2: Run, verify failure**
+- [ ] **Step 6: Run, verify the pre-fix red**
 
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_needs_zip64` — Expected: FAIL to compile (`needs_zip64` not found).
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs zip64_oversized -- --ignored` — Expected: FAIL with `oversized member must be written with zip64 enabled: Large file option has not been set` (pre-fix red; may take minutes — run once at red and once at green).
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs zip64_oversized -- --ignored`
+Expected: FAIL with `oversized member must be written with zip64 enabled: Large file option has not been set` (pre-fix red; may take minutes — runs once at red and once at green).
 
-- [ ] **Step 3: Implement**
-
-In `crates/zsign/src/ipa/archive.rs`:
-
-```rust
-/// Uncompressed-size gate for opting a member into ZIP64 extended fields.
-///
-/// Sits 1 MiB below the 32-bit size ceiling so deflate's worst-case
-/// expansion (5 bytes per 65535-byte stored block, about 328 KiB at 4 GiB)
-/// cannot push the compressed size past `0xFFFFFFFF` while the gate is
-/// closed. Members at or below the gate keep byte-identical headers.
-const ZIP64_SIZE_GATE: u64 = u64::from(u32::MAX) - (1 << 20);
-
-/// True when a member of `uncompressed_len` bytes must carry ZIP64
-/// extended information extra fields to be written without error.
-fn needs_zip64(uncompressed_len: u64) -> bool {
-    uncompressed_len > ZIP64_SIZE_GATE
-}
-```
+- [ ] **Step 7: Wire the gate into the walker**
 
 In `write_tree`'s regular-file branch, after the `#[cfg(unix)]` permissions block and before `start_file`:
 
@@ -441,14 +467,14 @@ In `write_tree`'s regular-file branch, after the `#[cfg(unix)]` permissions bloc
             };
 ```
 
-- [ ] **Step 4: Run gates**
+- [ ] **Step 8: Run gates**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs ipa -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS (the ignored test does not run here).
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs zip64_oversized -- --ignored`
 Expected: PASS — evidence for the final report (paste verbatim output).
 
-- [ ] **Step 5: Controller commit**
+- [ ] **Step 9: Controller commit**
 
 `fix(ipa): enable zip64 for oversized archive members (ZSN-39)`
 
@@ -523,6 +549,8 @@ Expected: PASS — output names byte-identical to before on Linux.
 - Modify: `crates/zsign/src/ipa/archive.rs` — validator + constant; walker symlink branch; tests.
 
 - [ ] **Step 1: Write the failing tests**
+
+Add `use crate::ipa::extract_ipa;` to the `mod tests` import block of `archive.rs` (`mod tests`'s `super` is the `archive` module, so the crate-root re-export is not reachable unqualified); `create_test_app_bundle`, `File`, `ZipArchive`, `TempDir` are already in scope there.
 
 ```rust
     #[test]
@@ -809,6 +837,26 @@ Expected: PASS — including `test_create_ipa_preserves_symlinks` (safe targets 
             Some(RuleAction::Include),
             "tie_rank: Include < Omit"
         );
+
+        // The escaped rules2 spelling of the version key matches exactly;
+        // a prefix read would let its weight-20 Include beat the weight-10
+        // Omit below on "version.plist.bak".
+        let mut exact = Dictionary::new();
+        let mut include20 = Dictionary::new();
+        include20.insert("weight".to_string(), Value::Real(20.0));
+        exact.insert(
+            "^version\\.plist$".to_string(),
+            Value::Dictionary(include20),
+        );
+        let mut omit10 = Dictionary::new();
+        omit10.insert("omit".to_string(), Value::Boolean(true));
+        omit10.insert("weight".to_string(), Value::Real(10.0));
+        exact.insert("^version".to_string(), Value::Dictionary(omit10));
+        assert_eq!(
+            rule_action(&exact, "version.plist.bak"),
+            Some(RuleAction::Omit),
+            "the escaped key must not prefix-match past version.plist"
+        );
     }
 ```
 
@@ -909,6 +957,7 @@ fn rule_pattern_matches(pattern: &str, rel: &str) -> bool {
             }),
         "^Base\\.lproj/" => rel.starts_with("Base.lproj/"),
         "^version.plist$" => rel == "version.plist",
+        "^version\\.plist$" => rel == "version.plist",
         ".*\\.dSYM($|/)" => rel.ends_with(".dSYM") || rel.contains(".dSYM/"),
         "^(.*/)?\\.DS_Store$" => rel == ".DS_Store" || rel.ends_with("/.DS_Store"),
         "^Info\\.plist$" => rel == "Info.plist",
