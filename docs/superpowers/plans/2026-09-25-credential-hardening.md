@@ -103,15 +103,21 @@ two PEMs, then inspect each certificate — `-noout` alone prints nothing:
 
 ```bash
 d=$(mktemp -d -p "$HOME/tmp-cargo" zsn37-vfy.XXXXXX)
+# Unfiltered -nokeys output: -clcerts would drop the -certfile certificate on
+# OpenSSL 3.6.3 (it classifies the second self-signed cert as a CA cert).
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/identity_duplicate_certs.p12 \
-  -nokeys -passin pass:testpassword -clcerts 2>/dev/null > "$d/dup.pem"
-awk -v d="$d" '/-----BEGIN CERTIFICATE-----/{n++} {print > (d "/dup_" n ".pem")}' "$d/dup.pem"
-ls "$d"/dup_*.pem                                    # exactly two files
+  -nokeys -passin pass:testpassword 2>/dev/null > "$d/dup.pem"
+# Emit ONLY certificate lines (Bag Attributes before the first BEGIN are skipped).
+awk -v d="$d" '
+  /-----BEGIN CERTIFICATE-----/{n++; in_cert=1}
+  in_cert {print > (d "/dup_" n ".pem")}
+  /-----END CERTIFICATE-----/{in_cert=0}' "$d/dup.pem"
+test "$(ls "$d"/dup_*.pem | wc -l)" -eq 2 || echo "UNEXPECTED certificate count"
 openssl x509 -in "$d/dup_1.pem" -noout -serial -subject   # serial=0401, subject=CN=zsign-test-fixture
 openssl x509 -in "$d/dup_2.pem" -noout -serial -subject   # serial=0402, subject=CN=zsign-test-fixture
 for i in 1 2; do openssl x509 -in "$d/dup_$i.pem" -noout -pubkey | openssl sha256; done  # identical hashes (same SPKI)
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/identity_single.p12 \
-  -nokeys -passin pass:testpassword -clcerts 2>/dev/null \
+  -nokeys -passin pass:testpassword 2>/dev/null \
   | openssl x509 -noout -text \
   | grep -E 'Extended Key Usage|Key Usage|Not |CA:'   # codeSigning / digitalSignature / CA:FALSE / ~10y window
 rm -rf "$d"
@@ -172,6 +178,9 @@ fn build_cert(
         subject_key.to_public_key().to_public_key_der().unwrap().as_ref(),
     )
     .unwrap();
+    // The builder borrows the signer, so bind it first — a temporary would be
+    // dropped before `add_extension`/`build` (E0716).
+    let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(issuer_key.clone());
     let mut b = CertificateBuilder::new(
         Profile::Leaf {
             issuer: Name::from_str(issuer).unwrap(),
@@ -182,7 +191,7 @@ fn build_cert(
         validity,
         Name::from_str(subject).unwrap(),
         spki,
-        &rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(issuer_key.clone()),
+        &signer,
     )
     .unwrap();
     if let Some(eku) = &eku {
@@ -214,8 +223,8 @@ fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>)
 
 (Imports at the top of `mod tests` — exact paths at x509-cert 0.2.5 / der 0.7.10:
 `der::{Decode, Encode, EncodePem}`, `der::pem::LineEnding`, `pkcs8::{DecodePrivateKey,
-EncodePrivateKey}`, `spki::{EncodePublicKey, SubjectPublicKeyInfoOwned}` (the `spki`
-crate re-export, as `cms_verify.rs` tests use — `x509_cert::spki` does not exist),
+EncodePrivateKey}`, `spki::{EncodePublicKey, SubjectPublicKeyInfoOwned}` (the `spki` crate path, as
+`cms_verify.rs` tests use; `x509_cert` also re-exports `spki`, but one path is enough),
 `x509_cert::builder::{Builder, CertificateBuilder, Profile}`,
 `x509_cert::name::Name`,
 `x509_cert::{serial_number::SerialNumber, time::{Time, Validity}}`,
@@ -281,10 +290,20 @@ fn from_p12_selects_single_identity_with_empty_chain() {
 #[test]
 fn from_pem_self_signed_leaf_yields_empty_chain() {
     let key = fresh_2048();
-    let cert = build_cert("CN=zsn pem self", "CN=zsn pem self", &key, &key, present(), None);
+    // codeSigning EKU inline (the production OID constant lands in Task 2): keeps
+    // this loader test policy-compliant so Task 2's gate does not break it.
+    let eku = ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3")]);
+    let cert = build_cert(
+        "CN=zsn pem self",
+        "CN=zsn pem self",
+        &key,
+        &key,
+        present(),
+        Some(eku),
+    );
     let (cert_pem, key_pem) = leaf_pems(&cert, &key);
     let creds = SigningCredentials::from_pem(&cert_pem, &key_pem, None)
-        .expect("self-signed leaf must load at this stage (no policy yet)");
+        .expect("policy-compliant self-signed leaf must load");
     assert!(creds.cert_chain.is_empty());
 }
 
@@ -318,7 +337,7 @@ fn wwdr_issuer_injects_missing_intermediate_and_root() {
     let k = fresh_2048();
     let leaf = build_cert(
         "CN=zsn wwdr leaf",
-        "OU=G3, CN=Apple Worldwide Developer Relations CA, O=Apple Inc., C=US",
+        "OU=G3,CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
         &k, &k, present(), None,
     );
     let chain = build_chain_from_leaf(&leaf, vec![]);
@@ -342,22 +361,27 @@ fn provided_chain_is_completed_without_duplicates() {
     let leaf_key = fresh_2048();
     let root = build_cert("CN=Apple Root CA", "CN=Apple Root CA", &root_key, &root_key, present(), None);
     let int = build_cert(
-        "CN=Apple Worldwide Developer Relations CA, O=Apple Inc., C=US",
+        "CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
         "CN=Apple Root CA", &int_key, &root_key, present(), None,
     );
     let leaf = build_cert(
         "CN=zsn full chain leaf",
-        "CN=Apple Worldwide Developer Relations CA, O=Apple Inc., C=US",
+        "CN=Apple Worldwide Developer Relations CA,O=Apple Inc.,C=US",
         &leaf_key, &int_key, present(), None,
     );
     // Provided chain already has WWDR + Root: nothing injected, nothing duplicated.
     let chain = build_chain_from_leaf(&leaf, vec![root.clone(), int.clone()]);
-    assert_eq!(chain.len(), 2, "no injection when the walk already links: {chain:?}");
+    assert_eq!(chain.len(), 2, "nothing injected or duplicated");
+    assert_eq!(
+        chain[0].tbs_certificate.subject, int.tbs_certificate.subject,
+        "walk starts at the WWDR intermediate"
+    );
+    assert_eq!(
+        chain[1].tbs_certificate.subject, root.tbs_certificate.subject,
+        "walk continues to the provided root"
+    );
 }
 ```
-
-(`chain:?` in the message requires no `Debug` on `Certificate` — if it is not derived,
-print subjects instead: `chain.iter().map(|c| c.tbs_certificate.subject.to_string())`.)
 
 - [ ] **Step 1.3: Run red**
 
@@ -365,13 +389,17 @@ print subjects instead: `chain.iter().map(|c| c.tbs_certificate.subject.to_strin
 TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic
 ```
 
-Expected: RED — `from_p12_rejects_ambiguous_identity` and
-`from_p12_selects_single_identity_with_empty_chain` and
-`from_pem_self_signed_leaf_yields_empty_chain` fail at runtime (current code signs with
-`certs[0]` and appends the Apple Root unconditionally); `select_identity_*` and
-`chain_walk_*`/`self_signed_*`/`wwdr_*`/`provided_chain_*` fail at compile time
-(`select_identity`/`build_chain_from_leaf` do not exist yet). All pre-existing tests stay
-green.
+Expected: RED as a **build failure** — the first run does not compile: `DecodedKey`,
+`select_identity` and `build_chain_from_leaf` do not exist yet (E0425/E0432 inside this
+test module), so no test executes. A compile error prevents the whole test binary from
+running, so runtime-red and compile-red cannot coexist in one run; the build failure IS
+this task's red. The three loader tests (`from_p12_rejects_ambiguous_identity`,
+`from_p12_selects_single_identity_with_empty_chain`,
+`from_pem_self_signed_leaf_yields_empty_chain`) additionally encode why the fix is
+needed — against the current loader they fail because positional `certs[0]` selection
+succeeds on the duplicate bundle and `build_apple_ca_chain` appends the Apple Root
+unconditionally — and they turn green in Step 1.5 once the wiring changes. Pre-existing
+tests stay green after Step 1.4 compiles.
 
 - [ ] **Step 1.4: Implement pairing + chain assembly in `cert.rs`**
 
@@ -608,14 +636,24 @@ onto the shared path — pure behavior-preserving refactor so Task 3's floor lan
 one place:
 
 ```rust
+        // The password rejection moves out of the decode expression into a
+        // standalone guard (same message, same position in the flow): the old
+        // `if let ... else if ... else` chain is being replaced wholesale, so the
+        // gate cannot stay embedded in it.
+        if password.is_some() {
+            return Err(Error::Certificate(
+                "Encrypted PEM keys are not yet supported. Use unencrypted keys or PKCS#12."
+                    .into(),
+            ));
+        }
         let decoded = DecodedKey::from_pkcs8_pem(key_str).ok_or_else(|| {
             Error::Certificate("Failed to parse private key as RSA or ECDSA".into())
         })?;
         let signing_key = decoded.into_signing_key()?;
 ```
 
-(replacing the `if let Ok(rsa_key) / else if let Ok(ecdsa_key) / else` chain; the password
-gate at 141-144 and the cert-PEM parse stay untouched).
+(replacing the `if let Ok(rsa_key) / else if let Ok(ecdsa_key) / else` chain including its
+password first-arm; the cert-PEM parse at 135-139 stays untouched).
 
 Doc migration in the same commit: `from_p12` `# Errors` list (181-186) gains the
 no-match/ambiguous-identity entries; delete the obsolete comment at 228-231; adjust
@@ -798,7 +836,7 @@ fn from_p12_rejects_non_policy_fixture() {
 
 (Imports at the top of `mod tests` as needed: `const_oid::ObjectIdentifier`,
 `x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages}` —
-`KeyUsages` is re-exported directly from `pkix` at x509-cert 0.2.5, the `key_usage`
+`KeyUsages` is re-exported directly from `pkix` at x509-cert 0.2.5, the `keyusage`
 module is private — plus `crate::{Error, Result}`. `Time`, `Validity`, `SerialNumber`,
 `SubjectPublicKeyInfoOwned`, `EncodePem`/`LineEnding` and `extract_subject_cn` come from
 Task 1's step.)
@@ -964,15 +1002,16 @@ openssl pkcs12 -export -inkey "$d/k1024.pem" -in "$d/c1024.pem" \
 rm -rf "$d"
 ```
 
-Verify (the `-nodes` flag is required: without it the exported key is encrypted and
-`openssl pkey` prompts/fails):
+Verify (`-nodes` controls encryption of the *output PEM*: `openssl pkcs12 -nocerts`
+writes an encrypted PEM key by default, so the downstream `openssl pkey` would prompt for
+a passphrase and fail; the stored shrouded key bag itself is unaffected by the flag):
 
 ```bash
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/weak_rsa1024.p12 \
   -nocerts -nodes -passin pass:testpassword 2>/dev/null \
   | openssl pkey -noout -text | head -1    # Private-Key: (1024 bit, 2 primes)
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/weak_rsa1024.p12 \
-  -nokeys -nodes -passin pass:testpassword 2>/dev/null \
+  -nokeys -passin pass:testpassword 2>/dev/null \
   | openssl x509 -noout -text | grep -E 'Extended Key Usage|Key Usage|CA:'  # codeSigning / digitalSignature / CA:FALSE
 ```
 
@@ -1440,10 +1479,21 @@ openssl pkcs12 -export -inkey "$d/k.pem" -in "$d/c.pem" \
 rm -rf "$d"
 ```
 
-Verify: `openssl pkcs12 -info -in crates/zsign-core/src/crypto/fixtures/raw_keybag.p12
--passin pass:testpassword -nokeys 2>&1 | grep -i 'key bag'` prints a `Key bag` line (and
-never `Shrouded Keybag`); the same `-info` output's MAC line shows `MAC: sha256` (the MAC
-stays on, default 2048 iterations), so wrong-password behavior is unchanged.
+Verify (capture once, then assert both directions — a bare `grep -i 'key bag'` cannot
+detect a `Shrouded Keybag` regression because OpenSSL spells it without the space):
+
+```bash
+info=$(openssl pkcs12 -info -in crates/zsign-core/src/crypto/fixtures/raw_keybag.p12 \
+  -passin pass:testpassword -nokeys 2>&1)
+printf '%s\n' "$info" | grep -i 'Key bag'     # the raw bag line must be present
+if printf '%s\n' "$info" | grep -qi 'Shrouded'; then
+  echo "UNEXPECTED: shrouded keybag present"
+fi
+printf '%s\n' "$info" | grep 'MAC:'           # MAC: sha256, Iteration 2048 (MAC stays on)
+```
+
+Expected: the `Key bag` line prints, the shrouded guard prints nothing, and the MAC line
+confirms wrong-password behavior is unchanged.
 
 - [ ] **Step 5.2: Write the failing tests (red)**
 
@@ -1467,23 +1517,80 @@ fn safe_bag(bag_id: &str, value_tlv: &[u8]) -> Vec<u8> {
 fn safe_contents(bags: &[Vec<u8>]) -> Vec<u8> { seq(bags) }
 ```
 
-1. `collect_bags_reads_raw_key_bag` — SafeContents with one `keyBag`
-   (`1.2.840.113549.1.12.10.1.1`) whose value is the PKCS#8 `PrivateKeyInfo` TLV →
-   `keys == [private_key_info_der]`. **RED** (current code skips `.1.1`).
-2. `collect_bags_recurses_into_safe_contents` — SafeContents containing a
-   `safeContentsBag` (`…10.1.6`) that wraps a `keyBag` and a `certBag` → one key, one
-   cert collected. **RED** (current code skips `.1.6`).
-3. `extract_p12_reads_raw_keybag_fixture` — `extract_p12(RAW_KEYBAG, "testpassword")` →
-   `keys.len() == 1`, `certs.len() == 1`, `assert_key_matches_cert(&keys[0], &certs[0])`
-   (existing helper). **RED** (fixture's raw bag is skipped → `keys` empty).
-4. `collect_bags_rejects_overdeep_nesting` — nest seven `safeContentsBag` levels (each
-   level exactly one bag wrapping the next): post-fix, the sixth recursion trips
-   `depth >= MAX_SAFE_CONTENTS_DEPTH` (5) → `Err(P12Error::Der)` containing `nesting`.
-   **RED** (no recursion support at all → the level-1 bag is silently skipped and no
-   error is raised).
+Tests (complete bodies; `collect_bags` already takes the `depth` argument these
+call sites use — see Step 5.4):
+
+```rust
+#[test]
+fn collect_bags_reads_raw_key_bag() {
+    let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let info = pkcs8::EncodePrivateKey::to_pkcs8_der(&key)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let contents = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.1", &info)]);
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    collect_bags(&contents, "pw", 0, &mut keys, &mut certs)
+        .expect("raw keyBag must be read");
+    assert_eq!(keys, vec![info], "the bag value is the PrivateKeyInfo itself");
+    assert!(certs.is_empty());
+}
+
+#[test]
+fn collect_bags_recurses_into_safe_contents() {
+    let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let info = pkcs8::EncodePrivateKey::to_pkcs8_der(&key)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    // certBag ::= SEQUENCE { certId, [0] EXPLICIT OCTET STRING }; the payload
+    // contents are never validated by parse_cert_bag.
+    let cert_bag = seq(&[
+        der_oid("1.2.840.113549.1.9.22.1"),
+        tlv(0xa0, &der_octets(b"cert-der-payload")),
+    ]);
+    let inner = safe_contents(&[
+        safe_bag("1.2.840.113549.1.12.10.1.1", &info),
+        safe_bag("1.2.840.113549.1.12.10.1.3", &cert_bag),
+    ]);
+    let outer = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.6", &inner)]);
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    collect_bags(&outer, "pw", 0, &mut keys, &mut certs)
+        .expect("nested safeContents must recurse");
+    assert_eq!(keys, vec![info]);
+    assert_eq!(certs, vec![b"cert-der-payload".to_vec()]);
+}
+
+#[test]
+fn extract_p12_reads_raw_keybag_fixture() {
+    let contents = extract_p12(RAW_KEYBAG, "testpassword")
+        .expect("raw keybag fixture must parse");
+    assert_eq!(contents.keys.len(), 1);
+    assert_eq!(contents.certs.len(), 1);
+    assert_key_matches_cert(&contents.keys[0], &contents.certs[0]);
+}
+
+#[test]
+fn collect_bags_rejects_overdeep_nesting() {
+    // Seven nested .6 bags: the bag at depth 5 fails `depth >= 5` (five
+    // successful recursions precede it).
+    let mut inner = safe_contents(&[]);
+    for _ in 0..7 {
+        inner = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.6", &inner)]);
+    }
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    let err = collect_bags(&inner, "pw", 0, &mut keys, &mut certs)
+        .expect_err("nesting beyond MAX_SAFE_CONTENTS_DEPTH must be rejected");
+    assert!(matches!(&err, P12Error::Der(m) if m.contains("nesting")), "{err}");
+}
+```
 
 (Shrouded-bag behavior needs no new test: the nine existing fixtures are all-shrouded and
-stay green as the guard.)
+stay green as the guard. The `keys`/`certs` locals are typed `Vec<Vec<u8>>` by inference
+from the `collect_bags` parameters.)
 
 - [ ] **Step 5.3: Run red**
 
@@ -1491,7 +1598,13 @@ stay green as the guard.)
 TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic
 ```
 
-Expected: tests 1, 2, 3, 4 RED; all pre-existing tests unchanged.
+Expected: RED as a **build failure** — the test module does not compile: the four new
+tests call `collect_bags` with the `depth` argument (and `MAX_SAFE_CONTENTS_DEPTH` is not
+defined) while the current signature has no such parameter (E0061/E0425). As in Task 1, a
+compile error prevents any test from running, so the build failure IS this task's red;
+the four behavioral REDs (raw bag skipped, `.1.6` skipped, fixture yields zero keys, no
+depth error) are the pre-fix behaviors Step 5.4 removes, and the tests turn green in
+Step 5.5. Pre-existing tests stay green after Step 5.4 compiles.
 
 - [ ] **Step 5.4: Implement four-way bag dispatch**
 
