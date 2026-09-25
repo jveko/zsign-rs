@@ -61,6 +61,170 @@ pub const APPLE_CDHASH_V2_OID: ObjectIdentifier =
 
 /// SHA-256 algorithm OID: `2.16.840.1.101.3.4.2.1`
 const SHA256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+/// Digest used by the test-only content signers.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestDigest {
+    Sha1,
+    Sha256,
+}
+
+#[cfg(test)]
+impl TestDigest {
+    fn digest(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            TestDigest::Sha1 => {
+                use sha1::Digest;
+                sha1::Sha1::digest(bytes).to_vec()
+            }
+            TestDigest::Sha256 => Sha256::digest(bytes).to_vec(),
+        }
+    }
+
+    fn algorithm(self) -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned {
+            oid: match self {
+                TestDigest::Sha1 => const_oid::db::rfc5912::ID_SHA_1,
+                TestDigest::Sha256 => SHA256_OID,
+            },
+            parameters: None,
+        }
+    }
+}
+
+/// Builds a bare CMS SignedData with `content` attached as eContent — the
+/// provisioning-profile shape: no blob wrapper, no Apple CDHash attributes;
+/// `contentType`/`messageDigest` are computed by the builder. Test-only;
+/// production signing uses [`sign_code_directory`].
+#[cfg(test)]
+pub(crate) fn sign_attached_content(
+    content: &[u8],
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    private_key: &rsa::RsaPrivateKey,
+    digest: TestDigest,
+) -> Result<Vec<u8>> {
+    let encap = EncapsulatedContentInfo {
+        econtent_type: const_oid::db::rfc5911::ID_DATA,
+        econtent: Some(
+            Any::new(Tag::OctetString, content)
+                .map_err(|e| signing_err("Failed to attach content", e))?,
+        ),
+    };
+    sign_test_content(signing_cert, cert_chain, private_key, digest, &encap, None)
+}
+
+/// Detached variant: no eContent; `messageDigest` is computed over `content`
+/// externally (RFC 5652 §5.2). Used to prove code-signature mode still
+/// rejects a SHA-1 signer digest.
+#[cfg(test)]
+pub(crate) fn sign_detached_content(
+    content: &[u8],
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    private_key: &rsa::RsaPrivateKey,
+    digest: TestDigest,
+) -> Result<Vec<u8>> {
+    let encap = EncapsulatedContentInfo {
+        econtent_type: const_oid::db::rfc5911::ID_DATA,
+        econtent: None,
+    };
+    let external = digest.digest(content);
+    sign_test_content(
+        signing_cert,
+        cert_chain,
+        private_key,
+        digest,
+        &encap,
+        Some(external.as_slice()),
+    )
+}
+
+#[cfg(test)]
+fn sign_test_content(
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    private_key: &rsa::RsaPrivateKey,
+    digest: TestDigest,
+    encap: &EncapsulatedContentInfo,
+    external_message_digest: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let sid = SignerIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
+        issuer: signing_cert.tbs_certificate.issuer.clone(),
+        serial_number: signing_cert.tbs_certificate.serial_number.clone(),
+    });
+
+    fn build<S, Sig>(
+        encap: &EncapsulatedContentInfo,
+        sid: SignerIdentifier,
+        digest_algorithm: AlgorithmIdentifierOwned,
+        external_message_digest: Option<&[u8]>,
+        signing_cert: &x509_cert::Certificate,
+        cert_chain: &[x509_cert::Certificate],
+        signer: &S,
+    ) -> Result<Vec<u8>>
+    where
+        S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
+        Sig: spki::SignatureBitStringEncoding,
+    {
+        let sib = SignerInfoBuilder::new(
+            signer,
+            sid,
+            digest_algorithm.clone(),
+            encap,
+            external_message_digest,
+        )
+        .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
+        let mut builder = SignedDataBuilder::new(encap);
+        builder
+            .add_digest_algorithm(digest_algorithm)
+            .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
+        builder
+            .add_certificate(CertificateChoices::Certificate(signing_cert.clone()))
+            .map_err(|e| signing_err("Failed to add signing certificate", e))?;
+        for cert in cert_chain {
+            builder
+                .add_certificate(CertificateChoices::Certificate(cert.clone()))
+                .map_err(|e| signing_err("Failed to add chain certificate", e))?;
+        }
+        builder
+            .add_signer_info::<S, Sig>(sib)
+            .map_err(|e| signing_err("Failed to add signer info", e))?;
+        builder
+            .build()
+            .map_err(|e| signing_err("Failed to build CMS SignedData", e))?
+            .to_der()
+            .map_err(|e| signing_err("Failed to encode CMS to DER", e))
+    }
+
+    let digest_algorithm = digest.algorithm();
+    match digest {
+        TestDigest::Sha256 => {
+            let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(private_key.clone());
+            build(
+                encap,
+                sid,
+                digest_algorithm,
+                external_message_digest,
+                signing_cert,
+                cert_chain,
+                &signer,
+            )
+        }
+        TestDigest::Sha1 => {
+            let signer = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(private_key.clone());
+            build(
+                encap,
+                sid,
+                digest_algorithm,
+                external_message_digest,
+                signing_cert,
+                cert_chain,
+                &signer,
+            )
+        }
+    }
+}
 
 /// Generates a CMS signature with Apple CDHash attributes.
 ///

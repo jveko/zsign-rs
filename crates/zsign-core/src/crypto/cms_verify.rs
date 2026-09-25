@@ -49,6 +49,30 @@ use der::{Decode, DecodePem, Encode, Reader, SliceReader, Tag, TagNumber};
 use pkcs8::DecodePublicKey;
 use sha2::{Digest, Sha256};
 
+/// SHA-1: `1.3.14.3.2.26` (legacy profile CMS signer digest).
+const OID_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+
+/// The signer's message-digest algorithm, carried through verification so the
+/// `messageDigest` attribute and the PKCS#1 v1.5 DigestInfo agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignerDigest {
+    Sha1,
+    Sha256,
+}
+
+/// Verification policy for a CMS SignedData structure.
+enum SignedDataMode<'a> {
+    /// Mach-O code signature: detached CodeDirectory content supplied by the
+    /// caller, mandatory Apple CDHash attributes, SHA-256 signer digest.
+    CodeSignature {
+        cd_sha1: Option<&'a [u8; 20]>,
+        cd_sha256: &'a [u8; 32],
+    },
+    /// Provisioning profile: attached eContent required, SHA-256 or SHA-1
+    /// signer digest, no Apple attributes.
+    AttachedProfile,
+}
+
 /// signedData content type: `1.2.840.113549.1.7.2`
 const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 /// id-data content type: `1.2.840.113549.1.7.1`
@@ -239,8 +263,12 @@ pub struct CmsVerifyReport {
     /// Whether the `messageDigest` attribute matched the content digest.
     pub message_digest_ok: bool,
     /// Whether the Apple CDHash v1 attribute matched the CodeDirectory.
+    /// Only meaningful for code-signature verification; always false for
+    /// envelope verification.
     pub cdhash_v1_ok: bool,
     /// Whether the Apple CDHash v2 attribute matched the CodeDirectory.
+    /// Only meaningful for code-signature verification; always false for
+    /// envelope verification.
     pub cdhash_v2_ok: bool,
     /// Whether the signature verified over the signed attributes.
     pub signature_ok: bool,
@@ -299,11 +327,76 @@ pub fn verify_code_signature_with_anchors(
     cd_sha256: &[u8; 32],
     anchors: &TrustAnchors,
 ) -> Result<CmsVerifyReport> {
+    let now = time_now();
     let cms = strip_blob_wrapper(cms_blob)?;
     // Some Apple-produced binaries use BER indefinite lengths; normalize to
     // strict DER before parsing (no-op on already-definite input).
     let cms = normalize_ber_lengths(cms)?;
-    verify_signed_data(&cms, content, cd_sha1, cd_sha256, anchors)
+    let (report, _attached) = verify_signed_data(
+        &cms,
+        Some(content),
+        &SignedDataMode::CodeSignature { cd_sha1, cd_sha256 },
+        anchors,
+        now,
+    )?;
+    Ok(report)
+}
+
+/// Result of verifying a bare CMS SignedData envelope with attached content —
+/// the provisioning-profile shape (no Mach-O blob wrapper, plist in eContent).
+///
+/// `content` is returned even when `report.valid` is false so callers can
+/// inspect what the envelope claims; only consume it after `report.valid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmsEnvelopeReport {
+    /// Signature, chain, and anchoring outcome (same shape as code signing;
+    /// the `cdhash_*` fields are not applicable and stay false).
+    pub report: CmsVerifyReport,
+    /// The attached eContent bytes — for profiles, the XML plist.
+    pub content: Option<Vec<u8>>,
+}
+
+/// Verifies a provisioning-profile-style CMS envelope against
+/// [`TrustAnchors::apple_root`].
+///
+/// `now` is the verification instant; `None` falls back to the wall clock
+/// (`time_now`).
+///
+/// ```ignore
+/// let out = zsign_core::crypto::cms_verify::verify_cms_envelope(&profile_bytes, None)?;
+/// assert!(out.report.valid);
+/// let plist = out.content.expect("profile carries its plist");
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Error::Verification`] when the bytes are not a well-formed CMS
+/// structure; integrity failures are report data (`report.valid == false`).
+pub fn verify_cms_envelope(
+    envelope: &[u8],
+    now: Option<time::OffsetDateTime>,
+) -> Result<CmsEnvelopeReport> {
+    let anchors = TrustAnchors::apple_root()?;
+    verify_cms_envelope_with_anchors(envelope, now, &anchors)
+}
+
+/// Like [`verify_cms_envelope`], but against an explicit anchor set (tests
+/// inject their own root here — mirror of `verify_code_signature_with_anchors`).
+pub fn verify_cms_envelope_with_anchors(
+    envelope: &[u8],
+    now: Option<time::OffsetDateTime>,
+    anchors: &TrustAnchors,
+) -> Result<CmsEnvelopeReport> {
+    let now = now.unwrap_or_else(time_now);
+    let normalized = normalize_ber_lengths(envelope)?;
+    let (report, content) = verify_signed_data(
+        &normalized,
+        None,
+        &SignedDataMode::AttachedProfile,
+        anchors,
+        now,
+    )?;
+    Ok(CmsEnvelopeReport { report, content })
 }
 
 /// Builds a verification report for an ad-hoc signature (no CMS present).
@@ -522,11 +615,11 @@ const TAG_CTX1: Tag = Tag::ContextSpecific {
 
 fn verify_signed_data(
     cms: &[u8],
-    content: &[u8],
-    cd_sha1: Option<&[u8; 20]>,
-    cd_sha256: &[u8; 32],
+    content: Option<&[u8]>,
+    mode: &SignedDataMode<'_>,
     anchors: &TrustAnchors,
-) -> Result<CmsVerifyReport> {
+    now: time::OffsetDateTime,
+) -> Result<(CmsVerifyReport, Option<Vec<u8>>)> {
     let mut report = CmsVerifyReport::default();
     let mut global_errors: Vec<String> = Vec::new();
 
@@ -587,10 +680,55 @@ fn verify_signed_data(
             "encapContentInfo eContentType is {econtent_type} (expected id-data)"
         ));
     }
-    // Skip an optional [0] eContent if present (detached signatures omit it).
+    // Optional [0] EXPLICIT eContent { OCTET STRING }; detached signatures omit it.
+    let mut econtent: Option<Vec<u8>> = None;
     if !encap_r.is_finished() {
-        let _ = AnyRef::decode(&mut encap_r);
+        let ec = AnyRef::decode(&mut encap_r)
+            .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
+        if ec.tag() != TAG_CTX0 {
+            return Err(Error::Verification(format!(
+                "eContent is not in [0] EXPLICIT wrapper (tag {:?})",
+                ec.tag()
+            )));
+        }
+        let mut ecr = reader(ec.value(), "malformed eContent wrapper")?;
+        if !ecr.is_finished() {
+            let inner = AnyRef::decode(&mut ecr)
+                .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
+            if inner.tag() != Tag::OctetString {
+                return Err(Error::Verification(
+                    "attached eContent is not an OCTET STRING".into(),
+                ));
+            }
+            if !ecr.is_finished() {
+                return Err(Error::Verification(
+                    "eContent wrapper has trailing data after the OCTET STRING".into(),
+                ));
+            }
+            econtent = Some(inner.value().to_vec());
+        }
     }
+    if !encap_r.is_finished() {
+        return Err(Error::Verification(
+            "encapContentInfo has trailing fields after eContent".into(),
+        ));
+    }
+
+    // Resolve the bytes the `messageDigest` attribute must cover (owned clone
+    // keeps the early-return moves borrow-free).
+    let bound_content: Option<Vec<u8>> = match mode {
+        SignedDataMode::CodeSignature { .. } => content.map(<[u8]>::to_vec),
+        SignedDataMode::AttachedProfile => match &econtent {
+            Some(c) => Some(c.clone()),
+            None => {
+                global_errors.push(
+                    "CMS has no attached content (eContent required for profile verification)"
+                        .into(),
+                );
+                None
+            }
+        },
+    };
 
     // Optional [0] IMPLICIT certificates, then signerInfos SET.
     let mut certs: Vec<x509_cert::Certificate> = Vec::new();
@@ -654,7 +792,7 @@ fn verify_signed_data(
 
     if signer_infos_raw.is_empty() {
         report.errors.push("no SignerInfo present".into());
-        return seal(report, global_errors);
+        return Ok((seal(report, global_errors)?, econtent));
     }
 
     // Verify each SignerInfo; the report reflects the best (valid) one.
@@ -731,12 +869,33 @@ fn verify_signed_data(
             ObjectIdentifier::decode(&mut dar)
                 .map_err(|e| Error::Verification(format!("malformed digest OID: {e}")))?
         };
-        if dig_oid != OID_SHA256 {
-            report.errors.push(format!(
-                "unsupported digest algorithm {dig_oid} (only SHA-256 is supported)"
-            ));
-            return seal(report, global_errors);
-        }
+        let signer_digest = match mode {
+            SignedDataMode::CodeSignature { .. } => {
+                if dig_oid != OID_SHA256 {
+                    report.errors.push(format!(
+                        "unsupported digest algorithm {dig_oid} (only SHA-256 is supported)"
+                    ));
+                    return Ok((seal(report, global_errors)?, econtent));
+                }
+                SignerDigest::Sha256
+            }
+            SignedDataMode::AttachedProfile => match dig_oid {
+                OID_SHA256 => SignerDigest::Sha256,
+                OID_SHA1 => {
+                    let w = "profile CMS is signed with a SHA-1 message digest";
+                    if !report.warnings.iter().any(|x| x == w) {
+                        report.warnings.push(w.to_string());
+                    }
+                    SignerDigest::Sha1
+                }
+                other => {
+                    report.errors.push(format!(
+                        "unsupported digest algorithm {other} (profile CMS allows SHA-256 or SHA-1)"
+                    ));
+                    return Ok((seal(report, global_errors)?, econtent));
+                }
+            },
+        };
 
         // signedAttrs [0] — capture raw bytes (the signed message).
         let attrs_start = usize::try_from(si_r.position()).unwrap_or(0);
@@ -787,7 +946,7 @@ fn verify_signed_data(
             report
                 .errors
                 .push("signing certificate not found in embedded set".into());
-            return seal(report, global_errors);
+            return Ok((seal(report, global_errors)?, econtent));
         };
 
         let cn = cert.tbs_certificate.subject.to_string();
@@ -799,32 +958,48 @@ fn verify_signed_data(
             .ok()
             .map(|d| hex(&d));
 
-        // 1. messageDigest attribute == SHA-256(content)
-        let digest = Sha256::digest(content);
-        let md_ok = attrs
-            .message_digest
-            .map(|md| md == digest.as_slice())
-            .unwrap_or(false);
+        // 1. messageDigest attribute == digest(bound content)
+        let md_ok = match &bound_content {
+            Some(b) => {
+                let computed: Vec<u8> = match signer_digest {
+                    SignerDigest::Sha1 => sha1::Sha1::digest(b).to_vec(),
+                    SignerDigest::Sha256 => Sha256::digest(b).to_vec(),
+                };
+                // `SignedAttrs::message_digest` is `Option<&[u8]>` — compare
+                // the slices directly, mirroring the existing check.
+                attrs
+                    .message_digest
+                    .map(|md| md == computed.as_slice())
+                    .unwrap_or(false)
+            }
+            None => false,
+        };
         report.message_digest_ok = md_ok;
 
         // 2. Apple CDHash attributes bind this CodeDirectory.
-        let v1_ok = attrs
-            .cdhash_v1_plist
-            .map(|p| cdhash_v1_matches(p, cd_sha1, cd_sha256))
-            .unwrap_or(false);
-        report.cdhash_v1_ok = v1_ok;
-        let v2_ok = attrs
-            .cdhash_v2_der
-            .map(|d| cdhash_v2_matches(d, cd_sha256))
-            .unwrap_or(false);
-        report.cdhash_v2_ok = v2_ok;
+        if let SignedDataMode::CodeSignature { cd_sha1, cd_sha256 } = mode {
+            report.cdhash_v1_ok = attrs
+                .cdhash_v1_plist
+                .as_ref()
+                .map(|p| cdhash_v1_matches(p, *cd_sha1, cd_sha256))
+                .unwrap_or(false);
+            report.cdhash_v2_ok = attrs
+                .cdhash_v2_der
+                .as_ref()
+                .map(|d| cdhash_v2_matches(d, cd_sha256))
+                .unwrap_or(false);
+        }
 
         // 3. Signature over the raw signedAttrs bytes.
-        let sig_ok = verify_signer_signature(cert, sig_oid, attrs_raw, signature);
+        let sig_ok = verify_signer_signature(cert, sig_oid, signer_digest, attrs_raw, signature);
         report.signature_ok = sig_ok;
 
         // 4. Chain structure and trust anchoring.
-        let outcome = verify_chain(&certs, cert, anchors);
+        let purpose = match mode {
+            SignedDataMode::CodeSignature { .. } => SignerPurpose::CodeSigning,
+            SignedDataMode::AttachedProfile => SignerPurpose::ProvisioningProfile,
+        };
+        let outcome = verify_chain(&certs, cert, anchors, now, purpose);
         report.chain_ok = outcome.ok;
         report.anchored = outcome.anchored;
         report.chain = outcome.subjects;
@@ -839,11 +1014,13 @@ fn verify_signed_data(
         if !md_ok {
             errors.push("messageDigest attribute does not match the signed content".into());
         }
-        if !v1_ok {
-            errors.push("Apple CDHash v1 attribute does not match the CodeDirectory".into());
-        }
-        if !v2_ok {
-            errors.push("Apple CDHash v2 attribute does not match the CodeDirectory".into());
+        if let SignedDataMode::CodeSignature { .. } = mode {
+            if !report.cdhash_v1_ok {
+                errors.push("Apple CDHash v1 attribute does not match the CodeDirectory".into());
+            }
+            if !report.cdhash_v2_ok {
+                errors.push("Apple CDHash v2 attribute does not match the CodeDirectory".into());
+            }
         }
         if !sig_ok {
             errors.push("signature does not verify over the signed attributes".into());
@@ -869,14 +1046,14 @@ fn verify_signed_data(
             }
             // No-op when globals are empty; otherwise the structural errors
             // land first and keep `valid` false.
-            return seal(report, global_errors);
+            return Ok((seal(report, global_errors)?, econtent));
         }
         if report.errors.is_empty() {
             report.errors = errors;
         }
     }
 
-    seal(report, global_errors)
+    Ok((seal(report, global_errors)?, econtent))
 }
 
 /// Checks the Apple CDHash v1 plist attribute (a plist with a `cdhashes`
@@ -934,6 +1111,7 @@ fn cdhash_v2_matches(der: &[u8], cd_sha256: &[u8; 32]) -> bool {
 fn verify_signer_signature(
     cert: &x509_cert::Certificate,
     sig_oid: ObjectIdentifier,
+    digest: SignerDigest,
     signed_attrs_raw: &[u8],
     signature: &[u8],
 ) -> bool {
@@ -957,10 +1135,33 @@ fn verify_signer_signature(
         candidates.push(&set_form);
     }
 
-    // Dispatch on signatureAlgorithm; RSA can be rsaEncryption (with the
-    // digest OID carrying SHA-256) or sha256WithRSAEncryption directly.
-    let rsa_sig = sig_oid == OID_SHA256_WITH_RSA || sig_oid == OID_RSA_ENCRYPTION;
+    // Dispatch on signatureAlgorithm. RSA accepts digest-less rsaEncryption
+    // or an explicit *WithRSAEncryption OID, which must name the SignerInfo
+    // digest.
+    let rsa_sig = sig_oid == OID_SHA256_WITH_RSA
+        || sig_oid == OID_SHA1_WITH_RSA
+        || sig_oid == OID_RSA_ENCRYPTION;
     let ecdsa_sig = sig_oid == OID_ECDSA_WITH_SHA256;
+
+    if rsa_sig {
+        let consistent = sig_oid == OID_RSA_ENCRYPTION
+            || (sig_oid == OID_SHA256_WITH_RSA && digest == SignerDigest::Sha256)
+            || (sig_oid == OID_SHA1_WITH_RSA && digest == SignerDigest::Sha1);
+        if !consistent {
+            // signatureAlgorithm/digestAlgorithm mismatch — reject outright.
+            return false;
+        }
+    }
+    // The digest the RSA PKCS#1 v1.5 DigestInfo must carry: explicit
+    // *WithRSAEncryption OIDs were checked against `digest` above;
+    // rsaEncryption inherits it.
+    let effective_digest = if sig_oid == OID_SHA1_WITH_RSA {
+        SignerDigest::Sha1
+    } else if sig_oid == OID_SHA256_WITH_RSA {
+        SignerDigest::Sha256
+    } else {
+        digest
+    };
 
     for msg in candidates {
         let ok = if rsa_sig && alg == OID_RSA_ENCRYPTION {
@@ -973,9 +1174,14 @@ fn verify_signer_signature(
             let Ok(sig) = rsa::pkcs1v15::Signature::try_from(signature) else {
                 return false;
             };
-            rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pub_key)
-                .verify(msg, &sig)
-                .is_ok()
+            match effective_digest {
+                SignerDigest::Sha256 => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pub_key)
+                    .verify(msg, &sig)
+                    .is_ok(),
+                SignerDigest::Sha1 => rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::new(pub_key)
+                    .verify(msg, &sig)
+                    .is_ok(),
+            }
         } else if ecdsa_sig && alg == OID_EC_PUBLIC_KEY {
             let Ok(pk_der) = spki.to_der() else {
                 return false;
@@ -1011,6 +1217,17 @@ struct ChainOutcome {
     warnings: Vec<String>,
 }
 
+/// Which end-entity policy applies to the signer certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignerPurpose {
+    /// Mach-O code signatures: the leaf must assert the codeSigning EKU.
+    CodeSigning,
+    /// Provisioning-profile CMS: Apple's profile-signing leaves carry no EKU
+    /// extension, so RFC 5280 4.2.1.12 imposes no purpose; only the shared
+    /// keyUsage/basicConstraints rules apply.
+    ProvisioningProfile,
+}
+
 /// Notes that a certificate's own signature uses SHA-1 (accepted, but
 /// recorded so consumers can surface weak-crypto usage).
 fn sha1_warning(child: &x509_cert::Certificate) -> Option<String> {
@@ -1029,13 +1246,18 @@ fn verify_chain(
     certs: &[x509_cert::Certificate],
     leaf: &x509_cert::Certificate,
     anchors: &TrustAnchors,
+    now: time::OffsetDateTime,
+    purpose: SignerPurpose,
 ) -> ChainOutcome {
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
-    let now = time_now();
 
-    if let Some(reason) = leaf_purpose_reason(leaf) {
+    let purpose_reason = match purpose {
+        SignerPurpose::CodeSigning => leaf_purpose_reason(leaf),
+        SignerPurpose::ProvisioningProfile => leaf_ku_bc_reason(leaf),
+    };
+    if let Some(reason) = purpose_reason {
         return ChainOutcome {
             ok: false,
             anchored: false,
@@ -1284,7 +1506,7 @@ fn find_cert_by_ski<'a>(
 
 /// End-entity purpose constraints; applied unconditionally to the leaf.
 fn leaf_purpose_reason(leaf: &x509_cert::Certificate) -> Option<String> {
-    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
     let Some(eku_bytes) = ext_value(leaf, OID_EXT_KEY_USAGE) else {
         return Some("leaf lacks codeSigning EKU extension".into());
     };
@@ -1294,6 +1516,14 @@ fn leaf_purpose_reason(leaf: &x509_cert::Certificate) -> Option<String> {
     if !eku.0.contains(&OID_CODE_SIGNING) {
         return Some(format!("leaf EKU lacks codeSigning: {:?}", eku.0));
     }
+    leaf_ku_bc_reason(leaf)
+}
+
+/// keyUsage/basicConstraints rules shared by every leaf purpose: both
+/// extensions are optional, but when present keyUsage must set
+/// digitalSignature and basicConstraints must assert CA=false.
+fn leaf_ku_bc_reason(leaf: &x509_cert::Certificate) -> Option<String> {
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
     if let Some(ku_bytes) = ext_value(leaf, OID_KEY_USAGE) {
         let Ok(ku) = KeyUsage::from_der(ku_bytes) else {
             return Some("leaf keyUsage extension is malformed".into());
@@ -1351,7 +1581,11 @@ fn in_validity(cert: &x509_cert::Certificate, now: time::OffsetDateTime) -> bool
     nb <= now && now <= na
 }
 
-fn time_now() -> time::OffsetDateTime {
+/// Returns the wall-clock verification instant used as the default for new
+/// entry points, which take `now: Option<OffsetDateTime>` defaulted with
+/// `now.unwrap_or_else(time_now)`. The wasm32 contract for that default lands
+/// in queue item 4 as `resolve_now`.
+pub(crate) fn time_now() -> time::OffsetDateTime {
     // WASM builds have no reliable wall clock; a fixed reference keeps the
     // module compiling on wasm32 while native builds get real validity checks.
     #[cfg(target_arch = "wasm32")]
@@ -1374,6 +1608,7 @@ mod tests {
     use super::*;
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::cms::sign_code_directory;
+    use crate::crypto::cms::{sign_attached_content, sign_detached_content, TestDigest};
     use crate::crypto::SigningCredentials;
     use sha2::Sha256;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -1667,6 +1902,8 @@ mod tests {
             &[root.clone(), leaf.clone()],
             &leaf,
             &TrustAnchors::from_certificates(vec![root.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
         );
         assert!(
             outcome.ok,
@@ -1725,6 +1962,8 @@ mod tests {
             &[root.clone(), leaf.clone()],
             leaf,
             &TrustAnchors::from_certificates(vec![root.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
         )
     }
 
@@ -1826,6 +2065,8 @@ mod tests {
             std::slice::from_ref(&self_signed),
             &self_signed,
             &TrustAnchors::from_certificates(vec![self_signed.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
         );
         assert!(!outcome.ok);
         assert!(outcome
@@ -2044,6 +2285,8 @@ mod tests {
             &[issuer_like.clone(), leaf.clone()],
             &leaf,
             &TrustAnchors::from_certificates(vec![issuer_like.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
         );
         assert!(!outcome.ok);
         assert!(outcome
@@ -2096,6 +2339,8 @@ mod tests {
             &[leaf.clone(), int.clone(), subca.clone()],
             &leaf,
             &TrustAnchors::from_certificates(vec![subca.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
         );
         assert!(!outcome.ok);
         assert!(outcome
@@ -2505,5 +2750,441 @@ mod tests {
             report.errors
         );
         assert!(report.errors[0].contains("encapContentInfo eContentType"));
+    }
+
+    // ---- injected clock + signer purpose ----
+
+    const T_2025: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+    const T_2026_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+    const T_2026_APR: i64 = 1_775_001_600; // 2026-04-01T00:00:00Z
+    const T_2026_JUL: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
+    const T_2027: i64 = 1_798_761_600; // 2027-01-01T00:00:00Z
+    const T_2030: i64 = 1_893_456_000; // 2030-01-01T00:00:00Z
+
+    /// Root valid 2020-01-01..2030-01-01 (covers every fixed instant below);
+    /// leaf valid exactly [not_before, not_after].
+    fn fixed_validity_chain(
+        not_before_unix: u64,
+        not_after_unix: u64,
+        eku: Option<ExtendedKeyUsage>,
+    ) -> (
+        x509_cert::Certificate,
+        x509_cert::Certificate,
+        rsa::RsaPrivateKey,
+        TrustAnchors,
+    ) {
+        let to_time = |unix: u64| {
+            x509_cert::time::Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(unix))
+                .unwrap()
+        };
+        let root_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let root_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(root_key.clone());
+        let root_name = Name::from_str("CN=zsn3 fixed-time root").unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(
+            root_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(21u32),
+            Validity {
+                not_before: to_time(1_577_836_800),
+                not_after: to_time(T_2030 as u64),
+            },
+            root_name.clone(),
+            root_pub,
+            &root_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let leaf_name = Name::from_str("CN=zsn3 fixed-time leaf").unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
+            leaf_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut leaf_builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(22u32),
+            Validity {
+                not_before: to_time(not_before_unix),
+                not_after: to_time(not_after_unix),
+            },
+            leaf_name,
+            leaf_pub,
+            &root_signing,
+        )
+        .unwrap();
+        if let Some(eku) = &eku {
+            leaf_builder.add_extension(eku).unwrap();
+        }
+        let leaf_cert = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+
+        let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
+        (root_cert, leaf_cert, leaf_key, anchors)
+    }
+
+    fn at(unix: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(unix).unwrap()
+    }
+
+    #[test]
+    fn chain_validity_follows_injected_now_not_wall_clock() {
+        let (root, leaf, _leaf_key, anchors) = fixed_validity_chain(
+            T_2026_START as u64,
+            T_2026_JUL as u64,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let certs = vec![root, leaf.clone()];
+
+        let inside = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2026_APR),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(inside.ok, "inside window must pass: {:?}", inside.reason);
+
+        let expired = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2027),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(!expired.ok);
+        assert!(
+            expired
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside validity"),
+            "reason: {:?}",
+            expired.reason
+        );
+
+        let early = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2025),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(!early.ok);
+        assert!(
+            early
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside validity"),
+            "reason: {:?}",
+            early.reason
+        );
+    }
+
+    #[test]
+    fn profile_purpose_accepts_eku_less_leaf_and_code_purpose_rejects_it() {
+        let (root, leaf, _leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        let certs = vec![root, leaf.clone()];
+        let now = at(T_2026_APR);
+
+        let profile = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            now,
+            SignerPurpose::ProvisioningProfile,
+        );
+        assert!(
+            profile.ok,
+            "profile purpose must not require EKU: {:?}",
+            profile.reason
+        );
+        assert!(profile.anchored);
+
+        let code = verify_chain(&certs, &leaf, &anchors, now, SignerPurpose::CodeSigning);
+        assert!(!code.ok);
+        assert!(
+            code.reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("codeSigning EKU"),
+            "reason: {:?}",
+            code.reason
+        );
+    }
+
+    #[test]
+    fn profile_purpose_still_enforces_key_usage_and_ca_flag() {
+        let (root, mut leaf, _leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        replace_extension(
+            &mut leaf,
+            OID_BASIC_CONSTRAINTS,
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            },
+        );
+        let certs = vec![root, leaf.clone()];
+
+        let outcome = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2026_APR),
+            SignerPurpose::ProvisioningProfile,
+        );
+        assert!(!outcome.ok);
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("basicConstraints asserts CA"),
+            "reason: {:?}",
+            outcome.reason
+        );
+    }
+    // ---- attached-content (profile) envelope ----
+
+    fn sample_plist() -> &'static [u8] {
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+          <plist version=\"1.0\">\n\
+          <dict>\n\
+          <key>Name</key><string>Test Profile</string>\n\
+          <key>Entitlements</key><dict><key>get-task-allow</key><true/></dict>\n\
+          </dict>\n\
+          </plist>"
+    }
+
+    #[test]
+    fn attached_profile_envelope_round_trips_with_injected_anchors() {
+        let (root, leaf, leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        let envelope = sign_attached_content(
+            sample_plist(),
+            &leaf,
+            &[root],
+            &leaf_key,
+            TestDigest::Sha256,
+        )
+        .unwrap();
+
+        let out =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(out.report.valid, "errors: {:?}", out.report.errors);
+        assert_eq!(out.content.as_deref(), Some(sample_plist()));
+        assert!(out.report.anchored);
+        assert!(out.report.message_digest_ok);
+        assert!(out.report.signature_ok);
+        assert!(out.report.chain_ok);
+        assert!(out.report.signer_subject.is_some());
+    }
+
+    #[test]
+    fn attached_profile_envelope_is_unanchored_against_apple_roots() {
+        let (root, leaf, leaf_key, _anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        let envelope = sign_attached_content(
+            sample_plist(),
+            &leaf,
+            &[root],
+            &leaf_key,
+            TestDigest::Sha256,
+        )
+        .unwrap();
+
+        let out = verify_cms_envelope(&envelope, Some(at(T_2026_APR))).unwrap();
+        assert!(!out.report.valid);
+        assert!(!out.report.anchored);
+        assert!(
+            out.report.errors.iter().any(|e| e.contains("anchored")),
+            "errors: {:?}",
+            out.report.errors
+        );
+    }
+
+    #[test]
+    fn tampered_attached_content_fails_message_digest() {
+        let (root, leaf, leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        let mut envelope = sign_attached_content(
+            sample_plist(),
+            &leaf,
+            &[root],
+            &leaf_key,
+            TestDigest::Sha256,
+        )
+        .unwrap();
+        let idx = envelope
+            .windows(sample_plist().len())
+            .position(|w| w == sample_plist())
+            .expect("eContent embedded in envelope");
+        envelope[idx] = b'!';
+
+        let out =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(!out.report.valid);
+        assert!(!out.report.message_digest_ok);
+        assert!(
+            out.report
+                .errors
+                .iter()
+                .any(|e| e.contains("messageDigest")),
+            "errors: {:?}",
+            out.report.errors
+        );
+    }
+
+    #[test]
+    fn attached_profile_accepts_sha1_signer_digest_with_warning() {
+        let (root, leaf, leaf_key, anchors) =
+            fixed_validity_chain(T_2026_START as u64, T_2030 as u64, None);
+        let envelope =
+            sign_attached_content(sample_plist(), &leaf, &[root], &leaf_key, TestDigest::Sha1)
+                .unwrap();
+
+        let out =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(out.report.valid, "errors: {:?}", out.report.errors);
+        assert!(
+            out.report.warnings.iter().any(|w| w.contains("SHA-1")),
+            "warnings: {:?}",
+            out.report.warnings
+        );
+    }
+
+    #[test]
+    fn detached_code_cms_reports_missing_attached_content() {
+        let creds = rsa_credentials();
+        let content: &[u8] = b"detached content";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds.0, None, &cd_sha256).unwrap();
+
+        let out =
+            verify_cms_envelope_with_anchors(&cms, Some(at(T_2026_APR)), &anchors_for(&creds.0))
+                .unwrap();
+        assert!(!out.report.valid);
+        assert!(out.content.is_none());
+        assert!(
+            out.report
+                .errors
+                .iter()
+                .any(|e| e.contains("no attached content")),
+            "errors: {:?}",
+            out.report.errors
+        );
+    }
+
+    #[test]
+    fn code_signature_mode_still_rejects_sha1_signer_digest() {
+        let (creds, key) = rsa_credentials();
+        let content: &[u8] = b"detached sha1 content";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_detached_content(content, &creds.certificate, &[], &key, TestDigest::Sha1)
+            .unwrap();
+        let wrapped = wrap(&cms);
+
+        let report = verify_code_signature_with_anchors(
+            &wrapped,
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("only SHA-256 is supported")),
+            "errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn rsa_signature_rejects_digest_and_signature_oid_mismatches() {
+        use signature::{SignatureEncoding, Signer};
+
+        let (creds, key) = rsa_credentials();
+        let msg: &[u8] = b"\x02\x01\x01 mismatch-probe";
+
+        let sha256_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let sig256: rsa::pkcs1v15::Signature = sha256_key.sign(msg);
+        let sig256_bytes = sig256.to_vec();
+
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha256,
+            msg,
+            &sig256_bytes,
+        ));
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_RSA_ENCRYPTION,
+            SignerDigest::Sha256,
+            msg,
+            &sig256_bytes,
+        ));
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA1_WITH_RSA,
+            SignerDigest::Sha256,
+            msg,
+            &sig256_bytes,
+        ));
+
+        let sha1_key = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(key.clone());
+        let sig1: rsa::pkcs1v15::Signature = sha1_key.sign(msg);
+        let sig1_bytes = sig1.to_vec();
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_SHA1_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            &sig1_bytes,
+        ));
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_RSA_ENCRYPTION,
+            SignerDigest::Sha1,
+            msg,
+            &sig1_bytes,
+        ));
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            &sig256_bytes,
+        ));
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            &sig1_bytes,
+        ));
     }
 }
