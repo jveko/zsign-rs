@@ -208,6 +208,10 @@ Options:
   minimal two's complement (trim redundant leading `0xFF` octets while the
   following octet's MSB is set) and add golden vectors `-1 → 02 01 ff`,
   `-128 → 02 01 80`, `-129 → 02 02 ff 7f`, `i64::MIN → 02 08 80 00…00`.
+  **Ruled option B by the supervisor and applied** (empirical bytes outrank
+  the argument-only retraction): the `else if val >> 63 == 1` branch plus
+  `test_encode_integer_negative_minimal` landed; the positive/zero path is
+  untouched and still pinned by every pre-existing vector.
 
 ### Item 5 — interop ground truth + ZSN-23 handover
 
@@ -337,8 +341,10 @@ ad-hoc bundle); no diagnostic content is removed.
 
 ## Known items for the orchestrator (out of lane scope or recorded risks)
 
-1. **Negative-integer encoding is wrong at c9ff0fb** (observation above); brief
-   says do not fix → open question, default option A (no fix, no vector).
+1. **Negative-integer encoding was wrong at c9ff0fb** (observation above);
+   RESOLVED this lane under the supervisor's option-B ruling: minimal two's
+   complement fix + four golden vectors (`test_encode_integer_negative_minimal`),
+   non-negative encoding unchanged (36-test scoped gate + 26 doctests green).
 2. **`codesign/superblob.rs:246-251` doctest** uses `vec![0x31, 0x00]; //
    minimal empty SET` — stale pre-canonical illustration. Doc-only (cannot
    fail), and superblob.rs is not in this lane's scope; reported, not edited.

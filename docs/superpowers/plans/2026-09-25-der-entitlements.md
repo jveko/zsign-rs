@@ -49,8 +49,10 @@ the behavior:
 | Data/Date inside envelope | Task 4 (item 4) | `test_plist_to_der_data_and_date_in_envelope` |
 | cross-check vs `codesign --generate-entitlement-der` | Task 5 (item 5) | script entitlements step (macOS) |
 
-Negative-integer vectors are intentionally absent: see the design doc's open
-question (default option A — brief says do not fix the negative path).
+Negative-integer vectors landed under the supervisor's option-B ruling:
+`test_encode_integer_negative_minimal` pins `-1 → 02 01 ff`,
+`-128 → 02 01 80`, `-129 → 02 02 ff 7f`, `i64::MIN → 02 08 80 00…00`
+(design doc item 4 records the question and the ruling).
 
 ---
 

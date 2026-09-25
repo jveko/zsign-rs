@@ -223,6 +223,21 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
             if val == 0 {
                 output.push(1); // length
                 output.push(0); // value
+            } else if val >> 63 == 1 {
+                // Minimal two's complement for negative values: drop the
+                // leading 0xFF octets that only repeat the sign of the next
+                // octet (X.690 clause 8.3.2); the sign octet always stays.
+                let bytes = val.to_be_bytes();
+                let mut start = 0;
+                while start + 1 < bytes.len()
+                    && bytes[start] == 0xFF
+                    && bytes[start + 1] & 0x80 != 0
+                {
+                    start += 1;
+                }
+                let minimal = &bytes[start..];
+                encode_length(&mut output, minimal.len());
+                output.extend_from_slice(minimal);
             } else {
                 // Calculate number of bytes needed for the value
                 let leading_zeros = val.leading_zeros() as usize;
@@ -683,6 +698,28 @@ mod tests {
                 0x04, 0x03, 0x01, 0x02, 0x03, 0x30, 0x15, 0x0c, 0x02, b't', b's', 0x18, 0x0f, b'1',
                 b'9', b'8', b'1', b'0', b'5', b'1', b'6', b'1', b'1', b'3', b'2', b'0', b'6', b'Z',
             ]
+        );
+    }
+
+    #[test]
+    fn test_encode_integer_negative_minimal() {
+        // Minimal two's complement for in-range negatives (X.690 clause 8.3.2):
+        // -1, -128, and the i64 boundary each collapse to their shortest form.
+        assert_eq!(
+            encode_value(&Value::Integer((-1i64).into())).unwrap(),
+            vec![0x02, 0x01, 0xff]
+        );
+        assert_eq!(
+            encode_value(&Value::Integer((-128i64).into())).unwrap(),
+            vec![0x02, 0x01, 0x80]
+        );
+        assert_eq!(
+            encode_value(&Value::Integer((-129i64).into())).unwrap(),
+            vec![0x02, 0x02, 0xff, 0x7f]
+        );
+        assert_eq!(
+            encode_value(&Value::Integer(i64::MIN.into())).unwrap(),
+            vec![0x02, 0x08, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
     }
 }
