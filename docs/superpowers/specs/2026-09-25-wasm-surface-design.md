@@ -334,7 +334,7 @@ core variant fails to compile until categorized:
 | `EncryptedBinary` | `ZSIGN_ENCRYPTED_BINARY` | `Error::EncryptedBinary` |
 | `SigningFailed` | `ZSIGN_SIGNING_FAILED` | `Error::Signing` |
 | `InvalidCertificate` | `ZSIGN_INVALID_CERTIFICATE` | `Error::Certificate` |
-| `InvalidPassword` | `ZSIGN_INVALID_PASSWORD` | constructor classifier: `from_p12` failures whose message contains `invalid PKCS#12 password (MAC mismatch)` (see below) |
+| `InvalidPassword` | `ZSIGN_INVALID_PASSWORD` | constructor classifier: `from_p12` failures whose message contains a password-layer marker — MAC mismatch or decryption failure (see below) |
 | `MissingCredentials` | `ZSIGN_MISSING_CREDENTIALS` | `Error::MissingCredentials` |
 | `Config` | `ZSIGN_CONFIG` | `Error::Config` |
 | `InvalidProfile` | `ZSIGN_INVALID_PROFILE` | `Error::ProvisioningProfile` |
@@ -359,14 +359,19 @@ wraps every `extract_p12` failure — including the wrong-password MAC
 failure — as `Error::Certificate` (cert.rs:203-205), and core never
 constructs `Error::InvalidPassword` (error.rs:19-20 has no producer). The
 wasm constructor therefore classifies `from_p12` errors before falling back
-to the generic mapping: a message containing `invalid PKCS#12 password (MAC
-mismatch)` (P12Error::Mac's Display, pkcs12.rs:79) yields
+to the generic mapping, keyed on BOTH password-layer markers:
+`invalid PKCS#12 password (MAC mismatch)` (P12Error::Mac's Display,
+pkcs12.rs:79 — the standard unencrypted-authSafe flow, proven across all
+nine core fixtures) and `PKCS#12 decryption failed` (P12Error::Decrypt's
+Display — encrypted AuthenticatedSafe/key-bag files, where a wrong
+password fails at decryption before any MAC check). Either marker yields
 `ZSIGN_INVALID_PASSWORD`; everything else yields the variant-derived code.
-This is deterministic for all supported p12 variants — core's own tests
-prove wrong passwords fail the MAC check (pkcs12.rs:895-907) — and fails
-safe (a future message change degrades to `ZSIGN_INVALID_CERTIFICATE`, the
-test guarding it goes red). The exhaustive `match` still maps
-`Error::InvalidPassword` for completeness.
+Residual, documented fail-safe: for an encrypted/no-MAC file whose wrong
+password degenerates into a malformed-ASN.1 parse error, no password-layer
+signal survives and the code degrades to `ZSIGN_INVALID_CERTIFICATE`
+(classifier tests pin both markers and the generic fallback; a message
+change anywhere degrades to generic and the marker test goes red). The
+exhaustive `match` still maps `Error::InvalidPassword` for completeness.
 
 ### Item 6 — test suite
 

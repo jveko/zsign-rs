@@ -901,13 +901,21 @@ fn core_err(e: zsign_core::Error) -> JsValue {
     js_err(code, e)
 }
 
-/// `from_p12` wraps every PKCS#12 failure — including the wrong-password MAC
-/// failure — as `Error::Certificate` (crypto/cert.rs:203-205); the MAC
-/// mismatch Display text (crypto/pkcs12.rs:79) is the only surviving
-/// wrong-password signal, and core's own tests prove wrong passwords fail
-/// the MAC check (pkcs12.rs:895-907). Anything else keeps the generic code.
+/// `from_p12` wraps every PKCS#12 failure — including wrong-password
+/// failures — as `Error::Certificate` (crypto/cert.rs:203-205). Both
+/// password-layer Display markers are classified: the MAC mismatch text
+/// (crypto/pkcs12.rs:79, the standard unencrypted-authSafe flow proven
+/// across all nine core fixtures) and `PKCS#12 decryption failed`
+/// (encrypted AuthenticatedSafe/key-bag files, where a wrong password
+/// fails at decryption before any MAC check). A wrong password that
+/// degenerates into a malformed-ASN.1 parse error carries no password
+/// signal and degrades to the generic certificate code (fail-safe,
+/// documented). Anything else keeps the generic code.
 fn p12_err(e: zsign_core::Error) -> JsValue {
-    let code = if e.to_string().contains("invalid PKCS#12 password (MAC mismatch)") {
+    let text = e.to_string();
+    let code = if text.contains("invalid PKCS#12 password (MAC mismatch)")
+        || text.contains("PKCS#12 decryption failed")
+    {
         WasmErrorCode::InvalidPassword
     } else {
         code_for_core_error(&e)
