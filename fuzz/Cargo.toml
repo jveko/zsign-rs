@@ -1,0 +1,65 @@
+[package]
+name = "zsign-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+zsign-core = { path = "../crates/zsign-core" }
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
+[features]
+fuzzing = ["dep:libfuzzer-sys"]
+
+[[bin]]
+name = "superblob"
+path = "fuzz_targets/superblob.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "code_directory"
+path = "fuzz_targets/code_directory.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "verify_code_signature"
+path = "fuzz_targets/verify_code_signature.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "pkcs12"
+path = "fuzz_targets/pkcs12.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "plist_to_der"
+path = "fuzz_targets/plist_to_der.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "provisioning"
+path = "fuzz_targets/provisioning.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
