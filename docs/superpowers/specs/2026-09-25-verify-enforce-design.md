@@ -30,7 +30,7 @@ Queue corrections accepted from research (brief vs evidence):
   correction were imprecise. The *raw builder* all-empty fallback floors at
   `n_special = 3` (`code_directory.rs:501-535`, test `:772-779`), but *actual bare
   signer output* is `n_special = 2`: the signer always binds a nonzero requirements
-  hash (`signer.rs:798-801, 823-824`), `count_special_slots` trims unbound high
+  hash (`signer.rs:793-797, 822-823`), `count_special_slots` trims unbound high
   slots (−3..−7 absent → window stops at −2), and −1 stays inside the window
   zero-filled. Unaffected either way: the elevation rule keys on nonzero stored
   hashes, not on vector length.
@@ -49,7 +49,7 @@ Queue corrections accepted from research (brief vs evidence):
 4. No NEW failures against the macOS interop gate
    (`scripts/verify-apple-interop.sh` `agree_valid` on our ad-hoc bundle, `/bin/ls`,
    codesign ad-hoc output, and the tampered negative control). The `agree_valid
-   "cert-signed bundle"` line (`:190`) is **already red at c9ff0fb, pre-existing and
+   "cert-signed bundle"` line (`:191`) is **already red at c9ff0fb, pre-existing and
    out of scope**: the script self-signs its certificate (`:58-64`) while production
    CMS verification hard-defaults to Apple roots (`crypto/cms_verify.rs:281-288`) and
    the facade report is error-sensitive (`zsign/src/verify.rs:135-138`), so
@@ -66,7 +66,7 @@ Queue corrections accepted from research (brief vs evidence):
 - **C-3** `SliceVerifyReport.special_slots` stays positional, length == `n_special_slots`,
   with `NotChecked` entries at index 0 (slot −1) and 2 (slot −3):
   `crates/zsign/src/verify.rs:354-366, 496-509` compare `== Some(&NotChecked)`; test
-  `macho/verify.rs:686` asserts all-`Matched` for the supplied-input fixture.
+  `macho/verify.rs:678-679` asserts all-`Matched` for the supplied-input fixture.
 - **C-4** `verify_macho`/`verify_slice` must return `Ok(report)` for a parseable Mach-O
   with a broken signature: `crates/zsign/src/verify.rs:348` `?`-propagates, tests
   `:1090/:1239/:1253` unwrap. Signature findings = `report.errors.push(...)`.
@@ -157,8 +157,9 @@ Cross-cutting decisions (brainstorm picks, refined by research):
   `cd_sha256 = SHA256(bytes of the SHA-256 CD)`, CMS `content` stays `primary.raw()`.
   `cd_sha1 = None` when no SHA-1 CD exists (sha256-only → v1 single-element arm, current
   behavior). No SHA-256 CD while a non-empty CMS is present → explicit error
-  (cannot verify CDHash v2). Only computed inside the non-ad-hoc branch (after the
-  empty-wrapper early return), so ad-hoc output never hits it. `alternate_sha1` is
+  (cannot verify CDHash v2). Only computed inside the non-ad-hoc branch (a
+  branch, not an early return — after task 8's restructure the designated-requirement
+  step still runs on every path), so ad-hoc output never hits it. `alternate_sha1` is
   deleted (only caller is the site being rewritten).
 - **Requirements evaluation (item 8)**: bounded parser in `codesign/verify.rs`
   (Requirements SuperBlob `0xfade0c01` → typed index → requirement blob `0xfade0c00`
@@ -529,7 +530,7 @@ the final tree containing every constant the brief's item 10 lists.
 `scripts/verify-apple-interop.sh` (macOS CI, not part of the scoped cargo gate) runs
 `zsign -V` and requires `verified: yes` for our cert bundle, our ad-hoc bundle,
 `/bin/ls`, and codesign ad-hoc output; and requires *no* `verified: yes` for a tampered
-control. **Pre-existing status: the cert-signed-bundle line (`:190`) is already red at
+control. **Pre-existing status: the cert-signed-bundle line (`:191`) is already red at
 c9ff0fb** — the script's self-signed certificate (`:58-64`) can never satisfy the
 production Apple-root anchoring (`crypto/cms_verify.rs:281-288`) that the dual-pin
 design intentionally enforces (`zsign/src/verify.rs:135-138` makes the facade
@@ -612,7 +613,7 @@ computed by compiling Apple's own struct and printing `offsetof`):
 3. `zsign/src/verify.rs` will show duplicate messaging for slots −1/−3 (core error +
    ZSN-26's message) once task 3 lands; harmless (`.any()` assertions), removable only
    by editing a file this lane may not touch.
-4. **QUESTION 1 (interop cert line).** `scripts/verify-apple-interop.sh:190`
+4. **QUESTION 1 (interop cert line).** `scripts/verify-apple-interop.sh:191`
    `agree_valid "cert-signed bundle"` requires `zsign -V` → `verified: yes` on a bundle
    signed with the script's self-signed certificate, but production verification is
    hard-anchored to Apple's root, so this line is red at c9ff0fb and will stay red
@@ -633,7 +634,47 @@ computed by compiling Apple's own struct and printing `offsetof`):
 
 ## Known items
 
-(Reserved for the cold-review adjudication rule: findings from a NOT-READY *re-review*
-that are doc/nit-level and were authorized to proceed verbatim. Round 1 was NOT-READY
-and all 16 findings were applied before the round-2 re-review; empty unless round 2
-fails.)
+Round 1 (NOT-READY, 16 findings) — all applied in commit `6566c71`.
+
+Round 2 (NOT-READY) — the adjudication rule applied: every finding classified
+**doc/nit** (each is a defect in document text/snippets/expectations/citations that
+resolves by editing the docs; the designed logic they contradict is already correctly
+specified in the same documents — no control-flow, error-channel, match-arm,
+panic-path, or bounds-check decision in the design itself changed). All findings are
+recorded verbatim below and were applied alongside this record before implementation:
+
+1. "F9 NOT-LANDED/partial: policy landed design 138-146, plan 340-380, but test at
+   plan 326 expects alternate SHA-1 while dual output alternate is SHA-256 (signer
+   286-315; superblob 544-559); fix label." → APPLIED: label corrected to
+   `alternate SHA-256` with the routing rationale in the test comment.
+2. "F13 NOT-LANDED/partial: digest/synthetic CD landed plan 748-774,1649-1650, but
+   snippet line 778 references CSMAGIC_LAUNCH_CONSTRAINT before task10 (defer
+   statement 798-799); compile failure." → APPLIED: snippet uses the `0xfade8181u32`
+   literal with the task-10 swap note inline.
+3. "(1) logic-level plan 154-161 retains `return Ok(report)` on missing SHA-256,
+   contradicting plan 1327/design 165-170 no-early-return; can skip DR on that CMS
+   path." → APPLIED: task-1 snippet rewritten as a `match cd_sha256_opt` branch with
+   full error handling and no return; task 8 now carries explicit three-step edit
+   instructions plus the no-early-return invariant.
+4. "(2) logic-level Task1 `cdhash_pair` uses Sha256 at plan 143, but production
+   macho/verify.rs top imports only Sha1; no import instruction, compile failure." →
+   APPLIED: task 1 instructs adding `use sha2::{Digest, Sha256};` to production
+   imports.
+5. "(3) doc-nit stale design 158 says pair after empty-wrapper early return,
+   contradicts revised branch/fallthrough." → APPLIED (design ~160).
+6. "(4) doc-nit plan 421-422 code comment includes ZSN-24 ticket ID, violating brief
+   no ticket IDs in proposed code comments." → APPLIED: comment reworded to
+   `pairwise-overlap check`.
+7. "(5) doc-nit plan 1282-1284/163 retain `/* ... */` placeholder comments despite
+   self-review claim; named helpers are complete." → APPLIED: public-surface struct
+   sketches now carry real fields; task-1 error handling written out;
+   `push_page_errors` signature made concrete.
+8. "(6) doc-nit plan 810-817 says 326/32=10 but primary is SHA-1 (20-byte) in dual
+   fixture; comment only, test still lands bytes." → APPLIED: comment corrected to
+   the SHA-1 arithmetic (`hashOffset = 242`, `8 <= 12`, window `[82, 102)`).
+9. "(7) doc-nit design 69 cites macho/verify.rs:686 (actual 678-679), design 52/616
+   script :190 (actual 191), design 33 signer lines 798-801 (requirements actually
+   793-797/822-823)." → APPLIED to all three citation sites.
+
+Reviewer's overall verdict line: "Overall NOT-READY due F9/F13 + NEW logic issues; if
+adjudication treats only landed fixes, F9/F13 NOT-LANDED means not ready."

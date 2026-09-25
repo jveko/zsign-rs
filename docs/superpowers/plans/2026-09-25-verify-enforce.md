@@ -147,20 +147,32 @@ fn cdhash_pair(cds: &[&CodeDirectory<'_>]) -> (Option<[u8; 20]>, Option<[u8; 32]
 
 In `verify_slice`, bind `let cds = emitted_cds(&superblob);` immediately AFTER
 `primary` is established (before the page/slot checks — the CMS branch and later
-tasks reuse it). Replace the `let cd_sha256 … let cd_sha1 = alternate_sha1(…)` block
-in the non-empty CMS path with:
+tasks reuse it). Add `use sha2::{Digest, Sha256};` to `macho/verify.rs`'s PRODUCTION
+imports (today only `sha1` is imported there). Replace the `let cd_sha256 … let cd_sha1
+= alternate_sha1(…)` block in the non-empty CMS path with a branch — **no early
+return** (task 8's designated-requirement step must run on every path):
 
 ```rust
-let (cd_sha1, cd_sha256) = cdhash_pair(&cds);
-let Some(cd_sha256) = cd_sha256 else {
-    report.errors.push(
-        "CMS signature present but no SHA-256 CodeDirectory to bind CDHash v2".to_string(),
-    );
-    return Ok(report);
-};
-match crate::crypto::cms_verify::verify_code_signature(
-    cms_blob, primary.raw(), cd_sha1.as_ref(), &cd_sha256,
-) { /* unchanged error handling */ }
+let (cd_sha1, cd_sha256_opt) = cdhash_pair(&cds);
+match cd_sha256_opt {
+    None => report.errors.push(
+        "CMS signature present but no SHA-256 CodeDirectory to bind CDHash v2"
+            .to_string(),
+    ),
+    Some(cd_sha256) => {
+        match crate::crypto::cms_verify::verify_code_signature(
+            cms_blob, primary.raw(), cd_sha1.as_ref(), &cd_sha256,
+        ) {
+            Ok(cms_report) => {
+                if !cms_report.valid {
+                    report.errors.extend(cms_report.errors.clone());
+                }
+                report.cms = Some(cms_report);
+            }
+            Err(e) => report.errors.push(format!("CMS verification error: {e}")),
+        }
+    }
+}
 ```
 
 Delete `fn alternate_sha1` entirely (its only caller is this site; its
@@ -282,8 +294,9 @@ CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
 - pages: keep `report.pages = check_code_pages_in_file(primary, …)` and its existing
   four message arms verbatim; then for each alternate run `check_code_pages_in_file`
   and push failures as `alternate {SHA-1|SHA-256} ` + the same message texts —
-  reuse a small local closure `push_page_errors(label: &str, …)` so the primary keeps
-  byte-identical strings with an empty label.
+  reuse a small local `fn push_page_errors(report: &mut SliceVerifyReport,
+  label: &str, pages: &PageCheck)` so the primary keeps byte-identical strings with an
+  empty label.
 - special slots: keep the primary flow writing `report.special_slots`; for each
   alternate run `check_special_slots(cd, inputs, req, ent, der)` (the pre-task-6
   signature) and collect `(label, checks)` pairs in a local
@@ -321,9 +334,11 @@ fn bound_info_plist_without_input_is_an_error() {
     assert!(errors.iter()
         .any(|e| e.contains("special slot -1 is bound but its content was not supplied")),
         "primary: {:?}", errors);
-    // Dual output carries an alternate; its unavailable slot elevates too (tagged):
+    // Dual output's PRIMARY is the SHA-1 CD and its ALTERNATE is SHA-256
+    // (superblob.rs routes SHA-1 -> slot 0x0000, SHA-256 -> 0x1000), so the
+    // tagged label is "alternate SHA-256":
     assert!(errors.iter().any(|e| e.contains(
-        "alternate SHA-1 special slot -1 is bound but its content was not supplied")),
+        "alternate SHA-256 special slot -1 is bound but its content was not supplied")),
         "alternate: {:?}", errors);
     // With the real input the same binary has no slot finding:
     let ok = verify_macho(&signed, &SignatureInputs {
@@ -418,7 +433,7 @@ fn slot_magic_mismatch_is_rejected() {
 #[test]
 fn distinct_duplicate_slot_is_rejected() {
     // Two DIFFERENT children both claiming slot 0x0002 (distinct ranges, so the
-    // ZSN-24 overlap check passes): today last-wins Ok.
+    // pairwise-overlap check passes): today last-wins Ok.
     let mut b = synth_superblob(60, &[(CSSLOT_REQUIREMENTS, 28), (CSSLOT_REQUIREMENTS, 44)]);
     b[28..32].copy_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
     b[32..36].copy_from_slice(&16u32.to_be_bytes());
@@ -775,7 +790,7 @@ fn synth_cd_with_slot8(child: &[u8]) -> Vec<u8> {
 
 #[test]
 fn launch_constraint_content_comes_from_superblob_slot_8() {
-    let child: Vec<u8> = [CSMAGIC_LAUNCH_CONSTRAINT.to_be_bytes(),
+    let child: Vec<u8> = [0xfade8181u32.to_be_bytes(), // CSMAGIC_LAUNCH_CONSTRAINT (task 10 swaps the literal for the constant)
                           12u32.to_be_bytes(), [0u8; 4]].concat();
     let cd_bytes = synth_cd_with_slot8(&child);
     let cd = CodeDirectory::parse(&cd_bytes).unwrap();
@@ -822,9 +837,13 @@ fn bound_launch_constraint_without_blob_is_rejected() {
 }
 ```
 
-(`child_off_in_signed` is task 5's helper; parse guard `n_special <= hash_offset /
-hash_size` holds: `326/32 = 10 >= 8`. The alternate CD keeps `n = 7`, so only the
-primary contributes the −8 finding — tagged with the empty primary label.)
+(`child_off_in_signed` is task 5's helper. The fixture's PRIMARY is the SHA-1 CD
+(dual output, `hash_size` 20): `hashOffset = 88 + 14 + 7*20 = 242`, so the parse guard
+`n_special <= hashOffset/hash_size` gives `8 <= 12` ✓, and the grown −8 window
+`[242-160, 242-140) = [82, 102)` lands on the exec-segment header tail (nonzero flags
+word) plus the identifier bytes — deterministically nonzero "bound" storage. The
+alternate CD keeps `n = 7`, so only the primary contributes the −8 finding — tagged
+with the empty primary label.)
 
 - [ ] **Step 2: Confirm failure** — unit FAILS (old `check_special_slots` signature —
   compile error counts as the failing step; the `Matched` path does not exist yet).
@@ -1279,9 +1298,16 @@ evaluation exists).
 Public surface in `codesign/verify.rs` (all `pub`):
 
 ```rust
-pub struct RequirementsSet<'a> { /* entries: Vec<(u32 kind, Requirement<'a>)> */ }
-impl RequirementsSet<'_> { pub fn designated(&self) -> Option<&Requirement<'_>>; }
-pub struct Requirement<'a> { /* expr: Expr, raw: &'a [u8] */ }
+pub struct RequirementsSet<'a> {
+    entries: Vec<(u32, Requirement<'a>)>, // u32 = index type; CSREQ_DESIGNATED among them
+}
+impl RequirementsSet<'_> {
+    pub fn designated(&self) -> Option<&Requirement<'_>>;
+}
+pub struct Requirement<'a> {
+    expr: Expr,               // fully-supported expression tree (never mixed Unsupported)
+    raw: &'a [u8],            // the requirement child payload, for diagnostics
+}
 pub enum RequirementVerdict { Satisfied, Violated, Unsupported(String) }
 pub struct RequirementContext<'a> {
     pub identifier: Option<&'a str>,
@@ -1291,6 +1317,10 @@ pub struct RequirementContext<'a> {
 impl Requirement<'_> { pub fn evaluate(&self, ctx: &RequirementContext<'_>) -> RequirementVerdict; }
 pub fn parse_requirements(blob: &[u8]) -> Result<RequirementsSet<'_>>;
 ```
+
+(`Expr` is the private tree enum: `True | False | Ident(Vec<u8>) | AppleAnchor |
+AppleGenericAnchor | Not(Box<Expr>) | And(Box<Expr>, Box<Expr>) | Or(Box<Expr>,
+Box<Expr>) | CdHash(Vec<u8>)`.)
 
 Parser details — **one grammar rule (design §8), no contradictions**: SuperBlob
 `magic == CSMAGIC_REQUIREMENTS`, `count` bounded by the declared length (read from the
@@ -1312,20 +1342,20 @@ set (`designated()` → `None` → pass). Only fully-supported trees ever reach 
 evaluator, so `RequirementVerdict::Unsupported` is produced solely by this parse-time
 marker.
 
-`verify_slice` wiring — **the empty-wrapper guard is preserved**: the CMS block keeps
-its exact semantics by BRANCHING instead of early-returning, and both paths fall
-through to the designated-requirement step:
+`verify_slice` control flow — **the empty-wrapper guard is preserved by branching,
+not early-returning**. Explicit edits to the CMS block:
+1. In the empty-wrapper branch, DELETE the `return Ok(report);` — the branch keeps
+   setting `report.cms` (or pushing the non-ad-hoc error) and falls out of the
+   `if let Some(cms_blob)` block.
+2. The non-empty path already branches without returning (task 1's
+   `match cd_sha256_opt { … }`) — no change.
+3. After the ENTIRE chain — including the `else if adhoc` and `else` (no CMS slot but
+   not ad-hoc flagged) arms — place the designated-requirement block below.
+Invariant: `verify_code_signature` is called only for non-empty wrappers, and no path
+returns early from `verify_slice` between `primary` being established and the end of
+the function.
 
 ```rust
-// Existing CMS block, restructured (task 1's code lives in the else branch):
-// if let Some(cms_blob) = superblob.cms {
-//     if empty_wrapper { if primary.is_adhoc() { report.cms = Some(adhoc_report()); }
-//                        else { push "empty CMS wrapper but not ad-hoc flagged" } }
-//     else { let (cd_sha1, cd_sha256) = cdhash_pair(&cds); … verify_code_signature … }
-// } else if primary.is_adhoc() { report.cms = Some(adhoc_report()); }
-// else { push "no CMS signature slot but not ad-hoc flagged" }
-// — no early return anywhere; ad-hoc never reaches verify_code_signature.
-
 // Designated requirement (AFTER the whole chain; `cds` from task 1):
 if let Some(req) = superblob.entries.iter().find(|e| e.slot == CSSLOT_REQUIREMENTS) {
     match parse_requirements(req.blob) {
@@ -1595,7 +1625,8 @@ fn launch_constraint_slot_magic_is_validated() {
 }
 ```
 
-- [ ] **Step 2: Confirm failure** — `ticket_slot…` FAILS (0x10001);
+- [ ] **Step 2: Confirm failure** — `ticket_slot_is_the_notarization_slot` FAILS
+  (0x10001);
 `old_embedded_signature_magic_is_diagnosed` and
 `launch_constraint_slot_magic_is_validated` FAIL (constants/arms absent);
 `version_gate_values_match_apple` FAILS on RUNTIME/LINKAGE until task 9's revalue
