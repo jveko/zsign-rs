@@ -16,9 +16,6 @@ let startTime;
 
 // --- State ---
 let ipaFile = null;
-let ipaEntries = null;
-let appPrefix = "";
-let appName = "";
 let p12Bytes = null;
 let profileBytes = null;
 let signingInProgress = false;
@@ -99,6 +96,28 @@ function isSymlinkEntry(entry) {
   const mode =
     ((entry.externalFileAttributes >>> 16) & 0xffff) || (entry.unixMode ?? 0);
   return (mode & 0xf000) === 0xa000;
+}
+
+// The single app root is derived from file paths, not from directory entries:
+// an archive may legitimately omit those, and only paths say which bundle the
+// files belong to. Ambiguity is an error rather than a silent first match.
+function findAppRoot(entries) {
+  const prefixes = new Set();
+  for (const entry of entries) {
+    if (entry.directory) continue;
+    const m = entry.filename.match(/^Payload\/([^/]+\.app)\//);
+    if (m) prefixes.add(`Payload/${m[1]}/`);
+  }
+  if (prefixes.size === 0) {
+    throw new Error("No Payload/<name>.app bundle found in the archive");
+  }
+  if (prefixes.size > 1) {
+    throw new Error(
+      `Archive contains ${prefixes.size} top-level apps (${[...prefixes].join(", ")}) — expected exactly one`,
+    );
+  }
+  const prefix = [...prefixes][0];
+  return { prefix, name: prefix.slice("Payload/".length, -".app/".length) };
 }
 
 class CappedWriter extends Writer {
@@ -479,6 +498,9 @@ function rewriteBinaryBundleId(bytes, newId) {
 
 async function loadIpa(file) {
   if (signingInProgress) return; // a mid-run drop must not start a second run
+  // A rejected replacement must not leave the previous IPA signable.
+  ipaFile = null;
+  updateSignButton();
   startTime = performance.now();
   const logContainer = $("#log");
   logContainer.classList.add("visible");
@@ -510,21 +532,18 @@ async function loadIpa(file) {
     const entries = await zipReader.getEntries();
     log(`Found ${entries.length} entries in archive`);
 
-    // Find .app bundle root
-    const appEntry = entries.find((e) =>
-      e.filename.match(/Payload\/[^/]+\.app\/$/),
-    );
-    if (!appEntry) {
-      log("No .app bundle found in IPA", "err");
+    let app;
+    try {
+      app = findAppRoot(entries);
+    } catch (e) {
+      log(fmtErr(e), "err");
       return;
     }
-    appPrefix = appEntry.filename;
-    appName = appPrefix.match(/\/([^/]+)\.app\/$/)[1];
-    log(`Found bundle: ${appName}.app`, "ok");
+    log(`Found bundle: ${app.name}.app`, "ok");
 
     // Read Info.plist to extract bundle ID
     const infoPlistEntry = entries.find(
-      (e) => e.filename === `${appPrefix}Info.plist`,
+      (e) => e.filename === `${app.prefix}Info.plist`,
     );
     if (infoPlistEntry) {
       const plistData = await infoPlistEntry.getData(new Uint8ArrayWriter());
@@ -537,7 +556,7 @@ async function loadIpa(file) {
         log("Could not auto-detect bundle ID — please enter manually", "err");
       }
       const execName = tryExtractExecutableName(plistData, wasmReady);
-      if (execName && execName !== appName) {
+      if (execName && execName !== app.name) {
         log(`CFBundleExecutable: ${execName} (differs from .app name)`, "ok");
       }
     } else {
@@ -545,7 +564,6 @@ async function loadIpa(file) {
     }
 
     ipaFile = file;
-    ipaEntries = null; // will re-read during signing
 
     // Update UI
     dropZone.classList.add("loaded");
@@ -671,20 +689,8 @@ async function signIpa() {
     const entries = await zipReader.getEntries();
     log(`Found ${entries.length} entries in archive`);
 
-    // Find .app bundle root
-    const appEntry = entries.find((e) =>
-      e.filename.match(/Payload\/[^/]+\.app\/$/),
-    );
-    if (!appEntry) {
-      log("No .app bundle found in IPA", "err");
-      await zipReader.close();
-      zipReader = null;
-      return;
-    }
-    const currentAppPrefix = appEntry.filename;
-    const currentAppName = currentAppPrefix.match(
-      /\/([^/]+)\.app\/$/,
-    )[1];
+    const { prefix: currentAppPrefix, name: currentAppName } =
+      findAppRoot(entries);
     log(`Bundle: ${currentAppName}.app`, "ok");
 
     // Every bundle's Info.plist, including the root's, is read once in the
