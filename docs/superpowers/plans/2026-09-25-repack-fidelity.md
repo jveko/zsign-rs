@@ -332,11 +332,9 @@ pub(crate) fn create_ipa_from_root(
 
 - [ ] **Step 4: Wire `sign()`**
 
-In `crates/zsign/src/ipa/mod.rs`: add a **separate private import** `use archive::create_ipa_from_root;` in the module's import block (next to the existing `use archive::…` imports) — do **not** extend the `pub use archive::{create_ipa, CompressionLevel};` re-export at :57 (re-exporting a `pub(crate)` item there is E0364 and would grow the `lib.rs` public surface). Then replace :283:
+In `crates/zsign/src/ipa/mod.rs`: add a **separate private import** `use archive::create_ipa_from_root;` in the module's import block (next to the existing `use archive::…` imports) — do **not** extend the `pub use archive::{create_ipa, CompressionLevel};` re-export at :57 (re-exporting a `pub(crate)` item there is E0364 and would grow the `lib.rs` public surface). Then replace **only** the repack call at :283 (`create_ipa(&app_bundle, output_ipa, self.compression_level)?;`) with:
 
 ```rust
-        self.sign_bundle_from_options(&app_bundle)?;
-
         create_ipa_from_root(temp_dir.path(), output_ipa, self.compression_level)?;
 ```
 
@@ -500,7 +498,7 @@ Expected: PASS — evidence for the final report (paste verbatim output).
     }
 ```
 
-Tighten `test_create_ipa` (archive.rs:332): alongside the existing loose checks, assert the exact nested name:
+Tighten `test_create_ipa` (archive.rs:332): the existing `by_index` loop (archive.rs:350-363) only computes boolean matches — first collect the entry names inside it (`let mut names: Vec<String> = Vec::new();` … `names.push(entry.name().to_string());`), then alongside the existing loose checks assert the exact nested name:
 
 ```rust
         assert!(
@@ -630,12 +628,11 @@ Add `use crate::ipa::extract_ipa;` to the `mod tests` import block of `archive.r
     }
 ```
 
-- [ ] **Step 2: Run, verify failure**
+- [ ] **Step 2: Run, verify compile failure**
 
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs checked_symlink_target` — Expected: FAIL to compile (`checked_symlink_target` not found).
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_create_ipa_rejects_unsafe` — Expected after adding just the validator is absent → compile-fail; once the validator exists but before wiring, `create_ipa` still succeeds → `expect_err` panics (red). The round-trip test passes at every stage (it pins the invariant against future normalization).
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs checked_symlink_target` — Expected: FAIL to compile (`checked_symlink_target` / `MAX_SYMLINK_TARGET_BYTES` not found). The other two tests fail at the same compile error.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Add the constant and validator (not yet wired)**
 
 In `crates/zsign/src/ipa/archive.rs`:
 
@@ -676,12 +673,18 @@ fn checked_symlink_target(entry_name: &str, target: &std::ffi::OsStr) -> Result<
 
 (The safety predicate mirrors `is_safe_symlink_target` in the extract module — no leading `/`, no `..` component — which stays private and unedited.)
 
+- [ ] **Step 4: Run, verify the behavioural red**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_create_ipa_rejects_unsafe` — Expected: FAIL with `unsafe symlink target must fail at creation` (`create_ipa` still writes the unsafe target because the validator is not wired yet). The round-trip and boundary tests pass at this point (they pin the invariant against future normalization).
+
+- [ ] **Step 5: Wire the validator into the walker**
+
 In `write_tree`'s symlink branch, replace the verbatim emission:
 
 ```rust
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(path)?;
-            let target = checked_symlink_target(&archive_path, &target.as_os_str())?;
+            let target = checked_symlink_target(&archive_path, target.as_os_str())?;
             zip.add_symlink(&archive_path, &target, options)
                 .map_err(Error::Zip)?;
         }
@@ -689,12 +692,12 @@ In `write_tree`'s symlink branch, replace the verbatim emission:
 
 Doc updates in `archive.rs`: the module/features list "Preserves Unix file permissions and symlinks" → note targets must satisfy the extractor's policy (rejected at creation otherwise); `create_ipa` `# Errors` section gains "symlink targets that are absolute, escaping (`..`), non-UTF-8, or longer than 4096 bytes".
 
-- [ ] **Step 4: Run the scoped gate**
+- [ ] **Step 6: Run the scoped gate**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs ipa -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS — including `test_create_ipa_preserves_symlinks` (safe targets unaffected).
 
-- [ ] **Step 5: Controller commit**
+- [ ] **Step 7: Controller commit**
 
 `fix(ipa): reject unsafe symlink targets at archive creation (ZSN-39)`
 
@@ -838,23 +841,27 @@ Expected: PASS — including `test_create_ipa_preserves_symlinks` (safe targets 
             "tie_rank: Include < Omit"
         );
 
-        // The escaped rules2 spelling of the version key matches exactly;
-        // a prefix read would let its weight-20 Include beat the weight-10
-        // Omit below on "version.plist.bak".
+        // The escaped rules2 spelling of the version key matches exactly:
+        // `version.plist` resolves to this rule's Omit (a missing arm would
+        // fall through to `^.*` Include), and `version.plist.bak` must not
+        // over-match it (a prefix implementation would wrongly match).
         let mut exact = Dictionary::new();
-        let mut include20 = Dictionary::new();
-        include20.insert("weight".to_string(), Value::Real(20.0));
+        let mut omit20 = Dictionary::new();
+        omit20.insert("omit".to_string(), Value::Boolean(true));
+        omit20.insert("weight".to_string(), Value::Real(20.0));
         exact.insert(
             "^version\\.plist$".to_string(),
-            Value::Dictionary(include20),
+            Value::Dictionary(omit20),
         );
-        let mut omit10 = Dictionary::new();
-        omit10.insert("omit".to_string(), Value::Boolean(true));
-        omit10.insert("weight".to_string(), Value::Real(10.0));
-        exact.insert("^version".to_string(), Value::Dictionary(omit10));
+        exact.insert("^.*".to_string(), Value::Boolean(true));
+        assert_eq!(
+            rule_action(&exact, "version.plist"),
+            Some(RuleAction::Omit),
+            "the escaped key matches version.plist exactly"
+        );
         assert_eq!(
             rule_action(&exact, "version.plist.bak"),
-            Some(RuleAction::Omit),
+            Some(RuleAction::Include),
             "the escaped key must not prefix-match past version.plist"
         );
     }
@@ -1127,6 +1134,10 @@ Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs ipa -- --skip test_ipa_signing_
 Expected: PASS.
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs verify -- --skip test_ipa_signing_is_deterministic`
 Expected: PASS — the ZSN-26 regression fixtures (`omitted_locversion_deletion_stays_valid`, `optional_lproj_deletion_after_signing_stays_valid`, `base_lproj_deletion_is_not_optional`, `nested_ds_store_is_not_flagged_unsealed`, `unsupported_rule_is_reported`) stay green against the new emission.
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs bundle`
+Expected: PASS — the out-of-scope zsign wrapper (`crates/zsign/src/bundle/code_resources.rs`: `test_scan_bundle_directory` :370, `test_scan_bundle_with_symlinks` :440) consumes `build()` and must stay green.
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-wasm`
+Expected: PASS — `resource_digests` (lib.rs:1198-1223) reads the emitted `files2` and must keep resolving its fixture paths.
 
 - [ ] **Step 6: Controller commit**
 
