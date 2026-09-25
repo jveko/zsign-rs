@@ -14,6 +14,11 @@ use zsign_rs::{SigningCredentials, ZSign};
 #[command(name = "zsign")]
 #[command(about = "iOS code signing tool")]
 #[command(after_help = "upstream users: -p/-k now match upstream; --pkcs12 is long-only")]
+// mandatory: non-multiple groups auto-conflict their members in clap 4.6.7
+// (validator.rs:509-515), which would reject the legitimate -c + -k pairing
+#[command(group = clap::ArgGroup::new("credentials")
+    .args(["pkcs12", "certificate", "private_key"])
+    .multiple(true))]
 struct Cli {
     /// Input file (IPA, Mach-O, or app bundle)
     input: PathBuf,
@@ -23,16 +28,20 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Certificate file (PEM format)
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, requires = "private_key")]
     certificate: Option<PathBuf>,
 
     /// Private key or PKCS#12 file: format detected by content
     /// (PEM `-----BEGIN` key, DER key, or PKCS#12 — use `-k` alone for PKCS#12)
-    #[arg(short = 'k', long)]
+    #[arg(short = 'k', long, required_unless_present_any = ["adhoc", "verify", "credentials"])]
     private_key: Option<PathBuf>,
 
     /// PKCS#12 file (.p12)
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["certificate", "private_key"],
+        required_unless_present_any = ["adhoc", "verify", "credentials"]
+    )]
     pkcs12: Option<PathBuf>,
 
     /// Provisioning profile
@@ -49,7 +58,12 @@ struct Cli {
     /// ZIP compression level (0-9, default: 6)
     /// 0 = no compression (fastest, matches C++ zsign default)
     /// 9 = maximum compression (slowest, smallest file)
-    #[arg(short = 'z', long, default_value = "6")]
+    #[arg(
+        short = 'z',
+        long,
+        default_value = "6",
+        value_parser = clap::value_parser!(u32).range(0..=9)
+    )]
     zip_level: u32,
 
     /// New bundle identifier to set in Info.plist
@@ -97,7 +111,27 @@ struct Cli {
     /// `codesign --verify --deep --strict` does: code-page hashes, special
     /// slots, CodeResources, and the CMS signature + certificate chain.
     /// Exit 0 = valid, 1 = invalid, 2 = hard error.
-    #[arg(short = 'V', long)]
+    #[arg(
+        short = 'V',
+        long,
+        conflicts_with_all = [
+            "output",
+            "certificate",
+            "private_key",
+            "pkcs12",
+            "profile",
+            "zip_level",
+            "bundle_id",
+            "bundle_name",
+            "bundle_version",
+            "sha256_only",
+            "legacy_sha1",
+            "force",
+            "adhoc",
+            "dylibs",
+            "weak"
+        ]
+    )]
     verify: bool,
     /// Emit a machine-readable JSON document on stdout; failures become JSON
     /// objects on stderr. Human-readable output stays the default.
@@ -728,23 +762,56 @@ impl From<&zsign_rs::verify::CodeResourcesVerification> for CrDto {
     }
 }
 
+/// Reads a credential file, labeling io failures with the flag that named it:
+/// a bare `No such file or directory` never says which of the three paths
+/// was wrong.
+fn read_credential_file(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    std::fs::read(path)
+        .map_err(|e| format!("failed to read {label} '{}': {e}", path.display()).into())
+}
+
+/// Fails explicitly on encrypted PEM/DER key material, or on any non-empty
+/// password supplied to a key route: `from_pem`'s password parameter is
+/// rejection-only (it never decrypts), so a password here can only ever mean
+/// encrypted key material. The PKCS#12 routes are deliberately excluded — they
+/// use the password normally.
+fn reject_encrypted_key(cli: &Cli, key_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let password = cli.password.as_deref().unwrap_or_default();
+    let encrypted_marker = key_data
+        .windows(b"ENCRYPTED PRIVATE KEY".len())
+        .any(|w| w == b"ENCRYPTED PRIVATE KEY")
+        || key_data
+            .windows(b"Proc-Type: 4,ENCRYPTED".len())
+            .any(|w| w == b"Proc-Type: 4,ENCRYPTED");
+    if encrypted_marker || !password.is_empty() {
+        return Err("encrypted PEM keys are unsupported (see ZSN-18)".into());
+    }
+    Ok(())
+}
+
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
     if let Some(p12_path) = &cli.pkcs12 {
-        let p12_data = std::fs::read(p12_path)?;
+        let p12_data = read_credential_file(p12_path, "pkcs12")?;
         let password = resolve_p12_password(cli, &p12_data)?;
         let creds = SigningCredentials::from_p12(&p12_data, &password)?;
         return Ok(creds);
     }
 
     let Some(key_path) = &cli.private_key else {
-        return Err("Must provide either --pkcs12 or both --certificate and --private-key".into());
+        // Defense in depth: clap's required credential group already rejects
+        // invocations that reach this point.
+        return Err("--pkcs12 or --private-key is required".into());
     };
-    let key_data = std::fs::read(key_path)?;
+    let key_data = read_credential_file(key_path, "private key")?;
     if key_data.starts_with(b"-----BEGIN") {
+        reject_encrypted_key(cli, &key_data)?;
         let Some(cert_path) = &cli.certificate else {
             return Err("--certificate <FILE> is required with a PEM private key".into());
         };
-        let cert_data = std::fs::read(cert_path)?;
+        let cert_data = read_credential_file(cert_path, "certificate")?;
         let creds = SigningCredentials::from_pem(&cert_data, &key_data, None)?;
         return Ok(creds);
     }
@@ -775,7 +842,8 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
                     use --pkcs12"
                     .into());
             }
-            let cert_data = std::fs::read(cert_path)?;
+            reject_encrypted_key(cli, &key_data)?;
+            let cert_data = read_credential_file(cert_path, "certificate")?;
             let wrapped = pem_wrap_der(&key_data);
             let creds = SigningCredentials::from_pem(&cert_data, wrapped.as_bytes(), None)?;
             Ok(creds)
@@ -1488,6 +1556,147 @@ mod tests {
             r.stdout.contains("[env: ZSIGN_PASSWORD]"),
             "stdout: {}",
             r.stdout
+        );
+    }
+
+    /// Parse-level helper: these args must be rejected by clap itself, with the
+    /// failure surfaced as a typed `clap::error::Error` (never a runtime check).
+    /// `match` rather than `expect_err` because `Cli` deliberately has no
+    /// `Debug` impl and the production struct is frozen in this lane.
+    fn parse_err(args: &[&str]) -> clap::error::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("must be rejected"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn verify_conflicts_with_sign_only_flags() {
+        for extra in [
+            vec!["zsign", "-V", "-o", "x.ipa", "in.ipa"],
+            vec!["zsign", "-V", "-m", "p.mobileprovision", "in.ipa"],
+            vec!["zsign", "-V", "-z", "5", "in.ipa"],
+            vec!["zsign", "-V", "-a", "in.ipa"],
+            vec!["zsign", "-V", "-c", "c.pem", "-k", "k.pem", "in.ipa"],
+            vec!["zsign", "-V", "--pkcs12", "x.p12", "in.ipa"],
+            vec!["zsign", "-V", "-2", "in.ipa"],
+        ] {
+            assert_eq!(
+                parse_err(&extra).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        // verify itself stays valid, and ZSIGN_PASSWORD must NOT conflict (env presentness)
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn credentials_group_required_unless_adhoc_or_verify() {
+        assert_eq!(
+            parse_err(&["zsign", "in.ipa"]).kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(Cli::try_parse_from(["zsign", "-a", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "--pkcs12", "x.p12", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-k", "x.p12", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-c", "c.pem", "-k", "k.pem", "in.ipa"]).is_ok());
+        // certificate without private key
+        assert_eq!(
+            parse_err(&["zsign", "-c", "c.pem", "in.ipa"]).kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        // pkcs12 conflicts with the certificate/key pair
+        assert_eq!(
+            parse_err(&["zsign", "--pkcs12", "x.p12", "-c", "c.pem", "-k", "k.pem", "in.ipa"])
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn zip_level_range_is_enforced_at_parse() {
+        assert_eq!(
+            parse_err(&["zsign", "-a", "-z", "99", "in.ipa"]).kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert!(Cli::try_parse_from(["zsign", "-a", "-z", "9", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-a", "-z", "0", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn password_with_key_route_fails_explicitly() {
+        // content sniff fires before any parsing, so no real cert is needed
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("key.pem");
+        std::fs::write(
+            &key,
+            concat!("-----BEGIN ", "ENCRYPTED PRIVATE KEY-----", "\n"),
+        )
+        .unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        // encrypted content, no password: still the explicit unsupported error
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("encrypted PEM keys are unsupported"),
+            "stderr: {}",
+            r.stderr
+        );
+        // password supplied with an unencrypted key: same explicit failure, never silence
+        std::fs::write(&key, concat!("-----BEGIN ", "PRIVATE KEY-----", "\n")).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("pw"),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("encrypted PEM keys are unsupported"),
+            "stderr: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn credential_io_errors_name_the_file() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let missing_key = dir.path().join("absent.key");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                missing_key.as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1);
+        assert!(r.stderr.contains("absent.key"), "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("private key"),
+            "label the flag: {}",
+            r.stderr
         );
     }
 }
