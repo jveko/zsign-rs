@@ -123,6 +123,19 @@ fn is_precompressed(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Uncompressed-size gate for opting a member into ZIP64 extended fields.
+///
+/// Sits 1 MiB below the 32-bit size ceiling, so no compressed size derived
+/// from a member at or below the gate can cross `0xFFFFFFFF`; members below
+/// the gate keep byte-identical headers.
+const ZIP64_SIZE_GATE: u64 = u32::MAX as u64 - (1 << 20);
+
+/// True when a member of `uncompressed_len` bytes must carry ZIP64
+/// extended information extra fields to be written without error.
+fn needs_zip64(uncompressed_len: u64) -> bool {
+    uncompressed_len > ZIP64_SIZE_GATE
+}
+
 /// Creates an IPA file from a signed `.app` bundle.
 ///
 /// The app bundle is placed inside a `Payload/` directory in the archive,
@@ -340,6 +353,12 @@ fn write_tree(
                 file_options.unix_permissions(mode)
             };
 
+            let file_options = if needs_zip64(metadata.len()) {
+                file_options.large_file(true)
+            } else {
+                file_options
+            };
+
             zip.start_file(&archive_path, file_options)
                 .map_err(Error::Zip)?;
 
@@ -367,9 +386,71 @@ fn zip_entry_name(relative: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use zip::ZipArchive;
+
+    #[test]
+    fn test_needs_zip64_boundaries() {
+        assert!(!needs_zip64(0), "empty member is never zip64");
+        assert!(!needs_zip64(4096), "typical member is never zip64");
+        assert!(
+            !needs_zip64(ZIP64_SIZE_GATE),
+            "the gate itself is still 32-bit"
+        );
+        assert!(
+            needs_zip64(ZIP64_SIZE_GATE + 1),
+            "one byte past the gate opts in"
+        );
+        assert!(
+            needs_zip64(u64::from(u32::MAX)),
+            "u32::MAX is not reachable safely"
+        );
+        assert!(needs_zip64(u64::from(u32::MAX) + 1), "beyond 32 bits");
+    }
+
+    /// End-to-end proof that an oversized member is written instead of
+    /// aborting mid-copy: a 4 GiB+1 sparse file of zeros compresses to a
+    /// few MiB but crosses the size guard that zip only clears with
+    /// `large_file(true)`. Ignored so the routine suite never streams four
+    /// gigabytes through deflate; run explicitly with
+    /// `cargo test -p zsign-rs zip64_oversized -- --ignored`.
+    #[test]
+    #[ignore = "streams more than 4 GiB through deflate"]
+    fn test_create_ipa_zip64_oversized_member() {
+        let temp = TempDir::new().unwrap();
+        let app_dir = temp.path().join("Big.app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let big = app_dir.join("big.bin");
+        let file = File::create(&big).unwrap();
+        file.set_len(u64::from(u32::MAX) + 1).unwrap();
+        drop(file);
+
+        let out = temp.path().join("big.ipa");
+        create_ipa(&app_dir, &out, CompressionLevel::DEFAULT)
+            .expect("oversized member must be written with zip64 enabled");
+
+        let reader = File::open(&out).unwrap();
+        let mut archive = ZipArchive::new(reader).unwrap();
+        let mut entry = archive
+            .by_name("Payload/Big.app/big.bin")
+            .expect("member present");
+        // zip 7.2.0 patches the local header with the true 64-bit length,
+        // then clamps the struct the central directory is derived from to
+        // the 0xFFFFFFFF sentinel, so the recorded size saturates at
+        // `ZIP64_BYTES_THR`. What this proves is that the write completed
+        // without the mid-write guard aborting the entry.
+        assert!(
+            entry.size() >= zip::ZIP64_BYTES_THR,
+            "recorded size must reach the zip64 threshold, got {}",
+            entry.size()
+        );
+        let mut probe = [0u8; 16];
+        entry
+            .read_exact(&mut probe)
+            .expect("oversized member reads back");
+    }
 
     /// Create a test app bundle directory structure.
     fn create_test_app_bundle(dir: &Path) -> PathBuf {
