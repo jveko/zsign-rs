@@ -56,8 +56,12 @@ mod oid {
     pub const HMAC_SHA224: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.8");
     pub const HMAC_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.10");
     pub const HMAC_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.11");
-    pub const KEY_BAG: ObjectIdentifier =
+    pub const SHROUDED_KEY_BAG: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.2");
+    pub const PRIVATE_KEY_BAG: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.1");
+    pub const SAFE_CONTENTS_BAG: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.6");
     pub const CERT_BAG: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.3");
     pub const X509_CERT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.22.1");
@@ -134,7 +138,7 @@ pub(crate) fn extract_p12(data: &[u8], password: &str) -> Result<P12Contents> {
     while ci_reader.remaining() > 0 {
         let ci = ci_reader.read_sequence()?;
         let safe_contents = decrypt_content_info(ci, password)?;
-        collect_bags(&safe_contents, password, &mut keys, &mut certs)?;
+        collect_bags(&safe_contents, password, 0, &mut keys, &mut certs)?;
     }
 
     Ok(P12Contents { keys, certs })
@@ -143,6 +147,10 @@ pub(crate) fn extract_p12(data: &[u8], password: &str) -> Result<P12Contents> {
 /// Minimum and maximum PBKDF iteration counts accepted from untrusted input.
 const MIN_ITERATIONS: u32 = 1;
 const MAX_ITERATIONS: u32 = 10_000_000;
+
+/// Maximum nesting depth for recursive safeContentsBag traversal (RFC 7292
+/// permits nesting; real producers use at most two levels).
+const MAX_SAFE_CONTENTS_DEPTH: usize = 5;
 
 /// Minimal DER reader for the subset of ASN.1 used by PKCS#12.
 ///
@@ -728,12 +736,18 @@ where
         .unwrap_or(false)
 }
 
-/// Walks SafeContents, decrypting key bags and collecting certificates.
+/// Walks SafeContents, dispatching each bag type and collecting keys/certs.
+///
+/// A `keyBag` is stored as a bare PrivateKeyInfo, a `pkcs8ShroudedKeyBag` must
+/// be decrypted, a `certBag` yields a certificate, and a `safeContentsBag`
+/// recurses. Recursion is capped at [`MAX_SAFE_CONTENTS_DEPTH`] so a
+/// pathologically nested file cannot exhaust the stack.
 ///
 /// SafeContents ::= SEQUENCE OF SafeBag
 fn collect_bags(
     bytes: &[u8],
     password: &str,
+    depth: usize,
     keys: &mut Vec<Vec<u8>>,
     certs: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
@@ -755,13 +769,22 @@ fn collect_bags(
             None
         };
 
-        if bag_id == oid::KEY_BAG {
+        if bag_id == oid::PRIVATE_KEY_BAG {
+            // KeyBag ::= PrivateKeyInfo (RFC 7292 §2): stored unencrypted.
+            keys.push(value.to_vec());
+        } else if bag_id == oid::SHROUDED_KEY_BAG {
             keys.push(decrypt_key_bag(value, password)?);
         } else if bag_id == oid::CERT_BAG {
             certs.push(parse_cert_bag(value)?);
+        } else if bag_id == oid::SAFE_CONTENTS_BAG {
+            if depth >= MAX_SAFE_CONTENTS_DEPTH {
+                return Err(P12Error::Der(format!(
+                    "safeContents nesting deeper than {MAX_SAFE_CONTENTS_DEPTH} levels"
+                )));
+            }
+            collect_bags(value, password, depth + 1, keys, certs)?;
         }
-        // Other bag types (CRL, secret, safeContents) carry nothing the
-        // signer needs and are skipped.
+        // Other bag types (CRL, secret) carry nothing the signer needs and are skipped.
     }
     Ok(())
 }
@@ -1268,5 +1291,86 @@ mod tests {
         let out = pbes2_decrypt(&params, &ct, PBES2_PASS)
             .expect("agreeing keyLength declaration must not be rejected");
         assert_eq!(out, PBES2_PLAINTEXT);
+    }
+    const RAW_KEYBAG: &[u8] = include_bytes!("fixtures/raw_keybag.p12");
+
+    /// SafeBag: bagId, [0] EXPLICIT bagValue.
+    fn safe_bag(bag_id: &str, value_tlv: &[u8]) -> Vec<u8> {
+        seq(&[der_oid(bag_id), tlv(0xa0, value_tlv)])
+    }
+    fn safe_contents(bags: &[Vec<u8>]) -> Vec<u8> {
+        seq(bags)
+    }
+
+    #[test]
+    fn collect_bags_reads_raw_key_bag() {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let info = pkcs8::EncodePrivateKey::to_pkcs8_der(&key)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let contents = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.1", &info)]);
+        let mut keys = Vec::new();
+        let mut certs = Vec::new();
+        collect_bags(&contents, "pw", 0, &mut keys, &mut certs).expect("raw keyBag must be read");
+        assert_eq!(
+            keys,
+            vec![info],
+            "the bag value is the PrivateKeyInfo itself"
+        );
+        assert!(certs.is_empty());
+    }
+
+    #[test]
+    fn collect_bags_recurses_into_safe_contents() {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let info = pkcs8::EncodePrivateKey::to_pkcs8_der(&key)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        // certBag ::= SEQUENCE { certId, [0] EXPLICIT OCTET STRING }; the payload
+        // contents are never validated by parse_cert_bag.
+        let cert_bag = seq(&[
+            der_oid("1.2.840.113549.1.9.22.1"),
+            tlv(0xa0, &der_octets(b"cert-der-payload")),
+        ]);
+        let inner = safe_contents(&[
+            safe_bag("1.2.840.113549.1.12.10.1.1", &info),
+            safe_bag("1.2.840.113549.1.12.10.1.3", &cert_bag),
+        ]);
+        let outer = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.6", &inner)]);
+        let mut keys = Vec::new();
+        let mut certs = Vec::new();
+        collect_bags(&outer, "pw", 0, &mut keys, &mut certs)
+            .expect("nested safeContents must recurse");
+        assert_eq!(keys, vec![info]);
+        assert_eq!(certs, vec![b"cert-der-payload".to_vec()]);
+    }
+
+    #[test]
+    fn extract_p12_reads_raw_keybag_fixture() {
+        let contents =
+            extract_p12(RAW_KEYBAG, "testpassword").expect("raw keybag fixture must parse");
+        assert_eq!(contents.keys.len(), 1);
+        assert_eq!(contents.certs.len(), 1);
+        assert_key_matches_cert(&contents.keys[0], &contents.certs[0]);
+    }
+
+    #[test]
+    fn collect_bags_rejects_overdeep_nesting() {
+        // Seven nested .6 bags: the bag at depth 5 fails `depth >= 5` (five
+        // successful recursions precede it).
+        let mut inner = safe_contents(&[]);
+        for _ in 0..7 {
+            inner = safe_contents(&[safe_bag("1.2.840.113549.1.12.10.1.6", &inner)]);
+        }
+        let mut keys = Vec::new();
+        let mut certs = Vec::new();
+        let err = collect_bags(&inner, "pw", 0, &mut keys, &mut certs)
+            .expect_err("nesting beyond MAX_SAFE_CONTENTS_DEPTH must be rejected");
+        assert!(
+            matches!(&err, P12Error::Der(m) if m.contains("nesting")),
+            "{err}"
+        );
     }
 }
