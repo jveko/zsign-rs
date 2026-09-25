@@ -121,7 +121,7 @@ sign_and_verify() {
 # 3. Cert-signed: Apple's verifier must accept the full-signature output.
 # ---------------------------------------------------------------------------
 sign_and_verify "$WORK/cert" "cert-signed (RSA, sha256-only)" \
-    -p "$WORK/cs.p12" --password test
+    --pkcs12 "$WORK/cs.p12" --password test
 
 # ---------------------------------------------------------------------------
 # 4. Ad-hoc: structural path (no CMS identity) must also verify.
@@ -155,7 +155,7 @@ with open(sys.argv[2], "wb") as fh:
 PYPROF
 
 sign_and_verify "$WORK/ent" "cert-signed (RSA, entitlements)" \
-    -p "$WORK/cs.p12" --password test -m "$WORK/fixture.mobileprovision"
+    --pkcs12 "$WORK/cs.p12" --password test -m "$WORK/fixture.mobileprovision"
 
 app="$WORK/ent/Test.app"
 D=$(codesign -d --verbose=4 "$app/Test" 2>&1)

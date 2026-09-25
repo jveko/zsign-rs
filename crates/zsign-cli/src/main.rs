@@ -13,6 +13,7 @@ use zsign_rs::{SigningCredentials, ZSign};
 #[derive(Parser)]
 #[command(name = "zsign")]
 #[command(about = "iOS code signing tool")]
+#[command(after_help = "upstream users: -p/-k now match upstream; --pkcs12 is long-only")]
 struct Cli {
     /// Input file (IPA, Mach-O, or app bundle)
     input: PathBuf,
@@ -25,20 +26,21 @@ struct Cli {
     #[arg(short = 'c', long)]
     certificate: Option<PathBuf>,
 
-    /// Private key file (PEM format)
+    /// Private key or PKCS#12 file: format detected by content
+    /// (PEM `-----BEGIN` key, DER key, or PKCS#12 — use `-k` alone for PKCS#12)
     #[arg(short = 'k', long)]
     private_key: Option<PathBuf>,
 
     /// PKCS#12 file (.p12)
-    #[arg(short = 'p', long)]
+    #[arg(long)]
     pkcs12: Option<PathBuf>,
 
     /// Provisioning profile
     #[arg(short = 'm', long)]
     profile: Option<PathBuf>,
 
-    /// Password for private key or PKCS#12
-    #[arg(long)]
+    /// Password for the PKCS#12 or key material (empty password is valid)
+    #[arg(short = 'p', long)]
     password: Option<String>,
 
     /// ZIP compression level (0-9, default: 6)
@@ -724,21 +726,79 @@ impl From<&zsign_rs::verify::CodeResourcesVerification> for CrDto {
 }
 
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
-    if let Some(ref p12_path) = cli.pkcs12 {
+    if let Some(p12_path) = &cli.pkcs12 {
         let p12_data = std::fs::read(p12_path)?;
         let password = cli.password.as_deref().unwrap_or("");
         let creds = SigningCredentials::from_p12(&p12_data, password)?;
         return Ok(creds);
     }
 
-    if let (Some(ref cert_path), Some(ref key_path)) = (&cli.certificate, &cli.private_key) {
+    let Some(key_path) = &cli.private_key else {
+        return Err("Must provide either --pkcs12 or both --certificate and --private-key".into());
+    };
+    let key_data = std::fs::read(key_path)?;
+    if key_data.starts_with(b"-----BEGIN") {
+        let Some(cert_path) = &cli.certificate else {
+            return Err("--certificate <FILE> is required with a PEM private key".into());
+        };
         let cert_data = std::fs::read(cert_path)?;
-        let key_data = std::fs::read(key_path)?;
         let creds = SigningCredentials::from_pem(&cert_data, &key_data, None)?;
         return Ok(creds);
     }
 
-    Err("Must provide either --pkcs12 or both --certificate and --private-key".into())
+    match &cli.certificate {
+        // no PEM marker + certificate present: PKCS#12 content here is a
+        // flag-combination mistake, not a key file — detect it before the
+        // certificate loader misdiagnoses the ASN.1 as a broken certificate
+        Some(cert_path) => {
+            // A PKCS#12 authSafe ContentInfo carries pkcs7-data (…1.7.1) or, for
+            // encrypted-shroud containers, pkcs7-encryptedData (…1.7.6) — the only
+            // two OIDs our parser accepts for authSafe; a PKCS#8 key has neither.
+            const P12_PKCS7_DATA_OID: &[u8] = &[
+                0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01,
+            ];
+            const P12_PKCS7_ENCRYPTED_DATA_OID: &[u8] = &[
+                0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x06,
+            ];
+            if key_data
+                .windows(P12_PKCS7_DATA_OID.len())
+                .any(|w| w == P12_PKCS7_DATA_OID)
+                || key_data
+                    .windows(P12_PKCS7_ENCRYPTED_DATA_OID.len())
+                    .any(|w| w == P12_PKCS7_ENCRYPTED_DATA_OID)
+            {
+                return Err("--private-key contains a PKCS#12 file, which cannot be \
+                    combined with --certificate; pass -k alone (password via -p) or \
+                    use --pkcs12"
+                    .into());
+            }
+            let cert_data = std::fs::read(cert_path)?;
+            let wrapped = pem_wrap_der(&key_data);
+            let creds = SigningCredentials::from_pem(&cert_data, wrapped.as_bytes(), None)?;
+            Ok(creds)
+        }
+        // no PEM marker + no certificate => PKCS#12 content
+        None => {
+            let password = cli.password.as_deref().unwrap_or("");
+            let creds = SigningCredentials::from_p12(&key_data, password)?;
+            Ok(creds)
+        }
+    }
+}
+
+/// Wraps raw DER key bytes in a PEM envelope so the PEM-only loader can
+/// decode them (the library exposes no public DER entry point).
+fn pem_wrap_der(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::with_capacity(b64.len() + b64.len() / 64 + 64);
+    out.push_str(concat!("-----BEGIN ", "PRIVATE KEY-----", "\n"));
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+        out.push('\n');
+    }
+    out.push_str(concat!("-----END ", "PRIVATE KEY-----", "\n"));
+    out
 }
 
 #[cfg(test)]
@@ -901,6 +961,9 @@ mod tests {
     }
 
     const MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
+
+    const IDENTITY_P12: &[u8] =
+        include_bytes!("../../zsign-core/src/crypto/fixtures/identity_single.p12");
 
     #[test]
     fn verify_valid_input_exits_zero() {
@@ -1124,5 +1187,114 @@ mod tests {
             r.stdout
         );
         assert!(r.stdout.contains("slice: arm64"), "stdout: {}", r.stdout);
+    }
+
+    #[test]
+    fn short_p_is_password_and_pkcs12_is_long_only() {
+        let cli = Cli::parse_from(["zsign", "-a", "-p", "secret", "in.bin"]);
+        assert_eq!(cli.password.as_deref(), Some("secret"));
+        assert!(cli.pkcs12.is_none());
+        // old -p <path> invocations now parse as a password string, not a path
+        let cli = Cli::parse_from(["zsign", "-a", "-p", "some/path.p12", "in.bin"]);
+        assert_eq!(cli.password.as_deref(), Some("some/path.p12"));
+        // pkcs12 remains reachable, long-only
+        let cli = Cli::parse_from(["zsign", "-a", "--pkcs12", "some/path.p12", "in.bin"]);
+        assert_eq!(
+            cli.pkcs12.as_deref(),
+            Some(std::path::Path::new("some/path.p12"))
+        );
+    }
+
+    #[test]
+    fn help_carries_upstream_migration_note() {
+        let r = run_cli(&[OsStr::new("--help")], &[]);
+        assert_eq!(r.code, 0);
+        assert!(
+            r.stdout
+                .contains("upstream users: -p/-k now match upstream; --pkcs12 is long-only"),
+            "stdout: {}",
+            r.stdout
+        );
+    }
+
+    #[test]
+    fn key_route_pkcs12_content_loads_with_password() {
+        // `-k` carrying p12 bytes + `-p` password signs a bare Mach-O to exit 0:
+        // proves content routing (p12 branch) and that -p feeds from_p12.
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let out = dir.path().join("out.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 0, "expected signed output, stderr: {}", r.stderr);
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn pkcs12_content_with_certificate_names_the_conflict() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        // the OID check runs before the certificate is read, so a nonexistent
+        // -c path proves the misuse error fires first
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-c"),
+                dir.path().join("absent.pem").as_os_str(),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("PKCS#12"), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("--certificate"), "stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn pem_key_without_certificate_names_the_missing_flag() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("key.pem");
+        std::fs::write(&key, concat!("-----BEGIN ", "PRIVATE KEY-----", "\n")).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let out = dir.path().join("o.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("--certificate"), "stderr: {}", r.stderr);
+        // the generic "provide both" fallthrough also contains the substring
+        // "--certificate", so require the missing flag to be named on its own
+        assert!(
+            !r.stderr.contains("--pkcs12 or both"),
+            "error must name the missing flag, not the generic fallthrough: {}",
+            r.stderr
+        );
     }
 }
