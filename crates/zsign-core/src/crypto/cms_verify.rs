@@ -1256,7 +1256,7 @@ fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Cer
     }
 }
 /// The DER value of extension `id`, or `None` when the extension is absent.
-fn ext_value<'a>(cert: &'a x509_cert::Certificate, id: ObjectIdentifier) -> Option<&'a [u8]> {
+fn ext_value(cert: &x509_cert::Certificate, id: ObjectIdentifier) -> Option<&[u8]> {
     let exts = cert.tbs_certificate.extensions.as_ref()?;
     exts.iter()
         .find(|e| e.extn_id == id)
@@ -1823,7 +1823,7 @@ mod tests {
         // of its own chain and must pass the leaf purpose rules.
         let (_k, self_signed, _s) = build_rsa_root("CN=zsign bare self-signed");
         let outcome = verify_chain(
-            &[self_signed.clone()],
+            std::slice::from_ref(&self_signed),
             &self_signed,
             &TrustAnchors::from_certificates(vec![self_signed.clone()]),
         );
@@ -2448,7 +2448,7 @@ mod tests {
         let mut wrong = ski_of(&cert_a);
         let last = wrong.len() - 1;
         wrong[last] ^= 0xFF;
-        assert!(find_cert_by_ski(&[cert_a.clone()], &wrong).is_none());
+        assert!(find_cert_by_ski(std::slice::from_ref(&cert_a), &wrong).is_none());
     }
 
     #[test]
