@@ -193,13 +193,18 @@ fn realloc_code_sign_space_single(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = checked_u32(required - code_length, "sig_datasize")?;
+    let sig_datasize = checked_u32(
+        required
+            .checked_sub(sig_offset)
+            .ok_or_else(|| Error::MachO("signature datasize underflow".into()))?,
+        "sig_datasize",
+    )?;
 
     if let Some((offset, _)) = code_sig_cmd {
         write_u32(
             &mut output,
             offset + 8,
-            checked_u32(code_length, "code_length")?,
+            checked_u32(sig_offset, "sig_offset")?,
             is_big_endian,
         )?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
@@ -233,7 +238,7 @@ fn realloc_code_sign_space_single(
         write_u32(
             &mut output,
             max_load_cmd_end + 8,
-            checked_u32(code_length, "code_length")?,
+            checked_u32(sig_offset, "sig_offset")?,
             is_big_endian,
         )?;
         write_u32(
@@ -1022,22 +1027,24 @@ pub fn realloc_code_sign_space_with_metadata(
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
-    let sig_datasize = checked_u32(required - code_length, "sig_datasize")?;
+    let sig_datasize = checked_u32(
+        required
+            .checked_sub(sig_offset)
+            .ok_or_else(|| Error::MachO("signature datasize underflow".into()))?,
+        "sig_datasize",
+    )?;
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
         write_u32(
             &mut output,
             offset + 8,
-            checked_u32(code_length, "code_length")?,
+            checked_u32(sig_offset, "sig_offset")?,
             is_big_endian,
         )?;
         write_u32(&mut output, offset + 12, sig_datasize, is_big_endian)?;
 
-        updated_metadata.code_sig_cmd = Some((
-            offset,
-            checked_u32(code_length, "code_length")?,
-            sig_datasize,
-        ));
+        updated_metadata.code_sig_cmd =
+            Some((offset, checked_u32(sig_offset, "sig_offset")?, sig_datasize));
     } else {
         let new_cmd_size = LINKEDIT_DATA_COMMAND_SIZE as usize;
         let header_size = if metadata.is_64 { 32 } else { 28 };
@@ -1064,7 +1071,7 @@ pub fn realloc_code_sign_space_with_metadata(
         write_u32(
             &mut output,
             cmd_offset + 8,
-            checked_u32(code_length, "code_length")?,
+            checked_u32(sig_offset, "sig_offset")?,
             is_big_endian,
         )?;
         write_u32(&mut output, cmd_offset + 12, sig_datasize, is_big_endian)?;
@@ -1081,7 +1088,7 @@ pub fn realloc_code_sign_space_with_metadata(
 
         updated_metadata.code_sig_cmd = Some((
             cmd_offset,
-            checked_u32(code_length, "code_length")?,
+            checked_u32(sig_offset, "sig_offset")?,
             sig_datasize,
         ));
         updated_metadata.max_load_cmd_end = insert_end;
@@ -1891,6 +1898,102 @@ mod tests {
         assert!(
             vmsize_after >= 0x1000,
             "vmsize must never shrink below the original page"
+        );
+    }
+    #[test]
+    fn test_realloc_writes_aligned_dataoff_for_odd_code_length() {
+        use crate::macho::parser::MachOMetadata;
+        let data = crate::macho::fixtures::make_signed_minimal_macho_at(0x2001, 0x400);
+        assert_eq!(
+            data.len(),
+            0x2401,
+            "fixture precondition: odd dataoff, slot ends at EOF"
+        );
+        let metadata = MachOMetadata {
+            code_sig_cmd: Some((280, 0x2001, 0x400)),
+            linkedit_cmd: Some((184, 0x2000, 0x1000, 0x401)),
+            max_load_cmd_end: 296,
+            first_segment_offset: 0x1000,
+            is_big_endian: false,
+            is_64: true,
+        };
+        // metadata variant
+        let (out, meta) = realloc_code_sign_space_with_metadata(&data, &metadata, 0x2001)
+            .expect("expansion must succeed");
+        let (_, dataoff, datasize) = meta.code_sig_cmd.expect("metadata echoes the command");
+        assert_eq!(
+            dataoff % 16,
+            0,
+            "realloc must write a 16-aligned dataoff, got {dataoff:#x}"
+        );
+        assert!(
+            (dataoff as usize) + (datasize as usize) <= out.len(),
+            "declared range {dataoff:#x}+{datasize:#x} must fit {:#x}-byte output",
+            out.len()
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[288..292].try_into().unwrap()),
+            dataoff,
+            "LC bytes and metadata must carry the same dataoff"
+        );
+        // goblin variant, same contract
+        let out2 = realloc_code_sign_space(&data, 0x2001).expect("expansion must succeed");
+        let macho2 =
+            crate::macho::MachOFile::parse(out2.clone()).expect("expanded output must reparse");
+        let d2 = macho2.slices()[0].code_sig_offset.expect("LC present");
+        assert_eq!(
+            d2 % 16,
+            0,
+            "goblin variant must also write a 16-aligned dataoff, got {d2:#x}"
+        );
+        assert!(
+            (d2 as usize) + macho2.slices()[0].code_sig_size.expect("size") as usize <= out2.len(),
+            "declared range must fit the output"
+        );
+    }
+
+    #[test]
+    fn test_sign_unaligned_length_keeps_signature_in_bounds() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data.resize(0x2001, 0); // unsigned image with odd length: pad to sig_offset is normal
+        let macho = crate::macho::MachOFile::parse(data).expect("fixture must parse");
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.oddlen", None, None, None, false)
+                .expect("signing an odd-length unsigned binary must succeed");
+        let reparsed = crate::macho::MachOFile::parse(signed.clone())
+            .expect("signed output must reparse: declared range must fit");
+        let slice = &reparsed.slices()[0];
+        let dataoff = slice
+            .code_sig_offset
+            .expect("signed output carries LC_CODE_SIGNATURE");
+        assert_eq!(dataoff % 16, 0, "dataoff must be 16-byte aligned");
+        assert!(
+            (dataoff as usize) + slice.code_sig_size.expect("size") as usize <= signed.len(),
+            "declared range must fit the output"
+        );
+    }
+
+    #[test]
+    fn test_odd_dataoff_resign_roundtrip() {
+        let signed = crate::macho::fixtures::make_signed_minimal_macho_at(0x2001, 0x400);
+        let macho = crate::macho::MachOFile::parse(signed).expect("odd input must parse");
+        let resigned =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.odd", None, None, None, false)
+                .expect("expand-path odd re-sign must succeed with the pad allocated");
+        let reparsed = crate::macho::MachOFile::parse(resigned.clone())
+            .expect("odd re-sign output must reparse: no dangling declared range");
+        let slice = &reparsed.slices()[0];
+        let dataoff = slice
+            .code_sig_offset
+            .expect("signed output carries LC_CODE_SIGNATURE");
+        assert_eq!(
+            dataoff % 16,
+            0,
+            "re-signing must heal the signature start to 16 bytes, got {dataoff:#x}"
+        );
+        assert!(
+            (dataoff as usize) + slice.code_sig_size.expect("size") as usize <= resigned.len(),
+            "declared range must fit the output"
         );
     }
 }
