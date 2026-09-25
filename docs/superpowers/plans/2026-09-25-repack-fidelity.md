@@ -869,7 +869,7 @@ Expected: PASS — including `test_create_ipa_preserves_symlinks` (safe targets 
 
 - [ ] **Step 2: Run, verify failure**
 
-Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core test_build_omits_rule_declared_paths test_custom_exclude`
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core test_build_omits_rule_declared_paths` and `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core test_custom_exclude` (two sequential runs — `cargo test` accepts a single positional filter).
 Expected: FAIL to compile (`rule_action`/`RuleAction` not found) — then, after adding only the resolver, the assertions fail against today's `build()` (`en.lproj/locversion.plist` present in `files2`, `Base.lproj` carrying `optional`, no `^DebugResources/` key).
 
 - [ ] **Step 3: Implement the resolver**
