@@ -9,7 +9,7 @@
 # and the iOS 26 AMFI extension kill) at the format level.
 #
 # Runs only on macOS. No sudo, no persisted state (the signing certificate is
-# a self-signed code-signing CA that is its own implicit trust anchor).
+# a self-signed end-entity certificate that is its own implicit trust anchor).
 #
 # Usage: scripts/verify-apple-interop.sh        (requires target/release/zsign-cli)
 
@@ -49,16 +49,17 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Self-signed code-signing certificate.
-#    EKU codeSigning + KU digitalSignature + CA:TRUE make it valid under
-#    SecTrustEvaluate's code-signing policy even without a system anchor.
+# 1. Self-signed end-entity code-signing certificate.
+#    EKU codeSigning + KU digitalSignature + CA:FALSE satisfy the leaf rules
+#    enforced by the strict verifier (codeSigning EKU, digitalSignature KU,
+#    CA=false); the certificate is its own implicit trust anchor.
 # ---------------------------------------------------------------------------
 openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "$WORK/cs_key.pem" -out "$WORK/cs_cert.pem" -days 3 \
     -subj "/CN=zsign interop CI" \
     -addext "keyUsage=digitalSignature" \
     -addext "extendedKeyUsage=codeSigning" \
-    -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+    -addext "basicConstraints=critical,CA:FALSE" >/dev/null 2>&1
 openssl pkcs12 -export -out "$WORK/cs.p12" \
     -inkey "$WORK/cs_key.pem" -in "$WORK/cs_cert.pem" \
     -passout pass:test >/dev/null 2>&1
@@ -128,7 +129,91 @@ sign_and_verify "$WORK/cert" "cert-signed (RSA, sha256-only)" \
 sign_and_verify "$WORK/adhoc" "ad-hoc" -a
 
 # ---------------------------------------------------------------------------
-# 5. Structural asserts on the signed main binary (format regressions).
+# 5. Entitlements ground truth: profile-derived slot -7 DER must round-trip
+#    through Apple's own tools (display decode + generator cross-check).
+# ---------------------------------------------------------------------------
+cat > "$WORK/entitlements.xml" <<'ENTXML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>zz-counter</key><integer>42</integer>
+<key>get-task-allow</key><true/>
+<key>zsign-data-sample</key><data>AQID</data>
+<key>application-groups</key><array><string>group.com.zsign.interop</string></array>
+<key>com.zsign.interop.nested</key><dict><key>enabled</key><true/></dict>
+<key>application-identifier</key><string>TEAMID.com.zsign.interop</string>
+</dict></plist>
+ENTXML
+
+# Minimal fixture profile: the entitlements extractor only needs the XML
+# plist window, not a real CMS signature.
+python3 - "$WORK/entitlements.xml" "$WORK/fixture.mobileprovision" <<'PYPROF'
+import plistlib, sys
+ent = plistlib.load(open(sys.argv[1], "rb"))
+with open(sys.argv[2], "wb") as fh:
+    plistlib.dump({"Entitlements": ent}, fh, fmt=plistlib.FMT_XML)
+PYPROF
+
+sign_and_verify "$WORK/ent" "cert-signed (RSA, entitlements)" \
+    -p "$WORK/cs.p12" --password test -m "$WORK/fixture.mobileprovision"
+
+app="$WORK/ent/Test.app"
+D=$(codesign -d --verbose=4 "$app/Test" 2>&1)
+printf '%s\n' "$D" >>"$DIAG"
+
+codesign -d --entitlements - --der "$app/Test" >"$WORK/displayed.der" 2>/dev/null \
+    || fail "codesign cannot dump DER entitlements of our signature"
+codesign -d --entitlements - --xml "$app/Test" >"$WORK/displayed.xml" 2>/dev/null \
+    || fail "codesign cannot dump XML entitlements of our signature"
+
+# Apple's own DER for the same XML: the documented cross-check for the
+# golden-vector tests (they pin literals locally; this pins them to Apple).
+build_fixture "$WORK/ref/Test.app"
+codesign --force --sign - --entitlements "$WORK/entitlements.xml" \
+    --generate-entitlement-der "$WORK/ref/Test.app/Test" >/dev/null 2>&1 \
+    || fail "codesign --generate-entitlement-der reference signing"
+
+if ! python3 - "$app/Test" "$WORK/ref/Test.app/Test" \
+    "$WORK/displayed.der" "$WORK/displayed.xml" "$WORK/entitlements.xml" <<'PYDER'
+import plistlib, struct, sys, pathlib
+
+def slot_blob(path, wanted_type):
+    data = pathlib.Path(path).read_bytes()
+    off = data.rfind(b"\xfa\xde\x0c\xc0")
+    count = struct.unpack(">I", data[off + 8:off + 12])[0]
+    for i in range(count):
+        typ, eoff = struct.unpack(">II", data[off + 12 + i * 8:off + 20 + i * 8])
+        if typ == wanted_type:
+            base = off + eoff
+            size = struct.unpack(">I", data[base + 4:base + 8])[0]
+            return data[base:base + size]
+    return None
+
+ours = slot_blob(sys.argv[1], 7)
+reference = slot_blob(sys.argv[2], 7)
+if ours is None:
+    sys.exit("our signature has no slot 7 (DER entitlements) blob")
+if reference is None:
+    sys.exit("codesign reference signature has no slot 7 blob")
+if ours[8:] != reference[8:]:
+    sys.exit("slot -7 MISMATCH vs codesign --generate-entitlement-der:\n"
+             + "  ours:     " + ours[8:].hex() + "\n  codesign: " + reference[8:].hex())
+displayed = pathlib.Path(sys.argv[3]).read_bytes()
+if displayed != ours[8:]:
+    sys.exit("codesign --entitlements - --der output differs from our slot -7 payload")
+expected = plistlib.load(open(sys.argv[5], "rb"))
+shown = plistlib.load(open(sys.argv[4], "rb"))
+if shown != expected:
+    sys.exit("XML round-trip mismatch:\n  expected: %r\n  shown:    %r"
+             % (expected, shown))
+print("OK  entitlements: slot -7 matches codesign --generate-entitlement-der")
+PYDER
+then
+    fail "der entitlements round-trip (slot -7 ground truth)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Structural asserts on the signed main binary (format regressions).
 # ---------------------------------------------------------------------------
 app="$WORK/cert/Test.app"
 D=$(codesign -d --verbose=4 "$app/Test" 2>&1)
@@ -141,7 +226,7 @@ fi
 grep -q "Info.plist entries=" <<<"$D" || fail "Info.plist not bound to the signature"
 
 # ---------------------------------------------------------------------------
-# 6. CMS binding: the embedded CMS must cryptographically verify over the
+# 7. CMS binding: the embedded CMS must cryptographically verify over the
 #    primary CodeDirectory (independent of codesign's trust evaluation).
 # ---------------------------------------------------------------------------
 python3 - "$app/Test" "$WORK" <<'PY'
@@ -164,7 +249,7 @@ openssl cms -verify -binary -inform DER \
     -noverify -out /dev/null
 
 # ---------------------------------------------------------------------------
-# 7. zsign -V agreement: our verifier must agree with Apple's in both
+# 8. zsign -V agreement: our verifier must agree with Apple's in both
 #    directions — accept what codesign accepts, reject what codesign rejects.
 # ---------------------------------------------------------------------------
 agree_valid() {
@@ -187,19 +272,20 @@ agree_invalid() {
     echo "OK  zsign -V rejects $label"
 }
 
-# 7a. The two bundles codesign accepted in steps 3/4.
-agree_valid "cert-signed bundle" "$WORK/cert/Test.app"
+# 8a. The ad-hoc bundle codesign accepted in step 4. The cert-signed bundle
+# cannot be listed here: zsign -V anchors only to the Apple Root, so a
+# self-signed certificate never verifies.
 agree_valid "ad-hoc bundle"       "$WORK/adhoc/Test.app"
 
-# 7b. A real Apple-signed system binary (FAT, 16 KB pages, Apple chain).
+# 8b. A real Apple-signed system binary (FAT, 16 KB pages, Apple chain).
 agree_valid "Apple-signed /bin/ls" /bin/ls
 
-# 7c. An ad-hoc signature produced by codesign itself.
+# 8c. An ad-hoc signature produced by codesign itself.
 cp /bin/ls "$WORK/ls-adhoc"
 codesign --force -s - "$WORK/ls-adhoc" 2>/dev/null
 agree_valid "codesign ad-hoc output" "$WORK/ls-adhoc"
 
-# 7d. Negative control: tamper a signed binary — codesign and zsign must both
+# 8d. Negative control: tamper a signed binary — codesign and zsign must both
 #     reject it.
 cp "$WORK/cert/Test.app/Test" "$WORK/Test.tampered"
 printf '\x90' | dd of="$WORK/Test.tampered" bs=1 seek=64 conv=notrunc 2>/dev/null
