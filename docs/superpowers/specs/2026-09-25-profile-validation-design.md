@@ -264,6 +264,20 @@ Gate commands (per brief): mid-flight
 
 ## 6. Known items / evidence gaps
 
+- **Strict now-based chain validity rejects expired genuine profiles by
+  design.** Both observed Apple profile-signing leaves expired 2022-04-12
+  (iOS) / 2023-02-07 (macOS), and `openssl cms -verify` fails them with
+  "certificate has expired" unless `-no_check_time` (librarian §5d). The brief
+  mandates now-based rejection ("expired cert rejected when now > expiry"), so
+  this lane keeps it: signing a fresh profile is the remedy for legacy
+  profiles; the injectable `now` is precisely the seam a later lane can use if
+  signingTime-based semantics are ever wanted.
+- **`TrustAnchors::apple_root()` carries only the legacy Apple Root CA.** A
+  post-2022 rotated signer chaining to *Apple Root CA - G3* would verify as
+  unanchored against the embedded asset (UNVERIFIED — the obtainable sample
+  set ends 2021-01; all observed chains terminate at the legacy root, which
+  matches by SPKI despite subject renaming).
+
 - Hostname check (brief item 2) is **not implementable**: no host-identifying field
   exists in any profile (librarian §6: all 16 top-level keys enumerated on iOS +
   macOS; TN3125 + Bitrise agree). Scoped question stated to the supervisor; design

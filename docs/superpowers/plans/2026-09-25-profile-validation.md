@@ -338,10 +338,12 @@ fn leaf_ku_bc_reason(leaf: &x509_cert::Certificate) -> Option<String> {
    (signature of the public fn itself does NOT change).
 
 7. Update every in-module `verify_chain(...)` call site to the new arity —
-   `chain_with` (:1723), the SHA-1-root test around :1667, and any others found
-   by searching `verify_chain(` — passing
-   `time_now(), SignerPurpose::CodeSigning` so their wall-clock behavior is
-   unchanged.
+   there are exactly six: the production call (:827, covered in step 5) and
+   five test call sites at :1666, :1724 (inside the `chain_with` helper,
+   :1723), :1825 (bare self-signed), :2043 (issuer-like), and :2095 (subca) —
+   each test call passing `time_now(), SignerPurpose::CodeSigning` so its
+   wall-clock behavior is unchanged. Confirm completeness by searching
+   `verify_chain(` after the edit: no 3-argument call may remain.
 
 - [ ] **Step 4: Scoped gate (green)**
 
@@ -358,7 +360,7 @@ Expected: all `crypto` tests pass including the three new ones.
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms_verify.rs`
-  (`verify_signed_data` :523, digest gate :733, eContent skip :590, messageDigest
+  (`verify_signed_data` :523, digest gate :734-739, eContent skip :590, messageDigest
   :802, cdhash gates :842, `verify_signer_signature` :934, public entries :275/:295,
   `CmsVerifyReport` :229)
 - Modify: `crates/zsign-core/src/crypto/cms.rs` (test-only attached/detached signers)
@@ -714,6 +716,84 @@ to the module imports):
             report.errors
         );
     }
+
+    #[test]
+    fn rsa_signature_rejects_digest_and_signature_oid_mismatches() {
+        use signature::Signer;
+
+        let (creds, key) = rsa_credentials();
+        // Deliberately not 0xA0-prefixed, so `verify_signer_signature` treats
+        // these bytes as the single candidate message.
+        let msg: &[u8] = b"\x02\x01\x01 mismatch-probe";
+
+        let sha256_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let sig256: rsa::pkcs1v15::Signature = sha256_key.sign(msg);
+
+        // Consistent pairs verify.
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha256,
+            msg,
+            sig256.as_bytes(),
+        ));
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_RSA_ENCRYPTION,
+            SignerDigest::Sha256,
+            msg,
+            sig256.as_bytes(),
+        ));
+
+        // Mismatch direction 1: SHA-256 digestAlgorithm presented with the
+        // SHA-1 signature OID (a real SHA-256 signature must not be accepted
+        // under the SHA-1 label).
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA1_WITH_RSA,
+            SignerDigest::Sha256,
+            msg,
+            sig256.as_bytes(),
+        ));
+
+        let sha1_key = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(key.clone());
+        let sig1: rsa::pkcs1v15::Signature = sha1_key.sign(msg);
+
+        // Consistent SHA-1 pairs (the profile shape, incl. Apple's
+        // digest-less rsaEncryption form) verify.
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_SHA1_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            sig1.as_bytes(),
+        ));
+        assert!(verify_signer_signature(
+            &creds.certificate,
+            OID_RSA_ENCRYPTION,
+            SignerDigest::Sha1,
+            msg,
+            sig1.as_bytes(),
+        ));
+
+        // Mismatch direction 2: SHA-1 digestAlgorithm presented with the
+        // SHA-256 signature OID — rejected for both a SHA-256 and a SHA-1
+        // signature payload.
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            sig256.as_bytes(),
+        ));
+        assert!(!verify_signer_signature(
+            &creds.certificate,
+            OID_SHA256_WITH_RSA,
+            SignerDigest::Sha1,
+            msg,
+            sig1.as_bytes(),
+        ));
+    }
 ```
 
 - [ ] **Step 3: Run to confirm red**
@@ -902,7 +982,7 @@ fn verify_signed_data(
    digest. Three coordinated changes inside the function:
 
    a. The RSA predicate gains the SHA-1 OID (the constant already exists at
-   `cms_verify.rs` `OID_SHA1_WITH_RSA`, :64-65):
+   `cms_verify.rs` `OID_SHA1_WITH_RSA`, :73-74):
 
 ```rust
     let rsa_sig = sig_oid == OID_SHA256_WITH_RSA
@@ -910,20 +990,43 @@ fn verify_signed_data(
         || sig_oid == OID_RSA_ENCRYPTION;
 ```
 
-   b. Before the signature dispatch, pick the digest the signature actually
-   embeds — an explicit `sha1WithRSAEncryption` OID names SHA-1 but is only
-   honored when the SignerInfo digest agrees (profile mode), so
-   code-signature mode keeps its old accept set:
+   b. Before the signature dispatch, gate the pair for consistency — RFC 5652
+   SignerInfo semantics require `signatureAlgorithm` and `digestAlgorithm` to
+   name the same hash (RFC 5754 §2 pair rules): `rsaEncryption` names no
+   digest and inherits the SignerInfo digest, while an explicit
+   `*WithRSAEncryption` OID must agree with it. An inconsistent pair is
+   rejected outright (`return false`) — this is a strict pair-consistency
+   rule, not accept-set widening: pre-patch behavior refused
+   `sha1WithRSAEncryption` entirely; the gate keeps refusing every
+   mismatched combination (both directions) while admitting the two
+   consistent SHA-1 pairs real profiles use:
 
 ```rust
-    let effective_digest = if sig_oid == OID_SHA256_WITH_RSA {
-        SignerDigest::Sha256
-    } else if sig_oid == OID_SHA1_WITH_RSA && digest == SignerDigest::Sha1 {
+    if rsa_sig {
+        let consistent = sig_oid == OID_RSA_ENCRYPTION
+            || (sig_oid == OID_SHA256_WITH_RSA && digest == SignerDigest::Sha256)
+            || (sig_oid == OID_SHA1_WITH_RSA && digest == SignerDigest::Sha1);
+        if !consistent {
+            // signatureAlgorithm/digestAlgorithm mismatch — reject outright.
+            return false;
+        }
+    }
+    // The digest the RSA PKCS#1 v1.5 DigestInfo must carry: explicit
+    // *WithRSAEncryption OIDs were checked against `digest` above;
+    // rsaEncryption inherits it.
+    let effective_digest = if sig_oid == OID_SHA1_WITH_RSA {
         SignerDigest::Sha1
+    } else if sig_oid == OID_SHA256_WITH_RSA {
+        SignerDigest::Sha256
     } else {
         digest
     };
 ```
+
+   Place both blocks after the `rsa_sig`/`ecdsa_sig` predicates and before
+   the `for msg in candidates` loop (ECDSA never enters the gate; it keeps
+   its SHA-256 dispatch). Also update the stale comment above `rsa_sig`
+   (“the digest OID carrying SHA-256”) to describe the pair rule.
 
    c. In the `rsa_sig && alg == OID_RSA_ENCRYPTION` branch, dispatch on
    `effective_digest` instead of hard-coded `Sha256`:
@@ -1502,10 +1605,6 @@ Then the tests:
         assert!(err.to_string().contains("has no ExpirationDate"), "{err}");
     }
 ```
-
-Note: `signed_profile("")` in the forged-profile test only builds the fixture
-chain (its envelope is discarded) — the point is that raw XML never reaches CMS
-parsing successfully.
 
 - [ ] **Step 3: Run to confirm red**
 
@@ -2093,20 +2192,20 @@ wasm32 arm of `resolve_now` is compile-checked later by the Task 5 wasm
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
 Expected: green; baseline counts were 182 `zsign-core` / 89 `zsign-rs` tests
-plus this plan's additions (4 Task-1 + 6 Task-2 + 14 Task-3 ≈ +24, exact
+plus this plan's additions (3 Task-1 + 7 Task-2 + 16 Task-3 + 3 Task-4 = 29, exact
 numbers recorded in the lane report). Any other pre-existing failure is a
 blocker — stop and diagnose (skill: systematic-debugging).
 
 - [ ] **Step 2: wasm32 compile proof (the clock contract must build)**
 
-Run: `cargo check -p zsign-wasm --target wasm32-unknown-unknown`
+Run: `TMPDIR=$PWD/.tmptmp cargo check -p zsign-wasm --target wasm32-unknown-unknown`
 Expected: OK (the target may be absent on this machine — attempt once, record
 the outcome honestly; CI runs the same check). This is what proves
 `resolve_now`'s wasm arm compiles.
 
 - [ ] **Step 3: Consumer compile proof**
 
-Run: `cargo check --workspace`
+Run: `TMPDIR=$PWD/.tmptmp cargo check --workspace`
 Expected: OK — `extract_entitlements_from_profile` signature untouched, so
 `zsign/src/builder.rs`, `zsign/src/ipa/mod.rs`, `zsign-wasm`, and
 `zsign-cli` compile without edits (their adoption is later lanes' work).
