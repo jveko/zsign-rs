@@ -568,15 +568,32 @@ fn is_macho_file(path: &Path) -> Result<bool> {
     ))
 }
 
+/// A sealed key may only address files strictly inside the bundle: every
+/// path component must be a plain name (no `..`, no absolute prefix, no `.`).
+fn is_safe_bundle_key(key: &str) -> bool {
+    let path = Path::new(key);
+    path.components().next().is_some()
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// Verifies one CodeResources entry against the bundle on disk.
 fn verify_code_resource_entry(
     bundle: &Path,
+    bundle_real: &Path,
     rel: &str,
     entry: &plist::Value,
     out: &mut CodeResourcesVerification,
     rules: &[Rule],
     errors: &mut Vec<String>,
 ) -> Result<()> {
+    if !is_safe_bundle_key(rel) {
+        errors.push(format!(
+            "CodeResources entry path escapes the bundle: {rel}"
+        ));
+        return Ok(());
+    }
     let entry_dict = match entry.as_dictionary() {
         Some(d) => d,
         None => {
@@ -605,6 +622,28 @@ fn verify_code_resource_entry(
     }
 
     let file_path = bundle.join(rel);
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| crate::Error::Io(std::io::Error::other("invalid resource path")))?;
+    match std::fs::canonicalize(parent) {
+        Ok(resolved) if resolved.starts_with(bundle_real) => {}
+        Ok(_) => {
+            errors.push(format!(
+                "CodeResources entry path escapes the bundle: {rel}"
+            ));
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !matches!(
+                rule_action(rules, rel),
+                Some(RuleAction::Optional) | Some(RuleAction::Omit)
+            ) {
+                out.missing.push(rel.to_string());
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(crate::Error::Io(e)),
+    }
     if let Some(sealed_target) = symlink.and_then(|value| value.as_string()) {
         let metadata = match std::fs::symlink_metadata(&file_path) {
             Ok(metadata) => metadata,
@@ -733,6 +772,7 @@ fn check_code_resources(
     let rules = rules_dict
         .map(|dict| compile_rules(dict, errors))
         .unwrap_or_default();
+    let bundle_real = std::fs::canonicalize(bundle).map_err(crate::Error::Io)?;
     let Some(files2_value) = root.get("files2") else {
         errors.push("CodeResources has no files2 dictionary".into());
         return Ok(out);
@@ -770,7 +810,7 @@ fn check_code_resources(
                 errors.push(format!("malformed CodeResources entry: {rel}"));
                 continue;
             }
-            verify_code_resource_entry(bundle, rel, entry, &mut out, &rules, errors)?;
+            verify_code_resource_entry(bundle, &bundle_real, rel, entry, &mut out, &rules, errors)?;
         }
     }
     if let Some(files) = files {
@@ -779,7 +819,35 @@ fn check_code_resources(
                 continue;
             }
             if let Some(sealed_hash) = entry.as_data() {
+                if !is_safe_bundle_key(rel.as_str()) {
+                    errors.push(format!(
+                        "CodeResources entry path escapes the bundle: {rel}"
+                    ));
+                    continue;
+                }
                 let file_path = bundle.join(rel.as_str());
+                let parent = file_path.parent().ok_or_else(|| {
+                    crate::Error::Io(std::io::Error::other("invalid resource path"))
+                })?;
+                match std::fs::canonicalize(parent) {
+                    Ok(resolved) if resolved.starts_with(&bundle_real) => {}
+                    Ok(_) => {
+                        errors.push(format!(
+                            "CodeResources entry path escapes the bundle: {rel}"
+                        ));
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if !matches!(
+                            rule_action(&rules, rel),
+                            Some(RuleAction::Optional) | Some(RuleAction::Omit)
+                        ) {
+                            out.missing.push(rel.clone());
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(crate::Error::Io(e)),
+                }
                 let data = match std::fs::read(&file_path) {
                     Ok(data) => data,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -799,7 +867,15 @@ fn check_code_resources(
                     out.mismatched.push(rel.clone());
                 }
             } else {
-                verify_code_resource_entry(bundle, rel, entry, &mut out, &rules, errors)?;
+                verify_code_resource_entry(
+                    bundle,
+                    &bundle_real,
+                    rel,
+                    entry,
+                    &mut out,
+                    &rules,
+                    errors,
+                )?;
             }
         }
     }
@@ -1371,6 +1447,73 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("malformed CodeResources entry")),
             "got {:?}",
+            bundle.errors
+        );
+    }
+    #[test]
+    fn path_traversal_keys_are_rejected() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            for key in ["../../../../etc/passwd", "/etc/passwd"] {
+                let mut entry = plist::Dictionary::new();
+                entry.insert("hash2".to_string(), plist::Value::Data(vec![0u8; 32]));
+                files2.insert(key.to_string(), plist::Value::Dictionary(entry));
+            }
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(!report.valid());
+        let bundle = report.bundle.as_ref().unwrap();
+        for key in ["../../../../etc/passwd", "/etc/passwd"] {
+            assert!(
+                bundle
+                    .errors
+                    .iter()
+                    .any(|e| { e.contains("escapes the bundle") && e.contains(key) }),
+                "key {key:?} must be rejected; got {:?}",
+                bundle.errors
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_traversal_is_rejected() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        let outside = td.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"outside content").unwrap();
+        // A legitimately sealed symlink pointing out of the bundle: the builder
+        // hashes whatever read_link returns, so this signs cleanly.
+        let app = build_signed_bundle_with(td.path(), |app| {
+            symlink(&outside, app.join("Escape")).unwrap();
+        });
+        // Lexical-clean key whose intermediate component is that symlink; the
+        // attacker-chosen hash2 even matches the real outside content.
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            let mut entry = plist::Dictionary::new();
+            entry.insert(
+                "hash2".to_string(),
+                plist::Value::Data(Sha256::digest(b"outside content").to_vec()),
+            );
+            files2.insert(
+                "Escape/secret.txt".to_string(),
+                plist::Value::Dictionary(entry),
+            );
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(!report.valid());
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle
+                .errors
+                .iter()
+                .any(|e| e.contains("escapes the bundle") && e.contains("Escape/secret.txt")),
+            "symlink-parent key must be rejected before any read; got {:?}",
             bundle.errors
         );
     }
