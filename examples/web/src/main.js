@@ -118,12 +118,10 @@ function hashEntry(signer, relPath, bytes) {
 
 function tryExtractBundleId(plistData, wasmReady) {
   if (wasmReady) {
-    try {
-      const info = WasmSigner.parse_info_plist(plistData);
-      return info.bundle_id || null;
-    } catch (_) {
-      // fall through to text-based fallback
-    }
+    // A ready parser is authoritative: its errors carry a code and the regex
+    // below cannot read binary plists, so swallowing them hides the failure.
+    const info = WasmSigner.parse_info_plist(plistData);
+    return info.bundle_id || null;
   }
   // Fallback: try XML regex
   const text = new TextDecoder("utf-8", { fatal: false }).decode(plistData);
@@ -135,12 +133,8 @@ function tryExtractBundleId(plistData, wasmReady) {
 
 function tryExtractExecutableName(plistData, wasmReady) {
   if (wasmReady) {
-    try {
-      const info = WasmSigner.parse_info_plist(plistData);
-      return info.executable || null;
-    } catch (_) {
-      // fall through to text-based fallback
-    }
+    const info = WasmSigner.parse_info_plist(plistData);
+    return info.executable || null;
   }
   const text = new TextDecoder("utf-8", { fatal: false }).decode(plistData);
   const match = text.match(
@@ -437,7 +431,6 @@ async function loadIpa(file) {
   section(`▸ Reading ${file.name} (${formatSize(file.size)})`);
 
   // Init WASM early so we can parse binary plists
-  let wasmReady = false;
   try {
     const wasmResponse = await fetch(wasmUrl);
     const wasmBytes = await wasmResponse.arrayBuffer();
@@ -445,58 +438,72 @@ async function loadIpa(file) {
     wasmReady = true;
     log("WASM module loaded", "ok");
   } catch (_) {
+    wasmReady = false;
     log("WASM not loaded yet — using fallback plist parser");
   }
 
-  const zipReader = new ZipReader(new BlobReader(file));
-  const entries = await zipReader.getEntries();
-  log(`Found ${entries.length} entries in archive`);
+  // The drop and file handlers fire this without awaiting or catching, so
+  // every later failure is contained here: logged, reader closed, no new
+  // IPA selected.
+  let zipReader = null;
+  try {
+    zipReader = new ZipReader(new BlobReader(file));
+    const entries = await zipReader.getEntries();
+    log(`Found ${entries.length} entries in archive`);
 
-  // Find .app bundle root
-  const appEntry = entries.find((e) =>
-    e.filename.match(/Payload\/[^/]+\.app\/$/),
-  );
-  if (!appEntry) {
-    log("No .app bundle found in IPA", "err");
-    await zipReader.close();
-    return;
-  }
-  appPrefix = appEntry.filename;
-  appName = appPrefix.match(/\/([^/]+)\.app\/$/)[1];
-  log(`Found bundle: ${appName}.app`, "ok");
+    // Find .app bundle root
+    const appEntry = entries.find((e) =>
+      e.filename.match(/Payload\/[^/]+\.app\/$/),
+    );
+    if (!appEntry) {
+      log("No .app bundle found in IPA", "err");
+      return;
+    }
+    appPrefix = appEntry.filename;
+    appName = appPrefix.match(/\/([^/]+)\.app\/$/)[1];
+    log(`Found bundle: ${appName}.app`, "ok");
 
-  // Read Info.plist to extract bundle ID
-  const infoPlistEntry = entries.find(
-    (e) => e.filename === `${appPrefix}Info.plist`,
-  );
-  if (infoPlistEntry) {
-    const plistData = await infoPlistEntry.getData(new Uint8ArrayWriter());
-    const bundleId = tryExtractBundleId(plistData, wasmReady);
-    if (bundleId) {
-      bundleIdInput.value = bundleId;
-      log(`Bundle ID: ${bundleId}`, "ok");
+    // Read Info.plist to extract bundle ID
+    const infoPlistEntry = entries.find(
+      (e) => e.filename === `${appPrefix}Info.plist`,
+    );
+    if (infoPlistEntry) {
+      const plistData = await infoPlistEntry.getData(new Uint8ArrayWriter());
+      const bundleId = tryExtractBundleId(plistData, wasmReady);
+      if (bundleId) {
+        bundleIdInput.value = bundleId;
+        log(`Bundle ID: ${bundleId}`, "ok");
+      } else {
+        bundleIdInput.value = "";
+        log("Could not auto-detect bundle ID — please enter manually", "err");
+      }
+      const execName = tryExtractExecutableName(plistData, wasmReady);
+      if (execName && execName !== appName) {
+        log(`CFBundleExecutable: ${execName} (differs from .app name)`, "ok");
+      }
     } else {
-      bundleIdInput.value = "";
-      log("Could not auto-detect bundle ID — please enter manually", "err");
+      log("Info.plist not found in bundle", "err");
     }
-    const execName = tryExtractExecutableName(plistData, wasmReady);
-    if (execName && execName !== appName) {
-      log(`CFBundleExecutable: ${execName} (differs from .app name)`, "ok");
+
+    ipaFile = file;
+    ipaEntries = null; // will re-read during signing
+
+    // Update UI
+    dropZone.classList.add("loaded");
+    dropLabel.textContent = `${file.name} loaded`;
+    configSection.classList.add("visible");
+    updateSignButton();
+  } catch (e) {
+    log(`Error: ${fmtErr(e)}`, "err");
+    console.error(e);
+    ipaFile = null;
+    updateSignButton();
+  } finally {
+    if (zipReader) {
+      await zipReader.close();
+      zipReader = null;
     }
-  } else {
-    log("Info.plist not found in bundle", "err");
   }
-
-  await zipReader.close();
-
-  ipaFile = file;
-  ipaEntries = null; // will re-read during signing
-
-  // Update UI
-  dropZone.classList.add("loaded");
-  dropLabel.textContent = `${file.name} loaded`;
-  configSection.classList.add("visible");
-  updateSignButton();
 }
 
 // --- Sign button readiness ---
@@ -580,7 +587,13 @@ async function signIpa() {
     section("▸ Initializing WASM module");
     const wasmResponse = await fetch(wasmUrl);
     const wasmBytes = await wasmResponse.arrayBuffer();
-    await initWasm({ module_or_path: wasmBytes });
+    try {
+      await initWasm({ module_or_path: wasmBytes });
+      wasmReady = true;
+    } catch (e) {
+      wasmReady = false;
+      throw e;
+    }
     log("WASM module loaded", "ok");
 
     // 2. Create signer with credentials
@@ -696,7 +709,11 @@ async function signIpa() {
       const plistData = await plistEntry.getData(new Uint8ArrayWriter());
       const execName = tryExtractExecutableName(plistData, wasmReady);
       if (!execName) {
-        throw new Error(`bundle ${prefix} has no CFBundleExecutable`);
+        throw new Error(
+          isRoot
+            ? "Cannot determine main executable — Info.plist has no CFBundleExecutable (or it could not be parsed)"
+            : `bundle ${prefix} has no CFBundleExecutable`,
+        );
       }
       const execRel = execName;
       const execFull = `${prefix}${execRel}`;
