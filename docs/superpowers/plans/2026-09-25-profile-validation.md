@@ -2620,6 +2620,44 @@ covering constructed/indefinite eContent through the code-signature entry."
     }
 
     #[test]
+    fn attached_entry_rejects_trailing_encap_fields() {
+        // A field after eContent inside the encapContentInfo SEQUENCE must be
+        // a hard error on the attached entry (entry-level pin of the guard).
+        let id_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+        let id_signed_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+        let econtent = der_tlv(0xA0, &der_tlv(0x04, b"payload"));
+        let encap = der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_data), econtent, der_tlv(0x05, &[])].concat(),
+        );
+        let signed_data = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0x01]),
+                der_tlv(0x31, &[]),
+                encap,
+                der_tlv(0x31, &[]),
+            ]
+            .concat(),
+        );
+        let cms = der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_signed_data), der_tlv(0xA0, &signed_data)].concat(),
+        );
+
+        let err = verify_cms_envelope_with_anchors(
+            &cms,
+            Some(at(T_2026_APR)),
+            &anchors_for(&rsa_credentials().0),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("trailing fields after eContent"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn octet_stream_rejects_trailing_data() {
         let mut bytes = der_tlv(0x04, b"head");
         bytes.extend_from_slice(&der_tlv(0x05, &[])); // stray NULL after the TLV
@@ -2714,10 +2752,13 @@ fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], usize)> {
         }
         (len, 2 + n)
     };
+    let end = header
+        .checked_add(len)
+        .ok_or_else(|| Error::Verification("TLV length overflows the stream".into()))?;
     let body = bytes
-        .get(header..header + len)
+        .get(header..end)
         .ok_or_else(|| Error::Verification("truncated TLV body".into()))?;
-    Ok((tag, body, header + len))
+    Ok((tag, body, end))
 }
 
 /// Decodes one `0x04` primitive or `0x24` constructed OCTET STRING TLV into
@@ -2773,7 +2814,7 @@ Expected: all green (existing + the three new tests).
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
 Expected: green; baseline counts were 182 `zsign-core` / 89 `zsign-rs` tests
-plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b + 4 Task-2c = 38, exact
+plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b + 5 Task-2c = 39, exact
 numbers recorded in the lane report). Any other pre-existing failure is a
 blocker — stop and diagnose (skill: systematic-debugging).
 
