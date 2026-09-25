@@ -125,6 +125,14 @@ fn hash_code_pages_dual_seq(code: &[u8]) -> DualPageHashes {
 /// CodeDirectory header size for version 0x20400 (with exec segment fields).
 const CODEDIRECTORY_HEADER_SIZE: u32 = 88;
 
+/// Narrows a computed extent to the wire format's u32 field, failing loudly
+/// instead of silently truncating a signature blob into self-inconsistency.
+/// Builder inputs are trusted (the signer's own buffers), so an overflow is
+/// a programming error, not attacker input.
+pub(crate) fn u32_len(value: usize, what: &str) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| panic!("{what} length {value} exceeds u32::MAX"))
+}
+
 /// Builder for creating [`CodeDirectory`](https://developer.apple.com/documentation/technotes/tn3126-inside-code-signing-code-requirements) blobs.
 ///
 /// The CodeDirectory contains:
@@ -320,14 +328,14 @@ impl<'a> CodeDirectoryBuilder<'a> {
 
     /// Internal build function using pre-computed page hashes.
     fn build_from_hashes(&self, hash_type: u8, hash_size: usize, page_hashes: &[u8]) -> Vec<u8> {
-        let code_limit = self.code.len() as u32;
+        let code_limit = u32_len(self.code.len(), "code");
         let n_code_slots = if code_limit == 0 {
             0
         } else {
             (code_limit as usize).div_ceil(PAGE_SIZE)
         };
 
-        debug_assert_eq!(
+        assert_eq!(
             page_hashes.len(),
             n_code_slots * hash_size,
             "page_hashes length mismatch: expected {} ({}×{}), got {}",
@@ -340,7 +348,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
         let n_special_slots = self.count_special_slots();
 
         let ident_offset = CODEDIRECTORY_HEADER_SIZE;
-        let ident_len = self.identifier.len() as u32 + 1;
+        let ident_len = u32_len(self.identifier.len() + 1, "identifier");
 
         let team_offset = if self.team_id.is_some() {
             ident_offset + ident_len
@@ -350,12 +358,17 @@ impl<'a> CodeDirectoryBuilder<'a> {
         let team_len = self
             .team_id
             .as_ref()
-            .map(|t| t.len() as u32 + 1)
+            .map(|t| u32_len(t.len() + 1, "team identifier"))
             .unwrap_or(0);
 
-        let hash_offset =
-            ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
-        let total_len = hash_offset + (n_code_slots as u32 * hash_size as u32);
+        let hash_offset = ident_offset
+            .checked_add(ident_len)
+            .and_then(|off| off.checked_add(team_len))
+            .and_then(|off| off.checked_add(n_special_slots as u32 * hash_size as u32))
+            .expect("CodeDirectory hash offset overflows u32");
+        let total_len = hash_offset
+            .checked_add(n_code_slots as u32 * hash_size as u32)
+            .expect("CodeDirectory length overflows u32");
 
         let mut buf = Vec::with_capacity(total_len as usize);
 
@@ -399,7 +412,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
         // Code slots from pre-computed hashes
         buf.extend_from_slice(page_hashes);
 
-        debug_assert_eq!(buf.len(), total_len as usize);
+        assert_eq!(buf.len(), total_len as usize);
 
         buf
     }
@@ -407,7 +420,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
     /// Internal build function that handles both hash types.
     fn build_internal(&self, hash_type: u8, hash_size: usize) -> Vec<u8> {
         // Calculate number of code slots (pages)
-        let code_limit = self.code.len() as u32;
+        let code_limit = u32_len(self.code.len(), "code");
         let n_code_slots = if code_limit == 0 {
             0
         } else {
@@ -419,7 +432,7 @@ impl<'a> CodeDirectoryBuilder<'a> {
 
         // Calculate string offsets
         let ident_offset = CODEDIRECTORY_HEADER_SIZE;
-        let ident_len = self.identifier.len() as u32 + 1; // null-terminated
+        let ident_len = u32_len(self.identifier.len() + 1, "identifier"); // null-terminated
 
         let team_offset = if self.team_id.is_some() {
             ident_offset + ident_len
@@ -429,15 +442,20 @@ impl<'a> CodeDirectoryBuilder<'a> {
         let team_len = self
             .team_id
             .as_ref()
-            .map(|t| t.len() as u32 + 1)
+            .map(|t| u32_len(t.len() + 1, "team identifier"))
             .unwrap_or(0);
 
         // Hash offset is after header, identifier, team ID, and special slots
-        let hash_offset =
-            ident_offset + ident_len + team_len + (n_special_slots as u32 * hash_size as u32);
+        let hash_offset = ident_offset
+            .checked_add(ident_len)
+            .and_then(|off| off.checked_add(team_len))
+            .and_then(|off| off.checked_add(n_special_slots as u32 * hash_size as u32))
+            .expect("CodeDirectory hash offset overflows u32");
 
         // Total length includes header, strings, special slots, and code slots
-        let total_len = hash_offset + (n_code_slots as u32 * hash_size as u32);
+        let total_len = hash_offset
+            .checked_add(n_code_slots as u32 * hash_size as u32)
+            .expect("CodeDirectory length overflows u32");
 
         // Build the blob
         let mut buf = Vec::with_capacity(total_len as usize);
@@ -571,6 +589,12 @@ impl<'a> CodeDirectoryBuilder<'a> {
 
         let mut out = Vec::with_capacity(n_slots * hash_size);
         for slot in &slots[start..] {
+            assert_eq!(
+                slot.len(),
+                hash_size,
+                "special slot digest length {} does not match hash size {hash_size}",
+                slot.len()
+            );
             out.extend_from_slice(slot);
         }
         out
@@ -1023,5 +1047,40 @@ mod tests {
         manual_s256.update(&page);
         assert_eq!(&dual.sha1[..], &manual_s1.finalize()[..]);
         assert_eq!(&dual.sha256[..], &manual_s256.finalize()[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "page_hashes length")]
+    fn build_from_hashes_panics_on_length_mismatch() {
+        // 8192 bytes of code = 2 pages = 64 bytes of SHA-256 page hashes expected.
+        let code = vec![0x33u8; 8192];
+        let _ = CodeDirectoryBuilder::new("com.example.mismatch", &code)
+            .build_sha256_from_hashes(&[0u8; 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "special slot digest")]
+    fn build_rejects_special_slot_digest_of_wrong_length() {
+        // build_internal has NO length check today: pre-fix this returns a
+        // self-inconsistent blob silently (release AND debug). Post-fix the
+        // per-slot precondition fires at build time.
+        let code = vec![0x44u8; 4096];
+        let _ = CodeDirectoryBuilder::new("com.example.slot", &code)
+            .entitlements_hash(vec![0u8; 64])
+            .build_sha256();
+    }
+
+    #[test]
+    fn u32_len_accepts_u32_max() {
+        assert_eq!(u32_len(u32::MAX as usize, "test"), u32::MAX);
+        assert_eq!(u32_len(0, "test"), 0);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "exceeds u32::MAX")]
+    fn u32_len_panics_instead_of_truncating() {
+        // >4 GiB: `as u32` used to truncate silently (finding f's root cause).
+        let _ = u32_len(u32::MAX as usize + 1, "test");
     }
 }
