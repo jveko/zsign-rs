@@ -453,10 +453,12 @@ fn encode_dictionary(dict: &plist::Dictionary) -> Result<Vec<u8>> {
 ```
 
 Then replace the whole body of `encode_value`'s `Value::Dictionary(dict)` arm
-with:
+with (statement-style match: arms are unit-typed, and `encode_dictionary`
+already returns `Result<Vec<u8>>` — exactly `encode_value`'s return type — so
+return it directly; no `?`, no copying):
 
 ```rust
-        Value::Dictionary(dict) => encode_dictionary(dict)?,
+        Value::Dictionary(dict) => return encode_dictionary(dict),
 ```
 
 Then replace, in `plist_to_der`, the whole span from the current `:235`
