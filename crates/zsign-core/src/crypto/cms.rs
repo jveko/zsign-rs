@@ -154,54 +154,11 @@ fn sign_test_content(
         serial_number: signing_cert.tbs_certificate.serial_number.clone(),
     });
 
-    fn build<S, Sig>(
-        encap: &EncapsulatedContentInfo,
-        sid: SignerIdentifier,
-        digest_algorithm: AlgorithmIdentifierOwned,
-        external_message_digest: Option<&[u8]>,
-        signing_cert: &x509_cert::Certificate,
-        cert_chain: &[x509_cert::Certificate],
-        signer: &S,
-    ) -> Result<Vec<u8>>
-    where
-        S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
-        Sig: spki::SignatureBitStringEncoding,
-    {
-        let sib = SignerInfoBuilder::new(
-            signer,
-            sid,
-            digest_algorithm.clone(),
-            encap,
-            external_message_digest,
-        )
-        .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
-        let mut builder = SignedDataBuilder::new(encap);
-        builder
-            .add_digest_algorithm(digest_algorithm)
-            .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
-        builder
-            .add_certificate(CertificateChoices::Certificate(signing_cert.clone()))
-            .map_err(|e| signing_err("Failed to add signing certificate", e))?;
-        for cert in cert_chain {
-            builder
-                .add_certificate(CertificateChoices::Certificate(cert.clone()))
-                .map_err(|e| signing_err("Failed to add chain certificate", e))?;
-        }
-        builder
-            .add_signer_info::<S, Sig>(sib)
-            .map_err(|e| signing_err("Failed to add signer info", e))?;
-        builder
-            .build()
-            .map_err(|e| signing_err("Failed to build CMS SignedData", e))?
-            .to_der()
-            .map_err(|e| signing_err("Failed to encode CMS to DER", e))
-    }
-
     let digest_algorithm = digest.algorithm();
     match digest {
         TestDigest::Sha256 => {
             let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(private_key.clone());
-            build(
+            build_test_cms(
                 encap,
                 sid,
                 digest_algorithm,
@@ -213,7 +170,7 @@ fn sign_test_content(
         }
         TestDigest::Sha1 => {
             let signer = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(private_key.clone());
-            build(
+            build_test_cms(
                 encap,
                 sid,
                 digest_algorithm,
@@ -224,6 +181,81 @@ fn sign_test_content(
             )
         }
     }
+}
+
+#[cfg(test)]
+fn build_test_cms<S, Sig>(
+    encap: &EncapsulatedContentInfo,
+    sid: SignerIdentifier,
+    digest_algorithm: AlgorithmIdentifierOwned,
+    external_message_digest: Option<&[u8]>,
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    signer: &S,
+) -> Result<Vec<u8>>
+where
+    S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
+    Sig: spki::SignatureBitStringEncoding,
+{
+    let sib = SignerInfoBuilder::new(
+        signer,
+        sid,
+        digest_algorithm.clone(),
+        encap,
+        external_message_digest,
+    )
+    .map_err(|e| signing_err("Failed to create SignerInfoBuilder", e))?;
+    let mut builder = SignedDataBuilder::new(encap);
+    builder
+        .add_digest_algorithm(digest_algorithm)
+        .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
+    builder
+        .add_certificate(CertificateChoices::Certificate(signing_cert.clone()))
+        .map_err(|e| signing_err("Failed to add signing certificate", e))?;
+    for cert in cert_chain {
+        builder
+            .add_certificate(CertificateChoices::Certificate(cert.clone()))
+            .map_err(|e| signing_err("Failed to add chain certificate", e))?;
+    }
+    builder
+        .add_signer_info::<S, Sig>(sib)
+        .map_err(|e| signing_err("Failed to add signer info", e))?;
+    builder
+        .build()
+        .map_err(|e| signing_err("Failed to build CMS SignedData", e))?
+        .to_der()
+        .map_err(|e| signing_err("Failed to encode CMS to DER", e))
+}
+
+/// Attached-content signer using an ECDSA P-256 key (DER-encoded SignerInfo
+/// signature per RFC 5753). Test-only; the RSA twin is `sign_attached_content`.
+#[cfg(test)]
+pub(crate) fn sign_attached_content_ecdsa(
+    content: &[u8],
+    signing_cert: &x509_cert::Certificate,
+    cert_chain: &[x509_cert::Certificate],
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Result<Vec<u8>> {
+    let encap = EncapsulatedContentInfo {
+        econtent_type: const_oid::db::rfc5911::ID_DATA,
+        econtent: Some(
+            Any::new(Tag::OctetString, content)
+                .map_err(|e| signing_err("Failed to attach content", e))?,
+        ),
+    };
+    let sid = SignerIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
+        issuer: signing_cert.tbs_certificate.issuer.clone(),
+        serial_number: signing_cert.tbs_certificate.serial_number.clone(),
+    });
+    build_test_cms::<_, p256::ecdsa::DerSignature>(
+        &encap,
+        sid,
+        TestDigest::Sha256.algorithm(),
+        None,
+        signing_cert,
+        cert_chain,
+        signing_key,
+    )
 }
 
 /// Generates a CMS signature with Apple CDHash attributes.

@@ -1109,6 +1109,19 @@ fn cdhash_v2_matches(der: &[u8], cd_sha256: &[u8; 32]) -> bool {
     hash.as_bytes() == cd_sha256
 }
 
+/// Parses an ECDSA signature from the encodings real producers emit.
+///
+/// CMS `SignerInfo.signature` (RFC 5753 §2.1.1, §7.2) and X.509
+/// `signatureValue` (RFC 5280 §4.1.1.3 → RFC 3279 §2.2.3) carry the DER
+/// encoding of `SEQUENCE { r INTEGER, s INTEGER }`. A raw fixed-width `r‖s`
+/// (the RFC 7518 JWS form) is accepted as a lenient fallback — the shape the
+/// pre-fix code expected. RSA paths are unaffected.
+fn parse_ecdsa_signature(bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
+    p256::ecdsa::Signature::from_der(bytes)
+        .or_else(|_| p256::ecdsa::Signature::from_slice(bytes))
+        .ok()
+}
+
 /// Verifies the signerInfo signature over the signed attributes with the
 /// signing certificate's public key.
 fn verify_signer_signature(
@@ -1192,7 +1205,7 @@ fn verify_signer_signature(
             let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(&pk_der) else {
                 return false;
             };
-            let Ok(sig) = p256::ecdsa::Signature::from_slice(signature) else {
+            let Some(sig) = parse_ecdsa_signature(signature) else {
                 return false;
             };
             vk.verify(msg, &sig).is_ok()
@@ -1472,7 +1485,7 @@ fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Cer
         let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(&pk_der) else {
             return false;
         };
-        let Ok(sig) = p256::ecdsa::Signature::from_slice(&sig_bytes) else {
+        let Some(sig) = parse_ecdsa_signature(&sig_bytes) else {
             return false;
         };
         vk.verify(&tbs, &sig).is_ok()
@@ -1636,7 +1649,9 @@ mod tests {
     use super::*;
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::cms::sign_code_directory;
-    use crate::crypto::cms::{sign_attached_content, sign_detached_content, TestDigest};
+    use crate::crypto::cms::{
+        sign_attached_content, sign_attached_content_ecdsa, sign_detached_content, TestDigest,
+    };
     use crate::crypto::SigningCredentials;
     use sha2::Sha256;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -2788,6 +2803,194 @@ mod tests {
     const T_2026_JUL: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
     const T_2027: i64 = 1_798_761_600; // 2027-01-01T00:00:00Z
     const T_2030: i64 = 1_893_456_000; // 2030-01-01T00:00:00Z
+
+    // ---- cross-lane: DER ECDSA signatures ----
+
+    fn fixed_time(unix: u64) -> x509_cert::time::Time {
+        x509_cert::time::Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(unix)).unwrap()
+    }
+
+    /// ECDSA root issuing a leaf whose certificate signature is DER-encoded
+    /// ECDSA — exercises the chain's certificate-signature path.
+    fn ecdsa_root_chain() -> (x509_cert::Certificate, x509_cert::Certificate, TrustAnchors) {
+        let root_key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let root_name = Name::from_str("CN=zsn3 ecdsa root").unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&root_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(23u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030 as u64),
+            },
+            root_name.clone(),
+            root_pub,
+            &root_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
+
+        let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
+            leaf_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut leaf_builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(24u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030 as u64),
+            },
+            Name::from_str("CN=zsn3 leaf under ecdsa root").unwrap(),
+            leaf_pub,
+            &root_key,
+        )
+        .unwrap();
+        leaf_builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let leaf_cert = leaf_builder.build::<p256::ecdsa::DerSignature>().unwrap();
+
+        let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
+        (root_cert, leaf_cert, anchors)
+    }
+
+    /// Fixed-window RSA root issuing an ECDSA-keyed leaf (subject key =
+    /// id-ecPublicKey, certificate signed by the RSA root).
+    fn rsa_root_with_ecdsa_leaf(
+        eku: Option<ExtendedKeyUsage>,
+    ) -> (
+        x509_cert::Certificate,
+        x509_cert::Certificate,
+        p256::ecdsa::SigningKey,
+        TrustAnchors,
+    ) {
+        let root_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let root_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(root_key.clone());
+        let root_name = Name::from_str("CN=zsn3 ecdsa-leaf root").unwrap();
+        let root_pub = SubjectPublicKeyInfoOwned::from_der(
+            root_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let root_cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(26u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030 as u64),
+            },
+            root_name.clone(),
+            root_pub,
+            &root_signing,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+
+        let leaf_key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let leaf_name = Name::from_str("CN=zsn3 ecdsa signer leaf").unwrap();
+        let leaf_pub = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&leaf_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut leaf_builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(27u32),
+            Validity {
+                not_before: fixed_time(1_577_836_800),
+                not_after: fixed_time(T_2030 as u64),
+            },
+            leaf_name,
+            leaf_pub,
+            &root_signing,
+        )
+        .unwrap();
+        if let Some(eku) = &eku {
+            leaf_builder.add_extension(eku).unwrap();
+        }
+        let leaf_cert = leaf_builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+
+        let anchors = TrustAnchors::from_certificates(vec![root_cert.clone()]);
+        (root_cert, leaf_cert, leaf_key, anchors)
+    }
+
+    #[test]
+    fn ecdsa_certificate_chain_verifies_der_signatures() {
+        let (root, leaf, anchors) = ecdsa_root_chain();
+        let certs = vec![root, leaf.clone()];
+        let outcome = verify_chain(
+            &certs,
+            &leaf,
+            &anchors,
+            at(T_2026_APR),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(outcome.ok, "chain outcome reason: {:?}", outcome.reason);
+        assert!(outcome.anchored);
+    }
+
+    #[test]
+    fn ecdsa_code_signature_round_trips_with_der_signer_info() {
+        let (root, leaf, leaf_key, anchors) =
+            rsa_root_with_ecdsa_leaf(Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])));
+        let creds = SigningCredentials {
+            certificate: leaf,
+            signing_key: SigningKeyType::Ecdsa(leaf_key),
+            cert_chain: vec![root],
+            team_id: None,
+        };
+        let content: &[u8] = b"ecdsa code directory";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let wrapped = wrap(&cms);
+
+        let report =
+            verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors)
+                .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+        assert!(report.chain_ok);
+    }
+
+    #[test]
+    fn attached_profile_envelope_accepts_der_ecdsa_signer() {
+        let (root, leaf, leaf_key, anchors) = rsa_root_with_ecdsa_leaf(None);
+        let envelope =
+            sign_attached_content_ecdsa(sample_plist(), &leaf, &[root], &leaf_key).unwrap();
+
+        let out =
+            verify_cms_envelope_with_anchors(&envelope, Some(at(T_2026_APR)), &anchors).unwrap();
+        assert!(out.report.valid, "errors: {:?}", out.report.errors);
+        assert_eq!(out.content.as_deref(), Some(sample_plist()));
+        assert!(out.report.signature_ok);
+    }
 
     /// Root valid 2020-01-01..2030-01-01 (covers every fixed instant below);
     /// leaf valid exactly [not_before, not_after].
