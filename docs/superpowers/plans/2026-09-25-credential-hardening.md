@@ -114,9 +114,14 @@ awk -v d="$d" '
   /-----END CERTIFICATE-----/{in_cert=0}' "$d/dup.pem"
 test "$(ls "$d"/dup_*.pem | wc -l)" -eq 2 \
   || { echo "UNEXPECTED certificate count" >&2; exit 1; }
-openssl x509 -in "$d/dup_1.pem" -noout -serial -subject   # serial=0401, subject=CN=zsign-test-fixture
-openssl x509 -in "$d/dup_2.pem" -noout -serial -subject   # serial=0402, subject=CN=zsign-test-fixture
-for i in 1 2; do openssl x509 -in "$d/dup_$i.pem" -noout -pubkey | openssl sha256; done  # identical hashes (same SPKI)
+openssl x509 -in "$d/dup_1.pem" -noout -serial | grep -qi 'serial=0401' \
+  || { echo "UNEXPECTED: dup_1 serial is not 0401" >&2; exit 1; }
+openssl x509 -in "$d/dup_2.pem" -noout -serial | grep -qi 'serial=0402' \
+  || { echo "UNEXPECTED: dup_2 serial is not 0402" >&2; exit 1; }
+h1=$(openssl x509 -in "$d/dup_1.pem" -noout -pubkey | openssl sha256)
+h2=$(openssl x509 -in "$d/dup_2.pem" -noout -pubkey | openssl sha256)
+[ "$h1" = "$h2" ] || { echo "UNEXPECTED: duplicate certs carry different SPKIs" >&2; exit 1; }
+printf '%s\n' "$h1"   # identical pubkey hash (same SPKI), recorded for the report
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/identity_single.p12 \
   -nokeys -passin pass:testpassword 2>/dev/null \
   | openssl x509 -noout -text \
@@ -222,19 +227,27 @@ fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>)
 }
 ```
 
-(Imports at the top of `mod tests` — exact paths at x509-cert 0.2.5 / der 0.7.10:
-`const_oid::ObjectIdentifier` (the Task-1 EKU literal below needs it before Task 2's
-production import exists), `der::{Decode, Encode, EncodePem}`, `der::pem::LineEnding`,
-`pkcs8::{DecodePrivateKey,
-EncodePrivateKey}`, `spki::{EncodePublicKey, SubjectPublicKeyInfoOwned}` (the `spki` crate path, as
-`cms_verify.rs` tests use; `x509_cert` also re-exports `spki`, but one path is enough),
-`x509_cert::builder::{Builder, CertificateBuilder, Profile}`,
-`x509_cert::name::Name`,
-`x509_cert::{serial_number::SerialNumber, time::{Time, Validity}}`,
-`x509_cert::ext::pkix::ExtendedKeyUsage`, `std::str::FromStr`,
-`rand::thread_rng`. `Decode` is also reachable via the parent module's
-`use der::{Decode, DecodePem}` through `use super::*`, but importing it explicitly keeps
-the test module self-contained.)
+(Imports at the top of `mod tests` — **each name exactly once**; a name imported both
+here and inside a helper would leave the module-scope copy unused and fail the merge
+gate's `-D warnings`. The helper bodies above therefore carry their own local imports
+for every trait they use (`der::Encode` in `der_of`, `der::{EncodePem, pem::LineEnding}`
+in `leaf_pems`, `pkcs8::EncodePrivateKey` in `der_of`/`pkcs8_of`/`leaf_pems`,
+`spki::EncodePublicKey` + `x509_cert::builder::*` + `x509_cert::name::Name` +
+`std::str::FromStr` in `build_cert`), and none of those are repeated at module scope.
+The module-scope list is exactly the names the *test bodies* use bare:
+
+- `const_oid::ObjectIdentifier` — the Task-1 EKU literal, before Task 2's production
+  import exists;
+- `der::Decode` — `SubjectPublicKeyInfoOwned::from_der` inside `build_cert` (no local
+  copy; the parent's import would also resolve through `use super::*`, but the explicit
+  one is used and self-contained);
+- `spki::SubjectPublicKeyInfoOwned` — `build_cert` (no local copy);
+- `x509_cert::{serial_number::SerialNumber, time::{Time, Validity}}` — `build_cert` and
+  `window` (no local copies);
+- `x509_cert::ext::pkix::ExtendedKeyUsage` — EKU literals in tests.
+
+Not imported here: `rand::thread_rng` (called fully qualified as `rand::thread_rng()`)
+and `pkcs8::DecodePrivateKey` (no test uses it).)
 
 Tests:
 
@@ -398,8 +411,8 @@ TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_i
 ```
 
 Expected: RED as a **build failure** — the first run does not compile: `DecodedKey`,
-`select_identity` and `build_chain_from_leaf` do not exist yet (E0425/E0432 inside this
-test module), so no test executes. A compile error prevents the whole test binary from
+`select_identity` and `build_chain_from_leaf` do not exist yet (E0425 inside this
+test module — unresolved function paths), so no test executes. A compile error prevents the whole test binary from
 running, so runtime-red and compile-red cannot coexist in one run; the build failure IS
 this task's red. The three loader tests (`from_p12_rejects_ambiguous_identity`,
 `from_p12_selects_single_identity_with_empty_chain`,
@@ -664,7 +677,12 @@ one place:
 ```
 
 (replacing the `if let Ok(rsa_key) / else if let Ok(ecdsa_key) / else` chain including its
-password first-arm; the cert-PEM parse at 135-139 stays untouched).
+password first-arm; the cert-PEM parse at 135-139 stays untouched). Also **delete the
+now-orphaned `use pkcs8::DecodePrivateKey;` at `cert.rs:133`** — after the rewrite
+nothing in `from_pem` uses that trait (the `DecodedKey::from_pkcs8_pem` path carries its
+own function-local import), and leaving it behind trips `unused_imports`, which the
+merge gate's `cargo clippy --workspace --all-targets -- -D warnings` turns into an
+error).
 
 Doc migration in the same commit: `from_p12` `# Errors` list (181-186) gains the
 no-match/ambiguous-identity entries; delete the obsolete comment at 228-231; adjust
@@ -713,6 +731,7 @@ fn code_signing_eku() -> ExtendedKeyUsage {
 /// (pattern from `cms_verify.rs` tests; mutation invalidates the cert's own
 /// signature, which load-time policy never checks).
 fn replace_extension(cert: &mut Certificate, id: ObjectIdentifier, value: &impl der::Encode) {
+    use der::Encode; // `value.to_der()` below; the trait must be in scope here
     let bytes = value.to_der().unwrap();
     let exts = cert.tbs_certificate.extensions.get_or_insert_with(Vec::new);
     exts.retain(|e| e.extn_id != id);
@@ -867,12 +886,15 @@ fn from_p12_rejects_non_policy_fixture() {
 }
 ```
 
-(Imports at the top of `mod tests` as needed: `const_oid::ObjectIdentifier`,
-`x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages}` —
+(Imports: Task 1's step already provides `const_oid::ObjectIdentifier`, `der::Decode`,
+`spki::SubjectPublicKeyInfoOwned`,
+`x509_cert::{serial_number::SerialNumber, time::{Time, Validity}}` and
+`x509_cert::ext::pkix::ExtendedKeyUsage`; `Error`/`Result` resolve through the parent
+module's `use crate::{Error, Result}` via `use super::*`. Task 2 adds exactly ONE new
+import line: `x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages}` —
 `KeyUsages` is re-exported directly from `pkix` at x509-cert 0.2.5, the `keyusage`
-module is private — plus `crate::{Error, Result}`. `Time`, `Validity`, `SerialNumber`,
-`SubjectPublicKeyInfoOwned`, `EncodePem`/`LineEnding` and `extract_subject_cn` come from
-Task 1's step.)
+module is private. Nothing is imported twice; `extract_subject_cn` comes from Task 1's
+step.)
 
 - [ ] **Step 2.2: Run red**
 
@@ -891,7 +913,7 @@ the fix: `from_pem_accepts_compliant_leaf` and `from_pem_accepts_leaf_without_ku
 - [ ] **Step 2.3: Implement the policy in `cert.rs`**
 
 First add `use const_oid::ObjectIdentifier;` to cert.rs's module imports (beside
-`use der::{Decode, DecodePem};` at line 30): the constants and `ext_value` below use the
+`use der::{Decode, DecodePem};` at `cert.rs:29`): the constants and `ext_value` below use the
 bare type, and existing fully-qualified `const_oid::ObjectIdentifier` uses stay valid.
 Then add the module-private mirrors of the verify-side helpers (verbatim semantics of
 `cms_verify.rs:87-94, 1259-1264, 1285-1314, 1346-1364`; that module is out of scope —
@@ -1046,9 +1068,14 @@ a passphrase and fail; the stored shrouded key bag itself is unaffected by the f
 openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/weak_rsa1024.p12 \
   -nocerts -nodes -passin pass:testpassword 2>/dev/null \
   | openssl pkey -noout -text | head -1    # Private-Key: (1024 bit, 2 primes)
-openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/weak_rsa1024.p12 \
-  -nokeys -passin pass:testpassword 2>/dev/null \
-  | openssl x509 -noout -text | grep -E 'Extended Key Usage|Key Usage|CA:'  # codeSigning / digitalSignature / CA:FALSE
+leaf=$(openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/weak_rsa1024.p12 \
+  -nokeys -passin pass:testpassword 2>/dev/null | openssl x509 -noout -text)
+printf '%s\n' "$leaf" | grep -q 'Code Signing' \
+  || { echo "UNEXPECTED: weak fixture lacks codeSigning EKU" >&2; exit 1; }
+printf '%s\n' "$leaf" | grep -q 'Digital Signature' \
+  || { echo "UNEXPECTED: weak fixture lacks digitalSignature KU" >&2; exit 1; }
+printf '%s\n' "$leaf" | grep -q 'CA:FALSE' \
+  || { echo "UNEXPECTED: weak fixture leaf must be CA:FALSE" >&2; exit 1; }
 ```
 
 Expected: `Private-Key: (1024 bit, 2 primes)` and a policy-compliant leaf (so the *floor*
@@ -1559,8 +1586,9 @@ fn safe_bag(bag_id: &str, value_tlv: &[u8]) -> Vec<u8> {
 fn safe_contents(bags: &[Vec<u8>]) -> Vec<u8> { seq(bags) }
 ```
 
-Tests (complete bodies; `collect_bags` already takes the `depth` argument these
-call sites use — see Step 5.4):
+Tests (complete bodies; the three direct `collect_bags` call sites use the
+five-argument signature that Step 5.4 introduces — pre-fix that arity mismatch is
+exactly the E0061 build failure of Step 5.3):
 
 ```rust
 #[test]

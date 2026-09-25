@@ -1,6 +1,10 @@
 # Credential Loading Hardening — Design (ZSN-37)
 
-**Date:** 2026-09-25 · **Branch:** `zsn37-credentials` · **Base:** `main` @ `c9ff0fb`
+**Date:** 2026-09-25 · **Branch:** `zsn37-credentials` · **Base:** `main` @ `7f6d06a`
+(rebased twice: originally `c9ff0fb`, then `c174240`, then `7f6d06a` — every doc commit
+was replayed cleanly and the crypto files stayed byte-identical throughout, so all
+`cert.rs`/`pkcs12.rs`/`cms_verify.rs` line citations hold at every base; commit hashes
+cited below without the "pre-rebase" label are current-branch hashes)
 **Scope (authoritative):** lane brief `/tmp/zsn-37.txt`, queue items 1–5, files
 `crates/zsign-core/src/crypto/{cert.rs,pkcs12.rs}` + their inline `#[cfg(test)]` tests ONLY.
 
@@ -113,7 +117,7 @@ certificate that breaks several rules):**
 | 1 | Extended key usage | extension **present** and contains `codeSigning` (`1.3.6.1.5.5.7.3.3`) | subject, EKU contents / absence |
 | 2 | Key usage | if present, must include `digitalSignature` | subject, KU bits |
 | 3 | Basic constraints | if present, must assert `CA=false` | subject, CA flag |
-| 4 | Validity window | `notBefore ≤ now ≤ notAfter` (mirrored `time_now()`) | subject, both timestamps, current time |
+| 4 | Validity window | `notBefore ≤ now ≤ notAfter` (mirrored `time_now()`) | subject, the *violated* bound (`notBefore` when future, `notAfter` when expired) and current time — matching the plan's emitted messages exactly |
 
 Consistency note: the verify side *requires* the EKU extension, tolerates a *missing* KU and
 a *missing* BC (checking them only when present). The load side mirrors that exactly —
@@ -322,18 +326,32 @@ determinism test fails pre-existing and is skipped in full runs.
   struct-literal sites exist (12 helpers/locations — `zsign/verify.rs` has two), all in
   `#[cfg(test)]` helpers or the criterion bench
   (`cms.rs:531/647/751/828/884`, `cms_verify.rs:1415/1897`, `macho/signer.rs:947`,
-  `macho/verify.rs:344`, `zsign/test_util.rs:60`, `zsign/verify.rs:982/1056`,
+  `macho/verify.rs:601`, `zsign/test_util.rs:60`, `zsign/verify.rs:982/1056`,
   `benches/signing.rs:133`). Adding any field would break all of them — outside this
   lane's edit scope. Confirms the hard constraint above.
 - **Production loaders:** only `zsign-cli/src/main.rs:379/:386` and
-  `zsign-wasm/src/lib.rs:64`. Neither `ZSign` nor `IpaSigner` loads credentials; they
-  borrow values already constructed.
+  `zsign-wasm/src/lib.rs:236` (re-anchored after the rebase). Neither `ZSign` nor
+  `IpaSigner` loads credentials; they borrow values already constructed.
+- **Apple-interop consumer:** the macOS CI interop job signs via the CLI with the
+  self-signed certificate from `scripts/verify-apple-interop.sh`; since ZSN-38
+  (`7f6d06a`) that certificate is `CA:FALSE` + codeSigning EKU + digitalSignature KU,
+  i.e. policy-compliant, so the planned load policy keeps that job green. The upstream
+  CA:FALSE line has only been validated by `bash -n` + structural checks — macOS CI is
+  the real SecTrustEvaluate test, and a failure there is a ZSN-38 finding, not this
+  lane's. (Round 4's logic-level interop finding was resolved by this upstream change;
+  this lane never edits the script.)
 - **Error surfacing:** CLI propagates `?` raw to `main`'s `Result` (rendered via
-  `Debug`, exit 1); wasm flattens `Display` verbatim into a JS `Error`
-  (`lib.rs:64-65`); the zsign facade forwards core errors `#[error(transparent)]`
+  `Debug`, exit 1); wasm routes the loader through `p12_err` (`lib.rs:236`; `p12_err`
+  at `:144-160`) and flattens `Display` into a JS `Error` with a mapped code; the
+  zsign facade forwards core errors `#[error(transparent)]`
   (`zsign/src/error.rs:56-67`). **No consumer string-matches `Error::Certificate` text** —
-  message wording is free to change; the closest coupling is ZSN-23's
-  `cms_verify.rs:2077/2128`, which asserts *verify-report* strings, not load errors.
+  policy-message wording is free to change (the closest coupling there is ZSN-23's
+  `cms_verify.rs:2077/2128`, which asserts *verify-report* strings). **However —
+  cross-crate contract (round-4 finding):** `p12_err` string-matches the wrapped
+  *`P12Error` Display* markers `"invalid PKCS#12 password (MAC mismatch)"` and
+  `"PKCS#12 decryption failed"` to map `ZSIGN_INVALID_PASSWORD`, pinned by
+  `zsign-wasm/src/lib.rs:947-960`. Those two parse-stage strings must be preserved
+  verbatim by any future wording change in `pkcs12.rs`; this lane does not touch them.
 - **Existing loader tests cannot newly fail:** `cert.rs:401` and `cert.rs:407` assert
   `is_err()` on garbage input, failing at parse before any policy check. Every
   credential-consuming test elsewhere builds the struct literally, bypassing loaders. The
@@ -499,8 +517,11 @@ defect → STOP and report* — is triggered, so implementation did not start.
 
 ### State at STOP
 
-- Docs committed: `4a87a64` (design+plan), `f145d19` (round-1 fixes), `e50cd85`
-  (import-note delta, disclosed to the round-2 reviewer). No source or fixture commits.
+- Docs committed (pre-rebase lineage — those hashes were rewritten by the two rebases;
+  current equivalents: `53fc53d` design+plan, `9d55d0c` round-1 fixes, `8f4b2ba`
+  import-note delta, `7d9fc9a` round-2 record, `3714f22` round-2 fixes, `d55447d`
+  round-3 fixes, `a2654b4` round-3 disposition, `89b7135` round-4 record): `4a87a64`,
+  `f145d19`, `e50cd85`. No source or fixture commits at any point.
 - Baseline gate measured green: `59 passed; 0 failed` for the mandated scoped command.
 - Worktree untouched beyond docs: `crates/zsign-core/src/crypto/{cert.rs,pkcs12.rs}` are
   byte-identical to `c9ff0fb`; all nine committed fixtures intact; zero new fixtures.
