@@ -387,6 +387,7 @@ pub(crate) enum TestDigest {
     Sha256,
 }
 
+#[cfg(test)]
 impl TestDigest {
     fn digest(self, bytes: &[u8]) -> Vec<u8> {
         match self {
