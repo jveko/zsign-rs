@@ -374,12 +374,19 @@ Fixture strategy (no new files, no new deps, CI-safe):
 
 - **Leaf p12 embedded in the test module** as a base64 `&str` const with a
   ~15-line test-local decoder. Generated once, locally, with openssl:
-  self-issued P-256, `CA:FALSE`, `keyUsage=digitalSignature`,
+  self-issued **RSA-2048**, `CA:FALSE`, `keyUsage=digitalSignature`,
   `extendedKeyUsage=codeSigning`, `OU=ZSN40TEST`, validity from generation
   time (2026-09) to ≥2030 — the binding constraint is that it covers native
   now **and** the wasm fixed epoch 2027-01-15 (and any near-future epoch
-  ZSN-3 might pick), AES-256 p12, fixed password. This mirrors
-  the fixture-reality pattern (`Profile::Leaf` + codeSigning EKU +
+  ZSN-3 might pick), AES-256 p12, fixed password. RSA (not the originally
+  considered P-256) because this repo's verify path only handles RSA today:
+  `cms_verify.rs` parses ECDSA signatures as fixed 64-byte raw
+  (`p256::ecdsa::Signature::from_slice`, :986 SignerInfo / :1250 cert
+  chain) while `crypto/cms.rs` signs with DER-encoded ECDSA, so every ECDSA
+  CMS/cert verification fails to parse (observed live during Task 1; core
+  defect owned by ZSN-3 — cross-lane finding, recorded in known items).
+  RSA matches the in-repo `rsa_credentials` precedent and the
+  fixture-reality pattern (`Profile::Leaf` + codeSigning EKU +
   self-issued anchor) without x509-cert dev-deps and without
   `Validity::from_now` (which panics on wasm32). `from_p12` performs no
   validity check, so construction works on both targets.
@@ -433,6 +440,15 @@ determinism skip therefore irrelevant to this lane's scoped gates).
   does not touch `cms_verify.rs`. The fixed-epoch shim is used only by the
   test certificate's multi-year validity window; if ZSN-3 changes the epoch
   to any near-future value, the window (≥2030) keeps covering it. No code dependency.
+  **Cross-lane finding for ZSN-3 (observed live, Task 1):** ECDSA signature
+  verification in `cms_verify.rs` is broken — the module parses signatures
+  as fixed 64-byte raw ECDSA (`p256::ecdsa::Signature::from_slice` at :986
+  for SignerInfo and :1250 for cert chains) while `crypto/cms.rs` produces
+  DER-encoded ECDSA signatures; every ECDSA CMS or certificate verification
+  fails at parse ("signature does not verify over signed attributes",
+  "self-signed cert fails self-signature verification"). RSA is unaffected.
+  Out of this lane's scope; reported to the supervisor, not fixed here, and
+  this lane's fixture is RSA-2048 because of it.
 - **ZSN-41 (examples/web)**: must be briefed with the API delta (§ below);
   edits there are out of this lane's scope.
 - **ZSN-31 (.github)**: workflows untouched. Local gate command matches the

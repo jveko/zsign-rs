@@ -39,7 +39,7 @@ test(zsign-wasm): <subject> (ZSN-40)
 
 Test fixtures are embedded/`include_bytes!` in the test module — tracked files only, zero new files, zero new deps:
 
-- `LEAF_P12_B64` + `decode_base64()` — self-issued P-256 leaf p12 generated ONCE with the exact openssl commands in Task 1 Step 1 (CA:FALSE, digitalSignature, codeSigning EKU, `OU=ZSN40TEST`, password `test`). Mirrors fixture reality (`Profile::Leaf` + codeSigning EKU) without x509-cert dev-deps and without `Validity::from_now` (panics on wasm32). Validity must cover native now AND the wasm fixed verify epoch 2027-01-15 (cms_verify.rs:1359).
+- `LEAF_P12_B64` + `decode_base64()` — self-issued RSA-2048 leaf p12 generated ONCE with the exact openssl commands in Task 1 Step 1 (CA:FALSE, digitalSignature, codeSigning EKU, `OU=ZSN40TEST`, password `test`; RSA because the repo's verify path cannot parse DER-encoded ECDSA — cross-lane finding in the design doc). Mirrors fixture reality (`Profile::Leaf` + codeSigning EKU) without x509-cert dev-deps and without `Validity::from_now` (panics on wasm32). Validity must cover native now AND the wasm fixed verify epoch 2027-01-15 (cms_verify.rs:1359).
 - `MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin")` — tracked, thin arm64 MH_EXECUTE, 8192 B. If it turns out unsuitable for signing, build a minimal macho in the test module instead and log the deviation in the final report.
 - `PROFILE_XML: &str` — minimal provisioning-profile stand-in: XML plist containing an `Entitlements` dict (`get-task-allow` true + `application-identifier` string). `extract_entitlements_from_profile` (provisioning.rs:12-42) only requires `<?xml`, `</plist`, bounds, and re-serializes the `Entitlements` value.
 - `new_signer()` / `new_signer_with_profile()` helpers wrapping `WasmSigner::new` (profile fixture = `PROFILE_XML`).
@@ -66,19 +66,27 @@ Test fixtures are embedded/`include_bytes!` in the test module — tracked files
 
 - [ ] **Step 1: Generate the embedded leaf p12 (once, local)**
 
+RSA-2048 (not P-256): this repo's `cms_verify.rs` parses ECDSA signatures
+as fixed 64-byte raw while the CMS builder emits DER-encoded ECDSA — every
+ECDSA verification fails at parse (core defect owned by ZSN-3, recorded as
+a cross-lane finding in the design doc). RSA matches the in-repo
+`rsa_credentials`/fixture-reality precedent and is the proven verify path.
+
 ```bash
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-  -keyout /tmp/zsn40-key.pem -out /tmp/zsn40-cert.pem -days 3650 -nodes \
+openssl req -x509 -newkey rsa:2048 \
+  -keyout .tmptmp/zsn40-key.pem -out .tmptmp/zsn40-cert.pem -days 3650 -nodes \
   -subj "/CN=zsign-wasm-test/OU=ZSN40TEST" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature" \
   -addext "extendedKeyUsage=critical,codeSigning"
-openssl pkcs12 -export -out /tmp/zsn40.p12 -inkey /tmp/zsn40-key.pem \
-  -in /tmp/zsn40-cert.pem -passout pass:test \
+openssl pkcs12 -export -out .tmptmp/zsn40.p12 -inkey .tmptmp/zsn40-key.pem \
+  -in .tmptmp/zsn40-cert.pem -passout pass:test \
   -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg SHA256
-base64 -w0 /tmp/zsn40.p12
-openssl x509 -in /tmp/zsn40-cert.pem -noout -subject -dates -text | grep -E 'Subject:|notBefore|notAfter|CA:|Key Usage|Extended'
+base64 -w0 .tmptmp/zsn40.p12
+openssl x509 -in .tmptmp/zsn40-cert.pem -noout -subject -dates -text | grep -E 'Subject:|notBefore|notAfter|CA:|Key Usage|Extended'
 ```
+
+(Write all outputs under `.tmptmp/`, never `/tmp` — tmpfs quota flakes.)
 
 Verify the printed cert: `OU=ZSN40TEST`, `CA:FALSE`, `digitalSignature`, `codeSigning`, notAfter ≈ +10 years (must be after 2027-01-15). If `-days 3650` starts at now (2026-09-25) that satisfies the window; the design doc's exact dates are illustrative — the constraint is "covers native now and 2027-01-15". Paste `base64 -w0` output into the test module as `const LEAF_P12_B64: &str` (split into concatenated 76-char lines for reviewability).
 
