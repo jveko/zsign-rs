@@ -94,14 +94,19 @@ struct Cli {
     /// Exit 0 = valid, 1 = invalid, 2 = hard error.
     #[arg(short = 'V', long)]
     verify: bool,
+    /// Emit a machine-readable JSON document on stdout; failures become JSON
+    /// objects on stderr. Human-readable output stays the default.
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     match run(cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("error: {err}");
+            emit_error(json, &err.to_string());
             // signing/credential failures: unchanged contract (design, item 1)
             ExitCode::from(1)
         }
@@ -110,8 +115,9 @@ fn main() -> ExitCode {
 
 /// Runs the CLI from parsed arguments (testable without argv).
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let json = cli.json;
     if cli.verify {
-        return Ok(run_verify(&cli.input));
+        return Ok(run_verify(&cli.input, json));
     }
 
     let mut signer = if cli.adhoc {
@@ -158,14 +164,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 out
             });
             signer.sign_ipa(&cli.input, &output)?;
-            println!("Signed: {}", output.display());
+            report_sign(json, false, &output.display().to_string());
         }
         "app" => {
             // Folder signing: with -o ending in .ipa, repack; otherwise in place.
             signer.sign_bundle(&cli.input, cli.output.as_deref())?;
             match &cli.output {
-                Some(ipa) => println!("Signed: {}", ipa.display()),
-                None => println!("Signed in place: {}", cli.input.display()),
+                Some(ipa) => report_sign(json, false, &ipa.display().to_string()),
+                None => report_sign(json, true, &cli.input.display().to_string()),
             }
         }
         _ => {
@@ -175,7 +181,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 out
             });
             signer.sign_macho(&cli.input, &output)?;
-            println!("Signed: {}", output.display());
+            report_sign(json, false, &output.display().to_string());
         }
     }
 
@@ -185,7 +191,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 /// Maps verification to the exit-code contract: 0 valid, 1 invalid,
 /// 2 could-not-complete (unreadable/unsupported input or a report with
 /// top-level errors).
-fn run_verify(input: &std::path::Path) -> ExitCode {
+fn run_verify(input: &std::path::Path, json: bool) -> ExitCode {
     let report = match input
         .extension()
         .and_then(|e| e.to_str())
@@ -199,19 +205,34 @@ fn run_verify(input: &std::path::Path) -> ExitCode {
     let report = match report {
         Ok(report) => report,
         Err(err) => {
-            eprintln!("error: {err}");
+            emit_error(json, &err.to_string());
             return ExitCode::from(2);
         }
     };
 
-    print_report(&report);
+    if json {
+        let status = if report.valid() {
+            VerifyStatus::Valid
+        } else if report.errors.is_empty() {
+            VerifyStatus::Invalid
+        } else {
+            VerifyStatus::Error
+        };
+        emit_line(&VerifyDoc {
+            status,
+            input: input.display().to_string(),
+            report: ReportDto::from(&report),
+        });
+    } else {
+        print_report(&report);
+    }
 
     if report.valid() {
         ExitCode::from(0)
     } else if report.errors.is_empty() {
         ExitCode::from(1)
     } else {
-        eprintln!("error: verification could not complete");
+        emit_error(json, "verification could not complete");
         ExitCode::from(2)
     }
 }
@@ -272,17 +293,8 @@ fn print_macho(macho: &MachOVerifyReport) {
             }
         }
         // Index special slots -1..-n (index 0 = -1 Info.plist).
-        let labels = [
-            "Info.plist",
-            "requirements",
-            "CodeResources",
-            "application",
-            "entitlements",
-            "rep-specific",
-            "der entitlements",
-        ];
         for (i, check) in slice.special_slots.iter().enumerate() {
-            let label = labels.get(i).copied().unwrap_or("?");
+            let label = slot_label(i);
             match check {
                 SpecialSlotCheck::Matched => {}
                 SpecialSlotCheck::NotChecked => {}
@@ -380,6 +392,334 @@ fn display_path(path: &str) -> &str {
         "."
     } else {
         path
+    }
+}
+
+/// Human label for special slot `index` (0 = slot -1, Info.plist).
+fn slot_label(index: usize) -> &'static str {
+    const LABELS: [&str; 7] = [
+        "Info.plist",
+        "requirements",
+        "CodeResources",
+        "application",
+        "entitlements",
+        "rep-specific",
+        "der entitlements",
+    ];
+    LABELS.get(index).copied().unwrap_or("?")
+}
+
+/// Prints one sign success line: the JSON document under `--json`, else the
+/// byte-stable human text the interop script pins.
+fn report_sign(json: bool, in_place: bool, output: &str) {
+    if json {
+        emit_line(&SignDoc {
+            status: SignStatus::Signed,
+            output: output.to_string(),
+        });
+    } else if in_place {
+        println!("Signed in place: {output}");
+    } else {
+        println!("Signed: {output}");
+    }
+}
+
+/// Writes a serializable document to stdout as a single line.
+fn emit_line<T: serde::Serialize>(doc: &T) {
+    println!(
+        "{}",
+        serde_json::to_string(doc).expect("JSON document must serialize")
+    );
+}
+
+/// Renders a failure: one JSON object on stderr under `--json`, else the
+/// human `error: …` line.
+fn emit_error(json: bool, message: &str) {
+    if json {
+        eprintln!(
+            "{}",
+            serde_json::to_string(&ErrorDoc {
+                status: ErrorStatus::Error,
+                error: message.to_string(),
+            })
+            .expect("error document must serialize")
+        );
+    } else {
+        eprintln!("error: {message}");
+    }
+}
+
+// --- JSON schema v1 ---------------------------------------------------------
+//
+// CLI-local mirror DTOs of the verification report graph: the library structs
+// carry no serde derives, and every field they need to expose is public, so
+// the conversions below are pure copies. Field names and enum spellings here
+// are the stable v1 schema; renaming or removing one is a breaking change.
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifyStatus {
+    Valid,
+    Invalid,
+    Error,
+}
+
+#[derive(serde::Serialize)]
+struct SignDoc {
+    status: SignStatus,
+    output: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SignStatus {
+    Signed,
+}
+
+#[derive(serde::Serialize)]
+struct ErrorDoc {
+    status: ErrorStatus,
+    error: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ErrorStatus {
+    Error,
+}
+
+#[derive(serde::Serialize)]
+struct VerifyDoc {
+    status: VerifyStatus,
+    input: String,
+    report: ReportDto,
+}
+
+#[derive(serde::Serialize)]
+struct ReportDto {
+    valid: bool,
+    macho: Option<MachoDto>,
+    bundle: Option<BundleDto>,
+    errors: Vec<String>,
+}
+
+impl From<&zsign_rs::VerifyReport> for ReportDto {
+    fn from(report: &zsign_rs::VerifyReport) -> Self {
+        Self {
+            valid: report.valid(),
+            macho: report.macho.as_ref().map(MachoDto::from),
+            bundle: report.bundle.as_ref().map(BundleDto::from),
+            errors: report.errors.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MachoDto {
+    fat: bool,
+    slices: Vec<SliceDto>,
+}
+
+impl From<&MachOVerifyReport> for MachoDto {
+    fn from(macho: &MachOVerifyReport) -> Self {
+        Self {
+            fat: macho.fat,
+            slices: macho.slices.iter().map(SliceDto::from).collect(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SliceDto {
+    arch: String,
+    signed: bool,
+    identifier: Option<String>,
+    adhoc: bool,
+    valid: bool,
+    pages: PagesDto,
+    special_slots: Vec<SlotDto>,
+    cms: Option<CmsDto>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl From<&zsign_rs::verify::SliceVerifyReport> for SliceDto {
+    fn from(slice: &zsign_rs::verify::SliceVerifyReport) -> Self {
+        Self {
+            arch: slice.arch.clone(),
+            signed: slice.signed,
+            identifier: slice.identifier.clone(),
+            adhoc: slice.adhoc,
+            valid: slice.is_valid(),
+            pages: PagesDto::from(&slice.pages),
+            special_slots: slice
+                .special_slots
+                .iter()
+                .enumerate()
+                .map(|(i, check)| SlotDto {
+                    slot: -((i + 1) as i32),
+                    name: slot_label(i).to_string(),
+                    check: SlotCheckDto::from(check),
+                })
+                .collect(),
+            cms: slice.cms.as_ref().map(CmsDto::from),
+            errors: slice.errors.clone(),
+            warnings: slice.warnings.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PagesDto {
+    Matched,
+    Empty,
+    Mismatch { page_index: usize },
+    CountMismatch { stored: usize, computed: usize },
+}
+
+impl From<&PageCheck> for PagesDto {
+    fn from(pages: &PageCheck) -> Self {
+        match pages {
+            PageCheck::Matched => Self::Matched,
+            PageCheck::Empty => Self::Empty,
+            PageCheck::Mismatch { page_index } => Self::Mismatch {
+                page_index: *page_index,
+            },
+            PageCheck::CountMismatch { stored, computed } => Self::CountMismatch {
+                stored: *stored,
+                computed: *computed,
+            },
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SlotDto {
+    slot: i32,
+    name: String,
+    check: SlotCheckDto,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SlotCheckDto {
+    Matched,
+    NotChecked,
+    Mismatch,
+    Missing,
+}
+
+impl From<&SpecialSlotCheck> for SlotCheckDto {
+    fn from(check: &SpecialSlotCheck) -> Self {
+        match check {
+            SpecialSlotCheck::Matched => Self::Matched,
+            SpecialSlotCheck::NotChecked => Self::NotChecked,
+            SpecialSlotCheck::Mismatch => Self::Mismatch,
+            SpecialSlotCheck::Missing => Self::Missing,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CmsDto {
+    valid: bool,
+    no_signature: bool,
+    signer_subject: Option<String>,
+    signer_serial: Option<String>,
+    message_digest_ok: bool,
+    cdhash_v1_ok: bool,
+    cdhash_v2_ok: bool,
+    signature_ok: bool,
+    chain_ok: bool,
+    anchored: bool,
+    chain_reason: Option<String>,
+    chain: Vec<String>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl From<&zsign_rs::crypto::cms_verify::CmsVerifyReport> for CmsDto {
+    fn from(cms: &zsign_rs::crypto::cms_verify::CmsVerifyReport) -> Self {
+        Self {
+            valid: cms.valid,
+            no_signature: cms.no_signature,
+            signer_subject: cms.signer_subject.clone(),
+            signer_serial: cms.signer_serial.clone(),
+            message_digest_ok: cms.message_digest_ok,
+            cdhash_v1_ok: cms.cdhash_v1_ok,
+            cdhash_v2_ok: cms.cdhash_v2_ok,
+            signature_ok: cms.signature_ok,
+            chain_ok: cms.chain_ok,
+            anchored: cms.anchored,
+            chain_reason: cms.chain_reason.clone(),
+            chain: cms.chain.clone(),
+            errors: cms.errors.clone(),
+            warnings: cms.warnings.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BundleDto {
+    path: String,
+    valid: bool,
+    binaries: Vec<BinaryDto>,
+    code_resources: Option<CrDto>,
+    errors: Vec<String>,
+    nested: Vec<BundleDto>,
+}
+
+impl From<&zsign_rs::verify::BundleVerification> for BundleDto {
+    fn from(bundle: &zsign_rs::verify::BundleVerification) -> Self {
+        Self {
+            path: bundle.path.clone(),
+            valid: bundle.valid(),
+            binaries: bundle.binaries.iter().map(BinaryDto::from).collect(),
+            code_resources: bundle.code_resources.as_ref().map(CrDto::from),
+            errors: bundle.errors.clone(),
+            nested: bundle.nested.iter().map(BundleDto::from).collect(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BinaryDto {
+    path: String,
+    valid: bool,
+    report: Option<MachoDto>,
+    errors: Vec<String>,
+}
+
+impl From<&zsign_rs::verify::BinaryVerification> for BinaryDto {
+    fn from(binary: &zsign_rs::verify::BinaryVerification) -> Self {
+        Self {
+            path: binary.path.clone(),
+            valid: binary.valid(),
+            report: binary.report.as_ref().map(MachoDto::from),
+            errors: binary.errors.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CrDto {
+    valid: bool,
+    matched: usize,
+    mismatched: Vec<String>,
+    missing: Vec<String>,
+    unsealed: Vec<String>,
+}
+
+impl From<&zsign_rs::verify::CodeResourcesVerification> for CrDto {
+    fn from(cr: &zsign_rs::verify::CodeResourcesVerification) -> Self {
+        Self {
+            valid: cr.valid(),
+            matched: cr.matched,
+            mismatched: cr.mismatched.clone(),
+            missing: cr.missing.clone(),
+            unsealed: cr.unsealed.clone(),
+        }
     }
 }
 
@@ -676,5 +1016,113 @@ mod tests {
         ]);
         run(cli).expect("--force must sign the encrypted app");
         assert!(out.exists());
+    }
+
+    fn parse_json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("invalid JSON {e}: {s}"))
+    }
+
+    #[test]
+    fn json_sign_reports_output() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let signed = dir.path().join("signed.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("--json"),
+                OsStr::new("-a"),
+                OsStr::new("-o"),
+                signed.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let doc = parse_json(&r.stdout);
+        assert_eq!(doc["status"], "signed");
+        assert_eq!(doc["output"], signed.to_str().unwrap());
+        assert!(signed.exists());
+    }
+
+    #[test]
+    fn json_verify_valid_and_invalid_documents() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let signed = dir.path().join("signed.bin");
+        assert_eq!(
+            run_cli(
+                &[
+                    OsStr::new("-a"),
+                    OsStr::new("-o"),
+                    signed.as_os_str(),
+                    input.as_os_str()
+                ],
+                &[]
+            )
+            .code,
+            0
+        );
+
+        let ok = run_cli(
+            &[OsStr::new("--json"), OsStr::new("-V"), signed.as_os_str()],
+            &[],
+        );
+        assert_eq!(ok.code, 0, "{}", ok.stderr);
+        let doc = parse_json(&ok.stdout);
+        assert_eq!(doc["status"], "valid");
+        assert_eq!(doc["report"]["valid"], true);
+        assert_eq!(doc["report"]["macho"]["slices"][0]["arch"], "arm64");
+        assert_eq!(
+            doc["report"]["macho"]["slices"][0]["pages"]["kind"],
+            "matched"
+        );
+        assert_eq!(
+            doc["report"]["macho"]["slices"][0]["cms"]["no_signature"],
+            true
+        );
+
+        let bad = run_cli(
+            &[OsStr::new("--json"), OsStr::new("-V"), input.as_os_str()],
+            &[],
+        );
+        assert_eq!(bad.code, 1, "{}", bad.stderr);
+        let doc = parse_json(&bad.stdout);
+        assert_eq!(doc["status"], "invalid");
+        assert_eq!(doc["report"]["valid"], false);
+    }
+
+    #[test]
+    fn json_error_is_a_single_stderr_object() {
+        let dir = TempDir::new().unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("--json"),
+                OsStr::new("-V"),
+                dir.path().join("nope.bin").as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 2, "{}", r.stderr);
+        assert!(r.stdout.is_empty(), "stdout must stay empty: {}", r.stdout);
+        let doc = parse_json(&r.stderr);
+        assert_eq!(doc["status"], "error");
+        assert!(doc["error"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn human_output_is_unchanged_without_json_flag() {
+        // guard for the interop script's pinned stdout lines
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let r = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
+        assert!(
+            r.stdout.starts_with("verified: no\n"),
+            "stdout: {}",
+            r.stdout
+        );
+        assert!(r.stdout.contains("slice: arm64"), "stdout: {}", r.stdout);
     }
 }
