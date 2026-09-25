@@ -1053,12 +1053,14 @@ fn der_string(tag: u8, content: &[u8]) -> Result<plist::Value> {
             unsafe { std::str::from_utf8_unchecked(content) }.to_owned()
         }
         0x1e => {
-            if content.len() % 2 != 0 {
+            if !content.len().is_multiple_of(2) {
                 return Err(der_error("invalid DER BMPString length"));
             }
             let units = content
-                .chunks_exact(2)
-                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair));
             let utf16 = units.collect::<Vec<_>>();
             String::from_utf16(&utf16)
                 .map_err(|_| der_error("invalid DER BMPString surrogate pair"))?
@@ -1263,7 +1265,7 @@ mod tests {
         let mut e = 2u32.to_be_bytes().to_vec(); // opIdent
         e.extend_from_slice(&(name.len() as u32).to_be_bytes());
         e.extend_from_slice(name.as_bytes());
-        while e.len() % 4 != 0 {
+        while !e.len().is_multiple_of(4) {
             e.push(0);
         } // string operand 4-aligned
         e
@@ -1685,7 +1687,7 @@ mod tests {
                 "version 0x{version:05x} (tail {tail_len}) must parse"
             );
         }
-        let too_new = synth_cd(0x20601, &vec![0u8; 64]);
+        let too_new = synth_cd(0x20601, &[0u8; 64]);
         let err = CodeDirectory::parse(&too_new).unwrap_err();
         assert!(
             err.to_string()

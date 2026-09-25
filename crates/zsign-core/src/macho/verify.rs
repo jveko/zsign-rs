@@ -257,8 +257,8 @@ fn verify_slice(
                 None
             }
         };
-        match child(CSSLOT_DER_ENTITLEMENTS) {
-            Some(der_entry) => match der_entitlements_to_plist(der_entry.payload()) {
+        if let Some(der_entry) = child(CSSLOT_DER_ENTITLEMENTS) {
+            match der_entitlements_to_plist(der_entry.payload()) {
                 Ok(der_val) => {
                     if let Some(xml_val) = &xml_val {
                         if &der_val != xml_val {
@@ -271,8 +271,7 @@ fn verify_slice(
                 Err(e) => report
                     .errors
                     .push(format!("DER entitlements do not parse: {e}")),
-            },
-            None => {}
+            }
         }
     }
     // Binding rule: a bound -5 on a modern main executable requires a BOUND -7 child.
@@ -692,7 +691,7 @@ mod tests {
         let mut expr = 2u32.to_be_bytes().to_vec(); // opIdent
         expr.extend_from_slice(&(name.len() as u32).to_be_bytes());
         expr.extend_from_slice(name.as_bytes());
-        while expr.len() % 4 != 0 {
+        while !expr.len().is_multiple_of(4) {
             expr.push(0);
         }
         let child_len = 12 + expr.len();
