@@ -7,7 +7,7 @@
 //! This is the "verify one binary" entry point used by the CLI and by
 //! bundle-level verification; it never touches the filesystem.
 
-use crate::codesign::constants::CSMAGIC_BLOBWRAPPER;
+use crate::codesign::constants::*;
 use crate::codesign::verify::{
     check_code_pages, check_special_slots, parse_superblob, self_consistent_blobs, CodeDirectory,
     PageCheck, SignatureInputs, SpecialSlotCheck, SuperBlob,
@@ -15,6 +15,23 @@ use crate::codesign::verify::{
 use crate::Result;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+
+// -1/-3 need caller-supplied content: elevate ONLY when the caller demonstrated
+// bundle context (any SignatureInputs field present). SignatureInputs::none()
+// means "standalone: caller cannot supply these" - the zsign facade reports them.
+const CONTEXT_SLOTS: [i32; 2] = [CSSLOT_SPECIAL_INFOSLOT, CSSLOT_SPECIAL_RESOURCEDIR];
+
+// -2/-5/-7 and the launch-constraint slots are SuperBlob-sourced: their content
+// needs no caller context, so NotChecked there is ALWAYS a core failure.
+const SUPERBLOB_SLOTS: [i32; 7] = [
+    CSSLOT_SPECIAL_REQUIREMENTS,
+    CSSLOT_SPECIAL_ENTITLEMENTS,
+    CSSLOT_SPECIAL_DER_ENTITLEMENTS,
+    -8,
+    -9,
+    -10,
+    -11,
+];
 
 /// Report of the verification of one architecture slice.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -198,13 +215,24 @@ fn verify_slice(
             checks,
         ));
     }
-    // A follow-up will elevate NotChecked across every collected pair here.
+    let context_supplied = inputs.info_plist.is_some() || inputs.code_resources.is_some();
     for (label, checks) in &pairs {
         for (i, check) in checks.iter().enumerate() {
-            if *check == SpecialSlotCheck::Mismatch {
-                report
+            let k = i + 1;
+            let slot = -(k as i32);
+            match check {
+                SpecialSlotCheck::Mismatch => report
                     .errors
-                    .push(format!("{label}special slot -{} hash mismatch", i + 1));
+                    .push(format!("{label}special slot -{k} hash mismatch")),
+                SpecialSlotCheck::NotChecked
+                    if SUPERBLOB_SLOTS.contains(&slot)
+                        || (context_supplied && CONTEXT_SLOTS.contains(&slot)) =>
+                {
+                    report.errors.push(format!(
+                        "{label}special slot -{k} is bound but its content was not supplied"
+                    ));
+                }
+                _ => {}
             }
         }
     }
@@ -847,6 +875,97 @@ mod tests {
         assert_eq!(
             report.slices[0].pages,
             PageCheck::Mismatch { page_index: 0 }
+        );
+    }
+
+    #[test]
+    fn bound_slots_fail_when_context_is_supplied() {
+        let resources =
+            b"<?xml version=\"1.0\"?><plist><dict><key>files2</key><dict/></dict></plist>";
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let signed =
+            sign_macho_adhoc(&macho, "com.example", None, None, Some(resources), false).unwrap();
+        // Context supplied (any SignatureInputs field present) but the bound -3 content
+        // is not -> core-level failure, on primary and alternate alike:
+        let inputs = SignatureInputs {
+            info_plist: Some(b"not-the-fixture".as_slice()),
+            code_resources: None,
+        };
+        let report = verify_macho(&signed, &inputs).unwrap();
+        assert!(!report.is_valid());
+        let errors = &report.slices[0].errors;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("special slot -3 is bound but its content was not supplied")),
+            "primary: {:?}",
+            errors
+        );
+        // Dual output's alternate is the SHA-256 CD; its unavailable slot elevates tagged:
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "alternate SHA-256 special slot -3 is bound but its content was not supplied"
+            )),
+            "alternate: {:?}",
+            errors
+        );
+        // With BOTH contents supplied the same binary has no slot finding:
+        let ok = verify_macho(
+            &signed,
+            &SignatureInputs {
+                info_plist: None,
+                code_resources: Some(resources),
+            },
+        )
+        .unwrap();
+        assert!(ok.slices[0].errors.is_empty(), "{:?}", ok.slices[0].errors);
+    }
+
+    #[test]
+    fn standalone_without_context_stays_silent() {
+        // SignatureInputs::none() means "caller cannot supply -1/-3" (standalone
+        // verification): bound-but-unavailable -1 stays NotChecked, the facade
+        // (zsign verify_macho_file) reports it - core must not fail here.
+        let info = b"<?xml version=\"1.0\"?><plist><dict><key>CFBundleIdentifier</key><string>com.example</string></dict></plist>";
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let signed =
+            sign_macho_adhoc(&macho, "com.example", None, Some(info), None, false).unwrap();
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(report.is_valid(), "{:?}", report.slices[0].errors);
+        assert!(report.slices[0]
+            .errors
+            .iter()
+            .all(|e| !e.contains("bound but")));
+    }
+
+    #[test]
+    fn requirements_slot_failure_needs_no_context() {
+        // SuperBlob-sourced slots (-2 here) need NO caller context: drop the 0x0002
+        // child by renaming its index entry to an unknown slot and keep the nonzero
+        // -2 hash -> unconditional core failure, even with SignatureInputs::none().
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.bare", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let count =
+            u32::from_be_bytes(signed[sig_off + 8..sig_off + 12].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = sig_off + 12 + i * 8;
+            if u32::from_be_bytes(signed[e..e + 4].try_into().unwrap()) == CSSLOT_REQUIREMENTS {
+                signed[e..e + 4].copy_from_slice(&0x0040u32.to_be_bytes());
+            }
+        }
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid());
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("special slot -2 is bound but its content was not supplied")),
+            "errors: {:?}",
+            report.slices[0].errors
         );
     }
 }
