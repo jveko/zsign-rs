@@ -171,7 +171,7 @@ curve by construction.
 **Candidates considered:**
 
 - **A. Retain both fields, validate, dispatch.** `Pbkdf2Parameter::parse` keeps
-  `key_length: Option<u32>` and `prf: Option<AlgorithmIdentifier>`; `pbes2_decrypt`
+  `key_length: Option<u32>` and `prf: Option<ObjectIdentifier>` (PRF parameters dropped; only the OID drives dispatch); `pbes2_decrypt`
   validates `key_length` against the scheme-derived key size (AES-128 → 16, AES-192 → 24,
   AES-256 → 32) and dispatches the PRF: absent → HMAC-SHA1 (RFC 8018 DEFAULT), declared
   HMAC-SHA1 → `Sha1`, SHA-2 OIDs (HMAC-SHA224/256/384/512) → matching `sha2` digest,

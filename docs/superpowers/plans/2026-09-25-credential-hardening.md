@@ -112,7 +112,8 @@ awk -v d="$d" '
   /-----BEGIN CERTIFICATE-----/{n++; in_cert=1}
   in_cert {print > (d "/dup_" n ".pem")}
   /-----END CERTIFICATE-----/{in_cert=0}' "$d/dup.pem"
-test "$(ls "$d"/dup_*.pem | wc -l)" -eq 2 || echo "UNEXPECTED certificate count"
+test "$(ls "$d"/dup_*.pem | wc -l)" -eq 2 \
+  || { echo "UNEXPECTED certificate count" >&2; exit 1; }
 openssl x509 -in "$d/dup_1.pem" -noout -serial -subject   # serial=0401, subject=CN=zsign-test-fixture
 openssl x509 -in "$d/dup_2.pem" -noout -serial -subject   # serial=0402, subject=CN=zsign-test-fixture
 for i in 1 2; do openssl x509 -in "$d/dup_$i.pem" -noout -pubkey | openssl sha256; done  # identical hashes (same SPKI)
@@ -222,7 +223,9 @@ fn leaf_pems(cert: &Certificate, key: &rsa::RsaPrivateKey) -> (Vec<u8>, Vec<u8>)
 ```
 
 (Imports at the top of `mod tests` — exact paths at x509-cert 0.2.5 / der 0.7.10:
-`der::{Decode, Encode, EncodePem}`, `der::pem::LineEnding`, `pkcs8::{DecodePrivateKey,
+`const_oid::ObjectIdentifier` (the Task-1 EKU literal below needs it before Task 2's
+production import exists), `der::{Decode, Encode, EncodePem}`, `der::pem::LineEnding`,
+`pkcs8::{DecodePrivateKey,
 EncodePrivateKey}`, `spki::{EncodePublicKey, SubjectPublicKeyInfoOwned}` (the `spki` crate path, as
 `cms_verify.rs` tests use; `x509_cert` also re-exports `spki`, but one path is enough),
 `x509_cert::builder::{Builder, CertificateBuilder, Profile}`,
@@ -258,19 +261,24 @@ fn select_identity_reports_no_match() {
     let cert2 = build_cert("CN=zsn k2", "CN=zsn k2", &k2, &k2, present(), None);
     let keys = vec![pkcs8_of(&k1)];
     let certs = vec![der_of(&cert2)];
-    let err = select_identity(&keys, &certs).expect_err("no pair exists");
-    let msg = err.to_string();
-    assert!(msg.contains("no certificate"), "{msg}");
-    assert!(msg.contains("1 private key"), "{msg}");
+    let res = select_identity(&keys, &certs);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("no certificate") && m.contains("1 private key"))),
+        "expected no-match rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
 fn from_p12_rejects_ambiguous_identity() {
-    let err = SigningCredentials::from_p12(IDENTITY_DUP, "testpassword")
-        .expect_err("two distinct matching certs must be ambiguous");
-    let msg = err.to_string();
-    assert!(msg.contains("2 identities"), "{msg}");
-    assert!(msg.contains("CN=zsign-test-fixture"), "{msg}");
+    let res = SigningCredentials::from_p12(IDENTITY_DUP, "testpassword");
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("2 identities") && m.contains("CN=zsign-test-fixture"))),
+        "expected ambiguous-identity rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -465,6 +473,9 @@ fn select_identity(
     keys: &[Vec<u8>],
     certs: &[Vec<u8>],
 ) -> Result<(DecodedKey, Certificate, Vec<Certificate>)> {
+    // cert.rs imports der::{Decode, DecodePem} only; to_der() below needs Encode.
+    use der::Encode;
+
     let decoded: Vec<Option<DecodedKey>> = keys.iter().map(|d| DecodedKey::from_pkcs8_der(d)).collect();
     let parsed: Vec<Option<Certificate>> = certs.iter().map(|d| Certificate::from_der(d).ok()).collect();
     if !certs.is_empty() && parsed.iter().all(Option::is_none) {
@@ -694,10 +705,6 @@ fn load(cert: &Certificate, key: &rsa::RsaPrivateKey) -> Result<SigningCredentia
     SigningCredentials::from_pem(&cert_pem, &key_pem, None)
 }
 
-fn violation(err: Error) -> String {
-    err.to_string()
-}
-
 fn code_signing_eku() -> ExtendedKeyUsage {
     ExtendedKeyUsage(vec![OID_CODE_SIGNING])
 }
@@ -743,9 +750,13 @@ fn from_pem_rejects_expired_leaf() {
         window(1_500_000_000, 1_600_000_000),
         Some(code_signing_eku()),
     );
-    let msg = violation(load(&cert, &key).expect_err("expired leaf must be rejected"));
-    assert!(msg.contains("expired"), "{msg}");
-    assert!(msg.contains("CN=zsign expired"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("expired") && m.contains("CN=zsign expired"))),
+        "expected expired rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -759,18 +770,26 @@ fn from_pem_rejects_not_yet_valid_leaf() {
         window(2_200_000_000, 2_300_000_000),
         Some(code_signing_eku()),
     );
-    let msg = violation(load(&cert, &key).expect_err("future leaf must be rejected"));
-    assert!(msg.contains("not yet valid"), "{msg}");
-    assert!(msg.contains("CN=zsign future"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("not yet valid") && m.contains("CN=zsign future"))),
+        "expected not-yet-valid rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
 fn from_pem_rejects_leaf_without_eku() {
     let key = fresh_2048();
     let cert = build_cert("CN=zsign no eku", "CN=zsign no eku", &key, &key, present(), None);
-    let msg = violation(load(&cert, &key).expect_err("missing EKU must be rejected"));
-    assert!(msg.contains("codeSigning"), "{msg}");
-    assert!(msg.contains("CN=zsign no eku"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("codeSigning") && m.contains("CN=zsign no eku"))),
+        "expected missing-EKU rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -778,8 +797,12 @@ fn from_pem_rejects_leaf_with_wrong_purpose_eku() {
     let key = fresh_2048();
     let server_auth = ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1")]);
     let cert = build_cert("CN=zsign tls leaf", "CN=zsign tls leaf", &key, &key, present(), Some(server_auth));
-    let msg = violation(load(&cert, &key).expect_err("serverAuth-only leaf must be rejected"));
-    assert!(msg.contains("codeSigning"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m) if m.contains("codeSigning"))),
+        "expected wrong-purpose rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -787,9 +810,13 @@ fn from_pem_rejects_leaf_without_digital_signature() {
     let key = fresh_2048();
     let mut cert = build_cert("CN=zsign weak ku", "CN=zsign weak ku", &key, &key, present(), Some(code_signing_eku()));
     replace_extension(&mut cert, OID_KEY_USAGE, &KeyUsage(KeyUsages::KeyCertSign.into()));
-    let msg = violation(load(&cert, &key).expect_err("KU without digitalSignature must be rejected"));
-    assert!(msg.contains("digitalSignature"), "{msg}");
-    assert!(msg.contains("CN=zsign weak ku"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("digitalSignature") && m.contains("CN=zsign weak ku"))),
+        "expected KU rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -801,9 +828,13 @@ fn from_pem_rejects_ca_leaf() {
         OID_BASIC_CONSTRAINTS,
         &BasicConstraints { ca: true, path_len_constraint: None },
     );
-    let msg = violation(load(&cert, &key).expect_err("CA=true leaf must be rejected"));
-    assert!(msg.contains("CA"), "{msg}");
-    assert!(msg.contains("CN=zsign ca leaf"), "{msg}");
+    let res = load(&cert, &key);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("CA") && m.contains("CN=zsign ca leaf"))),
+        "expected CA=true rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -823,14 +854,16 @@ fn from_pem_accepts_leaf_without_ku_and_bc() {
 fn from_p12_rejects_non_policy_fixture() {
     // The committed extract-level fixtures are not policy-compliant (no EKU,
     // basicConstraints CA:TRUE) — loading them must now fail loudly.
-    let err = SigningCredentials::from_p12(
+    let res = SigningCredentials::from_p12(
         include_bytes!("fixtures/modern_pbes2_aes256.p12"),
         "testpassword",
-    )
-    .expect_err("non-compliant fixture must be rejected at load");
-    let msg = err.to_string();
-    assert!(msg.contains("codeSigning"), "{msg}");
-    assert!(msg.contains("CN=zsign-test-fixture"), "{msg}");
+    );
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("codeSigning") && m.contains("CN=zsign-test-fixture"))),
+        "expected non-compliant fixture rejection, got {:?}",
+        res.as_ref().err()
+    );
 }
 ```
 
@@ -857,7 +890,10 @@ the fix: `from_pem_accepts_compliant_leaf` and `from_pem_accepts_leaf_without_ku
 
 - [ ] **Step 2.3: Implement the policy in `cert.rs`**
 
-Module-private mirrors of the verify-side helpers (verbatim semantics of
+First add `use const_oid::ObjectIdentifier;` to cert.rs's module imports (beside
+`use der::{Decode, DecodePem};` at line 30): the constants and `ext_value` below use the
+bare type, and existing fully-qualified `const_oid::ObjectIdentifier` uses stay valid.
+Then add the module-private mirrors of the verify-side helpers (verbatim semantics of
 `cms_verify.rs:87-94, 1259-1264, 1285-1314, 1346-1364`; that module is out of scope —
 see design doc "Known duplication"):
 
@@ -1025,11 +1061,13 @@ const WEAK_RSA1024: &[u8] = include_bytes!("fixtures/weak_rsa1024.p12");
 
 #[test]
 fn from_p12_rejects_weak_rsa_key() {
-    let err = SigningCredentials::from_p12(WEAK_RSA1024, "testpassword")
-        .expect_err("1024-bit key must be rejected");
-    let msg = err.to_string();
-    assert!(msg.contains("1024"), "actual bit count named: {msg}");
-    assert!(msg.contains("2048"), "minimum named: {msg}");
+    let res = SigningCredentials::from_p12(WEAK_RSA1024, "testpassword");
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("1024") && m.contains("2048"))),
+        "expected weak-RSA rejection naming both bit counts, got {:?}",
+        res.as_ref().err()
+    );
 }
 
 #[test]
@@ -1047,10 +1085,13 @@ fn from_pem_rejects_weak_rsa_key() {
         Some(code_signing_eku()),
     );
     let (cert_pem, key_pem) = leaf_pems(&cert, &key);
-    let err = SigningCredentials::from_pem(&cert_pem, &key_pem, None)
-        .expect_err("1024-bit key must be rejected");
-    let msg = err.to_string();
-    assert!(msg.contains("1024") && msg.contains("2048"), "{msg}");
+    let res = SigningCredentials::from_pem(&cert_pem, &key_pem, None);
+    assert!(
+        matches!(&res, Err(Error::Certificate(m)
+            if m.contains("1024") && m.contains("2048"))),
+        "expected weak-RSA rejection naming both bit counts, got {:?}",
+        res.as_ref().err()
+    );
 }
 ```
 
@@ -1487,7 +1528,8 @@ info=$(openssl pkcs12 -info -in crates/zsign-core/src/crypto/fixtures/raw_keybag
   -passin pass:testpassword -nokeys 2>&1)
 printf '%s\n' "$info" | grep -i 'Key bag'     # the raw bag line must be present
 if printf '%s\n' "$info" | grep -qi 'Shrouded'; then
-  echo "UNEXPECTED: shrouded keybag present"
+  echo "UNEXPECTED: shrouded keybag present" >&2
+  exit 1
 fi
 printf '%s\n' "$info" | grep 'MAC:'           # MAC: sha256, Iteration 2048 (MAC stays on)
 ```
@@ -1598,13 +1640,16 @@ from the `collect_bags` parameters.)
 TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic
 ```
 
-Expected: RED as a **build failure** — the test module does not compile: the four new
-tests call `collect_bags` with the `depth` argument (and `MAX_SAFE_CONTENTS_DEPTH` is not
-defined) while the current signature has no such parameter (E0061/E0425). As in Task 1, a
-compile error prevents any test from running, so the build failure IS this task's red;
-the four behavioral REDs (raw bag skipped, `.1.6` skipped, fixture yields zero keys, no
-depth error) are the pre-fix behaviors Step 5.4 removes, and the tests turn green in
-Step 5.5. Pre-existing tests stay green after Step 5.4 compiles.
+Expected: RED as a **build failure** — the test module does not compile: the three
+direct-call tests (`collect_bags_reads_raw_key_bag`, `collect_bags_recurses_into_safe_contents`,
+`collect_bags_rejects_overdeep_nesting`) pass five arguments while the current
+`collect_bags` takes four (E0061); `extract_p12_reads_raw_keybag_fixture` calls
+`extract_p12` and compiles fine, and `MAX_SAFE_CONTENTS_DEPTH` appears only in
+comments/messages, so no E0425 arises. As in Task 1, a compile error prevents any test
+from running, so the build failure IS this task's red; the four behavioral REDs (raw bag
+skipped, `.1.6` skipped, fixture yields zero keys, no depth error) are the pre-fix
+behaviors Step 5.4 removes, and the tests turn green in Step 5.5. Pre-existing tests stay
+green after Step 5.4 compiles.
 
 - [ ] **Step 5.4: Implement four-way bag dispatch**
 
