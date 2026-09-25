@@ -179,12 +179,12 @@ Correctness contract the demo mirrors:
   structure + `textContent` for every dynamic string (decision §2.1).
 - **Vite 6 + `?url` wasm:** importing `zsign_wasm_bg.wasm?url` is the documented
   pattern (Vite guide, "Accessing the WebAssembly Module"); the asset is emitted under
-  `dist/assets` with a hashed name (observed: `dist/assets/zsign_wasm_bg-BLrlmTX6.wasm`
-  in this lane's green build) and fetched at runtime; inlining only under 4 KiB (never
+  `dist/assets` with a content-hashed name (this lane's builds observed e.g.
+  `zsign_wasm_bg-UCv7etqo.wasm`; the hash tracks wasm content) and fetched at runtime; inlining only under 4 KiB (never
   for a 1.1 MB wasm); COOP/COEP not required (no `SharedArrayBuffer`/`Atomics` in the
   glue); the demo's ArrayBuffer init path (`initWasm({module_or_path: wasmBytes})`)
   uses `WebAssembly.instantiate` and sidesteps the `application/wasm` MIME requirement
-  (`zsign_wasm.js:466-474`).
+  (`zsign_wasm.js:506-515`).
 - **bplist00 rewrite feasibility:** normative layout = Apple `CFBinaryPList.c`
   (apple-oss-distributions/CF, comment block ~lines 239-281): 8-byte header, object
   table with marker nibbles (int `0x1n`, data `0x4n`, **ASCII string `0x5n`,
@@ -223,7 +223,8 @@ Correctness contract the demo mirrors:
   immediately after classification — before any hashing, CodeResources, or zip work.
   The outer `catch` logs via the (now safe) `log()`; the download button, summary, and
   object URL are only ever set on the success path (they are inside the try after the
-  blob). Resource cleanup moves to `finally`: `signer.free()` and `zipReader.close()`
+  blob). Resource cleanup moves to `finally`: freeing the signer(s) and closing the
+  zip reader
   run on **every** path (currently success-only — a throw leaks the WASM signer with
   credentials).
 - **Rejected:** A — with N broken binaries the user fixes one per attempt (poor
@@ -273,8 +274,13 @@ Correctness contract the demo mirrors:
     (always invoked at sign time, even when no change is requested) against
     `^[A-Za-z0-9._-]+$` / max 255 chars, so the spliced value is always ASCII
     (marker types verified empirically against Python `plistlib`, design §1.4);
-  - XML (`<?xml`/`<plist`): replace the `<string>` value following
-    `<key>CFBundleIdentifier</key>`;
+  - XML (`<?xml`/`<plist`): locate the depth-1 `CFBundleIdentifier` key with a
+    nesting-aware tag scan and replace the **element-bounded** `<string>` value that
+    immediately follows it (anchored `^([^<]*)<\/string>` — never search onward
+    through the document);
+  - duplicate root `CFBundleIdentifier` keys (either encoding) → reject: plist
+    parsers are last-wins while a first-match rewrite would touch only the first
+    key, desynchronizing the emitted plist from the signed identifier;
   - anything else (no CFBundleIdentifier key, non-string value, unknown format) →
     throw a precise error (fail-closed; native inserts a missing key — known
     divergence, §5). Additional fail-closed rejections (cold-review round 1): input
@@ -419,7 +425,7 @@ Correctness contract the demo mirrors:
   - Object URLs: remember the previous `URL.createObjectURL` result and
     `revokeObjectURL` it when a new run starts (currently every successful sign leaks
     a blob).
-  - `hash_file` takes `&[u8]`: the generated glue (`pkg/zsign_wasm.js:120-127`)
+  - `hash_file` takes `&[u8]`: the generated glue (`pkg/zsign_wasm.js:126-131`)
     `malloc`s argument buffers and frees **no** arguments (all glue frees are return
     buffers). Empirically settled by probe: a metric-validated node run (known 200 MB
     alloc → `200.0` MB delta) showed 100 × 4 MB borrowed-arg calls → arrayBuffers
@@ -468,7 +474,7 @@ FIRST (synchronously, before any await): snapshot the run inputs —
     (the corruption proof: profile A-derived entitlements embedded with profile-B
     bytes read at the late root scan). The credential/ID inputs and pickers are also
     disabled for the run and re-enabled in `finally` — belt; the snapshot is the fix.
-→ init wasm (idempotent) → signers: rootSigner = new WasmSigner(run.p12Bytes, run.password, run.profile)
+→ init wasm (idempotent) → signers: rootSigner = new WasmSigner(run.p12Bytes, run.password, run.profileBytes)
     and nestedSigner = new WasmSigner(run.p12Bytes, run.password, null)   // entitlements parity, §2.3
 → open ZipReader (one reader for scan + write passes, closed in finally)
 → getEntries → findAppRoot (file-derived) → assertArchiveWithinLimits
@@ -490,7 +496,12 @@ FIRST (synchronously, before any await): snapshot the run inputs —
   bundle's Info.plist (bytes retained for its signing step), extract
   CFBundleExecutable (wasmReady flag), and require a matching Mach-O path in that
   bundle's subtree — any bundle failing → THROW before any hashing/signing (item 5
-  generalized; mirrors native get_main_executable, `mod.rs:838-894`)
+  generalized; mirrors native get_main_executable, `mod.rs:838-894`). Also THROW
+  here if any SOURCE entry sitting at a **generated-override path** (root
+  `Info.plist`, root `embedded.mobileprovision`, any discovered bundle's
+  `_CodeSignature/CodeResources`) is a symlink — the scan would seal it as a
+  symlink while the write pass would emit regular generated bytes (type/content
+  disagreement must fail closed before signing)
 → per bundle B, deepest-first, using signer = (B is root ? rootSigner : nestedSigner):
     1. read B's Info.plist. ROOT ONLY, ALWAYS call
        infoPlistData = rewriteBundleIdentifier(infoPlistData, run.bundleId)
@@ -548,8 +559,8 @@ FIRST (synchronously, before any await): snapshot the run inputs —
          (`((mode & 0xffff) << 16) | (entry.externalFileAttributes & 0xff)` —
          §2.6; never zero), versionMadeBy Unix, compressionMethod 0 (Stored)
       6. else: fresh-read source bytes (per-entry actual ≤ declared check) → emit
-    then append unmatched output (BLOCKER 1): for key of [...signedFiles.keys()
-      .filter(k => !emitted.has(k)).sort()]:
+    then append unmatched output (BLOCKER 1): for (const key of
+      [...signedFiles.keys()].filter((k) => !emitted.has(k)).sort()):
       - if key ends with "_CodeSignature/CodeResources" and its "_CodeSignature/"
         directory is neither a source dir nor already emitted → emit that dir entry
         first (root and nested alike — no special-cased synthetic block)
@@ -581,7 +592,9 @@ Notes:
   rewrite impossible) throw before hashing/signing where feasible.
 - Per-binary signing failures accumulate → one aggregated throw before the bundle's
   hashing step (so a partial bundle is never sealed).
-- `finally`: close reader, `signer.free()`, re-enable the sign button. Download
+- `finally`: close the reader, free **both signers** (root and nested, when
+  present), clear the in-flight guard, re-enable the inputs, re-enable the sign
+  button. Download
   href/summary/object URL are set only after `zipWriter.close()` resolves.
 - wasm `Error.message` strings are displayed verbatim but never parsed or matched
   (ZSN-40 may restyle them).
