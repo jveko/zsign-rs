@@ -209,7 +209,9 @@ panic in a file owned by **no** active lane (`macho/verify.rs`, `crypto/pkcs12.r
 route to the supervisor; `codesign/der.rs` and all of `codesign/*` route to ZSN-29.
 
 **Known candidates — status after ZSN-29 landing (supervisor update, verified against
-`git show 2e06a17:…`):** this branch's base (0f07c30) **predates** main commit `2e06a17`,
+`git show 2e06a17:…`; every post-fix line number below refers to the `2e06a17` blob read via
+`git show`, NOT to this worktree's files):** this branch's base (0f07c30) **predates** main
+commit `2e06a17`,
 which landed `page_size_log2` validation + checked shift (`verify.rs:613-618,884`),
 hash-region `checked_mul` including `special_slot_hash`/`code_hashes` (`verify.rs:709,795,804,906`),
 the `write_norm` BER depth cap, and superblob u32 narrowing guards. Consequences for this lane:
