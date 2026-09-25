@@ -35,6 +35,8 @@ pub struct SignedSlice {
     pub offset: usize,
     /// Original size before signing.
     pub original_size: usize,
+    /// CPU type of the original slice, validated against the FAT table on reassembly.
+    pub cpu_type: u32,
     /// Complete signed binary data for this slice.
     pub signed_data: Vec<u8>,
 }
@@ -303,10 +305,11 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
                 slice_index: 0,
                 offset: first_arch.offset as usize,
                 original_size: first_arch.size as usize,
+                cpu_type: first_arch.cputype,
                 signed_data: embed_signature_single(slice_data, &first_macho, signature)?,
             };
 
-            embed_fat_from_signed_slices(data, &fat, &[signed_slice])
+            embed_fat_from_signed_slices(&fat, &[signed_slice])
         }
     }
 }
@@ -319,27 +322,36 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::MachO`] if the binary format is invalid or slices are empty.
+/// Returns [`Error::MachO`] if the binary format is invalid, if the signed slice
+/// set does not cover every architecture exactly once, or if a signed slice does
+/// not match the identity (offset, size, CPU type) recorded in the container.
 pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result<Vec<u8>> {
     let mach =
         Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
 
     match mach {
         Mach::Binary(_) => {
-            if signed_slices.is_empty() {
-                return Err(Error::MachO("No signed slices provided".into()));
+            if signed_slices.len() != 1 {
+                return Err(Error::MachO(format!(
+                    "non-FAT binary requires exactly one signed slice, got {}",
+                    signed_slices.len()
+                )));
             }
-            Ok(signed_slices[0].signed_data.clone())
+            let signed = &signed_slices[0];
+            if signed.original_size != data.len() {
+                return Err(Error::MachO(format!(
+                    "non-FAT binary signed slice identity mismatch: original_size={} but container is {} bytes",
+                    signed.original_size,
+                    data.len()
+                )));
+            }
+            Ok(signed.signed_data.clone())
         }
-        Mach::Fat(fat) => embed_fat_from_signed_slices(data, &fat, signed_slices),
+        Mach::Fat(fat) => embed_fat_from_signed_slices(&fat, signed_slices),
     }
 }
 
-fn embed_fat_from_signed_slices(
-    data: &[u8],
-    fat: &MultiArch,
-    signed_slices: &[SignedSlice],
-) -> Result<Vec<u8>> {
+fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) -> Result<Vec<u8>> {
     let arches: Vec<FatArch> = fat
         .iter_arches()
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -349,16 +361,40 @@ fn embed_fat_from_signed_slices(
         return Err(Error::MachO("Empty FAT binary".into()));
     }
 
-    let mut slice_data_vec: Vec<Vec<u8>> = Vec::with_capacity(arches.len());
+    if signed_slices.len() != arches.len() {
+        return Err(Error::MachO(format!(
+            "FAT reassembly requires exactly one signed slice per architecture: {} arches, {} signed slices",
+            arches.len(),
+            signed_slices.len()
+        )));
+    }
+
+    let mut slice_data_vec: Vec<&[u8]> = Vec::with_capacity(arches.len());
 
     for (i, arch) in arches.iter().enumerate() {
-        if let Some(signed) = signed_slices.iter().find(|s| s.slice_index == i) {
-            slice_data_vec.push(signed.signed_data.clone());
-        } else {
-            let offset = arch.offset as usize;
-            let size = arch.size as usize;
-            slice_data_vec.push(data[offset..offset + size].to_vec());
+        let signed = signed_slices
+            .iter()
+            .find(|s| s.slice_index == i)
+            .ok_or_else(|| {
+                Error::MachO(format!(
+                    "FAT reassembly: no signed slice for architecture {i}"
+                ))
+            })?;
+        if signed.offset != arch.offset as usize
+            || signed.original_size != arch.size as usize
+            || signed.cpu_type != arch.cputype
+        {
+            return Err(Error::MachO(format!(
+                "FAT reassembly: signed slice {i} identity mismatch: signed (offset={}, size={}, cpu=0x{:x}) vs container (offset={}, size={}, cpu=0x{:x})",
+                signed.offset,
+                signed.original_size,
+                signed.cpu_type,
+                arch.offset,
+                arch.size,
+                arch.cputype
+            )));
         }
+        slice_data_vec.push(&signed.signed_data);
     }
 
     let header_size = 8 + arches.len() * 20;
@@ -1994,6 +2030,128 @@ mod tests {
         assert!(
             (dataoff as usize) + slice.code_sig_size.expect("size") as usize <= resigned.len(),
             "declared range must fit the output"
+        );
+    }
+
+    /// A real signature payload: sign a thin fixture ad-hoc and extract its
+    /// LC_CODE_SIGNATURE blob.
+    fn signature_bytes() -> Vec<u8> {
+        let macho = crate::macho::MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+            .expect("fixture parses");
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.zsign.blobsrc", None, None, None, false)
+                .expect("adhoc sign of minimal fixture");
+        let m = crate::macho::MachOFile::parse(signed.clone()).expect("signed parses");
+        let sl = &m.slices()[0];
+        let sig = sl.code_sig_offset.expect("signature present") as usize;
+        let len = sl.code_sig_size.expect("signature size present") as usize;
+        signed[sig..sig + len].to_vec()
+    }
+
+    #[test]
+    fn test_embed_fat_requires_one_signed_slice_per_arch() {
+        let mut b = crate::macho::fixtures::make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        let fat = crate::macho::fixtures::make_fat_macho(
+            &[crate::macho::fixtures::make_minimal_macho(), b],
+            &[12, 12],
+        );
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = crate::macho::fixtures::test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.set",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(full.len(), 2);
+
+        let err = embed_signature_fat(&fat, &full[0..1])
+            .expect_err("one-of-two signed slices must be rejected, not reassembled unsigned");
+        assert!(
+            err.to_string().contains("exactly one signed slice"),
+            "{err}"
+        );
+
+        let err =
+            embed_signature_fat(&fat, &[]).expect_err("zero-of-two signed slices must be rejected");
+        assert!(
+            err.to_string().contains("exactly one signed slice"),
+            "{err}"
+        );
+
+        // prove the pre-fix defect concretely for one-of-two: BEFORE the fix this
+        // returns Ok whose second slice carries no signature; record that in red output.
+        if let Ok(out) = embed_signature_fat(&fat, &full[0..1]) {
+            let m = crate::macho::MachOFile::parse(out).expect("pre-fix output parses");
+            panic!(
+                "pre-fix half-signed output: slice1 code_sig_offset = {:?}",
+                m.slices()[1].code_sig_offset
+            );
+        }
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_signed_slice_identity_mismatch() {
+        let fat = crate::macho::fixtures::make_fat_macho(
+            &[crate::macho::fixtures::make_minimal_macho(), {
+                let mut b = crate::macho::fixtures::make_minimal_macho();
+                b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+                b
+            }],
+            &[12, 12],
+        );
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = crate::macho::fixtures::test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.ident",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(full.len(), 2);
+
+        let mut tampered = full.clone();
+        tampered[0].original_size += 1;
+        let err = embed_signature_fat(&fat, &tampered)
+            .expect_err("original_size mismatch must be rejected");
+        assert!(err.to_string().contains("identity mismatch"), "{err}");
+
+        let mut tampered = full.clone();
+        tampered[1].offset += 0x1000;
+        let err =
+            embed_signature_fat(&fat, &tampered).expect_err("offset mismatch must be rejected");
+        assert!(err.to_string().contains("identity mismatch"), "{err}");
+
+        let mut tampered = full.clone();
+        tampered[0].cpu_type = 0xdead_beef; // field added by the green phase
+        let err =
+            embed_signature_fat(&fat, &tampered).expect_err("cpu_type mismatch must be rejected");
+        assert!(err.to_string().contains("identity mismatch"), "{err}");
+    }
+
+    #[test]
+    fn test_embed_signature_rejects_multi_arch_fat() {
+        let fat = crate::macho::fixtures::make_fat_macho(
+            &[
+                crate::macho::fixtures::make_minimal_macho(),
+                crate::macho::fixtures::make_minimal_macho(),
+            ],
+            &[12, 12],
+        );
+        let err = embed_signature(&fat, &signature_bytes())
+            .expect_err("embed_signature must not produce a partially signed universal");
+        assert!(
+            err.to_string().contains("exactly one signed slice"),
+            "{err}"
         );
     }
 }

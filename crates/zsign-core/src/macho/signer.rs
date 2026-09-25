@@ -714,6 +714,7 @@ fn sign_slice_complete(
             slice_index: 0,
             offset: slice.offset,
             original_size: slice.size,
+            cpu_type: slice.cpu_type,
             signed_data: buf2,
         });
     }
@@ -725,6 +726,7 @@ fn sign_slice_complete(
         slice_index: 0,
         offset: slice.offset,
         original_size: slice.size,
+        cpu_type: slice.cpu_type,
         signed_data: buf,
     })
 }
