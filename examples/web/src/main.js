@@ -41,7 +41,13 @@ function log(msg, cls = "") {
   const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
   const line = document.createElement("div");
   line.className = `log-line ${cls}`;
-  line.innerHTML = `<span class="ts">[${elapsed}s]</span><span class="msg">${msg}</span>`;
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = `[${elapsed}s]`;
+  const body = document.createElement("span");
+  body.className = "msg";
+  body.textContent = msg;
+  line.append(ts, body);
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -110,7 +116,7 @@ async function loadIpa(file) {
   startTime = performance.now();
   const logContainer = $("#log");
   logContainer.classList.add("visible");
-  logEl.innerHTML = "";
+  logEl.replaceChildren();
   $("#summary").classList.add("hidden");
   $("#plist-output").classList.add("hidden");
   downloadBtn.classList.remove("visible");
@@ -233,7 +239,7 @@ async function signIpa() {
   startTime = performance.now();
   const logContainer = $("#log");
   logContainer.classList.add("visible");
-  logEl.innerHTML = "";
+  logEl.replaceChildren();
   $("#summary").classList.add("hidden");
   $("#plist-output").classList.add("hidden");
   downloadBtn.classList.remove("visible");
@@ -522,12 +528,25 @@ async function signIpa() {
 
     const summaryEl = $("#summary");
     summaryEl.classList.remove("hidden");
-    summaryEl.innerHTML = `
-      <div class="stat"><div class="value">${fileMap.size}</div><div class="label">Files Processed</div></div>
-      <div class="stat"><div class="value">${machoFiles.length}</div><div class="label">Mach-O Signed</div></div>
-      <div class="stat"><div class="value">${formatSize(blob.size)}</div><div class="label">Output Size</div></div>
-      <div class="stat"><div class="value">${elapsed}s</div><div class="label">Elapsed</div></div>
-    `;
+    summaryEl.replaceChildren(
+      ...[
+        [String(fileMap.size), "Files Processed"],
+        [String(machoFiles.length), "Mach-O Signed"],
+        [formatSize(blob.size), "Output Size"],
+        [`${elapsed}s`, "Elapsed"],
+      ].map(([value, label]) => {
+        const stat = document.createElement("div");
+        stat.className = "stat";
+        const v = document.createElement("div");
+        v.className = "value";
+        v.textContent = value;
+        const l = document.createElement("div");
+        l.className = "label";
+        l.textContent = label;
+        stat.append(v, l);
+        return stat;
+      }),
+    );
 
     const url = URL.createObjectURL(blob);
     const outputName = ipaFile.name.replace(/\.ipa$/i, "_signed.ipa");
