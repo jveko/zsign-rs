@@ -63,7 +63,7 @@ use crate::macho::{sign_any_macho, sign_macho, MachOFile};
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -420,6 +420,114 @@ impl<'a> IpaSigner<'a> {
         }
     }
 
+    /// Resolve `rel` — a root-relative name (raw plist value or literal) —
+    /// under `root`.
+    ///
+    /// Never reinterprets `rel` as already root-prefixed: a value that
+    /// starts with the root's own name still joins below the root. The
+    /// spelling must be plain — no `..`, no absolute prefix, no `.`, no
+    /// redundant separators — and no existing component may be a symlink.
+    /// Returns `root.join(rel)`, the lexical shape WalkDir produces.
+    fn resolve_relative(root: &Path, rel: &str) -> Result<PathBuf> {
+        let rel_path = Path::new(rel);
+        if rel_path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} escapes the bundle root {}",
+                rel,
+                root.display()
+            ))));
+        }
+        let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+        if rel.split(separator).any(|s| s.is_empty() || s == ".") {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} is not a plain relative path under {}",
+                rel,
+                root.display()
+            ))));
+        }
+        Self::check_no_symlink_components(root, rel_path)?;
+        Ok(root.join(rel))
+    }
+
+    /// Resolve `path` — already root-prefixed (discovery-walk output or a
+    /// previously joined target) — under `root`.
+    ///
+    /// `strip_prefix` must succeed; the remainder must be plain; no
+    /// existing component may be a symlink. Returns `root.join(relative)`,
+    /// the lexical shape WalkDir produces.
+    fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} is not under root {}",
+                path.display(),
+                root.display()
+            )))
+        })?;
+        if relative.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} escapes the bundle root {}",
+                relative.display(),
+                root.display()
+            ))));
+        }
+        // The remainder must contain no empty segments (redundant or
+        // trailing separators) and no "." segments — a PathBuf rebuild
+        // would join with the native separator and reject plain
+        // '/'-spelled values on Windows. CodeResources' main-executable
+        // exclusion compares the raw CFBundleExecutable string against
+        // WalkDir-relative paths, so only plain raw values keep that
+        // invariant intact.
+        let raw = relative.to_string_lossy();
+        let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+        if raw.split(separator).any(|s| s.is_empty() || s == ".") {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Path {} is not a plain relative path under {}",
+                relative.display(),
+                root.display()
+            ))));
+        }
+        Self::check_no_symlink_components(root, relative)?;
+        Ok(root.join(relative))
+    }
+
+    /// Walk `relative` below `root`: reject symlink components, stop at the
+    /// first missing component (a fresh tail is safe), and turn any other
+    /// metadata failure into a hard error instead of treating it as absence.
+    fn check_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "Pre-existing symlink in signing path: {}",
+                        current.display()
+                    ))));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "Failed to inspect signing path {}: {}",
+                        current.display(),
+                        e
+                    ))))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Calculate the nesting depth of a bundle relative to the root bundle.
     ///
     /// Depth is based on how many bundle directories are in the path.
@@ -697,15 +805,20 @@ impl<'a> IpaSigner<'a> {
     }
 
     /// Get the main executable path from Info.plist.
+    ///
+    /// A present `CFBundleExecutable` must be a string naming a relative
+    /// path to an existing regular file inside the bundle; non-string
+    /// values, absolute values, non-plain spellings, traversal, and
+    /// symlinked components are rejected. The file-stem fallback applies
+    /// only when the key is absent.
     fn get_main_executable(&self, bundle_path: &Path) -> Result<PathBuf> {
         let info_plist_path = bundle_path.join("Info.plist");
 
         if !info_plist_path.exists() {
-            let bundle_name = bundle_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            return Ok(bundle_path.join(bundle_name));
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Info.plist not found in bundle: {}",
+                bundle_path.display()
+            ))));
         }
 
         let plist_data = fs::read(&info_plist_path)?;
@@ -716,20 +829,52 @@ impl<'a> IpaSigner<'a> {
             )))
         })?;
 
-        let executable_name = plist
+        let executable_value = match plist
             .as_dictionary()
             .and_then(|d| d.get("CFBundleExecutable"))
-            .and_then(|v| v.as_string())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                bundle_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
+        {
+            None => bundle_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            Some(value) => {
+                let value = value.as_string().ok_or_else(|| {
+                    Error::Core(zsign_core::Error::Signing(format!(
+                        "CFBundleExecutable in {} must be a string",
+                        bundle_path.display()
+                    )))
+                })?;
+                if Path::new(value).is_absolute() {
+                    return Err(Error::Core(zsign_core::Error::Signing(format!(
+                        "CFBundleExecutable \"{}\" must be a relative path inside the bundle {}",
+                        value,
+                        bundle_path.display()
+                    ))));
+                }
+                let executable = Self::resolve_relative(bundle_path, value)?;
+                match fs::symlink_metadata(&executable) {
+                    Ok(metadata) if metadata.is_file() => return Ok(executable),
+                    Ok(_) => {
+                        return Err(Error::Core(zsign_core::Error::Signing(format!(
+                            "CFBundleExecutable \"{}\" does not name a regular file in {}",
+                            value,
+                            bundle_path.display()
+                        ))))
+                    }
+                    Err(e) => {
+                        return Err(Error::Core(zsign_core::Error::Signing(format!(
+                            "CFBundleExecutable \"{}\" in {} is not an existing regular file: {}",
+                            value,
+                            bundle_path.display(),
+                            e
+                        ))))
+                    }
+                }
+            }
+        };
 
-        Ok(bundle_path.join(executable_name))
+        Self::resolve_relative(bundle_path, &executable_value)
     }
 
     /// Check if a file is a Mach-O binary by reading its magic bytes.
@@ -972,6 +1117,42 @@ mod tests {
         ipa_path
     }
 
+    /// XML for an Info.plist declaring `cf_bundle_executable_entry`
+    /// (already XML) as CFBundleExecutable.
+    fn info_plist_xml(cf_bundle_executable_entry: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleExecutable</key>
+    {cf_bundle_executable_entry}
+</dict>
+</plist>"#
+        )
+    }
+
+    /// Serializes the tests that mutate the process working directory.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a minimal `.app` folder whose Info.plist declares
+    /// `executable_value` as CFBundleExecutable.
+    fn create_folder_bundle(dir: &Path, executable_value: &str, write_executable: bool) -> PathBuf {
+        let app = dir.join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            info_plist_xml(&format!("<string>{executable_value}</string>")),
+        )
+        .unwrap();
+        if write_executable {
+            std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        }
+        app
+    }
+
     #[test]
     fn test_extract_and_repack_ipa() {
         let temp_dir = TempDir::new().unwrap();
@@ -1126,5 +1307,245 @@ mod tests {
             .sign_folder_in_place(&app)
             .expect("allow_encrypted=true must sign");
         assert!(app.join("_CodeSignature/CodeResources").exists());
+    }
+
+    #[test]
+    fn test_sign_rejects_executable_path_outside_bundle() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside_macho");
+        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        let app = create_folder_bundle(temp.path(), "../outside_macho", true);
+        let before = std::fs::read(&outside).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("parent traversal in CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("outside_macho") && message.contains("escapes"),
+            "error must name the escaping value: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            before,
+            "outside file must stay untouched"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_absolute_executable_path() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside_macho");
+        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        let app = create_folder_bundle(temp.path(), outside.to_str().unwrap(), true);
+        let before = std::fs::read(&outside).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("absolute CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be a relative path"),
+            "error must reject the absolute value: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            before,
+            "outside file must stay untouched"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_absolute_executable_path_inside_bundle() {
+        let temp = TempDir::new().unwrap();
+        let in_bundle = temp.path().join("App.app").join("Test");
+        let app = create_folder_bundle(temp.path(), in_bundle.to_str().unwrap(), true);
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("absolute CFBundleExecutable must be rejected even inside the bundle");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be a relative path"),
+            "error must reject the absolute value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_non_string_executable_value() {
+        let temp = TempDir::new().unwrap();
+        let app = temp.path().join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            info_plist_xml("<integer>42</integer>"),
+        )
+        .unwrap();
+        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a non-string CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("CFBundleExecutable") && message.contains("must be a string"),
+            "error must name the wrong-typed value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_nonplain_executable_value() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "./Test", true);
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a non-plain CFBundleExecutable value must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a plain relative path"),
+            "error must name the spelling problem: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_rejects_symlinked_main_executable() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", false);
+        let real = app.join("RealTest");
+        std::fs::write(&real, crate::test_util::minimal_macho()).unwrap();
+        // Flattened versioned-framework layout: the declared executable
+        // is the root link, RealTest the real binary.
+        symlink(&real, app.join("Test")).unwrap();
+        let before = std::fs::read(&real).unwrap();
+
+        let error = IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect_err("a symlinked main executable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Pre-existing symlink"),
+            "error must name the cause: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            before,
+            "the symlink target must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sign_errors_on_unreadable_path_component() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "locked/tool", true);
+        let locked = app.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Environments that bypass DAC checks (e.g. running as root) cannot
+        // exercise the metadata-error arm; skip the assertions there.
+        match std::fs::metadata(locked.join("tool")) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            _ => {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
+        }
+
+        let result = IpaSigner::new_adhoc().sign_folder_in_place(&app);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unreadable path component must be a hard error");
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to inspect signing path"),
+            "error must surface the metadata failure: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_root_shaped_value_with_relative_root() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "App.app/Test", true);
+        let before = std::fs::read(app.join("Test")).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let result = IpaSigner::new_adhoc().sign_folder_in_place("App.app");
+        std::env::set_current_dir(previous).unwrap();
+
+        let error =
+            result.expect_err("a root-relative CFBundleExecutable must not strip the root prefix");
+        let message = error.to_string();
+        assert!(
+            message.contains("App.app/Test") && message.contains("not an existing regular file"),
+            "error must name the misresolved target: {message}"
+        );
+        assert_eq!(
+            std::fs::read(app.join("Test")).unwrap(),
+            before,
+            "nothing may be signed when the declared target does not resolve"
+        );
+    }
+
+    #[test]
+    fn test_sign_rejects_nonplain_value_under_dot_root() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("Info.plist"),
+            info_plist_xml("<string>./Test</string>"),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("Test"), crate::test_util::minimal_macho()).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let result = IpaSigner::new_adhoc().sign_folder_in_place(".");
+        std::env::set_current_dir(previous).unwrap();
+
+        let error = result.expect_err("a '.'-spelled CFBundleExecutable must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a plain relative path"),
+            "error must name the spelling problem: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_tolerates_missing_executable_key() {
+        let temp = TempDir::new().unwrap();
+        let app = temp.path().join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        // Named after the bundle's file stem so the fallback target is the
+        // file that actually gets signed.
+        std::fs::write(app.join("App"), crate::test_util::minimal_macho()).unwrap();
+
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_folder_in_place(&app)
+            .expect("key-absent bundle must still sign via the file-stem fallback");
+        assert!(
+            app.join("_CodeSignature/CodeResources").exists(),
+            "signing must complete through the fallback path"
+        );
     }
 }
