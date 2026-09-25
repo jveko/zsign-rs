@@ -2539,6 +2539,220 @@ byte-identical in behavior).
 
 ---
 
+### Task 2c: Final-review fix — mode-gate eContent capture (constructed-OCTET tolerance)
+
+**Files:**
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (eContent block + two small helpers)
+- Test: inline `mod tests`
+
+**Intent (final integration review finding, verbatim):** "The new capture path
+decodes the optional inner eContent for both modes. A BER-encoded constructed
+OCTET STRING (`0x24`, necessarily constructed when its length is indefinite) is
+rejected by `der`'s `AnyRef::decode`, and `normalize_ber_lengths` preserves that
+tag, so `verify_code_signature[_with_anchors]` now returns `Error::Verification`
+where the pre-patch path skipped the wrapper and returned an integrity report.
+This mode does not consume eContent — it verifies `messageDigest` against the
+caller-supplied CodeDirectory — so preserve its prior behavior by ignoring
+optional eContent in `CodeSignature` mode; in `AttachedProfile` mode, flatten
+valid constructed OCTET STRING segments before digesting. Add a regression
+covering constructed/indefinite eContent through the code-signature entry."
+
+- [ ] **Step 1: Write the failing tests** — append to `mod tests` in
+`crates/zsign-core/src/crypto/cms_verify.rs`:
+
+```rust
+    // ---- final-review fix: constructed eContent tolerance ----
+
+    /// Hand-built ContentInfo whose encapContentInfo carries a BER constructed
+    /// OCTET STRING (tag 0x24, two primitive segments) and an empty
+    /// signerInfos set — structurally well-formed, cryptographically empty.
+    fn hand_built_constructed_econtent_cms() -> Vec<u8> {
+        let id_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+        let id_signed_data = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+        let seg1 = der_tlv(0x04, b"part1");
+        let seg2 = der_tlv(0x04, b"part2");
+        let constructed = der_tlv(0x24, &[seg1, seg2].concat());
+        let econtent = der_tlv(0xA0, &constructed);
+        let encap = der_tlv(0x30, &[der_tlv(0x06, &id_data), econtent].concat());
+        let signed_data = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0x01]),
+                der_tlv(0x31, &[]),
+                encap,
+                der_tlv(0x31, &[]),
+            ]
+            .concat(),
+        );
+        der_tlv(
+            0x30,
+            &[der_tlv(0x06, &id_signed_data), der_tlv(0xA0, &signed_data)].concat(),
+        )
+    }
+
+    #[test]
+    fn code_signature_entry_tolerates_unparseable_econtent() {
+        // Pre-patch behavior: the wrapper was skipped unread, so an odd
+        // eContent could never turn an integrity outcome into a hard error.
+        let cms = hand_built_constructed_econtent_cms();
+        let wrapped = wrap(&cms);
+        let content: &[u8] = b"caller-supplied code directory";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let report =
+            verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors_for(&rsa_credentials().0))
+                .expect("code-signature entry must stay report-based for odd eContent");
+        assert!(!report.valid);
+        assert!(
+            report.errors.iter().any(|e| e.contains("no SignerInfo present")),
+            "errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn attached_entry_flattens_constructed_econtent_segments() {
+        let cms = hand_built_constructed_econtent_cms();
+        let out = verify_cms_envelope_with_anchors(&cms, Some(at(T_2026_APR)), &anchors_for(&rsa_credentials().0))
+            .expect("attached entry parses constructed eContent via segment flattening");
+        assert!(!out.report.valid);
+        assert_eq!(out.content.as_deref(), Some(&b"part1part2"[..]));
+    }
+
+    #[test]
+    fn constructed_octet_stream_rejects_non_octet_segments() {
+        // A constructed body containing a non-0x04 segment is malformed.
+        let bad = der_tlv(0x24, &der_tlv(0x02, &[0x01]));
+        assert!(decode_octet_string_stream(&bad).is_err());
+        // Primitive single TLV decodes to its value.
+        assert_eq!(
+            decode_octet_string_stream(&der_tlv(0x04, b"plain")).unwrap(),
+            b"plain"
+        );
+    }
+```
+
+- [ ] **Step 2: Run to confirm red**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core code_signature_entry_tolerates`
+Expected: first test FAILS with `Error::Verification` (the current strict
+capture hard-errors on `0x24`); `decode_octet_string_stream` missing → compile
+error also expected until Step 3 (add the tests after declaring expectations
+in the same run, or accept the compile-red as the red).
+
+- [ ] **Step 3: Implement** in `crates/zsign-core/src/crypto/cms_verify.rs`
+
+1. Replace the eContent capture block so it is mode-gated:
+
+```rust
+    // Optional [0] EXPLICIT eContent { OCTET STRING }; detached signatures omit it.
+    let mut econtent: Option<Vec<u8>> = None;
+    if !encap_r.is_finished() {
+        match mode {
+            SignedDataMode::CodeSignature { .. } => {
+                // Code signatures never consume eContent: keep the pre-patch
+                // tolerant skip so an odd encoding can never hard-fail a path
+                // whose digest target is the caller-supplied content.
+                let _ = AnyRef::decode(&mut encap_r);
+            }
+            SignedDataMode::AttachedProfile => {
+                let ec = AnyRef::decode(&mut encap_r)
+                    .map_err(|e| Error::Verification(format!("malformed eContent: {e}")))?;
+                if ec.tag() != TAG_CTX0 {
+                    return Err(Error::Verification(format!(
+                        "eContent is not in [0] EXPLICIT wrapper (tag {:?})",
+                        ec.tag()
+                    )));
+                }
+                if !ec.value().is_empty() {
+                    econtent = Some(decode_octet_string_stream(ec.value())?);
+                }
+            }
+        }
+    }
+```
+
+   Gate BOTH trailing-data checks (`ecr`-level check is gone — replaced by the
+   stream decoder — and the `encap_r` trailing check) behind
+   `SignedDataMode::AttachedProfile` so the code path keeps its pre-patch
+   tolerance. In AttachedProfile the trailing checks stay exactly as committed.
+
+2. Add the two bounds-checked helpers (no indexing that can panic — every
+   slice access goes through `.get`/`.first()` with an `Error::Verification`):
+
+```rust
+/// Reads one definite-length TLV (tag byte, body, bytes consumed).
+/// `normalize_ber_lengths` has already rewritten indefinite lengths, so only
+/// short and long definite forms appear here.
+fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let tag = *bytes
+        .first()
+        .ok_or_else(|| Error::Verification("TLV stream is empty".into()))?;
+    let len0 = *bytes
+        .get(1)
+        .ok_or_else(|| Error::Verification("truncated TLV length".into()))?;
+    let (len, header) = if len0 < 0x80 {
+        (len0 as usize, 2)
+    } else {
+        let n = (len0 & 0x7F) as usize;
+        if n == 0 || n > 8 {
+            return Err(Error::Verification("unsupported TLV length form".into()));
+        }
+        let lb = bytes
+            .get(2..2 + n)
+            .ok_or_else(|| Error::Verification("truncated TLV length".into()))?;
+        let mut len = 0usize;
+        for b in lb {
+            len = (len << 8) | *b as usize;
+        }
+        (len, 2 + n)
+    };
+    let body = bytes
+        .get(header..header + len)
+        .ok_or_else(|| Error::Verification("truncated TLV body".into()))?;
+    Ok((tag, body, header + len))
+}
+
+/// Decodes one `0x04` primitive or `0x24` constructed OCTET STRING TLV into
+/// its value bytes. A constructed body is consecutive primitive segments
+/// (BER 8.7); anything else is rejected.
+fn decode_octet_string_stream(bytes: &[u8]) -> Result<Vec<u8>> {
+    let (tag, body, _) = read_tlv(bytes)?;
+    match tag {
+        0x04 => Ok(body.to_vec()),
+        0x24 => {
+            let mut out = Vec::new();
+            let mut rest = body;
+            while !rest.is_empty() {
+                let (seg_tag, seg_body, used) = read_tlv(rest)?;
+                if seg_tag != 0x04 {
+                    return Err(Error::Verification(
+                        "constructed eContent contains a non-OCTET STRING segment".into(),
+                    ));
+                }
+                out.extend_from_slice(seg_body);
+                rest = &rest[used..];
+            }
+            Ok(out)
+        }
+        other => Err(Error::Verification(format!(
+            "eContent is not an OCTET STRING (tag 0x{other:02x})"
+        ))),
+    }
+}
+```
+
+- [ ] **Step 4: Scoped gate (green)**
+
+Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto -- --skip test_ipa_signing_is_deterministic && TMPDIR=$PWD/.tmptmp cargo test -p zsign-core provisioning -- --skip test_ipa_signing_is_deterministic`
+Expected: all green (existing + the three new tests).
+
+- [ ] **Step 5: Commit (controller)**
+
+`git add -u crates/zsign-core/src/crypto/cms_verify.rs && git commit -m "fix(zsign-core): tolerate constructed econtent in code verification (ZSN-3)"`
+
+---
+
 ### Task 5: Full-suite gates and consumer compile proof
 
 **Files:** none changed; verification only.
@@ -2547,7 +2761,7 @@ byte-identical in behavior).
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test --workspace -- --skip test_ipa_signing_is_deterministic`
 Expected: green; baseline counts were 182 `zsign-core` / 89 `zsign-rs` tests
-plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b = 34, exact
+plus this plan's additions (3 Task-1 + 7 Task-2 + 18 Task-3 + 3 Task-4 + 3 Task-4b + 3 Task-2c = 37, exact
 numbers recorded in the lane report). Any other pre-existing failure is a
 blocker — stop and diagnose (skill: systematic-debugging).
 
