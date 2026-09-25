@@ -541,3 +541,49 @@ format private key material); the three remaining `expect_err` calls are on
 `Ok = Vec<u8>` / `Ok = ()`, which implement `Debug`; both shell guards now `exit 1`;
 the imports and wording corrections are in place. A fresh round-4 cold review was then
 dispatched under the same addressed-preamble and derivation rules.
+
+### Round 4 → STOP (second)
+
+Round 4 verified **every round-2/round-3 fix LANED** (11 `matches!` negative tests,
+both imports, hoisted signer, standalone password gate, build-failure red steps, Task-5
+bodies, `exit 1` guards, corrected rationale, aligned `prf` type — all with path:line
+evidence), then returned `NOT-READY` with 7 new findings.
+
+Logic-level (3, each re-verified against source before classification):
+
+1. **Apple-interop consumer conflict (out of lane scope).** `scripts/verify-apple-interop.sh`
+   generated its certificate with `basicConstraints=critical,CA:TRUE` deliberately and
+   signed through `zsign-cli -p` → `SigningCredentials::from_p12` on every macOS CI run,
+   so Task 2's CA=false leaf policy would have rejected the script's ground-truth signing
+   step; `scripts/` and CI files are outside this lane's fence.
+2. **Orphaned trait import.** The plan's `from_pem` rewrite replaces the direct decode
+   expression but does not remove `cert.rs:133`'s `use pkcs8::DecodePrivateKey;` →
+   `unused_imports`, promoted to an error by the repo's `-D warnings` clippy gate
+   (`.github/workflows/ci.yml`, `hk.pkl`).
+3. **Duplicate Task-1 test imports.** The prose instructed module-scope imports the
+   helper bodies already import locally → ~11 unused outer bindings (including
+   `DecodePrivateKey`, `rand::thread_rng`) → same `-D warnings` failure. Fix: each name
+   imported exactly once; helpers keep their local trait imports; module scope keeps only
+   names used bare across test bodies.
+
+Doc/nit (4+): the design's absolute "no consumer string-matches error text" claim is
+false — `zsign-wasm`'s `p12_err` (`lib.rs:144-160`, pinned by tests `:947-960`)
+string-matches the two `P12Error` Display markers to map `ZSIGN_INVALID_PASSWORD`, so
+those markers are a cross-crate contract while `Error::Certificate` policy wording stays
+free; consumer-map citations drifted with the rebase (`macho/verify.rs` literal
+`344`→`601`, wasm loader `:64`→`:236`); the header still names base `c9ff0fb`; the
+validity-row message contract (design says both timestamps, plan names the violated
+bound); plus wording nits (`E0432`→`E0425`, the module-import anchor line, two
+print-only fixture greps, and the temporally backwards "already takes depth" prose).
+
+Classification: logic-level present → **STOP and report**; phase 5 not started.
+
+**Supervisor ruling:** finding 1 was resolved upstream after the previous rebase —
+ZSN-38 landed `7f6d06a` on main rewriting the interop script's certificate to
+`basicConstraints=critical,CA:FALSE` end-entity (verified via
+`git show main:scripts/verify-apple-interop.sh`), so this lane absorbs the resolution by
+rebasing and never edits the script (scope stays crypto-only; a policy carve-out was
+rejected). Findings 2-7 were authorized to apply on top of that rebase, followed by one
+fresh cold review (round 5). Monitoring note for the record: the upstream CA:FALSE line
+has only been validated by `bash -n` + structural checks — macOS CI is the true
+SecTrustEvaluate test, and a failure there is a ZSN-38 finding, not this lane's.
