@@ -5,7 +5,8 @@
 //!
 //! - PBES1 with SHA-1 (Apple Keychain and OpenSSL ≤ 1.1 exports):
 //!   RC2-40, RC2-128, 2-key and 3-key Triple-DES
-//! - PBES2 with PBKDF2 and AES-128/192/256-CBC (OpenSSL 3 default)
+//! - PBES2 with PBKDF2 and AES-128/192/256-CBC (OpenSSL 3 default); PRF per
+//!   RFC 8018 (HMAC-SHA1 default; HMAC-SHA1/224/256/384/512 accepted)
 //! - MAC integrity verification with HMAC-SHA1 or HMAC-SHA256
 //!
 //! Only pure-Rust crypto primitives are used, so this module compiles for
@@ -24,7 +25,7 @@ use pbkdf2::pbkdf2_hmac;
 use rc2::cipher::{Block, BlockDecrypt, KeyInit};
 use rc2::Rc2;
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Sha224, Sha256, Sha384, Sha512};
 use std::fmt;
 
 /// Object identifiers used by PKCS#12 structures.
@@ -52,6 +53,9 @@ mod oid {
     pub const SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
     pub const HMAC_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.7");
     pub const HMAC_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.9");
+    pub const HMAC_SHA224: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.8");
+    pub const HMAC_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.10");
+    pub const HMAC_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.11");
     pub const KEY_BAG: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.2");
     pub const CERT_BAG: ObjectIdentifier =
@@ -485,20 +489,52 @@ fn pbes2_decrypt(params: &[u8], data: &[u8], password: &str) -> Result<Vec<u8>> 
         .ok_or_else(|| P12Error::Der("PBKDF2 parameters missing".into()))?;
     let salt = Pbkdf2Parameter::parse(pbkdf2_params)?;
 
-    let (key_len, iv) = match scheme.oid {
-        oid::AES_128_CBC => (16, aes_cbc_iv(&scheme)?),
-        oid::AES_192_CBC => (24, aes_cbc_iv(&scheme)?),
-        oid::AES_256_CBC => (32, aes_cbc_iv(&scheme)?),
+    let (key_len, iv, scheme_name) = match scheme.oid {
+        oid::AES_128_CBC => (16, aes_cbc_iv(&scheme)?, "AES-128-CBC"),
+        oid::AES_192_CBC => (24, aes_cbc_iv(&scheme)?, "AES-192-CBC"),
+        oid::AES_256_CBC => (32, aes_cbc_iv(&scheme)?, "AES-256-CBC"),
         _ => {
             return Err(P12Error::Unsupported(format!(
                 "PBES2 encryption scheme {oid}",
                 oid = scheme.oid
-            )))
+            )));
         }
     };
 
+    // RFC 8018 keyLength is the derived key length in octets; a declared value
+    // that disagrees with the scheme's key size is rejected, mirroring
+    // OpenSSL's EVP_R_UNSUPPORTED_KEYLENGTH check (the RFC itself treats the
+    // field as advisory, so this is local policy, not a standard requirement).
+    if let Some(declared) = salt.key_length {
+        if declared != key_len as u32 {
+            return Err(P12Error::Der(format!(
+                "PBKDF2 keyLength {declared} does not match the {key_len}-byte key required by the {scheme_name} scheme"
+            )));
+        }
+    }
+
     let mut key = vec![0u8; key_len];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.salt, salt.iterations, &mut key);
+    match salt.prf {
+        // RFC 8018 DEFAULT: an absent prf means HMAC-SHA-1.
+        None | Some(oid::HMAC_SHA1) => {
+            pbkdf2_hmac::<Sha1>(password.as_bytes(), salt.salt, salt.iterations, &mut key)
+        }
+        Some(oid::HMAC_SHA224) => {
+            pbkdf2_hmac::<Sha224>(password.as_bytes(), salt.salt, salt.iterations, &mut key)
+        }
+        Some(oid::HMAC_SHA256) => {
+            pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.salt, salt.iterations, &mut key)
+        }
+        Some(oid::HMAC_SHA384) => {
+            pbkdf2_hmac::<Sha384>(password.as_bytes(), salt.salt, salt.iterations, &mut key)
+        }
+        Some(oid::HMAC_SHA512) => {
+            pbkdf2_hmac::<Sha512>(password.as_bytes(), salt.salt, salt.iterations, &mut key)
+        }
+        Some(other) => {
+            return Err(P12Error::Unsupported(format!("PBKDF2 PRF {other}")));
+        }
+    }
 
     let plaintext = match key_len {
         16 => aes_decrypt::<Aes128>(&key, iv, data)?,
@@ -517,6 +553,8 @@ fn pbes2_decrypt(params: &[u8], data: &[u8], password: &str) -> Result<Vec<u8>> 
 struct Pbkdf2Parameter<'a> {
     salt: &'a [u8],
     iterations: u32,
+    key_length: Option<u32>,
+    prf: Option<ObjectIdentifier>,
 }
 
 impl<'a> Pbkdf2Parameter<'a> {
@@ -527,16 +565,25 @@ impl<'a> Pbkdf2Parameter<'a> {
         let iterations = inner.read_integer_u32()?;
         validate_iterations(iterations)?;
 
-        // keyLength (if present) precedes the optional PRF. It is only
-        // read when actually an INTEGER, so a PRF-only layout is handled.
-        if inner.peek_tag() == Some(0x02) {
-            let _key_length = inner.read_integer_u32()?;
-        }
-        if inner.remaining() > 0 {
-            let _prf = AlgorithmId::parse(&mut inner)?;
-        }
+        // keyLength (if present) precedes the optional PRF (RFC 8018 DEFAULT
+        // hmacSHA1 when absent). Both are retained for validation/dispatch.
+        let key_length = if inner.peek_tag() == Some(0x02) {
+            Some(inner.read_integer_u32()?)
+        } else {
+            None
+        };
+        let prf = if inner.remaining() > 0 {
+            Some(AlgorithmId::parse(&mut inner)?.oid)
+        } else {
+            None
+        };
 
-        Ok(Self { salt, iterations })
+        Ok(Self {
+            salt,
+            iterations,
+            key_length,
+            prf,
+        })
     }
 }
 
@@ -1001,5 +1048,225 @@ mod tests {
             bmp_string("päss"),
             vec![0x00, 0x70, 0x00, 0xe4, 0x00, 0x73, 0x00, 0x73, 0x00, 0x00]
         );
+    }
+    /// One TLV: tag byte + definite length + content.
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else {
+            let be = (content.len() as u32).to_be_bytes();
+            let n = 4 - be.iter().take_while(|&&b| b == 0).count();
+            out.push(0x80 | n as u8);
+            out.extend_from_slice(&be[4 - n..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+    fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
+        tlv(0x30, &parts.concat())
+    }
+    fn der_oid(id: &str) -> Vec<u8> {
+        use der::Encode;
+        const_oid::ObjectIdentifier::new_unwrap(id)
+            .to_der()
+            .unwrap()
+    }
+    /// Minimal DER INTEGER (u32): strip leading zeros, pad one 0x00 if the top
+    /// bit would make it negative.
+    fn der_int(v: u32) -> Vec<u8> {
+        let be = v.to_be_bytes();
+        let mut body: Vec<u8> = match be.iter().position(|&b| b != 0) {
+            Some(i) => be[i..].to_vec(),
+            None => vec![0],
+        };
+        if body[0] & 0x80 != 0 {
+            body.insert(0, 0);
+        }
+        tlv(0x02, &body)
+    }
+    fn der_null() -> Vec<u8> {
+        tlv(0x05, b"")
+    }
+    fn der_octets(b: &[u8]) -> Vec<u8> {
+        tlv(0x04, b)
+    }
+
+    /// PBES2-params decoded SEQUENCE value: PBKDF2 kdf AlgorithmIdentifier
+    /// (optional keyLength, optional prf) ++ AES-CBC scheme AlgorithmIdentifier —
+    /// exactly what `pbes2_decrypt` takes as its `params` argument.
+    fn pbes2_params(
+        salt: &[u8],
+        iter: u32,
+        key_length: Option<u32>,
+        prf_oid: Option<&str>,
+        iv: &[u8],
+        aes_oid: &str,
+    ) -> Vec<u8> {
+        let mut pbkdf2_inner = vec![der_octets(salt), der_int(iter)];
+        if let Some(kl) = key_length {
+            pbkdf2_inner.push(der_int(kl));
+        }
+        if let Some(oid) = prf_oid {
+            pbkdf2_inner.push(seq(&[der_oid(oid), der_null()])); // AlgorithmIdentifier
+        }
+        let kdf = seq(&[der_oid("1.2.840.113549.1.5.12"), seq(&pbkdf2_inner)]);
+        let scheme = seq(&[der_oid(aes_oid), der_octets(iv)]);
+        // Decoded SEQUENCE value: the two AlgorithmIdentifier TLVs, no outer 0x30.
+        [kdf, scheme].concat()
+    }
+
+    /// One-block AES-CBC ciphertext (PKCS#7 padded) for a known plaintext.
+    fn aes128_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        use aes::cipher::{Block, BlockEncrypt, KeyInit};
+        use aes::Aes128;
+        assert!(plaintext.len() <= 15, "helper pads to a single block");
+        let pad = 16 - plaintext.len();
+        let mut block = [0u8; 16];
+        block[..plaintext.len()].copy_from_slice(plaintext);
+        block[plaintext.len()..].fill(pad as u8);
+        for (b, v) in block.iter_mut().zip(iv) {
+            *b ^= *v;
+        }
+        let cipher = Aes128::new_from_slice(key).expect("16-byte key");
+        let mut block = Block::<Aes128>::clone_from_slice(&block);
+        cipher.encrypt_block(&mut block);
+        block.to_vec()
+    }
+
+    const AES_128_CBC: &str = "2.16.840.1.101.3.4.1.2";
+    const HMAC_SHA1_OID: &str = "1.2.840.113549.2.7";
+    const HMAC_SHA256_OID: &str = "1.2.840.113549.2.9";
+    /// A digest OID outside the PBKDF2-PRF set — deliberately unknown as a PRF.
+    const SHA3_256_DIGEST_OID: &str = "2.16.840.1.101.3.4.2.8";
+
+    const PBES2_PASS: &str = "zsign pbes2 test";
+    const PBES2_SALT: &[u8] = &[0x11; 16];
+    const PBES2_IV: &[u8; 16] = &[0x22; 16];
+    const PBES2_PLAINTEXT: &[u8] = b"zsign prf test"; // 14 bytes -> one padded block
+    const PBES2_ITER: u32 = 2048;
+
+    fn derived_key_sha1(password: &[u8], salt: &[u8], iter: u32, len: usize) -> Vec<u8> {
+        let mut key = vec![0u8; len];
+        pbkdf2_hmac::<Sha1>(password, salt, iter, &mut key);
+        key
+    }
+
+    fn derived_key_sha256(password: &[u8], salt: &[u8], iter: u32, len: usize) -> Vec<u8> {
+        let mut key = vec![0u8; len];
+        pbkdf2_hmac::<Sha256>(password, salt, iter, &mut key);
+        key
+    }
+
+    #[test]
+    fn pbkdf2_omitted_prf_defaults_to_hmac_sha1() {
+        // RFC 8018: absent prf => HMAC-SHA-1.
+        let params = pbes2_params(PBES2_SALT, PBES2_ITER, None, None, PBES2_IV, AES_128_CBC);
+        let key: [u8; 16] = derived_key_sha1(PBES2_PASS.as_bytes(), PBES2_SALT, PBES2_ITER, 16)
+            .try_into()
+            .unwrap();
+        let ct = aes128_cbc_encrypt(&key, PBES2_IV, PBES2_PLAINTEXT);
+        let out = pbes2_decrypt(&params, &ct, PBES2_PASS)
+            .expect("RFC 8018 default PRF (HMAC-SHA1) must decrypt");
+        assert_eq!(out, PBES2_PLAINTEXT);
+    }
+
+    #[test]
+    fn pbkdf2_declared_sha1_prf_uses_sha1() {
+        let params = pbes2_params(
+            PBES2_SALT,
+            PBES2_ITER,
+            None,
+            Some(HMAC_SHA1_OID),
+            PBES2_IV,
+            AES_128_CBC,
+        );
+        let key: [u8; 16] = derived_key_sha1(PBES2_PASS.as_bytes(), PBES2_SALT, PBES2_ITER, 16)
+            .try_into()
+            .unwrap();
+        let ct = aes128_cbc_encrypt(&key, PBES2_IV, PBES2_PLAINTEXT);
+        let out =
+            pbes2_decrypt(&params, &ct, PBES2_PASS).expect("declared HMAC-SHA1 PRF must decrypt");
+        assert_eq!(out, PBES2_PLAINTEXT);
+    }
+
+    #[test]
+    fn pbkdf2_declared_sha256_prf_unchanged() {
+        // Pins the behavior the four committed modern_* fixtures depend on:
+        // green before and after the change.
+        let params = pbes2_params(
+            PBES2_SALT,
+            PBES2_ITER,
+            None,
+            Some(HMAC_SHA256_OID),
+            PBES2_IV,
+            AES_128_CBC,
+        );
+        let key: [u8; 16] = derived_key_sha256(PBES2_PASS.as_bytes(), PBES2_SALT, PBES2_ITER, 16)
+            .try_into()
+            .unwrap();
+        let ct = aes128_cbc_encrypt(&key, PBES2_IV, PBES2_PLAINTEXT);
+        let out = pbes2_decrypt(&params, &ct, PBES2_PASS)
+            .expect("declared HMAC-SHA256 PRF must keep decrypting");
+        assert_eq!(out, PBES2_PLAINTEXT);
+    }
+
+    #[test]
+    fn pbkdf2_unknown_prf_rejected() {
+        let params = pbes2_params(
+            PBES2_SALT,
+            PBES2_ITER,
+            None,
+            Some(SHA3_256_DIGEST_OID),
+            PBES2_IV,
+            AES_128_CBC,
+        );
+        let err = pbes2_decrypt(&params, &[0u8; 16], PBES2_PASS)
+            .expect_err("a PRF outside the supported set must be rejected");
+        assert!(
+            matches!(&err, P12Error::Unsupported(m) if m.contains("2.16.840.1.101.3.4.2.8")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_keylength_mismatch_rejected() {
+        // Declared 24-byte key with an AES-128-CBC (16-byte) scheme.
+        let params = pbes2_params(
+            PBES2_SALT,
+            PBES2_ITER,
+            Some(24),
+            None,
+            PBES2_IV,
+            AES_128_CBC,
+        );
+        let err = pbes2_decrypt(&params, &[0u8; 16], PBES2_PASS)
+            .expect_err("declared keyLength must match the scheme's key size");
+        assert!(
+            matches!(&err, P12Error::Der(m)
+            if m.contains("keyLength") && m.contains("24") && m.contains("16")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_matching_keylength_accepted() {
+        // A keyLength that agrees with the scheme must be accepted (guard: green
+        // before and after — the field was previously ignored).
+        let params = pbes2_params(
+            PBES2_SALT,
+            PBES2_ITER,
+            Some(16),
+            Some(HMAC_SHA256_OID),
+            PBES2_IV,
+            AES_128_CBC,
+        );
+        let key: [u8; 16] = derived_key_sha256(PBES2_PASS.as_bytes(), PBES2_SALT, PBES2_ITER, 16)
+            .try_into()
+            .unwrap();
+        let ct = aes128_cbc_encrypt(&key, PBES2_IV, PBES2_PLAINTEXT);
+        let out = pbes2_decrypt(&params, &ct, PBES2_PASS)
+            .expect("agreeing keyLength declaration must not be rejected");
+        assert_eq!(out, PBES2_PLAINTEXT);
     }
 }
