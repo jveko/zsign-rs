@@ -719,7 +719,7 @@ to the module imports):
 
     #[test]
     fn rsa_signature_rejects_digest_and_signature_oid_mismatches() {
-        use signature::Signer;
+        use signature::{SignatureEncoding, Signer};
 
         let (creds, key) = rsa_credentials();
         // Deliberately not 0xA0-prefixed, so `verify_signer_signature` treats
@@ -728,6 +728,7 @@ to the module imports):
 
         let sha256_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
         let sig256: rsa::pkcs1v15::Signature = sha256_key.sign(msg);
+        let sig256_bytes = sig256.to_vec();
 
         // Consistent pairs verify.
         assert!(verify_signer_signature(
@@ -735,14 +736,14 @@ to the module imports):
             OID_SHA256_WITH_RSA,
             SignerDigest::Sha256,
             msg,
-            sig256.as_bytes(),
+            &sig256_bytes,
         ));
         assert!(verify_signer_signature(
             &creds.certificate,
             OID_RSA_ENCRYPTION,
             SignerDigest::Sha256,
             msg,
-            sig256.as_bytes(),
+            &sig256_bytes,
         ));
 
         // Mismatch direction 1: SHA-256 digestAlgorithm presented with the
@@ -753,11 +754,12 @@ to the module imports):
             OID_SHA1_WITH_RSA,
             SignerDigest::Sha256,
             msg,
-            sig256.as_bytes(),
+            &sig256_bytes,
         ));
 
         let sha1_key = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(key.clone());
         let sig1: rsa::pkcs1v15::Signature = sha1_key.sign(msg);
+        let sig1_bytes = sig1.to_vec();
 
         // Consistent SHA-1 pairs (the profile shape, incl. Apple's
         // digest-less rsaEncryption form) verify.
@@ -766,14 +768,14 @@ to the module imports):
             OID_SHA1_WITH_RSA,
             SignerDigest::Sha1,
             msg,
-            sig1.as_bytes(),
+            &sig1_bytes,
         ));
         assert!(verify_signer_signature(
             &creds.certificate,
             OID_RSA_ENCRYPTION,
             SignerDigest::Sha1,
             msg,
-            sig1.as_bytes(),
+            &sig1_bytes,
         ));
 
         // Mismatch direction 2: SHA-1 digestAlgorithm presented with the
@@ -784,14 +786,14 @@ to the module imports):
             OID_SHA256_WITH_RSA,
             SignerDigest::Sha1,
             msg,
-            sig256.as_bytes(),
+            &sig256_bytes,
         ));
         assert!(!verify_signer_signature(
             &creds.certificate,
             OID_SHA256_WITH_RSA,
             SignerDigest::Sha1,
             msg,
-            sig1.as_bytes(),
+            &sig1_bytes,
         ));
     }
 ```

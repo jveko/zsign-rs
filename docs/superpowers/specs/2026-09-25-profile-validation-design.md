@@ -264,6 +264,23 @@ Gate commands (per brief): mid-flight
 
 ## 6. Known items / evidence gaps
 
+**Round-3 cold-review finding (recorded verbatim per the adjudication rule;
+classified doc-level — a method-name error in a planned test snippet, no logic
+change — and corrected in the plan before implementation):**
+
+> Use a real signature-byte accessor in the new mismatch test — The newly added
+> test calls `sig256.as_bytes()` and `sig1.as_bytes()` at
+> docs/superpowers/plans/2026-09-25-profile-validation.md:738,745,756,769,776,787,795.
+> In the locked rsa-0.9.10 API, `rsa::pkcs1v15::Signature` implements
+> `signature::SignatureEncoding` (rsa-0.9.10/src/pkcs1v15/signature.rs:1-80),
+> whose byte methods are `to_bytes`/`to_vec`
+> (signature-2.2.0/src/encoding.rs:7-25); it has no `as_bytes` method. The
+> scoped crypto test therefore fails to compile with E0599 before it can
+> exercise the required pair-consistency cases. Bind `SignatureEncoding` and
+> keep the signatures' `to_vec()` byte buffers, then pass those slices to the
+> verifier. (severity: major)
+
+
 - **Strict now-based chain validity rejects expired genuine profiles by
   design.** Both observed Apple profile-signing leaves expired 2022-04-12
   (iOS) / 2023-02-07 (macOS), and `openssl cms -verify` fails them with
