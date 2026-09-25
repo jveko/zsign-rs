@@ -767,6 +767,7 @@ fn check_code_resources(
     if let Some(files2) = files2 {
         for (rel, entry) in files2 {
             if entry.as_dictionary().is_none() {
+                errors.push(format!("malformed CodeResources entry: {rel}"));
                 continue;
             }
             verify_code_resource_entry(bundle, rel, entry, &mut out, &rules, errors)?;
@@ -1347,6 +1348,30 @@ mod tests {
                 .any(|e| e.contains("unsupported CodeResources rule")),
             "got {:?}",
             report.bundle.as_ref().unwrap().errors
+        );
+    }
+
+    #[test]
+    fn malformed_entry_is_reported() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = build_signed_bundle(td.path());
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            files2.insert(
+                "Frameworks/Sub.framework/Info.plist".to_string(),
+                plist::Value::String("garbage".into()),
+            );
+        });
+        let report = verify_bundle(&app).unwrap();
+        assert!(!report.valid());
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle
+                .errors
+                .iter()
+                .any(|e| e.contains("malformed CodeResources entry")),
+            "got {:?}",
+            bundle.errors
         );
     }
 }
