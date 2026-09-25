@@ -514,3 +514,30 @@ addressed-preamble (its verdict weighs the round-1/round-2 fixes landing plus NE
 material defects only; re-litigation does not count; any disputed RED/GREEN claim must
 arrive with a step-by-step derivation naming the pre-fix lines and values). Per that
 authorization, round 3 replaces the brief's exhausted re-review budget.
+
+**Correction to the paragraph above:** round 3 verified that two round-2 logic findings
+had *not* actually been applied (the `use der::Encode;` instruction inside
+`select_identity` and the production `use const_oid::ObjectIdentifier;` import
+instruction), despite this section claiming all round-2 findings landed. They were
+applied with the round-3 batch (see below); the original claim was written in error.
+
+### Round 3 → round 4 (supervisor-authorized)
+
+Round 3 returned `NOT-READY` with 7 findings. Classified logic-level (5): the two
+missed round-2 imports above; the Task-1 EKU test's missing
+`const_oid::ObjectIdentifier` import; 11 `expect_err` calls on success types that do
+not implement `Debug` (`SigningCredentials` and `DecodedKey` derive nothing — std's
+`Result::expect_err` requires `T: Debug`, so every negative loader test failed E0277
+before running); and two fixture-verification guards that `echo`ed a warning yet exited
+0, so they could never fail the sequence. Doc/nit (2): the Task-5 build-failure
+rationale (three E0061 call sites, not four/E0425) and this document's
+`prf: Option<AlgorithmIdentifier>` vs the plan's `Option<ObjectIdentifier>`.
+
+The supervisor accepted the classification and authorized the fix path + round 4:
+all 7 findings were applied and committed (`1044a1d`). The negative tests now use
+`matches!(&res, Err(Error::Certificate(m) if …))` guards with `res.as_ref().err()` on
+the panic side — `Debug` is deliberately NOT derived on credential types (it would
+format private key material); the three remaining `expect_err` calls are on
+`Ok = Vec<u8>` / `Ok = ()`, which implement `Debug`; both shell guards now `exit 1`;
+the imports and wording corrections are in place. A fresh round-4 cold review was then
+dispatched under the same addressed-preamble and derivation rules.
