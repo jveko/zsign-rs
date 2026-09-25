@@ -280,7 +280,7 @@ printf '%s\n' "$VB" >>"$DIAG"
 grep -q '^verified: no'                     <<<"$VB" || fail "zsign -V must not report verified: yes for the cert-signed bundle:\n$VB"
 grep -q '^    arm64: pages ok, CMS INVALID' <<<"$VB" || fail "zsign -V did not reach the structural+CMS verdict for the cert-signed bundle:\n$VB"
 grep -q '^  code resources: ok'             <<<"$VB" || fail "zsign -V did not confirm sealed top-level code resources for the cert-signed bundle:\n$VB"
-if grep -qi mismatch <<<"$VB"; then
+if grep -qiE 'mismatch|!= ' <<<"$VB"; then
     fail "zsign -V reported structural mismatches on the cert-signed bundle:\n$VB"
 fi
 
@@ -293,7 +293,7 @@ grep -q '^verified: no'                   <<<"$VM" || fail "zsign -V accepted th
 grep -q 'not anchored to a trusted root'   <<<"$VM" || fail "zsign -V missing the expected anchoring failure:\n$VM"
 grep -q 'signer: CN=zsign interop CI'      <<<"$VM" || fail "zsign -V did not parse the self-signed CMS signer:\n$VM"
 grep -q 'cms: INVALID (chain: CN=zsign interop CI, anchor: false)' <<<"$VM" || fail "zsign -V did not report the expected unanchored self-signed CMS state:\n$VM"
-if grep -qi mismatch <<<"$VM"; then
+if grep -qiE 'mismatch|!= ' <<<"$VM"; then
     fail "zsign -V reported structural mismatches on the cert-signed main binary:\n$VM"
 fi
 echo "OK  zsign -V dual-pin: structure valid + unanchored (expected) for cert-signed bundle"
