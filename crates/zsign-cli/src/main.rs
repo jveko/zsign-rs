@@ -48,6 +48,10 @@ struct Cli {
     #[arg(short = 'm', long)]
     profile: Option<PathBuf>,
 
+    /// Custom entitlements file (replaces the profile's entitlements)
+    #[arg(short = 'e', long)]
+    entitlements: Option<PathBuf>,
+
     /// Password for the PKCS#12 or key material (empty password is valid).
     /// Precedence: this flag beats the ZSIGN_PASSWORD environment variable.
     /// Values passed on the command line are visible to other users in
@@ -120,6 +124,7 @@ struct Cli {
             "private_key",
             "pkcs12",
             "profile",
+            "entitlements",
             "zip_level",
             "bundle_id",
             "bundle_name",
@@ -169,6 +174,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if let Some(profile) = cli.profile {
         signer = signer.provisioning_profile(profile);
+    }
+
+    if let Some(entitlements) = cli.entitlements {
+        signer = signer.entitlements(entitlements);
     }
 
     if let Some(bundle_id) = cli.bundle_id {
@@ -1589,6 +1598,33 @@ mod tests {
         }
         // verify itself stays valid, and ZSIGN_PASSWORD must NOT conflict (env presentness)
         assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn entitlements_flag_parses_short_and_long() {
+        for args in [
+            ["zsign", "-a", "-e", "x.plist", "in.bin"],
+            ["zsign", "-a", "--entitlements", "x.plist", "in.bin"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("must parse");
+            assert_eq!(cli.entitlements, Some(PathBuf::from("x.plist")));
+        }
+    }
+
+    #[test]
+    fn verify_conflicts_with_entitlements() {
+        for extra in [
+            vec!["zsign", "-V", "-e", "x.plist", "in.ipa"],
+            vec!["zsign", "-V", "--entitlements", "x.plist", "in.ipa"],
+        ] {
+            assert_eq!(
+                parse_err(&extra).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        // entitlements alone (and alongside adhoc) stays valid
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-a", "-e", "x.plist", "in.bin"]).is_ok());
     }
 
     #[test]

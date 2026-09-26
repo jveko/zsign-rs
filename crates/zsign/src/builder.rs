@@ -86,6 +86,8 @@ pub struct ZSign {
     dylibs: Vec<String>,
     weak_dylibs: bool,
     allow_encrypted: bool,
+    /// Custom entitlements file: replaces profile-derived entitlements
+    entitlements: Option<PathBuf>,
 }
 
 impl ZSign {
@@ -111,6 +113,7 @@ impl ZSign {
             dylibs: Vec::new(),
             weak_dylibs: false,
             allow_encrypted: false,
+            entitlements: None,
         }
     }
 
@@ -153,6 +156,25 @@ impl ZSign {
     /// ```
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
         self.provisioning_profile = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets a custom entitlements file.
+    ///
+    /// The file must be an XML or binary plist with a top-level dictionary
+    /// whose values the signer can encode to DER; it replaces the
+    /// entitlements extracted from the provisioning profile. A rejected file
+    /// fails the sign instead of silently falling back to the profile.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zsign_rs::ZSign;
+    ///
+    /// let zsign = ZSign::new().entitlements("custom.entitlements");
+    /// ```
+    pub fn entitlements(mut self, path: impl AsRef<Path>) -> Self {
+        self.entitlements = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -317,7 +339,9 @@ impl ZSign {
                 .unwrap_or("unknown"),
         };
 
-        let entitlements = self.load_entitlements_from_profile()?;
+        let entitlements = self
+            .load_entitlements_override()?
+            .or(self.load_entitlements_from_profile()?);
         let signed_binary = if self.adhoc {
             crate::macho::sign_macho_adhoc(
                 &macho,
@@ -423,6 +447,10 @@ impl ZSign {
             signer = signer.provisioning_profile(profile_path);
         }
 
+        if let Some(entitlements) = &self.entitlements {
+            signer = signer.entitlements(entitlements);
+        }
+
         if let Some(ref id) = self.bundle_id {
             signer = signer.bundle_id(id);
         }
@@ -475,6 +503,9 @@ impl ZSign {
         if let Some(ref profile) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile);
         }
+        if let Some(entitlements) = &self.entitlements {
+            signer = signer.entitlements(entitlements);
+        }
         if let Some(ref bundle_id) = self.bundle_id {
             signer = signer.bundle_id(bundle_id.as_str());
         }
@@ -524,6 +555,48 @@ impl ZSign {
         }
         Ok(None)
     }
+
+    /// Reads and validates a custom entitlements file. Every rejection is a
+    /// hard error naming the path — silently falling back to the profile is
+    /// the upstream failure mode this port deliberately does not reproduce.
+    fn load_entitlements_override(&self) -> Result<Option<Vec<u8>>> {
+        let Some(path) = &self.entitlements else {
+            return Ok(None);
+        };
+        let data = std::fs::read(path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read entitlements file '{}': {e}", path.display()),
+            )
+        })?;
+        validate_entitlements_blob(&data, path)?;
+        Ok(Some(data))
+    }
+}
+
+/// Validates entitlements bytes against the blob contract: XML-or-binary
+/// plist, dictionary root, and DER-encodable by the signer's encoder —
+/// the same three checks the wasm setter runs before accepting an override.
+pub(crate) fn validate_entitlements_blob(data: &[u8], source: &Path) -> crate::Result<()> {
+    let value: plist::Value = plist::from_bytes(data).map_err(|e| {
+        Error::Core(zsign_core::Error::Config(format!(
+            "entitlements file '{}' is not a valid plist: {e}",
+            source.display()
+        )))
+    })?;
+    if value.as_dictionary().is_none() {
+        return Err(Error::Core(zsign_core::Error::Config(format!(
+            "entitlements file '{}' must contain a top-level dictionary",
+            source.display()
+        ))));
+    }
+    zsign_core::codesign::der::plist_to_der(data).map_err(|e| {
+        Error::Core(zsign_core::Error::DerEncoding(format!(
+            "entitlements in '{}' contain types the signer cannot encode: {e}",
+            source.display()
+        )))
+    })?;
+    Ok(())
 }
 
 impl Default for ZSign {
@@ -541,6 +614,7 @@ mod tests {
         let zsign = ZSign::default();
         assert!(zsign.credentials.is_none());
         assert!(zsign.provisioning_profile.is_none());
+        assert!(zsign.entitlements.is_none());
     }
 
     #[test]
@@ -1049,5 +1123,272 @@ mod tests {
         let result = ZSign::new().sign_macho(&input, &out_bin);
         assert!(matches!(result, Err(Error::MissingCredentials(_))));
         assert!(!out_bin.exists());
+    }
+
+    const OVERRIDE_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.override.app</string>
+    <key>com.zsign.override.ent</key>
+    <true/>
+</dict>
+</plist>"#;
+
+    /// Slot blob of the signed output's primary CodeDirectory, if any.
+    fn entitlements_slot_blob(signed: &[u8]) -> Option<String> {
+        use crate::codesign::constants::CSSLOT_ENTITLEMENTS;
+
+        let sb = thin_code_signature(signed);
+        sb.entries
+            .iter()
+            .find(|e| e.slot == CSSLOT_ENTITLEMENTS)
+            .map(|e| String::from_utf8_lossy(e.blob).into_owned())
+    }
+
+    #[test]
+    fn test_sign_macho_entitlements_override_replaces_profile() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("test.mobileprovision");
+        std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
+        let ents = dir.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        let out = dir.path().join("signed.bin");
+        ZSign::new()
+            .adhoc(true)
+            .provisioning_profile(&profile)
+            .entitlements(&ents)
+            .sign_macho(&input, &out)
+            .expect("adhoc sign with entitlements override");
+
+        let blob = entitlements_slot_blob(&std::fs::read(&out).unwrap())
+            .expect("entitlements slot must be present");
+        assert!(
+            blob.contains("com.zsign.override.ent"),
+            "override entitlements must be signed: {blob}"
+        );
+        assert!(
+            !blob.contains("com.zsign.test.entitlement"),
+            "the profile's entitlements must be fully replaced: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_entitlements_override_with_credentials() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("test.mobileprovision");
+        std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
+        let ents = dir.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        let out = dir.path().join("signed.bin");
+        ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .provisioning_profile(&profile)
+            .entitlements(&ents)
+            .sign_macho(&input, &out)
+            .expect("certificate sign with entitlements override");
+
+        let blob = entitlements_slot_blob(&std::fs::read(&out).unwrap())
+            .expect("entitlements slot must be present");
+        assert!(
+            blob.contains("com.zsign.override.ent"),
+            "override entitlements must be signed: {blob}"
+        );
+        assert!(
+            !blob.contains("com.zsign.test.entitlement"),
+            "the profile's entitlements must be fully replaced: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_adhoc_entitlements_override_without_profile() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ents = dir.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        let out = dir.path().join("signed.bin");
+        ZSign::new()
+            .adhoc(true)
+            .entitlements(&ents)
+            .sign_macho(&input, &out)
+            .expect("adhoc sign with entitlements only");
+
+        let blob = entitlements_slot_blob(&std::fs::read(&out).unwrap())
+            .expect("entitlements slot must be present without a profile");
+        assert!(
+            blob.contains("com.zsign.override.ent"),
+            "override entitlements must be signed: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_override_missing_file_names_path() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("absent.entitlements");
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+        let out = dir.path().join("signed.bin");
+
+        let err = ZSign::new()
+            .adhoc(true)
+            .entitlements(&missing)
+            .sign_macho(&input, &out)
+            .expect_err("a missing entitlements file must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("entitlements file"),
+            "the error must name the failure: {message}"
+        );
+        assert!(
+            message.contains("absent.entitlements"),
+            "the error must name the path: {message}"
+        );
+        assert!(
+            !out.exists(),
+            "no output may be written for a rejected override"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_override_rejects_non_dictionary() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ents = dir.path().join("array.entitlements");
+        std::fs::write(
+            &ents,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <string>nope</string>
+</array>
+</plist>"#,
+        )
+        .unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        let err = ZSign::new()
+            .adhoc(true)
+            .entitlements(&ents)
+            .sign_macho(&input, dir.path().join("signed.bin"))
+            .expect_err("a top-level array must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("dictionary"),
+            "the error must name the required shape: {message}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_override_rejects_unencodable_values() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ents = dir.path().join("real.entitlements");
+        std::fs::write(
+            &ents,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.zsign.override.real</key>
+    <real>1.5</real>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        let err = ZSign::new()
+            .adhoc(true)
+            .entitlements(&ents)
+            .sign_macho(&input, dir.path().join("signed.bin"))
+            .expect_err("Real values cannot be DER-encoded and must be rejected up front");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot encode") && message.contains("real.entitlements"),
+            "the DER gate must reject Real and name the file: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_forwards_entitlements_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("in.ipa");
+        write_ipa_fixture(&input);
+        let ents = dir.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
+        let out = dir.path().join("out.ipa");
+
+        ZSign::new()
+            .adhoc(true)
+            .entitlements(&ents)
+            .sign_ipa(&input, &out)
+            .expect("sign_ipa must forward the entitlements override");
+
+        let exe = ipa_entry(&out, "Payload/Test.app/Test");
+        let blob = entitlements_slot_blob(&exe)
+            .expect("the root binary must carry the forwarded override");
+        assert!(
+            blob.contains("com.zsign.override.ent"),
+            "sign_ipa must forward the override to IpaSigner: {blob}"
+        );
+
+        // The control path (no override) must not carry the slot at all.
+        let control = dir.path().join("control.ipa");
+        ZSign::new()
+            .adhoc(true)
+            .sign_ipa(&input, &control)
+            .expect("control sign");
+        assert!(
+            entitlements_slot_blob(&ipa_entry(&control, "Payload/Test.app/Test")).is_none(),
+            "without an override no entitlements slot may be emitted"
+        );
+    }
+
+    #[test]
+    fn test_sign_bundle_forwards_entitlements_override() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        let ents = dir.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
+
+        ZSign::new()
+            .adhoc(true)
+            .entitlements(&ents)
+            .sign_bundle(&app, None)
+            .expect("sign_bundle must forward the entitlements override");
+
+        let blob = entitlements_slot_blob(&std::fs::read(app.join("Test")).unwrap())
+            .expect("the root binary must carry the forwarded override");
+        assert!(
+            blob.contains("com.zsign.override.ent"),
+            "sign_bundle must forward the override to IpaSigner: {blob}"
+        );
     }
 }

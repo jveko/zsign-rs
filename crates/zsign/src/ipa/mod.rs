@@ -134,6 +134,8 @@ pub struct IpaSigner<'a> {
     weak_dylibs: bool,
     /// Override the FairPlay-encryption refusal (sign an encrypted binary anyway).
     allow_encrypted: bool,
+    /// Custom entitlements file replacing the profile-derived entitlements
+    entitlements_override: Option<PathBuf>,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -154,6 +156,7 @@ impl<'a> IpaSigner<'a> {
             dylibs: Vec::new(),
             weak_dylibs: false,
             allow_encrypted: false,
+            entitlements_override: None,
         }
     }
 
@@ -170,6 +173,7 @@ impl<'a> IpaSigner<'a> {
             dylibs: Vec::new(),
             weak_dylibs: false,
             allow_encrypted: false,
+            entitlements_override: None,
         }
     }
 
@@ -188,6 +192,17 @@ impl<'a> IpaSigner<'a> {
     /// where errors can be properly propagated.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
         self.provisioning_profile_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets a custom entitlements file.
+    ///
+    /// The file must be an XML or binary plist with a top-level dictionary
+    /// whose values the signer can encode to DER; it replaces the
+    /// entitlements extracted from the provisioning profile and applies only
+    /// to the root app bundle. A rejected file fails the sign.
+    pub fn entitlements(mut self, path: impl AsRef<Path>) -> Self {
+        self.entitlements_override = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -304,6 +319,21 @@ impl<'a> IpaSigner<'a> {
         }
     }
 
+    /// Reads and validates the custom entitlements file, if one is set.
+    fn load_entitlements_override(&self) -> Result<Option<Vec<u8>>> {
+        let Some(path) = &self.entitlements_override else {
+            return Ok(None);
+        };
+        let data = fs::read(path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read entitlements file '{}': {e}", path.display()),
+            )
+        })?;
+        crate::builder::validate_entitlements_blob(&data, path)?;
+        Ok(Some(data))
+    }
+
     /// Signs an app bundle in place (`.app` folder signing).
     ///
     /// All Mach-O binaries are signed in place, the provisioning profile is
@@ -345,7 +375,8 @@ impl<'a> IpaSigner<'a> {
                 bundle_path.display()
             ))));
         }
-        let (profile_data, entitlements) = self.load_profile()?;
+        let (profile_data, profile_entitlements) = self.load_profile()?;
+        let entitlements = self.load_entitlements_override()?.or(profile_entitlements);
         self.sign_bundle(
             bundle_path,
             entitlements.as_deref(),
@@ -2123,6 +2154,123 @@ mod tests {
         assert_eq!(
             bundle.nested[0].path, "XPCServices/Foo.xpc",
             "the verifier must recognize the XPC bundle by the same predicate"
+        );
+    }
+    /// Provisioning profile whose entitlements differ from any override, so
+    /// precedence between the two is observable in the signed slot.
+    const OVERRIDE_TEST_PROFILE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.zsign.profile.entitlement</string>
+  </dict>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    const OVERRIDE_TEST_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.zsign.bundle.override.ent</key>
+    <true/>
+</dict>
+</plist>"#;
+
+    /// Blob of slot `slot` in `binary`'s superblob, if bound.
+    fn signature_slot_blob(binary: &Path, slot: u32) -> Option<Vec<u8>> {
+        use zsign_core::codesign::verify::parse_superblob;
+
+        let m = crate::macho::MachOFile::open(binary).unwrap();
+        let sl = &m.slices()[0];
+        let off = sl.code_sig_offset? as usize;
+        let len = sl.code_sig_size? as usize;
+        let sb = parse_superblob(&m.data()[off..off + len]).unwrap();
+        sb.entries
+            .iter()
+            .find(|e| e.slot == slot)
+            .map(|e| e.blob.to_vec())
+    }
+
+    /// An `.app` with an XPC service nested under `XPCServices/`, used to prove
+    /// the root-only scope of the entitlements override.
+    fn create_bundle_with_xpc(dir: &Path) -> PathBuf {
+        let app = create_folder_bundle(dir, "Test", true);
+        let xpc = app.join("XPCServices").join("Foo.xpc");
+        std::fs::create_dir_all(&xpc).unwrap();
+        std::fs::write(
+            xpc.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.test.foo.xpc</string>
+    <key>CFBundleExecutable</key><string>Foo</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(xpc.join("Foo"), crate::test_util::minimal_macho()).unwrap();
+        app
+    }
+
+    #[test]
+    fn test_entitlements_override_applies_to_root_bundle() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let ents = temp.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_TEST_ENTITLEMENTS).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements(&ents)
+            .sign_folder_in_place(&app)
+            .expect("signing with an entitlements override must succeed");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root main binary must carry the override entitlements");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.bundle.override.ent"),
+            "the override must reach the root binary's entitlements slot"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "the override must replace, not merge with, the profile's entitlements"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_override_not_inherited_by_nested() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_xpc(temp.path());
+        let ents = temp.path().join("custom.entitlements");
+        std::fs::write(&ents, OVERRIDE_TEST_ENTITLEMENTS).unwrap();
+
+        IpaSigner::new_adhoc()
+            .entitlements(&ents)
+            .sign_folder_in_place(&app)
+            .expect("signing with an entitlements override must succeed");
+
+        let nested = app.join("XPCServices/Foo.xpc/Foo");
+        assert!(
+            crate::macho::MachOFile::open(&nested).unwrap().slices()[0]
+                .code_sig_offset
+                .is_some(),
+            "the nested binary must be signed, or an absent entitlements slot proves nothing"
+        );
+        assert!(
+            signature_slot_blob(
+                &nested,
+                zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+            )
+            .is_none(),
+            "a nested bundle must not inherit the root's entitlements override"
         );
     }
 }
