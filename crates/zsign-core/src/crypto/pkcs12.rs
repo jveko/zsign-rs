@@ -197,6 +197,17 @@ impl<'a> DerReader<'a> {
         Ok((tag, value))
     }
 
+    /// The complete TLV at the current position — tag, length and value — as the
+    /// bytes stored in the input, and advances past it.
+    ///
+    /// Callers that must verify a signature over a structure need the responder's
+    /// own encoding, not a re-encoding of the parsed value: any non-canonical
+    /// length form the producer chose would be silently normalised away.
+    pub(crate) fn span_of_next_tlv(&mut self) -> Option<&'a [u8]> {
+        let start = self.pos;
+        self.read_tlv().ok()?;
+        Some(&self.buf[start..self.pos])
+    }
     /// Reads a definite BER length (short or long form).
     fn read_len(&mut self) -> Result<usize> {
         let first = self.read_byte()?;

@@ -933,7 +933,7 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
     const PASS: &str = "testpassword";
 
     #[test]
-    fn from_pem_loads_every_supported_key_form() {
+    fn from_pem_loads_every_supported_encrypted_key_form() {
         // Generated rather than committed: the certificate for each generated key is built the
         // same way `cms_verify.rs:1741-1776` builds its self-signed leaf, so key and certificate
         // agree by construction.

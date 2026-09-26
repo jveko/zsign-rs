@@ -33,6 +33,7 @@ pub mod cms;
 pub mod cms_verify;
 pub mod encrypted_pem;
 mod pkcs12;
+pub mod revocation;
 
 pub use cert::SigningCredentials;
 pub use cert::SigningKeyType;
