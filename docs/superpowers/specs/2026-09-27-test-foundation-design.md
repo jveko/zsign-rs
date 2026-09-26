@@ -191,17 +191,29 @@ are chain builders, payload keys, or parametrized factories and stay
 | `provisioning.rs:548` `signed_profile` | ~8 | **Keep** — must mint a fresh keypair per profile (CMS signature must differ) |
 | `benches/signing.rs:100` | 1 | **Keep** — bench-only (§3.2) |
 
-### 4.2 OnceLock mechanics
+### 4.2 OnceLock mechanics (landed as `LazyLock`)
+
+> **Implementation deviation (accepted at review, D1-ACCEPT):** the caches
+> are implemented with `std::sync::LazyLock::new(build_fn)` instead of
+> `OnceLock::get_or_init` — one-time, thread-safe, on-first-deref init,
+> semantically identical for this pattern. Basis: `LazyLock` is the repo's
+> only pre-existing static-cache idiom (`zsign-cli/src/main.rs` static
+> `BIN: LazyLock<PathBuf>`) while `OnceLock`/`get_or_init` occur nowhere
+> in the workspace, and AGENTS.md prohibits a second convention beside an
+> existing one. The ticket's "OnceLock credentials" requirement is
+> satisfied as the caching property. All four caches (canon, root, zsign
+> pair, cms pair) use it. See also §9 ledger.
 
 ```rust
-// crates/zsign-core/src/macho/fixtures.rs
-use std::sync::OnceLock;
-
-static CANON_CREDS: OnceLock<crate::crypto::SigningCredentials> = OnceLock::new();
+// crates/zsign-core/src/macho/fixtures.rs (credential items are #[cfg(test)])
+#[cfg(test)]
+static CANON_CREDS: LazyLock<crate::crypto::SigningCredentials> =
+    LazyLock::new(build_test_signing_credentials);
 
 /// Shared self-signed RSA-2048 code-signing credentials (cached after first call).
-pub fn test_signing_credentials() -> crate::crypto::SigningCredentials {
-    CANON_CREDS.get_or_init(build_canon_credentials).clone()
+#[cfg(test)]
+pub(crate) fn test_signing_credentials() -> crate::crypto::SigningCredentials {
+    CANON_CREDS.clone()
 }
 ```
 
@@ -451,6 +463,19 @@ formatting). Decision recorded here per brief; no `Cargo.toml` change.
 - Notes folded in: `make_fat_macho` length assert (`fixtures.rs:568`),
   equality-direction identity check in the pre-flight, evidence greps
   scoped to code/config (this doc's prose mentions `--skip`).
+
+- **D1 (implementation, accepted):** the four credential caches landed as
+  `std::sync::LazyLock` instead of the plan's `OnceLock::get_or_init`
+  (semantically identical one-time init; `LazyLock` is the repo's only
+  existing static-cache idiom at `zsign-cli/src/main.rs`, `OnceLock`
+  occurs nowhere — AGENTS.md forbids a second convention). §4.2 amended
+  to match. The implementer's cited "rs-lazylock rule" was not found in
+  `~/.omp/agent/rules/` and must not be repeated as justification; the
+  repo-idiom evidence above is the real basis.
+- **Task-6 review additions (all landed):** e1b gained a tamper-sibling
+  test; the e2 zip helper was replaced by production `create_ipa` after
+  review proved the hand-rolled writer flattened symlinks; one tautological
+  assertion was deleted; 8 new tests total (workspace 739 → 747).
 
 Round 2 reviews only whether these landed; prior findings weigh solely on
 landing, new material defects only.

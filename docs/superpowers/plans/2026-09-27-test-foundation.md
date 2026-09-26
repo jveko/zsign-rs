@@ -371,6 +371,15 @@ Subject: `test: route cross-crate macho fixtures through zsign-core (ZSN-30)`
 
 ### Task 5: Credential consolidation + `OnceLock` (design §4)
 
+> **Landed-as note (D1-ACCEPT):** the implementation uses
+> `std::sync::LazyLock::new(build_fn)` for all four caches instead of the
+> `OnceLock::get_or_init` sketches below — semantically identical, and
+> `LazyLock` is the repo's only existing static-cache idiom
+> (`zsign-cli/src/main.rs` static `BIN`). See design §4.2/§9. The
+> structure of every step below (split build fn + cached wrapper with
+> unchanged signature, `#[cfg(test)]` on fixtures items, the fresh-split,
+> the in-place zsign pair) is exactly as landed.
+
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cert.rs` (Clone derives)
 - Modify: `crates/zsign-core/src/macho/fixtures.rs` (OnceLock wrappers +
