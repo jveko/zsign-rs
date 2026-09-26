@@ -28,6 +28,9 @@ modules, no new predicates, no zsn41/zsn42 files touched.
   error), not incidental compile breakage of unrelated code. New-option compile
   failure (`cannot find method`) is acceptable red for the flag tests.
 - Commit subjects: lowercase imperative, ticket ID in subject only, never in code.
+- Commits use path-scoped `git add crates/... docs/...` — `git add -A` is
+  PROHIBITED mid-lane: test runs create the untracked `.tmptmp/` scratch dir and
+  `.gitignore` edits belong to lane ZSN-30.
 
 ---
 
@@ -75,11 +78,16 @@ const OVERRIDE_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   - `test_sign_macho_adhoc_entitlements_override_without_profile`: adhoc +
     `-e` only → slot carries the override.
   - `test_entitlements_override_missing_file_names_path`: nonexistent path →
-    `Err`, message contains the file name and the label `entitlements file`.
+    `Err`; assert the substrings `entitlements file` and the file name survive
+    the layered rendering (`Error::Io` prefixes `IO error: ` around the inner
+    `failed to read entitlements file '<path>': <os>` — the same double prefix
+    d3dfaab accepts for profiles, builder.rs:511-519; substring asserts only).
   - `test_entitlements_override_rejects_non_dictionary`: top-level array plist →
     `Err` containing `dictionary`.
   - `test_entitlements_override_rejects_unencodable_values`: dict with a
-    `<date>` value (DER encoder rejects Real/Date per der.rs doc) → `Err`.
+    `<real>1.5</real>` value — the DER gate rejects Real but ACCEPTS Data/Date
+    (der.rs:284-302), so Real is the fixture (shape of der.rs's own
+    unsupported-real test :468-480) → `Err`.
 
 - [ ] **Step 1.2:** Run `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs entitlements_override -- --skip test_ipa_signing_is_deterministic`;
   expect compile failure `no method named 'entitlements'` (red).
@@ -130,13 +138,13 @@ const OVERRIDE_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// the same three checks the wasm setter runs before accepting an override.
 pub(crate) fn validate_entitlements_blob(data: &[u8], source: &std::path::Path) -> crate::Result<()> {
     let value: plist::Value = plist::from_bytes(data).map_err(|e| {
-        crate::Error::Core(zsign_core::Error::Signing(format!(
+        crate::Error::Core(zsign_core::Error::Config(format!(
             "entitlements file '{}' is not a valid plist: {e}",
             source.display()
         )))
     })?;
     if value.as_dictionary().is_none() {
-        return Err(crate::Error::Core(zsign_core::Error::Signing(format!(
+        return Err(crate::Error::Core(zsign_core::Error::Config(format!(
             "entitlements file '{}' must contain a top-level dictionary",
             source.display()
         ))));
@@ -151,9 +159,11 @@ pub(crate) fn validate_entitlements_blob(data: &[u8], source: &std::path::Path) 
 }
 ```
 
-(`Error::Plist` carries a `#[from] plist::Error` only, so path-naming parse
-rejections use `Error::Core(Error::Signing(..))`; `DerEncoding(String)` takes
-the message directly — both variants verified in `zsign-core/src/error.rs:31-38`.)
+(Variant choice, verified in `zsign-core/src/error.rs`: `Config(String)` :25-26
+and `DerEncoding(String)` :37-38 take path-named messages directly and render
+"Configuration error: …" / "DER encoding error: …"; `Error::Plist` is
+`#[from] plist::Error`-only, and `Error::Signing` would mislabel a user-input
+rejection as a signing failure — both rejected.)
 
 - [ ] **Step 1.4: IpaSigner plumbing.** Field `entitlements_override:
   Option<PathBuf>` + `pub fn entitlements(mut self, path: impl AsRef<Path>) ->
@@ -189,7 +199,9 @@ the message directly — both variants verified in `zsign-core/src/error.rs:31-3
   `"entitlements"` appended to `-V`'s `conflicts_with_all` list; forwarding in
   `run()` after the profile forward (:170-172).
 
-- [ ] **Step 1.6 (Tester): CLI tests** — `entitlements_flag_parses_short_and_long`,
+- [ ] **Step 1.6 (Tester): CLI tests** — `entitlements_flag_parses_short_and_long`
+  (parse `["zsign", "-a", "-e", "x.plist", "in.bin"]` and the long form — the
+  `-a` in both spells also pins the legal `-e`+`-a` combination),
   `verify_conflicts_with_entitlements` (both orders + alone-valid control,
   `parse_err` pattern :1573+).
 - [ ] **Step 1.7:** Run library + CLI scoped:
@@ -197,7 +209,7 @@ the message directly — both variants verified in `zsign-core/src/error.rs:31-3
   `TMPDIR=$PWD/.tmptmp cargo test -p zsign-cli -- --skip test_ipa_signing_is_deterministic`
   — green.
 - [ ] **Step 1.8:** `cargo fmt -p zsign-rs -p zsign-cli && cargo clippy -p zsign-rs --all-targets -- -D warnings && cargo clippy -p zsign-cli --all-targets -- -D warnings`.
-- [ ] **Step 1.9:** Commit: `git add -A && git commit -m "feat(signing): add custom entitlements file override (ZSN-10)"`
+- [ ] **Step 1.9:** Commit: `git add crates/ && git commit -m "feat(signing): add custom entitlements file override (ZSN-10)"`
   (red tests may share the commit; green is what the subject guarantees).
 
 ---
@@ -225,7 +237,9 @@ task: `-e` > dir(root id) > profile-derived > none.
     `com.zsign.evil`) one level above the dir → falls back to profile
     entitlements; evil marker absent from the slot.
   - `test_entitlements_dir_invalid_file_names_path`: dir file is garbage →
-    `Err` naming the file (and signing aborted before any mutation).
+    `Err` naming the file; no signing mutation happened (main binary's
+    superblob slot -5 absent, `_CodeSignature/` not written — the plan build
+    of design §3.1 validates every option input before the first sign write).
   CLI: `entitlements_dir_flag_parses`, `verify_conflicts_with_entitlements_dir`.
 - [ ] **Step 2.2:** Red run (`-- --skip test_ipa_signing_is_deterministic`),
   expect `no method named 'entitlements_dir'`.
@@ -330,13 +344,13 @@ task: `-e` > dir(root id) > profile-derived > none.
 - [ ] **Step 3.3 (Implementer): map loading.** `ZSign` + `IpaSigner` field
   `bundle_profiles: Vec<(String, PathBuf)>`, replacing setter
   `bundle_profiles(Vec<(String, PathBuf)>)`; forward in both rebind blocks.
-  IpaSigner loader (called once per run, before the bundle loop):
+  IpaSigner loader (called once per run, inside the pre-mutation plan build):
 
 ```rust
     /// Loads the exact-key nested-profile map. Root-id keys are rejected (the
     /// root profile belongs in `provisioning_profile`), as are ids that could
     /// escape the precedence lookup; every entry's bytes + derived
-    /// entitlements load up front so failures precede any mutation.
+    /// entitlements load during plan build, before the first sign write.
     fn load_bundle_profiles(&self, root_id: &str) -> Result<HashMap<String, ProfilePayload>> {
         let mut map = HashMap::new();
         for (id, path) in &self.bundle_profiles {
@@ -346,17 +360,17 @@ task: `-e` > dir(root id) > profile-derived > none.
                 || id.contains('\0')
                 || id.contains("..")
             {
-                return Err(Error::Core(zsign_core::Error::Signing(format!(
+                return Err(Error::Core(zsign_core::Error::Config(format!(
                     "invalid bundle id '{id}' in provisioning profile map"
                 ))));
             }
             if id == root_id {
-                return Err(Error::Core(zsign_core::Error::Signing(format!(
+                return Err(Error::Core(zsign_core::Error::Config(format!(
                     "profile map key '{id}' is the main bundle; the root profile belongs in --profile"
                 ))));
             }
             if map.contains_key(id) {
-                return Err(Error::Core(zsign_core::Error::Signing(format!(
+                return Err(Error::Core(zsign_core::Error::Config(format!(
                     "duplicate profile map key '{id}'"
                 ))));
             }
@@ -376,48 +390,64 @@ task: `-e` > dir(root id) > profile-derived > none.
     }
 ```
 
-- [ ] **Step 3.4 (Implementer): the resolver loop.** `sign_bundle` absorbs
-  resolution (its `entitlements`/`profile_data` params die), so the loop reads
-  (design §3.1; deep-first order and the dylib pass unchanged):
+- [ ] **Step 3.4 (Implementer): plan build + sign loop.** `sign_bundle`
+  absorbs resolution (its `entitlements`/`profile_data` params die). Ordering
+  per design §3.1: root rewrites (requested mutation) → `collect_nested_bundles`
+  + sort moved ABOVE the dylib pass (pure reads; the dylib pass becomes the
+  first sign mutation) → pre-mutation plan build → dylib pass → sign loop:
 
 ```rust
+        // --- plan build: read-only; every rejection lands here ---
         let root_id = self.get_bundle_identifier(bundle_path)?;
-        let (profile_data, profile_entitlements) = self.load_profile()?;
+        let (root_profile_data, root_profile_ent) = self.load_profile()?;
         let root_entitlements = self
             .load_entitlements_override()?
             .or(self.dir_hit(&root_id)?)
-            .or(profile_entitlements);
-        let mut profile_map = self.load_bundle_profiles(&root_id)?;
+            .or(root_profile_ent);
+        let profile_map = self.load_bundle_profiles(&root_id)?;
+        let mut plan: Vec<(PathBuf, Option<Vec<u8>>, Option<Vec<u8>>)> =
+            Vec::with_capacity(bundles.len());
         let mut nested_ids = Vec::new();
-        for (nested_bundle_path, _depth) in &bundles {
-            let is_main_bundle = nested_bundle_path == bundle_path;
-            let (entitlements, profile_data) = if is_main_bundle {
-                (root_entitlements.clone(), profile_data.clone())
-            } else {
-                let id = self.get_bundle_identifier(nested_bundle_path)?;
-                nested_ids.push(id.clone());
-                match profile_map.remove(&id) {
-                    Some((pd, pe)) => (self.dir_hit(&id)?.or(pe), pd),
-                    None => (self.dir_hit(&id)?, None),
-                }
-            };
+        for (path, _depth) in &bundles {
+            if path == bundle_path {
+                plan.push((path.clone(), root_entitlements.clone(), root_profile_data.clone()));
+                continue;
+            }
+            let id = self.get_bundle_identifier(path)?;
+            nested_ids.push(id.clone());
+            let mapped = profile_map.get(&id);
+            let entitlements = self
+                .dir_hit(&id)?
+                .or_else(|| mapped.and_then(|(_, ent)| ent.clone()));
+            plan.push((path.clone(), entitlements, mapped.map(|(data, _)| data.clone())));
+        }
+        let mut unused: Vec<&String> = profile_map
+            .keys()
+            .filter(|key| !nested_ids.iter().any(|id| id == *key))
+            .collect();
+        if !unused.is_empty() {
+            unused.sort();
+            nested_ids.sort();
+            return Err(Error::Core(zsign_core::Error::Config(format!(
+                "provisioning profile map keys matched no bundle: {unused:?}; nested bundle ids: {nested_ids:?}"
+            ))));
+        }
+        // --- only now does anything mutate ---
+        dylibs
+            .par_iter()
+            .try_for_each(|dylib_path| self.sign_standalone_dylib(bundle_path, dylib_path))?;
+        for (path, entitlements, profile_data) in &plan {
             self.sign_single_bundle(
-                nested_bundle_path,
+                path,
                 entitlements.as_deref(),
                 profile_data.as_deref(),
                 &already_signed,
             )?;
         }
-        if !profile_map.is_empty() {
-            let mut unused: Vec<_> = profile_map.keys().cloned().collect();
-            unused.sort();
-            nested_ids.sort();
-            return Err(Error::Core(zsign_core::Error::Signing(format!(
-                "provisioning profile map keys matched no bundle: {unused:?}; nested bundle ids: {nested_ids:?}"
-            ))));
-        }
 ```
 
+  (`already_signed` keeps its current construction at :391 — built from the
+  dylib list before the sign loop, semantics unchanged.)
   `sign_single_bundle`: drop the `copy_provisioning_profile: bool` param; embed
   iff `profile_data` is `Some` (the block at :711-723 unwraps one level).
   Update the `sign_bundle` doc step list (:367-370) from "main app only" to
@@ -437,9 +467,11 @@ task: `-e` > dir(root id) > profile-derived > none.
 
   free fn `fn parse_profile_map(s: &str) -> std::result::Result<(String, PathBuf), String>`
   via `split_once('=')` requiring both sides non-empty (error message:
-  `"expected bundle-id=path, got '{s}'"`); add `"profile_map"` (the field id)
-  to `-V`'s conflict list; `run()` forwards `signer.bundle_profiles(cli.profile_map.clone())`
-  when non-empty.
+  `"expected bundle-id=path, got '{s}'"`); add `"profile_map"` to `-V`'s
+  conflict list — `-V`'s `conflicts_with_all` entries are clap FIELD ids
+  (snake_case), matching the existing `"sha256_only"`/`"bundle_id"` entries
+  (main.rs:117-133, verified convention); `run()` forwards
+  `signer.bundle_profiles(cli.profile_map.clone())` when non-empty.
 - [ ] **Step 3.6:** Green runs (filters `profile_map` + ipa mod, then
   `-p zsign-cli`); confirm :1766/:2111 pins pass unchanged. fmt/clippy scoped.
   Commits: red-test commit, then
@@ -453,7 +485,7 @@ task: `-e` > dir(root id) > profile-derived > none.
 - Modify: `crates/zsign-core/src/provisioning.rs` (new `profile_document` +
   refactor of `extract_entitlements_from_profile` :385-407; its tests mod)
 - Modify: `crates/zsign/src/ipa/mod.rs` (cascade rewrite after root rewrite;
-  entitlements transform in the resolver loop; helpers; tests)
+  entitlements transform during plan build; helpers; tests)
 - NOT modified: `crates/zsign/src/builder.rs`, CLI (the trigger is the
   existing `-b`/`bundle_id` surface)
 
@@ -532,14 +564,15 @@ fn replace_id_prefix(value: &str, old: &str, new: &str) -> Option<String> {
   only when a string value passes `replace_id_prefix`. One read-modify-write
   per bundle; serialize XML like `rewrite_plist_string` (:821-827). Caller: in
   `sign_bundle`, capture `old_root_id = self.get_bundle_identifier(bundle_path)?`
-  BEFORE the root rewrites, then after `collect_nested_bundles` (:393-395) and
-  BEFORE the resolver loop, run the cascade when `self.bundle_id` is `Some`.
-  (Move collection above the dylib pass if that keeps ordering honest —
-  discovery does not depend on signing.)
-- [ ] **Step 4.5 (Implementer): entitlements transform.** In the resolver loop,
-  after `entitlements` resolves and when the trigger is active, for the bundle's
-  OLD/NEW ids (nested: from the cascade map path→(old,new); root: old_root/
-  new_root):
+  BEFORE the root rewrites; run the cascade after `collect_nested_bundles`
+  (Task 3 moved collection above the dylib pass) and BEFORE plan build, so
+  every subsequent id read sees the rewritten value; when the trigger is set,
+  also record the path→(old_id,new_id) map for Step 4.5's per-bundle
+  entitlements transform (root pair: old_root_id/new_root).
+- [ ] **Step 4.5 (Implementer): entitlements transform.** During plan build
+  (design §3.1 step 5), before pushing each plan entry, when the trigger is
+  active transform that bundle's resolved entitlements using its OLD/NEW ids
+  (nested: from the cascade map path→(old,new); root: old_root/new_root):
 
 ```rust
 /// Aligns signature entitlements with a changed bundle id (design §3.5):
@@ -565,7 +598,8 @@ fn rewrite_entitlements_for_id(
   `fn profile_is_distribution(profile_data: Option<&[u8]>) -> bool` = document
   present and lacks `ProvisionedDevices` (get-task-allow untouched when no
   profile resolves at all — design D7). Applied per bundle to the bundle's own
-  resolved `(entitlements, profile_data)`, root included.
+  resolved `(entitlements, profile_data)`, root included, inside plan build —
+  so a bad profile document still fails before any sign write.
 - [ ] **Step 4.6:** Green runs (filters above; full `-p zsign-rs ipa::` mod;
   `-p zsign-core` provisioning tests). fmt/clippy scoped on the three touched
   packages. Commits: red-test commit, then
@@ -585,9 +619,14 @@ fn rewrite_entitlements_for_id(
   - `test_remove_embedded_profile_strips_every_bundle`: folder fixture pre-seeds
     `embedded.mobileprovision` (junk bytes) at root AND in `PlugIns/Ext.appex`
     (source-shipped profiles); `remove_embedded_profile(true)`, no profile
-    options → after `sign_folder_in_place` both files are gone, and
-    `crate::verify::verify_bundle` on the result reports the tree valid (no
-    `missing` findings) — the seal never references them (design §3.6).
+    options → after `sign_folder_in_place` both files are gone, and the result
+    SELF-SEALS: `crate::verify::verify_bundle`'s `code_resources` report has no
+    `missing`/`mismatched` finding mentioning `embedded.mobileprovision`. Do
+    NOT assert the full `valid()` tree — CMS-anchor validity of the
+    self-signed `test_credentials()` fixture fails by construction
+    ("not anchored to a trusted root", pattern pinned at
+    `zsign-core/src/macho/verify.rs:949-965`); assert exactly the
+    CodeResources dimension plus file absence.
   - `test_remove_embedded_profile_skips_embed_but_keeps_derived_entitlements`:
     `-m` root profile + map entry for the appex + `-R` → no
     `embedded.mobileprovision` at root or appex; root slot keeps profile
@@ -652,9 +691,9 @@ fn rewrite_entitlements_for_id(
 |---|---|---|
 | ZSN-10 | `-e` overrides profile-derived ents on every surface; adhoc honors it; invalid input hard-fails naming the path; wasm untouched (already conforms) | Task 1 steps 1.1-1.9 (6 library tests + 2 CLI tests; wasm item-0 verify-then-skip) |
 | ZSN-22 | `<dir>/<id>.plist` beats profile for the root; miss falls back; traversal-shaped ids never escape; precedence table as designed | Task 2 steps 2.1-2.4 + design §3.2 |
-| ZSN-12 | nested bundle embeds its OWN mapped profile before seal + derives its ents from it; unknown nested = today's default (ZSN-34 pins green); unused/root/duplicate keys error; `-p`-style mapping documented as our extension after the mis-citation finding | Task 3 steps 3.1-3.6 + design §3.4 |
+| ZSN-12 | nested bundle embeds its OWN mapped profile before seal + derives its ents from it; unknown nested = today's default (ZSN-34 pins green); unused/root/duplicate keys error before the first sign write; mapping flag design recorded after the mis-citation finding | Task 3 steps 3.1-3.6 + design §3.4 |
 | ZSN-11 | `-b` cascades nested ids + dependent keys (documented set only), rewrites application-identifier/keychain-access-groups to prefix+own id, drops get-task-allow for distribution, never touches app groups; child profiles resolve by rewritten id | Task 4 steps 4.1-4.6 |
-| ZSN-20 | no `embedded.mobileprovision` at any level, output self-verifies, derive-but-don't-embed with maps | Task 5 steps 5.1-5.4 |
+| ZSN-20 | no `embedded.mobileprovision` at any level; output self-seals (CodeResources report free of profile missing-findings; anchor-gated dimensions not asserted); derive-but-don't-embed with maps | Task 5 steps 5.1-5.4 |
 | — | defaults unchanged | invariant-1 controls: existing :1766/:2111 pins + Task 4 verbatim control test |
 
 ## Self-review checklist

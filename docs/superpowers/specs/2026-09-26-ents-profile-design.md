@@ -23,7 +23,7 @@ numbers date 2026-09-24; "~350 commits" note honored.
 |---|---|---|
 | ZSN-10: "ZSign state has no entitlements field (builder.rs:79-88)" | TRUE, shifted | `ZSign` struct `crates/zsign/src/builder.rs:77-89` (11 fields, none for entitlements); setters :146-238; `IpaSigner` likewise single `provisioning_profile_path` `crates/zsign/src/ipa/mod.rs:116-136` |
 | ZSN-10: "adhoc sign_macho branch must honor override; ab8ced8 made adhoc apply profile ents" | LANDED as described | ab8ced8 = `builder.rs:320-330`: `sign_macho` loads profile ents via `load_entitlements_from_profile` (:509-527) and passes them to `sign_macho_adhoc` (the two `None`s are `info_plist`/`code_resources`); pinned by `test_sign_macho_adhoc_applies_profile_entitlements` builder.rs:973-1017 |
-| ZSN-10: "wasm has a validated entitlements setter (ZSN-40)" | LANDED | `crates/zsign-wasm/src/lib.rs`: `profile_entitlements`+`entitlements_override` :204-205, `set_entitlements` 4-gate validation :269-302 (size, plist parse, dict root, `plist_to_der` encodability), `effective_entitlements` override-first :304-308; tests :1052, :1075 |
+| ZSN-10: "wasm has a validated entitlements setter (ZSN-40)" | LANDED | `crates/zsign-wasm/src/lib.rs`: `profile_entitlements`+`entitlements_override` :204-205, `set_entitlements` 4-gate validation :269-302 (size, plist parse, dict root, `plist_to_der` encodability), `effective_entitlements` override-first :304-308; tests :1052, :1075 — caveat: `:1075` (the invalid-input test) is guest-only (`#[wasm_bindgen_test]` without `unsupported = test`), so the DER arm's only host-pinned precedent is `test_plist_to_der_unsupported_real_type` (der.rs:468-480); Task 1 re-pins every gate host-side natively |
 | ZSN-22: per-bundle entitlements picking | ABSENT | no `entitlements_dir`/`-e` anywhere in CLI (flag inventory main.rs:21-140: `-e`, `-R` free; `-p`=password :55, `-r`=bundle_version :78, `-m`=profile :48) |
 | ZSN-12: "root-only branch passes entitlements=None/profile_data=None for nested (ipa/mod.rs:380-386)" | TRUE, shifted | `ipa/mod.rs:397-405`; nulling at :402 (ents) / :403 (profile); embed gate is `copy_provisioning_profile: bool` param of `sign_single_bundle` :684 fed by `is_main_bundle` :401, embed block :711-721 |
 | ZSN-12: "extensions get NO profile" | TRUE | zero production callers of profile-per-bundle logic; nested bundles keep whatever the source archive shipped (extract writes every entry verbatim; `ipa/extract.rs` has no profile handling) |
@@ -131,21 +131,25 @@ shared with the verifier — ZSN-34 invariant).
 ### 3.1 Pipeline shape
 
 ```
-sign_bundle_from_options (ipa/mod.rs:337)
-  1. capture old_root_id = CFBundleIdentifier of the root (pre-rewrite)
+sign_bundle (option resolution absorbed; entry: sign_bundle_from_options :337)
+  1. capture old_root_id = root CFBundleIdentifier (pre-rewrite)
   2. root Info.plist rewrites (existing :377-385)   [unchanged entry point]
-  3. ZSN-11 cascade (only when bundle_id override set):
-       nested CFBundleIdentifier substring old→new,
-       WKCompanionAppBundleIdentifier, WKAppBundleIdentifier
-       (top level AND NSExtension>NSExtensionAttributes>)  [new]
-  4. build BundleResolver once (load + validate all inputs; hard-fail errors)
-  5. collect + sort bundles deepest-first (existing :393-395)
-  6. per bundle b (its identity = post-rewrite CFBundleIdentifier):
-       resources = resolver.resources_for(id(b))
-       ents      = ZSN-11 entitlements transform (only when override active)
+  3. collect + sort bundles deepest-first (existing :393-395)
+  4. ZSN-11 cascade (only when bundle_id override set): nested
+       CFBundleIdentifier, WKCompanionAppBundleIdentifier,
+       WKAppBundleIdentifier (top level AND NSExtension>NSExtensionAttributes>)
+       rewritten by the boundary-aware rule (value == old, or old = prefix of
+       a sub-id; NEVER a bare substring)                        [new]
+  5. build the resolution plan ONCE, before the first sign mutation: for each
+       bundle (deepest-first) read its id, resolve (entitlements, profile)
+       through the precedence table — every option-input read/validate (-e,
+       dir hits, map loads) and the unused-key check (map keys vs discovered
+       nested ids) happen here; failure aborts before any binary is signed
+  6. ZSN-11 entitlements transform (when override active) during plan build
+  7. dylib pass (existing :387-391) then the sign loop from the plan:
        sign_single_bundle(b, ents, profile_data, already_signed)
-       embed embedded.mobileprovision iff profile_data.is_some() && !remove_profile
-       strip existing embedded.mobileprovision when remove_profile (before seal)
+       embed embedded.mobileprovision iff plan profile_data.is_some() && !remove_profile
+       strip existing embedded.mobileprovision when remove_profile (before signing/seal)
 ```
 
 `sign_single_bundle` loses its `copy_provisioning_profile: bool` parameter (the
@@ -186,10 +190,13 @@ Validation gate for every entitlements source (`-e` file AND each directory hit)
 identical in spirit to the existing wasm setter (`zsign-wasm/src/lib.rs:269-302`,
 which is REUSED, not replaced): read file (path-named error per the `d3dfaab`
 convention) → `plist::from_bytes` must parse → root must be a dictionary →
-`zsign_core::codesign::der::plist_to_der` must encode (types the signer cannot
-embed fail at set-consumption time, not half-way through signing). Silently
-ignoring an unreadable/invalid `-e` is prohibited — that is upstream bug #303 and
-our contract is the opposite.
+`zsign_core::codesign::der::plist_to_der` must encode. The encoder today
+accepts Data/Date and rejects Real and out-of-range integers
+(`der.rs:284-302`, `:609-612`) — the wasm setter's inline comment claiming
+"Data/Date/Real are rejected" overstates (recorded for the docs lane). Types
+the signer cannot embed fail at load time, not half-way through signing.
+Silently ignoring an unreadable/invalid `-e` is prohibited — that is upstream
+bug #303 and our contract is the opposite.
 
 CLI (`crates/zsign-cli/src/main.rs`): `-e/--entitlements <path>`,
 `--entitlements-dir <dir>`, repeatable `--profile-map <BUNDLE_ID>=<PATH>`
@@ -207,13 +214,14 @@ CLI (`crates/zsign-cli/src/main.rs`): `-e/--entitlements <path>`,
 :296-304). Rejections at build time: empty id, duplicate id, id equal to the root
 bundle's identifier ("the root profile belongs in `--profile`"), id containing a
 path separator or `..` component (never legal, and it is the lookup key for the
-entitlements directory too). After the bundle loop, an entry that matched no
-bundle is a hard error listing unused keys and the bundle ids discovered
-(match's "readonly miss lists available profiles" posture, §2) — silent
-fallthrough to another profile (upstream's bug, bundle.cpp:411-421) is
-prohibited. Unknown nested bundle (present in the tree, absent from the map)
-keeps today's behavior: no profile, no entitlements — the map is opt-in per
-extension, so the ZSN-34 default pins (:2111-2113) stay green untouched.
+entitlements directory too). During the pre-sign plan build (§3.1 step 5), an
+entry whose key matches no discovered nested bundle id is a hard error listing
+unused keys and the discovered ids (match's "readonly miss lists available
+profiles" posture, §2) — before any on-disk mutation, and silent fallthrough to
+another profile (upstream's bug, bundle.cpp:411-421) is prohibited. Unknown
+nested bundle (present in the tree, absent from the map) keeps today's
+behavior: no profile, no entitlements — the map is opt-in per extension, so the
+ZSN-34 default pins (:2111-2113) stay green untouched.
 
 Embed order: the resolver's profile bytes reach `sign_single_bundle` before its
 CodeResources seal (:725), which is already the internal order of the current
@@ -252,9 +260,12 @@ recorded as a future seam, §7).
      **bundle's own resolved profile's** `Entitlements["application-identifier"]`,
      else the root profile's, else `TeamIdentifier[0]`, else the existing value's
      own prefix (never assume prefix == TeamID — TN2415:461).
-   - `keychain-access-groups`: substring replace `old_root`→`new_root` in each
-     entry's suffix, and every entry's prefix normalized to the prefix above
-     (TN2415:465: all prefixes must match); shared group names keep their suffix.
+  - `keychain-access-groups`: each entry's prefix normalized to the prefix
+    above (TN2415:465: all prefixes must match); an entry's suffix is rewritten
+    only when it IS the old id or a sub-id of it (`old.<rest>` → `new.<rest>`
+    via the same boundary-aware rule as the Info.plist cascade — never a bare
+    substring); shared names (`prefix.groupname`) keep their suffix verbatim
+    (rewriting them orphans existing keychain items, TN2319 migration warnings).
    - `get-task-allow`: removed iff a profile resolves for the signing AND that
      profile has no `ProvisionedDevices` (distribution, TN2319:225). No profile →
      key untouched (cert-type sniffing would mean crypto-lane internals — seam).
@@ -385,8 +396,13 @@ rejected alternatives are recorded here with the tradeoff that killed them.
    own final CFBundleIdentifier>`, all `keychain-access-groups` prefixes equal
    that prefix, `get-task-allow` is absent when the bundle's resolved profile is
    distribution, and app-group values are byte-unchanged.
-5. Every input rejection happens before any on-disk mutation of the target tree
-   (resolver built and fully validated in step 4 of §3.1, before step 6 signs).
+5. Every option-input rejection happens before the first SIGN mutation of the
+   target tree (the pre-sign plan build of §3.1 step 5 performs every option
+   read and validation — including directory hits and unused-map-key detection
+   — before the first binary is signed, embedded, or sealed; the only earlier
+   writes are the explicitly requested CFBundle identity rewrites of steps
+   2/4, which are pure data edits, not signing output; the only fallible step
+   afterwards is fs I/O itself).
 6. No new entitlements slots for non-executables, no profile for standalone
    dylibs/frameworks (fe176bd / ZSN-34 contract).
 
@@ -421,8 +437,10 @@ Acceptance probes per ticket (observable outcomes, not plumbing):
   `com.new.app.appex`, its `WKAppBundleIdentifier`/`WKCompanionAppBundleIdentifier`
   rewrote, signature `application-identifier` = `<prefix>.com.new.app.appex`,
   distribution profile drops `get-task-allow`, `group.*` entries byte-unchanged.
-- ZSN-20: no `embedded.mobileprovision` at root or nested in output; `verify_*`
-  still reports the tree valid (no `missing` findings).
+- ZSN-20: no `embedded.mobileprovision` at root or nested in output; the tree
+  self-seals — `verify_bundle`'s CodeResources report has no missing/mismatched
+  finding for the profile path (CMS-anchor validity of the self-signed fixture
+  is NOT asserted; see plan Task 5 wording).
 
 ## 7. Out of scope and seams for other lanes
 
