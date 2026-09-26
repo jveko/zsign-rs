@@ -86,8 +86,9 @@ references are dead; current files are `src/zsign.cpp`, `src/bundle.cpp`,
   (`TEAM.*`) must be materialized to `TEAM.<bundle-id>` (tn2415:461).
 - `keychain-access-groups`: `"<prefix>.<suffix>"` entries; **all prefixes must match**
   the App ID prefix (tn2415:465); default group = first entry. On an id/team change:
-  rewrite the prefix of every entry; rewrite an entry's suffix only when it equals
-  the old bundle id (shared group names keep their suffix — rewriting orphans
+  rewrite the prefix of every entry; rewrite an entry's suffix only when it
+  equals the old bundle id or one of its sub-ids (`old.<rest>`) (shared group
+  names keep their suffix — rewriting orphans
   keychain items, TN2319 migration warnings). The "max 5 groups" claim is
   undocumented folklore [librarian INFERENCE; not enforced].
 - `get-task-allow`: true on development profiles, false/absent on distribution
@@ -246,13 +247,16 @@ entitlements; the wildcard-App-ID materialization for profile-less re-signs is
 recorded as a future seam, §7).
 
 1. **Info.plist cascade (before resolution).** Capture `old_root` (root
-   CFBundleIdentifier pre-rewrite). For every discovered nested bundle: substring
-   replace `old_root` → `new_root` in its `CFBundleIdentifier` when it starts with
-   `old_root`; same replacement in `WKCompanionAppBundleIdentifier` (watch apps)
+   CFBundleIdentifier pre-rewrite). For every discovered nested bundle, apply
+   the boundary-aware replacement (value equals `old_root`, or `old_root`
+   followed by `.` prefixes the remainder — never a bare substring, so a
+   sibling like `com.old.test` cannot match `com.old`): in its
+   `CFBundleIdentifier`, in `WKCompanionAppBundleIdentifier` (watch apps),
    and in `WKAppBundleIdentifier` at top level and under
-   `NSExtension→NSExtensionAttributes` (legacy location, TN2319:357-359) when the
-   keys exist. Keys are never created. `HostBundleIdentifier` is NOT handled —
-   not an Apple-documented key (§2) and upstream doesn't touch it.
+   `NSExtension→NSExtensionAttributes` (legacy location, TN2319:357-359) —
+   each only when the key exists. Keys are never created.
+   `HostBundleIdentifier` is NOT handled — not an Apple-documented key (§2)
+   and upstream doesn't touch it.
 2. **Per-bundle entitlements transform (after resolution, on the bundle's own
    resolved entitlements; a bundle with no entitlements gets none invented):**
    - `application-identifier` := `<prefix>.<this bundle's id>` when the key is
@@ -356,9 +360,10 @@ rejected alternatives are recorded here with the tradeoff that killed them.
   app-identifier/KCG on every sign would churn byte-identical re-signs and
   surprise the (rare) user whose profile has no `application-identifier`. Team
   changes are expressed as new profile + new id, which the trigger covers.
-  Prefix source chain (profile app-id → TeamIdentifier[0] → existing prefix) and
-  "never assume prefix == TeamID" follow TN2415:453-477; KCG suffix rewrite only
-  when it equals the old id, shared suffixes untouched (keychain-item orphans,
+  Prefix source chain (bundle's own profile app-id → root profile's app-id →
+  TeamIdentifier[0] → existing prefix) and "never assume prefix == TeamID"
+  follow TN2415:453-477; KCG suffix rewrite only when it equals the old id or
+  a sub-id of it, shared suffixes untouched (keychain-item orphans,
   TN2319); app-groups never rewritten (§2). `get-task-allow` removal is
   profile-driven (`ProvisionedDevices` absence = distribution); cert-EKU sniffing
   is a crypto-lane seam, §7.
@@ -391,7 +396,9 @@ rejected alternatives are recorded here with the tradeoff that killed them.
 3. `embedded.mobileprovision` is absent from a bundle's CodeResources seal iff the
    file is absent from disk when the seal is generated (embed-before-seal,
    strip-before-seal), so every signing output self-verifies.
-4. With the ZSN-11 trigger active, after signing, for every bundle: the
+4. With the ZSN-11 trigger active, after signing, for every bundle whose
+   signature carries entitlements (bundles resolving to none get none
+   invented — stage 2 of §3.5): the
    signature's `application-identifier` equals `<resolved-prefix>.<the bundle's
    own final CFBundleIdentifier>`, all `keychain-access-groups` prefixes equal
    that prefix, `get-task-allow` is absent when the bundle's resolved profile is

@@ -88,6 +88,18 @@ const OVERRIDE_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     `<real>1.5</real>` value — the DER gate rejects Real but ACCEPTS Data/Date
     (der.rs:284-302), so Real is the fixture (shape of der.rs's own
     unsupported-real test :468-480) → `Err`.
+  - Bundle-path pins (ipa/mod.rs tests mod; that mod needs its own profile
+    fixture const — copy the inline-XML `PROFILE_FIXTURE` pattern from
+    builder.rs :960):
+  - `test_entitlements_override_applies_to_root_bundle`: `sign_folder_in_place`
+    with entitlements file + provisioning profile → the ROOT main binary's
+    `CSSLOT_ENTITLEMENTS` carries the override marker (pins the
+    builder→IpaSigner rebind forwarding end-to-end, not just the bare path).
+  - `test_entitlements_override_not_inherited_by_nested`: same run with an
+    appex fixture present → the appex main binary carries NO
+    `CSSLOT_ENTITLEMENTS` slot at all (design §3.2 nested row / §5 invariant 2:
+    the override never reaches nested bundles; green from Task 1 onward via
+    the current nested-None default and stays pinned through Task 3).
 
 - [ ] **Step 1.2:** Run `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs entitlements_override -- --skip test_ipa_signing_is_deterministic`;
   expect compile failure `no method named 'entitlements'` (red).
@@ -253,9 +265,13 @@ task: `-e` > dir(root id) > profile-derived > none.
 
 ```rust
     /// Exact-key entitlements directory hit: `<dir>/<bundle-id>.plist`.
-    /// Ids with separators, `..` components, or NUL never hit the directory
-    /// (they are malformed identities, and reading through them is an escape).
-    fn entitlements_from_dir(&self, dir: &Path, bundle_id: &str) -> Result<Option<Vec<u8>>> {
+    /// `Ok(None)` when no directory is configured, and for ids containing
+    /// separators, `..` components, or NUL — malformed identities must never
+    /// read a file through the directory (that is an escape).
+    fn dir_hit(&self, bundle_id: &str) -> Result<Option<Vec<u8>>> {
+        let Some(dir) = &self.entitlements_dir else {
+            return Ok(None);
+        };
         if bundle_id.is_empty()
             || bundle_id.contains('/')
             || bundle_id.contains('\\')
@@ -292,10 +308,9 @@ task: `-e` > dir(root id) > profile-derived > none.
 ```
 
   with `root_id = self.get_bundle_identifier(bundle_path)?` computed after the
-  existing rewrites, and `dir_hit` returning `Ok(None)` when
-  `entitlements_dir` is unset. (`sign_bundle`'s `entitlements`/`profile_data`
-  params may be restructured by this move — Task 3 finalizes the signature
-  either way; keep `sign_bundle` compiling green at task end.)
+  existing rewrites. (`sign_bundle`'s `entitlements`/`profile_data` params may
+  be restructured by this move — Task 3 finalizes the signature either way;
+  keep `sign_bundle` compiling green at task end.)
 - [ ] **Step 2.4:** Green runs (library filters `entitlements_dir`, CLI
   package), fmt/clippy scoped, then commits: red-test commit, then
   `git commit -m "feat(signing): add bundle-keyed entitlements directory (ZSN-22)"`.
@@ -451,8 +466,8 @@ task: `-e` > dir(root id) > profile-derived > none.
   `sign_single_bundle`: drop the `copy_provisioning_profile: bool` param; embed
   iff `profile_data` is `Some` (the block at :711-723 unwraps one level).
   Update the `sign_bundle` doc step list (:367-370) from "main app only" to
-  per-bundle resolution wording. `dir_hit(id)` = Task 2's
-  `entitlements_from_dir` against `self.entitlements_dir`, `Ok(None)` unset.
+  per-bundle resolution wording. `dir_hit(id)` is the Task 2 single-argument
+  helper (unset `entitlements_dir` → `Ok(None)`).
 - [ ] **Step 3.5 (Implementer): CLI.** After `profile` in `Cli`:
 
 ```rust
@@ -530,11 +545,43 @@ task: `-e` > dir(root id) > profile-derived > none.
 /// consistent with the profile bytes about to be embedded (App ID prefix,
 /// team, distribution shape); trust decisions belong to
 /// [`validate_and_extract_profile`].
-pub fn profile_document(profile_data: &[u8]) -> Result<plist::Value> { /* scan + parse as :386-402 */ }
+///
+/// Returns [`Err`] when no embedded XML plist is found, the boundaries are
+/// inverted, or the slice fails to parse.
+pub fn profile_document(profile_data: &[u8]) -> Result<plist::Value> {
+    let plist_start = profile_data
+        .windows(6)
+        .position(|w| w == b"<?xml ")
+        .ok_or_else(|| Error::ProvisioningProfile("No XML plist found in profile data".into()))?;
+    let plist_end = profile_data
+        .windows(8)
+        .rposition(|w| w == b"</plist>")
+        .ok_or_else(|| Error::ProvisioningProfile("No closing </plist> tag found".into()))?
+        + 8;
+    if plist_start >= plist_end {
+        return Err(Error::ProvisioningProfile(
+            "Invalid plist boundaries".into(),
+        ));
+    }
+    let plist: plist::Value = plist::from_bytes(&profile_data[plist_start..plist_end])
+        .map_err(|e| Error::ProvisioningProfile(format!("Failed to parse plist: {}", e)))?;
+    Ok(plist)
+}
 ```
 
-  `extract_entitlements_from_profile` becomes
-  `profile_document(...)?.as_dictionary()… entitlements_to_xml(dict)`.
+  `extract_entitlements_from_profile` (:385-407) becomes — full body, the scan
+  lines deleted from it and now living in `profile_document`:
+
+```rust
+pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<Vec<u8>>> {
+    let plist = profile_document(profile_data)?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| Error::ProvisioningProfile("Profile plist is not a dictionary".into()))?;
+    entitlements_to_xml(dict)
+}
+```
+
   Re-export convention (verified): `crates/zsign/src/lib.rs:48` has
   `pub use zsign_core::provisioning::extract_entitlements_from_profile;` —
   add the identical line for `profile_document` beside it; consumers call
@@ -553,53 +600,226 @@ fn replace_id_prefix(value: &str, old: &str, new: &str) -> Option<String> {
     let rest = value.strip_prefix(old)?.strip_prefix('.')?;
     Some(format!("{new}.{rest}"))
 }
+
+/// `replace_id_prefix` on a present top-level string key; returns whether
+/// it rewrote.
+fn rewrite_string_key(dict: &mut plist::Dictionary, key: &str, old: &str, new: &str) -> bool {
+    let Some(current) = dict.get(key).and_then(|v| v.as_string()).map(str::to_owned) else {
+        return false;
+    };
+    match replace_id_prefix(&current, old, new) {
+        Some(rewritten) => {
+            dict.insert(key.to_string(), plist::Value::String(rewritten));
+            true
+        }
+        None => false,
+    }
+}
 ```
 
-  `fn rewrite_nested_identifiers(&self, bundles: &[(PathBuf, usize)], root: &Path, old: &str, new: &str) -> Result<()>`:
-  for every bundle EXCEPT `root` (root already rewritten at :377-379): read
-  Info.plist (skip missing/parse-fail? No — nested bundles by discovery always
-  have one; propagate errors), then per dictionary mutate: `CFBundleIdentifier`,
-  top-level `WKCompanionAppBundleIdentifier`, top-level `WKAppBundleIdentifier`,
-  and `NSExtension` → `NSExtensionAttributes` → `WKAppBundleIdentifier` — each
-  only when a string value passes `replace_id_prefix`. One read-modify-write
-  per bundle; serialize XML like `rewrite_plist_string` (:821-827). Caller: in
-  `sign_bundle`, capture `old_root_id = self.get_bundle_identifier(bundle_path)?`
-  BEFORE the root rewrites; run the cascade after `collect_nested_bundles`
-  (Task 3 moved collection above the dylib pass) and BEFORE plan build, so
-  every subsequent id read sees the rewritten value; when the trigger is set,
-  also record the path→(old_id,new_id) map for Step 4.5's per-bundle
-  entitlements transform (root pair: old_root_id/new_root).
-- [ ] **Step 4.5 (Implementer): entitlements transform.** During plan build
-  (design §3.1 step 5), before pushing each plan entry, when the trigger is
-  active transform that bundle's resolved entitlements using its OLD/NEW ids
-  (nested: from the cascade map path→(old,new); root: old_root/new_root):
+  Cascade method (returns the map Step 4.5 consumes — the old nested ids
+  exist nowhere else):
 
 ```rust
-/// Aligns signature entitlements with a changed bundle id (design §3.5):
-/// application-identifier := <prefix>.<new id>; every keychain-access-groups
-/// entry re-prefixed (all prefixes must match the App ID prefix — TN2415)
-/// with its suffix rewritten only when it was the old id; get-task-allow
-/// dropped for distribution profiles (TN2319); all other keys verbatim.
+    /// Cascades a bundle-id change into nested identity plists (design §3.5
+    /// stage 1): `CFBundleIdentifier`, `WKCompanionAppBundleIdentifier`,
+    /// top-level and `NSExtension→NSExtensionAttributes`
+    /// `WKAppBundleIdentifier`. Returns per-bundle (old, new) id pairs for
+    /// the entitlements transform; one read-modify-write per bundle.
+    fn rewrite_nested_identifiers(
+        &self,
+        bundles: &[(PathBuf, usize)],
+        root: &Path,
+        old: &str,
+        new: &str,
+    ) -> Result<HashMap<PathBuf, (String, String)>> {
+        let mut pairs = HashMap::new();
+        for (path, _depth) in bundles {
+            if path == root {
+                continue; // root rewritten by the existing requested rewrite
+            }
+            let info_plist = Self::resolve_relative(path, "Info.plist")?;
+            let data = fs::read(&info_plist)?; // discovery guarantees existence
+            let mut value: plist::Value = plist::from_bytes(&data).map_err(Error::Plist)?;
+            let dict = match value.as_dictionary_mut() {
+                Some(dict) => dict,
+                None => continue,
+            };
+            let mut modified = false;
+            if let Some(current) = dict
+                .get("CFBundleIdentifier")
+                .and_then(|v| v.as_string())
+                .map(str::to_owned)
+            {
+                if let Some(rewritten) = replace_id_prefix(&current, old, new) {
+                    dict.insert(
+                        "CFBundleIdentifier".to_string(),
+                        plist::Value::String(rewritten.clone()),
+                    );
+                    pairs.insert(path.clone(), (current, rewritten));
+                    modified = true;
+                }
+            }
+            modified |= rewrite_string_key(dict, "WKCompanionAppBundleIdentifier", old, new);
+            modified |= rewrite_string_key(dict, "WKAppBundleIdentifier", old, new);
+            if let Some(attrs) = dict
+                .get_mut("NSExtension")
+                .and_then(|v| v.as_dictionary_mut())
+                .and_then(|d| d.get_mut("NSExtensionAttributes"))
+                .and_then(|v| v.as_dictionary_mut())
+            {
+                modified |= rewrite_string_key(attrs, "WKAppBundleIdentifier", old, new);
+            }
+            if modified {
+                let mut buf = Vec::new();
+                plist::to_writer_xml(&mut buf, &value).map_err(|e| {
+                    Error::Core(zsign_core::Error::Signing(format!(
+                        "failed to serialize Info.plist for {}: {e}",
+                        path.display()
+                    )))
+                })?;
+                fs::write(&info_plist, &buf)?;
+            }
+        }
+        Ok(pairs)
+    }
+```
+
+  Caller: in `sign_bundle`, capture `old_root_id =
+  self.get_bundle_identifier(bundle_path)?` BEFORE the root rewrites; run the
+  cascade after `collect_nested_bundles` (Task 3 moved collection above the
+  dylib pass) and BEFORE plan build, binding `let id_pairs = …` when
+  `self.bundle_id` is `Some`.
+- [ ] **Step 4.5 (Implementer): entitlements transform.** During plan build
+  (design §3.1 step 5), before pushing each plan entry, when the trigger is
+  active and the entry's entitlements resolved to `Some`, transform them with
+  the bundle's OLD/NEW ids (`id_pairs` for nested; root pair old_root/new_root;
+  bundles with NO pair keep old = new = own id — the transform still
+  normalizes prefixes and get-task-allow for them):
+
+```rust
+/// Aligns signature entitlements with a changed bundle id (design §3.5
+/// stage 2). Keys outside the documented rewrite set — including
+/// `com.apple.security.application-groups` — are byte-preserved; bundles
+/// with no entitlements never reach here and none are invented.
 fn rewrite_entitlements_for_id(
     ents: &[u8],
     old_id: &str,
     new_id: &str,
     prefix: Option<&str>,
     drop_get_task_allow: bool,
-) -> Result<Vec<u8>>
+) -> Result<Vec<u8>> {
+    let mut value: plist::Value = plist::from_bytes(ents).map_err(|e| {
+        Error::Core(zsign_core::Error::Config(format!(
+            "resolved entitlements are not a valid plist: {e}"
+        )))
+    })?;
+    let dict = value.as_dictionary_mut().ok_or_else(|| {
+        Error::Core(zsign_core::Error::Config(
+            "resolved entitlements must be a dictionary".into(),
+        ))
+    })?;
+    let existing_prefix = dict
+        .get("application-identifier")
+        .or_else(|| dict.get("com.apple.application-identifier"))
+        .and_then(|v| v.as_string())
+        .and_then(|s| s.split('.').next())
+        .map(str::to_owned);
+    if let Some(prefix) = prefix.map(str::to_owned).or(existing_prefix) {
+        dict.insert(
+            "application-identifier".to_string(),
+            plist::Value::String(format!("{prefix}.{new_id}")),
+        );
+        if let Some(groups) = dict
+            .get_mut("keychain-access-groups")
+            .and_then(|v| v.as_array_mut())
+        {
+            for group in groups.iter_mut() {
+                let Some(text) = group.as_string().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(dot) = text.find('.') else {
+                    continue;
+                };
+                let suffix = &text[dot + 1..];
+                let suffix = replace_id_prefix(suffix, old_id, new_id)
+                    .unwrap_or_else(|| suffix.to_owned());
+                *group = plist::Value::String(format!("{prefix}.{suffix}"));
+            }
+        }
+    }
+    if drop_get_task_allow {
+        dict.remove("get-task-allow");
+    }
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, &value).map_err(|e| {
+        Error::Core(zsign_core::Error::Config(format!(
+            "failed to serialize rewritten entitlements: {e}"
+        )))
+    })?;
+    Ok(buf)
+}
+
+/// App-ID prefix chain (design §3.5/D7): own profile's Entitlements app-id
+/// prefix, then the root profile's, then either profile's
+/// `TeamIdentifier[0]`, then `None` (transform falls back to the resolved
+/// entitlements' own prefix). Never assumes prefix == TeamID (TN2415:461).
+fn app_id_prefix(own: Option<&[u8]>, root: Option<&[u8]>) -> Option<String> {
+    fn document(profile: &[u8]) -> Option<plist::Value> {
+        zsign_core::provisioning::profile_document(profile).ok()
+    }
+    for profile in own.iter().chain(root.iter()) {
+        let Some(doc) = document(profile) else { continue };
+        let app_id = doc
+            .as_dictionary()
+            .and_then(|d| d.get("Entitlements"))
+            .and_then(|e| {
+                e.get("application-identifier")
+                    .or_else(|| e.get("com.apple.application-identifier"))
+            })
+            .and_then(|v| v.as_string())
+            .and_then(|s| s.split('.').next())
+            .map(str::to_owned);
+        if app_id.is_some() {
+            return app_id;
+        }
+    }
+    for profile in own.iter().chain(root.iter()) {
+        let Some(doc) = document(profile) else { continue };
+        let team = doc
+            .as_dictionary()
+            .and_then(|d| d.get("TeamIdentifier"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_string())
+            .map(str::to_owned);
+        if team.is_some() {
+            return team;
+        }
+    }
+    None
+}
+
+/// Distribution detection (design D7): a resolved profile that lacks
+/// `ProvisionedDevices`. No resolved profile ⇒ never drop get-task-allow.
+fn profile_is_distribution(profile_data: Option<&[u8]>) -> bool {
+    let Some(profile) = profile_data else {
+        return false;
+    };
+    match zsign_core::provisioning::profile_document(profile) {
+        Ok(doc) => doc
+            .as_dictionary()
+            .is_some_and(|d| !d.contains_key("ProvisionedDevices")),
+        Err(_) => false,
+    }
+}
 ```
 
-  (free fn, plist parse → mutate dict → `plist::to_writer_xml`). Prefix chain
-  helper `fn app_id_prefix(profile_data: Option<&[u8]>) -> Option<String>`:
-  `profile_document` → `Entitlements['application-identifier']` (macOS spelling
-  `com.apple.application-identifier` fallback, mirroring ProfileInfo :58-60) →
-  text before first `.`; else `TeamIdentifier[0]`; else `None` (transform then
-  keeps the existing value's own prefix). Distribution detection:
-  `fn profile_is_distribution(profile_data: Option<&[u8]>) -> bool` = document
-  present and lacks `ProvisionedDevices` (get-task-allow untouched when no
-  profile resolves at all — design D7). Applied per bundle to the bundle's own
-  resolved `(entitlements, profile_data)`, root included, inside plan build —
-  so a bad profile document still fails before any sign write.
+  Per entry: `prefix = app_id_prefix(entry_profile, Some(&root_profile_bytes)
+  when set)`, `drop_get_task_allow = profile_is_distribution(entry_profile.or(
+  root_profile))` — own profile first, root fallback (design §3.5 tier 2),
+  inside plan build so a bad profile document still fails before any sign
+  write.
 - [ ] **Step 4.6:** Green runs (filters above; full `-p zsign-rs ipa::` mod;
   `-p zsign-core` provisioning tests). fmt/clippy scoped on the three touched
   packages. Commits: red-test commit, then
@@ -689,7 +909,7 @@ fn rewrite_entitlements_for_id(
 
 | Ticket | Acceptance | Proof |
 |---|---|---|
-| ZSN-10 | `-e` overrides profile-derived ents on every surface; adhoc honors it; invalid input hard-fails naming the path; wasm untouched (already conforms) | Task 1 steps 1.1-1.9 (6 library tests + 2 CLI tests; wasm item-0 verify-then-skip) |
+| ZSN-10 | `-e` overrides profile-derived ents on every surface incl. the bundle path and adhoc; nested never inherits it; invalid input hard-fails naming the path; wasm untouched (already conforms) | Task 1 steps 1.1-1.9 (8 library tests — 6 bare-path/validation + 2 bundle-path pins — and 2 CLI test families; wasm item-0 verify-then-skip) |
 | ZSN-22 | `<dir>/<id>.plist` beats profile for the root; miss falls back; traversal-shaped ids never escape; precedence table as designed | Task 2 steps 2.1-2.4 + design §3.2 |
 | ZSN-12 | nested bundle embeds its OWN mapped profile before seal + derives its ents from it; unknown nested = today's default (ZSN-34 pins green); unused/root/duplicate keys error before the first sign write; mapping flag design recorded after the mis-citation finding | Task 3 steps 3.1-3.6 + design §3.4 |
 | ZSN-11 | `-b` cascades nested ids + dependent keys (documented set only), rewrites application-identifier/keychain-access-groups to prefix+own id, drops get-task-allow for distribution, never touches app groups; child profiles resolve by rewritten id | Task 4 steps 4.1-4.6 |
@@ -701,10 +921,15 @@ fn rewrite_entitlements_for_id(
 - [x] Spec coverage: design §3.1→Task 3/4 ordering; §3.2→Tasks 1-3 table tests;
   §3.3→setters/forwards in Tasks 1/2/3/5; §3.4→Task 3; §3.5→Task 4; §3.6→Task 5;
   §3.7→Task 1 verify-only; §5 invariants→controls listed in acceptance table.
-- [x] Placeholder scan: none (all steps carry real code or exact commands).
-- [x] Type consistency: `validate_entitlements_blob` defined Task 1, used Task 2;
-  `ProfilePayload` reused Task 3; `dir_hit`/`entitlements_from_dir` naming fixed
-  in Task 2; `bundle_profiles(Vec<(String, PathBuf)>)` identical in builder,
-  IpaSigner, CLI forward.
+- [x] Placeholder scan: none — every code step carries a full body or exact
+  command (Task 4's `profile_document`, `extract_entitlements_from_profile`,
+  cascade, transform, prefix-chain, and distribution helpers are all
+  complete bodies after the round-2 pass).
+- [x] Type consistency: `validate_entitlements_blob` defined Task 1, used by
+  Task 2's `dir_hit` (single-argument, defined there, called in Tasks 2/3
+  snippets) and Task 3; `ProfilePayload` reused Task 3; cascade returns the
+  `HashMap<PathBuf,(String,String)>` Task 4 Step 4.5 consumes;
+  `bundle_profiles(Vec<(String, PathBuf)>)` identical in builder, IpaSigner,
+  CLI forward.
 - [ ] Executor note: line anchors date to HEAD `97e8460` + Tasks 1-4 shifting;
   re-anchor with reads, never trust these numbers blindly.
