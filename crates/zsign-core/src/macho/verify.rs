@@ -509,44 +509,6 @@ fn check_code_pages_in_file(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn debug_req_slot() {
-        let creds = rsa_credentials();
-        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let signed =
-            sign_macho_sha256_only(&macho, "com.example", None, &creds, None, None, false).unwrap();
-        let m = MachOFile::parse(signed.clone()).unwrap();
-        let sl = &m.slices()[0];
-        let (off, sz) = (
-            sl.code_sig_offset.unwrap() as usize,
-            sl.code_sig_size.unwrap() as usize,
-        );
-        let sb = parse_superblob(&signed[off..off + sz]).unwrap();
-        let cd = sb.code_directory.as_ref().unwrap();
-        println!("n_special={}", cd.n_special_slots);
-        for (idx, e) in sb.entries.iter().enumerate() {
-            println!(
-                "entry {idx}: slot 0x{:08x} blob_len={}",
-                e.slot,
-                e.blob.len()
-            );
-        }
-        for k in 1..=cd.n_special_slots as usize {
-            println!("slot -{k}: {}", hex(cd.special_slot_hash(k).unwrap_or(&[])));
-        }
-        for e in &sb.entries {
-            if e.slot == 2 {
-                println!(
-                    "req blob: {} bytes sha256={}",
-                    e.blob.len(),
-                    hex(&sha2::Sha256::digest(e.blob))
-                );
-            }
-        }
-        fn hex(b: &[u8]) -> String {
-            b.iter().map(|x| format!("{x:02x}")).collect()
-        }
-    }
 
     use super::*;
     use crate::codesign::constants::{
