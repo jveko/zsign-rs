@@ -90,6 +90,8 @@ pub struct ZSign {
     entitlements: Option<PathBuf>,
     /// Entitlements directory keyed by bundle id (`<dir>/<bundle-id>.plist`)
     entitlements_dir: Option<PathBuf>,
+    /// Per-nested-bundle provisioning profiles keyed by bundle id
+    bundle_profiles: Vec<(String, PathBuf)>,
 }
 
 impl ZSign {
@@ -117,6 +119,7 @@ impl ZSign {
             allow_encrypted: false,
             entitlements: None,
             entitlements_dir: None,
+            bundle_profiles: Vec::new(),
         }
     }
 
@@ -183,13 +186,15 @@ impl ZSign {
 
     /// Sets a directory of per-bundle-id entitlements files.
     ///
-    /// For the ROOT app bundle the file `<dir>/<bundle-id>.plist` — looked up
-    /// by the bundle id *after* any configured [`Self::bundle_id`] rewrite —
-    /// is used in place of the profile's entitlements. A missing *entry*
-    /// falls back to the profile, while a symlinked entry or a configured
-    /// directory that does not exist is a hard error. Precedence is
-    /// [`Self::entitlements`] > this directory > profile-derived entitlements.
-    /// Not consulted by [`Self::sign_macho`], which has no bundle identity.
+    /// For every bundle the file `<dir>/<bundle-id>.plist` — for the root, the
+    /// id *after* any configured [`Self::bundle_id`] rewrite — is used in place
+    /// of that bundle's profile-derived entitlements. A missing *entry* falls
+    /// back to the profile, while a symlinked entry or a configured directory
+    /// that does not exist is a hard error. Precedence for the root is
+    /// [`Self::entitlements`] > this directory > profile-derived
+    /// entitlements; for a nested bundle the directory beats the entitlements
+    /// derived from its [`Self::bundle_profiles`] entry. Not consulted by
+    /// [`Self::sign_macho`], which has no bundle identity.
     ///
     /// # Examples
     ///
@@ -200,6 +205,31 @@ impl ZSign {
     /// ```
     pub fn entitlements_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.entitlements_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Replaces the per-nested-bundle provisioning profiles with
+    /// `(bundle-id, path)` pairs.
+    ///
+    /// Each key must match a nested bundle's `CFBundleIdentifier` exactly; the
+    /// matched profile is embedded as that bundle's `embedded.mobileprovision`
+    /// and its extracted entitlements are signed into that bundle. A key that
+    /// matches no bundle, a duplicate key, or the root bundle's own id is an
+    /// error — the root profile belongs in [`Self::provisioning_profile`].
+    /// Not consulted by [`Self::sign_macho`], which has no bundle identity.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zsign_rs::ZSign;
+    ///
+    /// let zsign = ZSign::new().bundle_profiles(vec![(
+    ///     "com.example.app.ext".to_string(),
+    ///     "ext.mobileprovision".into(),
+    /// )]);
+    /// ```
+    pub fn bundle_profiles(mut self, profiles: Vec<(String, PathBuf)>) -> Self {
+        self.bundle_profiles = profiles;
         self
     }
 
@@ -479,6 +509,9 @@ impl ZSign {
         if let Some(entitlements_dir) = &self.entitlements_dir {
             signer = signer.entitlements_dir(entitlements_dir);
         }
+        if !self.bundle_profiles.is_empty() {
+            signer = signer.bundle_profiles(self.bundle_profiles.clone());
+        }
 
         if let Some(ref id) = self.bundle_id {
             signer = signer.bundle_id(id);
@@ -537,6 +570,9 @@ impl ZSign {
         }
         if let Some(entitlements_dir) = &self.entitlements_dir {
             signer = signer.entitlements_dir(entitlements_dir);
+        }
+        if !self.bundle_profiles.is_empty() {
+            signer = signer.bundle_profiles(self.bundle_profiles.clone());
         }
         if let Some(ref bundle_id) = self.bundle_id {
             signer = signer.bundle_id(bundle_id.as_str());
@@ -660,6 +696,8 @@ mod tests {
         assert!(zsign.credentials.is_none());
         assert!(zsign.provisioning_profile.is_none());
         assert!(zsign.entitlements.is_none());
+        assert!(zsign.entitlements_dir.is_none());
+        assert!(zsign.bundle_profiles.is_empty());
     }
 
     #[test]
@@ -1562,6 +1600,136 @@ mod tests {
         assert!(
             entitlements_slot_blob(&std::fs::read(&out).unwrap()).is_none(),
             "sign_macho has no bundle identity and must not sign with directory entitlements"
+        );
+    }
+
+    /// Root app `com.zsign.test` with `PlugIns/Ext.appex` (`com.zsign.test.ext`).
+    fn create_bundle_with_appex(dir: &Path) -> (PathBuf, PathBuf) {
+        let app = dir.join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        let appex = app.join("PlugIns").join("Ext.appex");
+        std::fs::create_dir_all(&appex).unwrap();
+        std::fs::write(appex.join("Info.plist"), EXT_APPLE_INFO_PLIST).unwrap();
+        std::fs::write(appex.join("Ext"), crate::test_util::minimal_macho()).unwrap();
+        (app, appex)
+    }
+
+    /// Info.plist for the `Ext.appex` fixture, shared by the folder and IPA
+    /// builders so both declare the same nested bundle id.
+    const EXT_APPLE_INFO_PLIST: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.zsign.test.ext</string>
+    <key>CFBundleExecutable</key><string>Ext</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+</dict></plist>"#;
+
+    /// A development profile whose entitlements carry `marker`.
+    fn write_ext_profile(path: &Path, marker: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.zsign.test.ext</string>
+    <key>{marker}</key>
+    <true/>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM</string></array>
+  <key>ProvisionedDevices</key>
+  <array><string>00008030-000000000000001E</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Writes an IPA carrying the same `Ext.appex` fixture as the folder builder.
+    fn write_ipa_with_appex(path: &Path) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Payload/App.app/Info.plist", opts).unwrap();
+        zip.write_all(FIXTURE_PLIST).unwrap();
+        zip.start_file("Payload/App.app/Test", opts).unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.start_file("Payload/App.app/PlugIns/Ext.appex/Info.plist", opts)
+            .unwrap();
+        zip.write_all(EXT_APPLE_INFO_PLIST).unwrap();
+        zip.start_file("Payload/App.app/PlugIns/Ext.appex/Ext", opts)
+            .unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn test_sign_bundle_forwards_bundle_profiles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(dir.path());
+        let ext_profile = dir.path().join("ext.mobileprovision");
+        write_ext_profile(&ext_profile, "com.zsign.ext.ent");
+
+        ZSign::new()
+            .adhoc(true)
+            .bundle_profiles(vec![(
+                "com.zsign.test.ext".to_string(),
+                ext_profile.clone(),
+            )])
+            .sign_bundle(&app, None)
+            .expect("sign_bundle must forward the profile map");
+
+        assert_eq!(
+            std::fs::read(appex.join("embedded.mobileprovision")).unwrap(),
+            std::fs::read(&ext_profile).unwrap(),
+            "the forwarded map must embed the appex's profile"
+        );
+        let blob = entitlements_slot_blob(&std::fs::read(appex.join("Ext")).unwrap())
+            .expect("the appex binary must carry its mapped entitlements");
+        assert!(
+            blob.contains("com.zsign.ext.ent"),
+            "sign_bundle must forward bundle_profiles to IpaSigner: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_forwards_bundle_profiles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ext_profile = dir.path().join("ext.mobileprovision");
+        write_ext_profile(&ext_profile, "com.zsign.ext.ent");
+        let ipa = dir.path().join("in.ipa");
+        write_ipa_with_appex(&ipa);
+        let out = dir.path().join("out.ipa");
+
+        // An unused key fails the whole sign, so a successful sign with a map
+        // entry is itself the evidence that the forward happened.
+        ZSign::new()
+            .adhoc(true)
+            .bundle_profiles(vec![(
+                "com.zsign.test.ext".to_string(),
+                ext_profile.clone(),
+            )])
+            .sign_ipa(&ipa, &out)
+            .expect("sign_ipa must forward the profile map");
+
+        assert_eq!(
+            ipa_entry(
+                &out,
+                "Payload/App.app/PlugIns/Ext.appex/embedded.mobileprovision"
+            ),
+            std::fs::read(&ext_profile).unwrap(),
+            "the mapped profile must be embedded in the signed IPA's appex"
         );
     }
 }

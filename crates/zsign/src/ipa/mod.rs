@@ -65,11 +65,18 @@ use crate::crypto::SigningCredentials;
 use crate::macho::{sign_any_macho, sign_macho, MachOFile};
 use crate::{Error, Result};
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+/// Provisioning profile bytes and their extracted entitlements.
+type ProfilePayload = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// One entry of the read-only signing plan: the bundle path, the entitlements
+/// resolved for it, and the profile bytes to embed (absent when it resolves none).
+type BundlePlan = (PathBuf, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// High-level IPA signing workflow.
 ///
@@ -103,16 +110,15 @@ use walkdir::WalkDir;
 /// The signing process involves these steps:
 /// 1. Extract IPA via [`extract_ipa`]
 /// 2. Sign all Mach-O binaries in the `.app` bundle
-/// 3. Embed provisioning profile (if provided)
+/// 3. Resolve each bundle's entitlements and embed the provisioning profile
+///    it resolved (the root profile, or a `--profile-map` entry for a nested
+///    bundle), if any
 /// 4. Generate `_CodeSignature/CodeResources`
 /// 5. Repack the extraction root via `create_ipa_from_root` (keeps
 ///    non-`Payload` entries such as `SwiftSupport/` and `iTunesMetadata.plist`)
 ///
 /// For manual control over extraction/repacking, use [`extract_ipa`] and
 /// [`create_ipa`] directly.
-/// Provisioning profile bytes and their extracted entitlements.
-type ProfilePayload = (Option<Vec<u8>>, Option<Vec<u8>>);
-
 pub struct IpaSigner<'a> {
     /// Reference to signing credentials; `None` signs ad-hoc
     credentials: Option<&'a SigningCredentials>,
@@ -136,8 +142,10 @@ pub struct IpaSigner<'a> {
     allow_encrypted: bool,
     /// Custom entitlements file replacing the profile-derived entitlements
     entitlements_override: Option<PathBuf>,
-    /// Directory of per-bundle-id entitlements files for the root bundle
+    /// Directory of per-bundle-id entitlements files, applied per bundle
     entitlements_dir: Option<PathBuf>,
+    /// Per-nested-bundle provisioning profiles keyed by bundle id
+    bundle_profiles: Vec<(String, PathBuf)>,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -160,6 +168,7 @@ impl<'a> IpaSigner<'a> {
             allow_encrypted: false,
             entitlements_override: None,
             entitlements_dir: None,
+            bundle_profiles: Vec::new(),
         }
     }
 
@@ -178,6 +187,7 @@ impl<'a> IpaSigner<'a> {
             allow_encrypted: false,
             entitlements_override: None,
             entitlements_dir: None,
+            bundle_profiles: Vec::new(),
         }
     }
 
@@ -212,16 +222,33 @@ impl<'a> IpaSigner<'a> {
 
     /// Sets a directory of per-bundle-id entitlements files.
     ///
-    /// For the ROOT app bundle the file `<dir>/<bundle-id>.plist` — looked up
-    /// by the bundle id *after* any [`Self::bundle_id`] rewrite — replaces the
-    /// profile's entitlements. A missing *entry* falls back to the profile, but
-    /// a symlinked entry is refused and a configured directory that does not
-    /// exist is a hard error, so a typo cannot silently sign with the
-    /// profile's entitlements. An entry that exists but is invalid also fails
-    /// the sign. Precedence is [`Self::entitlements`] > this directory >
-    /// profile-derived entitlements.
+    /// For every bundle the file `<dir>/<bundle-id>.plist` — for the root, the
+    /// id *after* any [`Self::bundle_id`] rewrite — replaces that bundle's
+    /// profile-derived entitlements. A missing *entry* falls back to the
+    /// profile, but a symlinked entry is refused and a configured directory
+    /// that does not exist is a hard error, so a typo cannot silently sign
+    /// with the profile's entitlements. An entry that exists but is invalid
+    /// also fails the sign. For a bundle with a [`Self::bundle_profiles`] entry
+    /// the directory still wins; for the root, [`Self::entitlements`] wins over
+    /// both. The file override applies to the root bundle only.
     pub fn entitlements_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.entitlements_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Replaces the nested-bundle provisioning profiles with `(bundle-id, path)`
+    /// pairs.
+    ///
+    /// Each key must match a nested bundle's `CFBundleIdentifier` exactly; the
+    /// matched profile is embedded as that bundle's `embedded.mobileprovision`
+    /// and its extracted entitlements are signed into that bundle. A key that
+    /// matches no bundle, a duplicate key, or the root bundle's own id is an
+    /// error — the root profile belongs in [`Self::provisioning_profile`].
+    /// For a nested bundle, [`Self::entitlements_dir`] beats the mapped
+    /// profile's derived entitlements.
+    /// Not consulted when signing a bare Mach-O, which has no bundle identity.
+    pub fn bundle_profiles(mut self, profiles: Vec<(String, PathBuf)>) -> Self {
+        self.bundle_profiles = profiles;
         self
     }
 
@@ -336,6 +363,56 @@ impl<'a> IpaSigner<'a> {
             }
             None => Ok((None, None)),
         }
+    }
+
+    /// Loads the exact-key nested-profile map. Root-id keys are rejected (the
+    /// root profile belongs in `provisioning_profile`), as are ids that could
+    /// escape the precedence lookup; every entry's bytes + derived
+    /// entitlements load during plan build, before the first sign write.
+    fn load_bundle_profiles(&self, root_id: &str) -> Result<HashMap<String, ProfilePayload>> {
+        let mut map = HashMap::new();
+        for (id, path) in &self.bundle_profiles {
+            if id.is_empty()
+                || id.contains('/')
+                || id.contains('\\')
+                || id.contains('\0')
+                || id.contains("..")
+            {
+                return Err(Error::Core(zsign_core::Error::Config(format!(
+                    "invalid bundle id '{id}' in provisioning profile map"
+                ))));
+            }
+            if id == root_id {
+                return Err(Error::Core(zsign_core::Error::Config(format!(
+                    "profile map key '{id}' is the main bundle; the root profile belongs in --profile"
+                ))));
+            }
+            if map.contains_key(id) {
+                return Err(Error::Core(zsign_core::Error::Config(format!(
+                    "duplicate profile map key '{id}'"
+                ))));
+            }
+            let data = fs::read(path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read provisioning profile for bundle '{id}' at '{}': {e}",
+                        path.display()
+                    ),
+                )
+            })?;
+            // Bare propagation here would report only "No XML plist found in
+            // profile data", which cannot say which entry of a multi-entry map
+            // is at fault.
+            let ent = zsign_core::extract_entitlements_from_profile(&data).map_err(|e| {
+                Error::Core(zsign_core::Error::Config(format!(
+                    "provisioning profile for bundle '{id}' at '{}' is invalid: {e}",
+                    path.display()
+                )))
+            })?;
+            map.insert(id.clone(), (Some(data), ent));
+        }
+        Ok(map)
     }
 
     /// Reads and validates the custom entitlements file, if one is set.
@@ -455,16 +532,23 @@ impl<'a> IpaSigner<'a> {
     ///
     /// Signs all Mach-O binaries and generates CodeResources.
     ///
-    /// The signing workflow follows C++ zsign order:
-    /// 1. Find and sign ALL standalone .dylib files first (with empty params)
+    /// The signing workflow:
+    /// 1. Apply the requested `Info.plist` rewrites (the only pre-existing
+    ///    mutation) — entitlements are keyed by the rewritten bundle id
     /// 2. Collect all bundles (main app, frameworks, plugins) with their depths
-    /// 3. Sort by depth (deepest first)
-    /// 4. Sign each bundle in order so nested bundles are fully signed before
+    ///    and sort by depth (deepest first)
+    /// 3. Build the read-only signing plan: resolve each bundle's entitlements
+    ///    and provisioning profile (root profile, `--entitlements` file,
+    ///    `--entitlements-dir` entry, or its `--profile-map` entry). Every
+    ///    rejection surfaces here, before any binary is written
+    /// 4. Sign ALL standalone .dylib files (with empty params)
+    /// 5. Sign each bundle in order so nested bundles are fully signed before
     ///    their parent includes them in CodeResources
     ///
     /// For each bundle, the signing order is:
     /// 1. Sign all Mach-O binaries in-place (modifies binary content)
-    /// 2. Copy provisioning profile to bundle (main app only)
+    /// 2. Embed the resolved provisioning profile as
+    ///    `embedded.mobileprovision` (whichever bundles resolved one)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
         if let Some(ref new_id) = self.bundle_id {
@@ -477,35 +561,70 @@ impl<'a> IpaSigner<'a> {
             self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
         }
 
-        // The directory is keyed by the POST-rewrite bundle id, so resolve it
-        // only after the rewrites — and before the dylib pass, which is the
-        // first step that mutates binaries.
-        let (profile_data, profile_entitlements) = self.load_profile()?;
+        // `collect_nested_bundles` is a pure read, so it runs before the dylib
+        // pass: plan build must precede the first sign write.
+        let mut bundles = self.collect_nested_bundles(bundle_path)?;
+        bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+        // --- plan build: read-only; every rejection lands here ---
+        // The entitlements directory is keyed by the POST-rewrite bundle id, so
+        // resolution follows the rewrites above.
         let root_id = self.get_bundle_identifier(bundle_path)?;
-        let entitlements = self
+        let (root_profile_data, root_profile_ent) = self.load_profile()?;
+        let root_entitlements = self
             .load_entitlements_override()?
             .or(self.dir_hit(&root_id)?)
-            .or(profile_entitlements);
-        let entitlements = entitlements.as_deref();
-        let profile_data = profile_data.as_deref();
+            .or(root_profile_ent);
+        let profile_map = self.load_bundle_profiles(&root_id)?;
+        let mut plan: Vec<BundlePlan> = Vec::with_capacity(bundles.len());
+        let mut nested_ids: Vec<String> = Vec::new();
+        for (path, _depth) in &bundles {
+            if path == bundle_path {
+                plan.push((
+                    path.clone(),
+                    root_entitlements.clone(),
+                    root_profile_data.clone(),
+                ));
+                continue;
+            }
+            let id = self.get_bundle_identifier(path)?;
+            nested_ids.push(id.clone());
+            let mapped = profile_map.get(&id);
+            let entitlements = self
+                .dir_hit(&id)?
+                .or_else(|| mapped.and_then(|(_, ent)| ent.clone()));
+            plan.push((
+                path.clone(),
+                entitlements,
+                // `ProfilePayload`'s profile bytes are always `Some` for a
+                // mapped key, so flatten rather than nest an empty option.
+                mapped.and_then(|(data, _)| data.clone()),
+            ));
+        }
+        let mut unused: Vec<&String> = profile_map
+            .keys()
+            .filter(|key| !nested_ids.iter().any(|id| id == *key))
+            .collect();
+        if !unused.is_empty() {
+            unused.sort();
+            nested_ids.sort();
+            return Err(Error::Core(zsign_core::Error::Config(format!(
+                "provisioning profile map keys matched no bundle: {unused:?}; nested bundle ids: {nested_ids:?}"
+            ))));
+        }
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
+        let already_signed: HashSet<PathBuf> = dylibs.iter().cloned().collect();
+
+        // --- only now does anything mutate ---
         dylibs
             .par_iter()
             .try_for_each(|dylib_path| self.sign_standalone_dylib(bundle_path, dylib_path))?;
-        let already_signed: HashSet<PathBuf> = dylibs.iter().cloned().collect();
-
-        let mut bundles = self.collect_nested_bundles(bundle_path)?;
-
-        bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-        for (nested_bundle_path, _depth) in &bundles {
-            let is_main_bundle = nested_bundle_path == bundle_path;
+        for (path, entitlements, profile_data) in &plan {
             self.sign_single_bundle(
-                nested_bundle_path,
-                is_main_bundle,
-                if is_main_bundle { entitlements } else { None },
-                if is_main_bundle { profile_data } else { None },
+                path,
+                entitlements.as_deref(),
+                profile_data.as_deref(),
                 &already_signed,
             )?;
         }
@@ -786,7 +905,6 @@ impl<'a> IpaSigner<'a> {
     fn sign_single_bundle(
         &self,
         bundle_path: &Path,
-        copy_provisioning_profile: bool,
         entitlements: Option<&[u8]>,
         profile_data: Option<&[u8]>,
         already_signed: &HashSet<PathBuf>,
@@ -813,18 +931,17 @@ impl<'a> IpaSigner<'a> {
             )
         })?;
 
-        if copy_provisioning_profile {
-            if let Some(data) = profile_data {
-                let embedded_path =
-                    Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
-                fs::write(&embedded_path, data).map_err(|e| {
-                    Error::Core(zsign_core::Error::Signing(format!(
-                        "Failed to write provisioning profile to {}: {}",
-                        embedded_path.display(),
-                        e
-                    )))
-                })?;
-            }
+        // The plan build hands this bundle the profile it resolved, so embedding
+        // is decided by presence rather than by a separate main-app flag.
+        if let Some(data) = profile_data {
+            let embedded_path = Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
+            fs::write(&embedded_path, data).map_err(|e| {
+                Error::Core(zsign_core::Error::Signing(format!(
+                    "Failed to write provisioning profile to {}: {}",
+                    embedded_path.display(),
+                    e
+                )))
+            })?;
         }
 
         self.generate_code_resources(bundle_path)?;
@@ -2685,6 +2802,256 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
             "a non-regular entry must fall back to the profile: {blob:?}"
+        );
+    }
+
+    /// Extension bundle profile: its own marker and app-identifier, plus the
+    /// team/device fields a development profile carries.
+    const EXT_PROFILE_FIXTURE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.test.app.ext</string>
+    <key>com.zsign.ext.ent</key>
+    <true/>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM</string></array>
+  <key>ProvisionedDevices</key>
+  <array><string>00008030-000000000000001E</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    /// Root app `com.test.app` with `PlugIns/Ext.appex` (`com.test.app.ext`).
+    fn create_bundle_with_appex(dir: &Path) -> (PathBuf, PathBuf) {
+        let app = create_folder_bundle(dir, "Test", true);
+        let appex = app.join("PlugIns").join("Ext.appex");
+        std::fs::create_dir_all(&appex).unwrap();
+        std::fs::write(
+            appex.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.test.app.ext</string>
+    <key>CFBundleExecutable</key><string>Ext</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(appex.join("Ext"), crate::test_util::minimal_macho()).unwrap();
+        (app, appex)
+    }
+
+    #[test]
+    fn test_profile_map_embeds_and_derives_for_nested() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let root_profile = temp.path().join("root.mobileprovision");
+        std::fs::write(&root_profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&root_profile)
+            .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile.clone())])
+            .sign_folder_in_place(&app)
+            .expect("a mapped nested profile must sign");
+
+        assert_eq!(
+            std::fs::read(appex.join("embedded.mobileprovision")).unwrap(),
+            std::fs::read(&ext_profile).unwrap(),
+            "the appex must embed exactly the mapped profile bytes"
+        );
+        let appex_blob = signature_slot_blob(
+            &appex.join("Ext"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the appex binary must carry its mapped entitlements");
+        assert!(
+            String::from_utf8_lossy(&appex_blob).contains("com.zsign.ext.ent"),
+            "the appex must be signed with entitlements derived from its mapped profile: {appex_blob:?}"
+        );
+        // No bleed in either direction: the root keeps its own entitlements.
+        let root_blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root binary must keep its own entitlements");
+        assert!(
+            String::from_utf8_lossy(&root_blob).contains("com.zsign.profile.entitlement"),
+            "the root must keep the root profile's entitlements: {root_blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&root_blob).contains("com.zsign.ext.ent"),
+            "the appex's entitlements must not bleed into the root: {root_blob:?}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_beats_mapped_profile_for_nested() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+        // A directory entry for the appex id must win over the map's derived
+        // entitlements — the map still supplies the embedded profile bytes.
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("com.test.app.ext.plist"),
+            dir_entitlements("com.zsign.dir.ent"),
+        )
+        .unwrap();
+
+        IpaSigner::new_adhoc()
+            .entitlements_dir(&dir)
+            .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile.clone())])
+            .sign_folder_in_place(&app)
+            .expect("a directory entry plus a mapped profile must sign");
+
+        let blob = signature_slot_blob(
+            &appex.join("Ext"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the appex binary must carry entitlements");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.dir.ent"),
+            "the directory tier must beat the map's derived entitlements: {blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.ext.ent"),
+            "the map's entitlements must not be used when the directory hits: {blob:?}"
+        );
+        assert_eq!(
+            std::fs::read(appex.join("embedded.mobileprovision")).unwrap(),
+            std::fs::read(&ext_profile).unwrap(),
+            "the directory supplies entitlements only; the map must still supply \
+             the embedded profile bytes"
+        );
+    }
+
+    #[test]
+    fn test_profile_map_unused_key_errors() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        // Plan build is read-only and precedes EVERY sign mutation, the dylib
+        // pass included, so an untouched dylib proves the rejection landed
+        // before any write.
+        let frameworks = app.join("Frameworks");
+        std::fs::create_dir_all(&frameworks).unwrap();
+        let dylib = frameworks.join("libHelper.dylib");
+        std::fs::write(&dylib, crate::test_util::minimal_dylib()).unwrap();
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.test.app.nope".to_string(), ext_profile)])
+            .sign_folder_in_place(&app)
+            .expect_err("a map key matching no bundle must fail the sign");
+        // Assert the untouched state first: if the dylib pass ran before the
+        // plan build, these fail on their own terms rather than on expect_err.
+        assert!(
+            crate::macho::MachOFile::open(&dylib).unwrap().slices()[0]
+                .code_sig_offset
+                .is_none(),
+            "the dylib pass is the first mutation, so it must not have run: {}",
+            dylib.display()
+        );
+        assert!(
+            !app.join("_CodeSignature").exists(),
+            "plan build precedes every mutation, so nothing may be sealed: {}",
+            app.display()
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.nope"),
+            "the error must name the unused key: {message}"
+        );
+    }
+
+    #[test]
+    fn test_profile_map_invalid_profile_names_bundle() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let good = temp.path().join("ext.mobileprovision");
+        std::fs::write(&good, EXT_PROFILE_FIXTURE).unwrap();
+        let bad = temp.path().join("broken.mobileprovision");
+        std::fs::write(&bad, b"not a provisioning profile at all").unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![
+                ("com.test.app.ext".to_string(), good),
+                ("com.test.app.bad".to_string(), bad.clone()),
+            ])
+            .sign_folder_in_place(&app)
+            .expect_err("a mapped profile that is not a profile must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.bad"),
+            "with several entries the error must name the offending bundle: {message}"
+        );
+        assert!(
+            message.contains("broken.mobileprovision"),
+            "the error must name the offending file: {message}"
+        );
+    }
+
+    #[test]
+    fn test_profile_map_root_id_rejected() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.test.app".to_string(), ext_profile)])
+            .sign_folder_in_place(&app)
+            .expect_err("the root id must be rejected as a map key");
+        let message = err.to_string();
+        assert!(
+            message.contains("--profile"),
+            "the error must point at the root profile flag: {message}"
+        );
+    }
+
+    #[test]
+    fn test_profile_map_duplicate_key_errors() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![
+                ("com.test.app.ext".to_string(), ext_profile.clone()),
+                ("com.test.app.ext".to_string(), ext_profile),
+            ])
+            .sign_folder_in_place(&app)
+            .expect_err("a duplicate map key must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.ext") && message.contains("duplicate"),
+            "the error must name the duplicated key: {message}"
+        );
+    }
+
+    #[test]
+    fn test_profile_map_missing_profile_file_names_path() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let missing = temp.path().join("nope.mobileprovision");
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.test.app.ext".to_string(), missing)])
+            .sign_folder_in_place(&app)
+            .expect_err("an unreadable mapped profile must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("nope.mobileprovision") && message.contains("com.test.app.ext"),
+            "the error must name both the bundle and the path: {message}"
         );
     }
 }

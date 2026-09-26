@@ -48,12 +48,21 @@ struct Cli {
     #[arg(short = 'm', long)]
     profile: Option<PathBuf>,
 
+    /// Per-bundle provisioning profile as bundle-id=profile-path (repeatable).
+    /// Applies to app bundles only; ignored when signing a bare Mach-O.
+    #[arg(
+        long = "profile-map",
+        value_name = "BUNDLE_ID=PATH",
+        value_parser = parse_profile_map
+    )]
+    profile_map: Vec<(String, PathBuf)>,
+
     /// Custom entitlements file (replaces the profile's entitlements)
     #[arg(short = 'e', long)]
     entitlements: Option<PathBuf>,
 
     /// Directory of per-bundle-id entitlements files (`<dir>/<bundle-id>.plist`).
-    /// Applies to the app bundle; falls back to the profile when no file matches.
+    /// Applies to every bundle; falls back to the profile when no file matches.
     #[arg(long)]
     entitlements_dir: Option<PathBuf>,
 
@@ -129,6 +138,7 @@ struct Cli {
             "private_key",
             "pkcs12",
             "profile",
+            "profile_map",
             "entitlements",
             "entitlements_dir",
             "zip_level",
@@ -148,6 +158,16 @@ struct Cli {
     /// objects on stderr. Human-readable output stays the default.
     #[arg(long)]
     json: bool,
+}
+
+/// Parses one `--profile-map bundle-id=path` pair.
+fn parse_profile_map(s: &str) -> std::result::Result<(String, PathBuf), String> {
+    match s.split_once('=') {
+        Some((id, path)) if !id.is_empty() && !path.is_empty() => {
+            Ok((id.to_string(), PathBuf::from(path)))
+        }
+        _ => Err(format!("expected bundle-id=path, got '{s}'")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -188,6 +208,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if let Some(entitlements_dir) = cli.entitlements_dir {
         signer = signer.entitlements_dir(entitlements_dir);
+    }
+
+    if !cli.profile_map.is_empty() {
+        signer = signer.bundle_profiles(cli.profile_map.clone());
     }
 
     if let Some(bundle_id) = cli.bundle_id {
@@ -1660,6 +1684,67 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zsign", "-a", "--entitlements-dir", "ents", "in.ipa"]).is_ok()
         );
+    }
+
+    #[test]
+    fn profile_map_parses_repeated_pairs() {
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "-a",
+            "--profile-map",
+            "com.test.app.ext=ext.mobileprovision",
+            "--profile-map",
+            "com.test.app.fwk=fwk.mobileprovision",
+            "in.ipa",
+        ])
+        .expect("must parse");
+        assert_eq!(
+            cli.profile_map,
+            vec![
+                (
+                    "com.test.app.ext".to_string(),
+                    PathBuf::from("ext.mobileprovision")
+                ),
+                (
+                    "com.test.app.fwk".to_string(),
+                    PathBuf::from("fwk.mobileprovision")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_map_rejects_malformed_at_parse() {
+        for bad in ["nopath", "=x", "a="] {
+            assert_eq!(
+                parse_err(&["zsign", "-a", "--profile-map", bad, "in.ipa"]).kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{bad:?} must be rejected at parse time"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "zsign",
+            "-a",
+            "--profile-map",
+            "com.test.app.ext=ext.mobileprovision",
+            "in.ipa"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn verify_conflicts_with_profile_map() {
+        for extra in [
+            vec!["zsign", "-V", "--profile-map", "a=b", "in.ipa"],
+            vec!["zsign", "--profile-map", "a=b", "-V", "in.ipa"],
+        ] {
+            assert_eq!(
+                parse_err(&extra).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-a", "--profile-map", "a=b", "in.ipa"]).is_ok());
     }
 
     #[test]
