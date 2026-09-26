@@ -1515,7 +1515,10 @@ fn fmt_time(t: &x509_cert::time::Time) -> String {
 }
 
 /// Verifies `child`'s signature with `issuer`'s public key.
-fn verify_cert_signature(child: &x509_cert::Certificate, issuer: &x509_cert::Certificate) -> bool {
+pub(crate) fn verify_cert_signature(
+    child: &x509_cert::Certificate,
+    issuer: &x509_cert::Certificate,
+) -> bool {
     use signature::Verifier;
     let Ok(tbs) = child.tbs_certificate.to_der() else {
         return false;

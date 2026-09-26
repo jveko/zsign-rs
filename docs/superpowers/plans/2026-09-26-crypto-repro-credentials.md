@@ -1404,13 +1404,14 @@ and the fixture recipe are unchanged.
     stays local to `revocation.rs` (`:675`): `cms_verify.rs` has no OCSPSigning helper, only
     codeSigning-purpose checks.
 
-11. **The scheme filter moved from AIA extraction into `check`.** The snippet filtered in
+12. **The scheme filter moved from AIA extraction into `check`.** The snippet filtered in
     `ocsp_responder_url` (`url.starts_with("http://").then_some(url)`), which made `UnusableUrl`
     unreachable — a non-`http:` responder would have been indistinguishable from a certificate
     with no OCSP pointer at all. Shipped code returns the AIA text whatever its scheme
     (`revocation.rs:162-178`) and `check` short-circuits `UnusableUrl` *before* the issuer lookup
     (`:801-803`), so an `https:` AIA with no issuer reports `UnusableUrl`, not
     `NoIssuerCertificate`. Both snippets below are corrected to that ordering.
+
 Two plan-side claims were also wrong and are corrected above where they appear: the snippet's
 expected request was `SEQUENCE x3` around the CertID where RFC 6960 has four levels
 (`OCSPRequest / tbsRequest / requestList / Request`), and the foreign-issuer-key case is not pinned

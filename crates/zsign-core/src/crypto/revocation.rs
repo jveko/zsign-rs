@@ -667,7 +667,7 @@ fn pick_signer(
 fn accepted_delegate(candidate: &Certificate, issuer: &Certificate) -> bool {
     candidate.tbs_certificate.issuer == issuer.tbs_certificate.subject
         && has_ocsp_signing_eku(candidate)
-        && verify_cert_signature(candidate, issuer)
+        && cms_verify::verify_cert_signature(candidate, issuer)
 }
 
 /// Whether the certificate's `extendedKeyUsage` extension lists
@@ -693,7 +693,11 @@ fn ext_value(cert: &Certificate, id: const_oid::ObjectIdentifier) -> Option<&[u8
         .map(|e| e.extn_value.as_bytes())
 }
 
-/// Verifies a raw PKCS#1 v1.5 or P-256 signature over `msg`.
+/// Verifies a raw PKCS#1 v1.5 or P-256 signature over `msg` — an arbitrary
+/// message under a certificate's key, which is what an OCSP response signature
+/// is. It is *not* the certificate-path check: to verify a child certificate's
+/// own signature under its issuer's key, use
+/// [`cms_verify::verify_cert_signature`]; the two answer different questions.
 fn verify_signature(
     signer: &Certificate,
     sig_alg_oid: &const_oid::ObjectIdentifier,
@@ -737,16 +741,6 @@ fn verify_signature(
     }
 }
 
-/// `child`'s signature verified with `issuer`'s public key.
-fn verify_cert_signature(child: &Certificate, issuer: &Certificate) -> bool {
-    verify_signature(
-        issuer,
-        &child.signature_algorithm.oid,
-        &child.tbs_certificate.to_der().unwrap_or_default(),
-        child.signature.raw_bytes(),
-    )
-}
-
 /// Splits a DER `ECDSA-Sig-Value` into its two halves.
 fn parse_ecdsa_signature(der: &[u8]) -> Option<p256::ecdsa::Signature> {
     p256::ecdsa::Signature::from_der(der).ok()
@@ -759,28 +753,35 @@ fn parse_ecdsa_signature(der: &[u8]) -> Option<p256::ecdsa::Signature> {
 /// RFC 3339 timestamp, so the two forms are converted to the calendar
 /// themselves: a two-digit year is the RFC 5280 sliding window (50-99 means
 /// 19xx), and a `Z` suffix is UTC.
+///
+/// The two forms are *not* interchangeable on the wire, so the field offsets
+/// are chosen by the digit count and each form is read at its own width:
+/// sharing the four-digit offsets would read the two-digit form's two-digit
+/// year as a month and then run off the end of the value.
 fn parse_time(tag: u8, value: &[u8]) -> Option<time::OffsetDateTime> {
     let text = std::str::from_utf8(value).ok()?;
     if tag != 0x17 && tag != 0x18 {
         return None;
     }
     let d = text.strip_suffix('Z').unwrap_or(text);
+    // The year width is decided by the digit count rather than by the tag:
     // OpenSSL emits a two-digit-year `GeneralizedTime` (`260101000000Z`) for
-    // `revocationTime`, so the year width is decided by the digit count rather
-    // than by the tag.
-    let (digits, year) = match d.len() {
+    // `revocationTime`, while RFC 6960 §4.2.1 lets `thisUpdate` be either tag.
+    // `month_at` is where the month field starts, so every later field follows
+    // at its own width.
+    let (digits, year, month_at) = match d.len() {
         12 => {
             let yy = d.get(..2)?.parse::<i32>().ok()?;
-            (d, if yy >= 50 { 1900 + yy } else { 2000 + yy })
+            (d, if yy >= 50 { 1900 + yy } else { 2000 + yy }, 2)
         }
-        14 => (d, d.get(..4)?.parse::<i32>().ok()?),
+        14 => (d, d.get(..4)?.parse::<i32>().ok()?, 4),
         _ => return None,
     };
     let num = |range: std::ops::Range<usize>| digits.get(range)?.parse::<u8>().ok();
-    let date =
-        time::Date::from_calendar_date(year, time::Month::try_from(num(4..6)?).ok()?, num(6..8)?)
-            .ok()?;
-    let time_of_day = time::Time::from_hms(num(8..10)?, num(10..12)?, num(12..14)?).ok()?;
+    let at = |offset: usize| (month_at + offset)..(month_at + offset + 2);
+    let month = time::Month::try_from(num(at(0))?).ok()?;
+    let date = time::Date::from_calendar_date(year, month, num(at(2))?).ok()?;
+    let time_of_day = time::Time::from_hms(num(at(4))?, num(at(6))?, num(at(8))?).ok()?;
     Some(time::OffsetDateTime::new_utc(date, time_of_day))
 }
 
@@ -1504,6 +1505,273 @@ mod tests {
                 RevocationStatus::NotChecked(NotCheckedReason::OutsideValidityWindow)
             ),
             "an expired answer must not be reused, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn both_asn1_time_forms_yield_the_same_instant() {
+        // `thisUpdate` is `GeneralizedTime` in every committed fixture, so both
+        // encodings a responder may legally send are pinned here directly: the
+        // two forms carry the same fields at different widths, and reading one
+        // with the other's offsets silently loses the year or the seconds.
+        let utc = |y, mo, d, h, mi, s| {
+            time::OffsetDateTime::new_utc(
+                time::Date::from_calendar_date(y, time::Month::try_from(mo).unwrap(), d).unwrap(),
+                time::Time::from_hms(h, mi, s).unwrap(),
+            )
+        };
+        // `UTCTime` (`0x17`): `YYMMDDHHMMSSZ`, the RFC 5280 sliding window maps
+        // 50-99 to 19xx, and 00-49 to 20xx.
+        assert_eq!(
+            parse_time(0x17, b"260102030405Z"),
+            Some(utc(2026, 1, 2, 3, 4, 5))
+        );
+        assert_eq!(
+            parse_time(0x17, b"990102030405Z"),
+            Some(utc(1999, 1, 2, 3, 4, 5))
+        );
+        assert_eq!(
+            parse_time(0x17, b"490102030405Z"),
+            Some(utc(2049, 1, 2, 3, 4, 5))
+        );
+        assert_eq!(
+            parse_time(0x17, b"500102030405Z"),
+            Some(utc(1950, 1, 2, 3, 4, 5))
+        );
+        // `GeneralizedTime` (`0x18`): `YYYYMMDDHHMMSSZ`, and the year is
+        // literal, so 1949 and 2049 stay distinct.
+        assert_eq!(
+            parse_time(0x18, b"20260102030405Z"),
+            Some(utc(2026, 1, 2, 3, 4, 5))
+        );
+        assert_eq!(
+            parse_time(0x18, b"19490102030405Z"),
+            Some(utc(1949, 1, 2, 3, 4, 5))
+        );
+        assert_eq!(
+            parse_time(0x18, b"20490102030405Z"),
+            Some(utc(2049, 1, 2, 3, 4, 5))
+        );
+        // A `Z` is optional in the value grammar, so the same digits parse
+        // without it.
+        assert_eq!(
+            parse_time(0x17, b"260102030405"),
+            Some(utc(2026, 1, 2, 3, 4, 5))
+        );
+    }
+
+    #[test]
+    fn a_malformed_asn1_time_is_never_widened_into_a_valid_one() {
+        // Neither form may be stretched: a wrong-width value, a missing
+        // seconds field, a non-ASCII byte, a non-digit, and a month, day or
+        // clock field out of range all yield `None`, never a shifted or
+        // defaulted timestamp.
+        for bad in [
+            &b"26010203040"[..], // 11 digits: one short of UTCTime
+            b"2601020304056Z",   // 13 digits: neither form's width
+            b"2601020304Z",      // seconds omitted
+            b"2601020304",       // seconds omitted, no `Z`
+            b"26010\xff030405Z", // non-ASCII byte
+            b"2601020304 5Z",    // non-digit in seconds
+            b"261302030405Z",    // month 13
+            b"260100030405Z",    // day 0
+            b"260132030405Z",    // day 32
+            b"260102250405Z",    // hour 25
+            b"260102036005Z",    // minute 60
+            b"260102030461Z",    // second 61
+            b"",                 // empty
+        ] {
+            for tag in [0x17, 0x18] {
+                assert_eq!(
+                    parse_time(tag, bad),
+                    None,
+                    "tag 0x{tag:02x} value {bad:02x?}"
+                );
+            }
+        }
+        // Correct digits under a non-time tag: the tag check, not the digits,
+        // is what rejects an INTEGER or an ENUMERATED here.
+        for tag in [0x02, 0x0a, 0x19, 0x1f] {
+            assert_eq!(parse_time(tag, b"260102030405Z"), None, "tag 0x{tag:02x}");
+        }
+    }
+
+    /// A 2026-01-01T12:00:00Z anchor, so a hand-framed answer is compared
+    /// against a `now` the test states outright rather than one derived from a
+    /// committed fixture the responder happened to sign.
+    fn noon_utc() -> time::OffsetDateTime {
+        time::Date::from_calendar_date(2026, time::Month::January, 1)
+            .unwrap()
+            .with_hms(12, 0, 0)
+            .unwrap()
+            .assume_utc()
+    }
+
+    /// Re-frames a `SingleResponse` carrying the fixture pair's real `CertID`,
+    /// so the walk matches it and goes on to read the time fields.
+    ///
+    /// The `tbsResponseData` is rebuilt around the supplied time TLVs rather
+    /// than lifted from a committed fixture, so the fixture's signature can no
+    /// longer cover it. That is deliberate and is why the honest observable for
+    /// a well-formed answer is `Unverified`: the walk reads `thisUpdate` and
+    /// `nextUpdate` *before* it touches a key, so a `UTCTime` that survives to
+    /// the signature check proves it parsed, while one that fails to parse
+    /// aborts the walk as `Malformed` before any of this is reachable.
+    fn response_with_times(
+        cert_status: &[u8],
+        this_update: &[u8],
+        next_update: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let (leaf, issuer) = fixture_pair();
+        let mut single = cert_id(&leaf, &issuer).expect("CertID");
+        single.extend_from_slice(cert_status);
+        single.extend_from_slice(this_update);
+        if let Some(next) = next_update {
+            single.extend_from_slice(&tlv(0xa0, next)); // nextUpdate [0] EXPLICIT
+        }
+        let subject = issuer
+            .tbs_certificate
+            .subject
+            .to_der()
+            .expect("issuer name");
+        let mut tbs_body = tlv(0xa1, &subject); // responderID byName [1]
+        tbs_body.extend_from_slice(&tlv(0x18, b"20260101120000Z")); // producedAt
+        tbs_body.extend_from_slice(&tlv(0x30, &tlv(0x30, &single)));
+        let mut basic = tlv(0x30, &tbs_body); // tbsResponseData
+        basic.extend_from_slice(&tlv(0x30, &oid_tlv(OID_SHA1_WITH_RSA)));
+        basic.extend_from_slice(&tlv(0x03, &[0x00, 0xde, 0xad, 0xbe, 0xef]));
+        let response_bytes = tlv(
+            0x30,
+            &concat(&[&oid_tlv(OID_OCSP_BASIC), &tlv(0x04, &tlv(0x30, &basic))]),
+        );
+        let mut envelope = tlv(0x0a, &[0x00]); // successful
+        envelope.extend_from_slice(&tlv(0xa0, &response_bytes));
+        tlv(0x30, &envelope)
+    }
+
+    #[test]
+    fn a_utc_time_this_update_reaches_the_signature_check() {
+        // RFC 6960 §4.2.1 lets `thisUpdate` be either tag, but the committed
+        // fixtures only ever carry the four-digit form. The two-digit form must
+        // be read at its own field widths: with the four-digit offsets the
+        // two-digit year was read as a month and the seconds read ran off the
+        // end, so the walk aborted as `Malformed` and a responder using
+        // `UTCTime` could never report a status at all.
+        let (leaf, issuer) = fixture_pair();
+        let now = noon_utc() + time::Duration::minutes(5);
+        for (this_update, label) in [
+            (&tlv(0x17, b"260101120000Z")[..], "UTCTime"),
+            (&tlv(0x18, b"20260101120000Z")[..], "GeneralizedTime"),
+        ] {
+            let status = parse_and_verify(
+                &response_with_times(&tlv(0x80, &[]), this_update, None),
+                &leaf,
+                &issuer,
+                now,
+            );
+            assert_eq!(
+                status,
+                RevocationStatus::NotChecked(NotCheckedReason::Unverified),
+                "{label} thisUpdate must parse and be read, got {status:?}"
+            );
+        }
+        // The sliding window decides which century a two-digit year means, and
+        // the year is never mistaken for a month: 50 is 1950 and 49 is 2049, so
+        // the two forms of 50..=99 are all past and those of 00..=49 are all
+        // future for a `now` in 2026. A future `thisUpdate` is rejected on the
+        // window before any key is touched.
+        for (value, expected) in [
+            ("200101120000Z", NotCheckedReason::Unverified), // 2020
+            ("500101120000Z", NotCheckedReason::Unverified), // 1950
+            ("990101120000Z", NotCheckedReason::Unverified), // 1999
+            ("490101120000Z", NotCheckedReason::OutsideValidityWindow), // 2049
+            (
+                "00101120000Z0",
+                NotCheckedReason::Malformed(
+                    // 13 digits
+                    "response is not a parseable OCSPResponse for this certificate".into(),
+                ),
+            ),
+        ] {
+            let status = parse_and_verify(
+                &response_with_times(&tlv(0x80, &[]), &tlv(0x17, value.as_bytes()), None),
+                &leaf,
+                &issuer,
+                now,
+            );
+            assert_eq!(
+                status,
+                RevocationStatus::NotChecked(expected),
+                "two-digit year {value}, got {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_utc_time_revocation_time_is_reported_not_malformed() {
+        // `RevokedInfo` holds its time directly rather than behind the
+        // `nextUpdate` wrapper, so the two-digit form is read on its own path
+        // too. `revokedAt` is still only reported after the signature verifies,
+        // and here it does not, so the observable is `Unverified` rather than a
+        // revocation: nothing here may produce a warning.
+        let (leaf, issuer) = fixture_pair();
+        let revoked = tlv(0xa1, &tlv(0x17, b"260101110000Z"));
+        let status = parse_and_verify(
+            &response_with_times(&revoked, &tlv(0x18, b"20260101120000Z"), None),
+            &leaf,
+            &issuer,
+            noon_utc() + time::Duration::minutes(5),
+        );
+        assert_eq!(
+            status,
+            RevocationStatus::NotChecked(NotCheckedReason::Unverified),
+            "a UTCTime revocationTime must parse, and an unverified revoked answer stays untrusted, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_utc_time_next_update_bounds_the_window() {
+        // `nextUpdate` is `[0] EXPLICIT` wrapping the time and is read through
+        // the same `parse_time`, so the two-digit form must bound the window
+        // exactly as the four-digit one does.
+        let (leaf, issuer) = fixture_pair();
+        let this_update = tlv(0x18, b"20260101100000Z");
+        let next_update = tlv(0x17, b"260101130000Z"); // 13:00Z
+        let build = || response_with_times(&tlv(0x80, &[]), &this_update, Some(&next_update));
+        // Half an hour past `nextUpdate`: the window is closed before the
+        // signature is ever considered.
+        let status = parse_and_verify(
+            &build(),
+            &leaf,
+            &issuer,
+            time::Date::from_calendar_date(2026, time::Month::January, 1)
+                .unwrap()
+                .with_hms(13, 30, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        assert!(
+            matches!(
+                status,
+                RevocationStatus::NotChecked(NotCheckedReason::OutsideValidityWindow)
+            ),
+            "a UTCTime nextUpdate in the past must expire the answer, got {status:?}"
+        );
+        // Inside the window the same answer gets as far as the signature, so
+        // the two-digit `nextUpdate` was read and compared, not ignored.
+        let status = parse_and_verify(
+            &build(),
+            &leaf,
+            &issuer,
+            time::Date::from_calendar_date(2026, time::Month::January, 1)
+                .unwrap()
+                .with_hms(12, 30, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        assert_eq!(
+            status,
+            RevocationStatus::NotChecked(NotCheckedReason::Unverified)
         );
     }
 
