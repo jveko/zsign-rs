@@ -137,14 +137,21 @@ pub(crate) trait Store: Sync {
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn list(&self, path: &Path) -> Result<Vec<(String, StoreKind)>>;
     fn metadata(&self, path: &Path) -> Result<StoreStat>;   // lstat; NotFound as io error
-    /// Pre-order walk (parent before children) under `root`, root excluded.
+    /// Pre-order walk (parent before children) under `root`, **root
+    /// included first** (exactly what `WalkDir` yields — root handling stays
+    /// per-site: `create_ipa` *needs* the root entry, its closure maps the
+    /// empty relative path to `Some("Payload/{app}")` at
+    /// `archive.rs:260-266`, pinned by `archive.rs:865`, while the two
+    /// historical `min_depth(1)` sites skip it explicitly).
     /// Per-entry results preserve each call site's current WalkDir error
     /// handling: sites that propagate errors write `entry?`, sites that
     /// skip write `let Ok(..) = entry else { continue }`. `FsStore` maps
     /// `WalkDir` 1:1 (entries in readdir order, entry errors as inner
     /// `Err`s); `MemStore` yields sorted entries, always `Ok`.
     fn walk(&self, root: &Path) -> Result<Vec<Result<(PathBuf, StoreKind), Error>>>;
-    /// Pruned walk mirroring `WalkDir::filter_entry`: returning `false`
+    /// Pruned walk mirroring `WalkDir::filter_entry` + `min_depth(1)` (the
+    /// root is never yielded, as in the source chain at `mod.rs:1326`):
+    /// returning `false`
     /// skips the subtree entirely (never visited, never yielded, any error
     /// inside it never surfaces) — exact parity for
     /// `find_immediate_macho_binaries`'s nested-bundle pruning.
@@ -192,8 +199,12 @@ Semantics pinned to native behavior:
   the browser instead of erroring.
 - `walk`/`walk_pruned` live in the trait so `FsStore` keeps using `WalkDir`
   exactly as each call site does today (`follow_links(false)`; per-entry
-  error handling preserved site-by-site via the inner `Result`s; the
-  `filter_entry` pruning at `mod.rs:1323-1334` maps to `walk_pruned` so
+  error handling preserved site-by-site via the inner `Result`s;
+  `walk` is **root-inclusive** — `create_ipa` needs the root entry
+  (`archive.rs:260-266`, pinned at `archive.rs:865`) and root handling is
+  therefore per-site; the
+  `filter_entry` pruning at `mod.rs:1323-1334` maps to `walk_pruned` (root
+  never yielded there, per its `min_depth(1)`) so
   pruned subtrees are never visited — a flat list plus post-filter would
   surface errors inside pruned subtrees that the native site never sees);
   `write_tree` keeps propagating walk errors (it does so today) rather than

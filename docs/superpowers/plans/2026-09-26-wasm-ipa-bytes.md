@@ -129,9 +129,11 @@ signing tests (`lib.rs:887`):
 Notes for the Tester:
 - `info_plist_xml` does not exist in the wasm tests yet — write it as a
   helper mirroring the native fixture shape
-  (`crates/zsign/src/ipa/mod.rs:1811-1828`): XML plist with
-  `CFBundleIdentifier = com.zsign.test`, `CFBundleExecutable = Test`,
-  `CFBundleName = Test`, `CFBundleVersion = 1.0`, `CFBundlePackageType = APPL`.
+  (`crates/zsign/src/ipa/mod.rs:1811-1826`): XML plist with exactly the
+  two keys the native helper emits — `CFBundleIdentifier = com.zsign.test`
+  and `CFBundleExecutable = Test`. Nothing in the sign flow reads other
+  Info.plist keys (`get_bundle_identifier` reads `CFBundleIdentifier` at
+  `mod.rs:1416`, `get_main_executable` reads `CFBundleExecutable`).
 - `anchored_verify_slice` and `new_signer` already exist in this test module
   (`lib.rs:806-852`, `lib.rs:738-741`); `MINIMAL_MACHO` at `lib.rs:691`.
 - Also add `use std::io::Read as _;` inside the test if not already in scope.
@@ -147,7 +149,8 @@ error; this is the red state.
 
 - [ ] **Step 0.3: Also add the limit red tests**
 
-Next to the existing limit tests (`lib.rs:1104-1199`), add:
+Next to the existing limit tests (the `ensure_size_*` block at
+`lib.rs:1104-1191`), add:
 
 ```rust
     #[wasm_bindgen_test(unsupported = test)]
@@ -253,14 +256,20 @@ pub(crate) trait Store: Sync {
     fn list(&self, path: &Path) -> Result<Vec<(String, StoreKind)>>;
     /// lstat: metadata of the entry itself, never following a final symlink.
     fn metadata(&self, path: &Path) -> Result<StoreStat>;
-    /// Pre-order walk (parent before children) under `root`, root itself
-    /// excluded. Per-entry results preserve each site's current WalkDir
-    /// error handling: propagating sites write `let e = e?;`, skipping sites
-    /// write `let Ok(e) = e else { continue };`.
+    /// Pre-order walk (parent before children) under `root`, **root
+    /// included first** — exactly what `WalkDir` yields, so root handling
+    /// stays per-site: `write_tree` needs the root entry (`create_ipa` maps
+    /// the empty relative path to `Some("Payload/{app}")` at
+    /// `archive.rs:260-266`, pinned by `archive.rs:865`), while the two
+    /// historical `min_depth(1)` sites skip it explicitly. Per-entry
+    /// results preserve each site's current WalkDir error handling:
+    /// propagating sites write `let e = e?;`, skipping sites write
+    /// `let Ok(e) = e else { continue };`.
     fn walk(&self, root: &Path) -> Result<Vec<Result<(PathBuf, StoreKind)>>>;
-    /// Pruned walk mirroring `WalkDir::filter_entry`: `prune` returning
-    /// `false` skips the whole subtree — never visited, never yielded, and
-    /// any error inside it never surfaces.
+    /// Pruned walk mirroring `WalkDir::filter_entry` + `min_depth(1)` (the
+    /// root is never yielded, as in the source chain at `mod.rs:1326`):
+    /// `prune` returning `false` skips the whole subtree — never visited,
+    /// never yielded, and any error inside it never surfaces.
     fn walk_pruned(
         &self,
         root: &Path,
@@ -346,13 +355,15 @@ impl Store for FsStore {
         Ok(StoreStat { kind, len: md.len(), unix_mode })
     }
     fn walk(&self, root: &Path) -> Result<Vec<Result<(PathBuf, StoreKind)>>> {
-        // Mirrors the call sites' WalkDir usage: follow_links(false),
-        // pre-order, entries in readdir order. Entry errors are preserved as
-        // inner results: `write_tree` (archive.rs:349-356) and the
-        // CodeResources scan (code_resources.rs:150-161) propagate them with
-        // the message "Failed to walk directory: {e}" — reproduce that exact
-        // format here; the min_depth(1) sites skip them
-        // (filter_map(|e| e.ok()) at mod.rs:968-970, :1147-1149, :1346-1348).
+        // Mirrors the call sites' WalkDir usage 1:1: follow_links(false),
+        // pre-order with the root yielded FIRST (root handling stays
+        // per-site — create_ipa needs the root entry, archive.rs:260-266;
+        // the min_depth(1) sites skip it themselves). Entry errors are
+        // preserved as inner results: `write_tree` (archive.rs:349-356) and
+        // the CodeResources scan (code_resources.rs:150-161) propagate them
+        // with the message "Failed to walk directory: {e}" — reproduce that
+        // exact format here; the min_depth(1) sites skip them
+        // (filter_map(|e| e.ok()) at mod.rs:968-970, :1147-1149).
         let mut out = Vec::new();
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
             let entry = match entry {
@@ -365,9 +376,6 @@ impl Store for FsStore {
                     continue;
                 }
             };
-            if entry.path() == root {
-                continue;
-            }
             let ft = entry.file_type();
             let kind = if ft.is_dir() {
                 StoreKind::Dir
@@ -472,14 +480,31 @@ impl Store for FsStore {
 }
 ```
 
-Fidelity check the implementer MUST run (not assume): `walk_pruned`'s
-`min_depth(1)` matches `find_immediate_macho_binaries`'s current chain
-(`mod.rs:1326`); `walk`'s root-exclusion matches `min_depth(1)` at
-`mod.rs:968`/`:1147` and is a no-op for the two unfiltered sites (their root
-entry is dropped later by `name_of("")` → `None` at `archive.rs:305-311` and
-the `is_dir` arm at `code_resources.rs:169-171`). If any site's current
-handling differs from the table above, preserve the site's behavior, not the
-table's.
+Fidelity check the implementer MUST run (not assume):
+- `walk` is root-inclusive (WalkDir 1:1). Root handling is **per-site**:
+  - `write_tree` (`archive.rs:349`) NEEDS the root entry — `create_ipa`
+    maps the empty relative path to `Some("Payload/{app}")`
+    (`archive.rs:260-266`, a `Payload/{app}/` entry pinned by
+    `test_create_ipa_writes_entries_in_sorted_order` at `archive.rs:865`),
+    while `create_ipa_from_root` maps it to `None` (`archive.rs:305-311`).
+    Excluding the root in the trait would silently drop that entry — this
+    is the round-2 finding the current shape exists to avoid.
+  - `collect_nested_bundles` (source chain `min_depth(1)` at `mod.rs:966`)
+    must skip the root explicitly (`path == bundle_path → continue`; it
+    already pushes `(bundle_path, 0)` manually at `:964`).
+  - `find_standalone_dylibs` (source chain `min_depth(1)` at `mod.rs:1145`)
+    excludes the root naturally — the root is a directory, and its
+    `!entry.file_type().is_file() → continue` check drops it before the
+    `.dylib` extension test. State this in a comment rather than adding a
+    redundant guard.
+  - the CodeResources scan drops the root through its existing `is_dir`
+    early-return (`code_resources.rs:169-171`) — keep it.
+- `walk_pruned`'s `min_depth(1)` matches `find_immediate_macho_binaries`'s
+  current chain (`mod.rs:1326`) — root never yielded there, exactly as
+  today.
+
+If any site's current handling differs from the table above, preserve the
+site's behavior, not the table's.
 
 - [ ] **Step 1.3: Compile and run the scoped native gate**
 
@@ -562,12 +587,18 @@ Required behavior (implement exactly; each is load-bearing):
   `Err(Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound)))`
   (same shape `fs::symlink_metadata` produces, so `exists()`/`is_dir()`
   call sites behave identically).
-- `walk(root)`: DFS pre-order over keys strictly under `root`, children
+- `walk(root)`: DFS pre-order over `root` itself and every key strictly
+  under it (root FIRST — matching `WalkDir`, whose root entry `create_ipa`
+  depends on), children
   sorted by file name; full `root.join(child)`-shaped keys exactly like
-  `WalkDir` (native sites `strip_prefix(root)`), root excluded, inner
+  `WalkDir` (native sites `strip_prefix(root)`), inner
   results all `Ok` (an in-memory tree cannot fail mid-walk once built).
-- `walk_pruned(root, prune)`: same traversal, but `prune(path, kind)` is
-  consulted before yielding AND before descending — a pruned subtree is
+  Callers that historically used `min_depth(1)` skip the first (root)
+  entry themselves.
+- `walk_pruned(root, prune)`: same traversal but root-invisible — the root
+  is never yielded (mirrors the source chain's `min_depth(1)`), and
+  `prune(path, kind)` is consulted for each child before yielding AND before
+  descending — a pruned subtree is
   never visited (matching `WalkDir::filter_entry`).
 - `read_link`: return stored target bytes; on a non-symlink, return the
   `NotFound`-shaped io error `fs::read_link` would produce.
@@ -682,10 +713,10 @@ else { continue }` skips):
 
 | site | today | becomes |
 | --- | --- | --- |
-| `write_tree` collect (`archive.rs:349-356`) | propagates `Failed to walk directory: {e}` | `for entry in store.walk(walk_root)? { let entry = entry?; ... }` (FsStore reproduces that message verbatim) |
-| `code_resources` scan (`code_resources.rs:150-161`) | propagates same message | `for entry in store.walk(&bundle_path)? { let entry = entry?; ... }` (the par phase then iterates the collected `Vec` as today) |
-| `collect_nested_bundles` (`mod.rs:966-971`) | `min_depth(1).filter_map(ok)` | `store.walk(bundle_path)?` + `let Ok((path, kind)) = entry else { continue };` + the site's existing dir/nested-bundle predicate |
-| `find_standalone_dylibs` (`mod.rs:1145-1150`) | `min_depth(1).filter_map(ok)` | same skip pattern |
+| `write_tree` collect (`archive.rs:349-356`) | propagates `Failed to walk directory: {e}` | `for entry in store.walk(walk_root)? { let entry = entry?; ... }` (FsStore reproduces that message verbatim; the root is yielded first and `name_of` decides its fate — `create_ipa` writes it as `Payload/{app}/` per `archive.rs:260-266`, `create_ipa_from_root` drops it via `None`) |
+| `code_resources` scan (`code_resources.rs:150-161`) | propagates same message | `for entry in store.walk(&bundle_path)? { let entry = entry?; ... }` (the par phase then iterates the collected `Vec` as today; the root entry falls out through the existing `is_dir` early-return at `:169-171`) |
+| `collect_nested_bundles` (`mod.rs:966-971`) | `min_depth(1).filter_map(ok)` | `store.walk(bundle_path)?` + **`if path == bundle_path { continue; }`** (standing in for `min_depth(1)` — the root is already pushed manually at `:964`) + `let Ok((path, kind)) = entry else { continue };` + the site's existing dir/nested-bundle predicate |
+| `find_standalone_dylibs` (`mod.rs:1145-1150`) | `min_depth(1).filter_map(ok)` | `let Ok((path, kind)) = entry else { continue };` skip pattern; the root needs no guard — it is a directory and the site's `!is_file() → continue` drops it before the `.dylib` test (comment this) |
 | `find_immediate_macho_binaries` (`mod.rs:1326-1348`) | `min_depth(1).filter_entry(prune).filter_map(ok)` | `store.walk_pruned(bundle_path, &prune_closure)?` + skip pattern — `walk_pruned` reproduces `filter_entry` subtree semantics (a flat walk + post-filter would surface errors inside pruned subtrees that this site never sees today) |
 
 `resolve_relative` (`mod.rs:990`), `resolve_within` (`mod.rs:1022`),
@@ -991,10 +1022,8 @@ pub(crate) fn create_ipa_from_store<S: Store>(store: &S, root: &Path, level: Com
 }
 ```
 
-(Exact `name_of` closure mirrors `create_ipa_from_root`'s mapping at
-`:305-311` — including whatever it does for the empty relative path (the
-root itself); read it while implementing and match it — `zip_entry_name`
-`archive.rs:425`.)
+(The `name_of` closure above is `create_ipa_from_root`'s, verbatim from
+`archive.rs:305-311`; `zip_entry_name` is at `archive.rs:425`.)
 
 - [ ] **Step 5.4: Scoped gate**
 
@@ -1052,8 +1081,11 @@ Supporting pieces (all small, all in `ipa/`):
 
 - [ ] **Step 6.2: Native round-trip tests**
 
-Add to `ipa/mod.rs` tests (reusing `write_test_ipa`-style fixture building,
-`mod.rs:1766-1807`, writing to a `Vec` via `Cursor` instead of a file):
+Add to `ipa/mod.rs` tests (reusing the existing helpers —
+`crate::test_util::test_credentials()` for signing, `minimal_macho()` for
+the executable, and `write_test_ipa`-style fixture building at
+`mod.rs:1766-1807` writing to a `Vec` via `Cursor` instead of a file; no
+new fixture code):
 
 1. `test_sign_ipa_bytes_round_trip` — sign the fixture IPA bytes; assert:
    output opens as a zip; `Payload/Test.app/_CodeSignature/CodeResources`
