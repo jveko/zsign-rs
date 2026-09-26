@@ -17,8 +17,10 @@
 //!       ├── embedded.mobileprovision
 //!       ├── _CodeSignature/
 //!       │   └── CodeResources
-//!       └── Frameworks/
-//!           └── *.framework/
+//!       ├── Frameworks/
+//!       │   └── *.framework/
+//!       └── XPCServices/
+//!           └── *.xpc/
 //! ```
 //!
 //! # Examples
@@ -406,7 +408,9 @@ impl<'a> IpaSigner<'a> {
         Ok(())
     }
 
-    /// Collect all nested bundles (.app, .framework, .appex) with their depths.
+    /// Collect all nested-code bundle directories with their depths.
+    ///
+    /// See [`crate::bundle::is_nested_bundle_dir`] for what qualifies.
     ///
     /// Returns a vector of (path, depth) tuples where depth is the nesting level.
     fn collect_nested_bundles(&self, bundle_path: &Path) -> Result<Vec<(PathBuf, usize)>> {
@@ -421,23 +425,13 @@ impl<'a> IpaSigner<'a> {
         {
             let path = entry.path();
 
-            if entry.file_type().is_dir() && Self::is_bundle_directory(path) {
+            if entry.file_type().is_dir() && crate::bundle::is_nested_bundle_dir(path) {
                 let depth = self.calculate_bundle_depth(path, bundle_path);
                 bundles.push((path.to_path_buf(), depth));
             }
         }
 
         Ok(bundles)
-    }
-
-    /// Check if a directory is an iOS bundle.
-    fn is_bundle_directory(path: &Path) -> bool {
-        if let Some(ext) = path.extension() {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            matches!(ext_str.as_str(), "app" | "framework" | "appex")
-        } else {
-            false
-        }
     }
 
     /// Resolve `rel` — a root-relative name (raw plist value or literal) —
@@ -579,15 +573,15 @@ impl<'a> IpaSigner<'a> {
     ///
     /// Depth is based on how many bundle directories are in the path.
     fn calculate_bundle_depth(&self, bundle_path: &Path, root_bundle: &Path) -> usize {
-        let relative = bundle_path.strip_prefix(root_bundle).unwrap_or(bundle_path);
+        let Ok(relative) = bundle_path.strip_prefix(root_bundle) else {
+            return 0;
+        };
 
         let mut depth = 0;
-        for component in relative.iter() {
-            let component_str = component.to_string_lossy();
-            if component_str.ends_with(".app")
-                || component_str.ends_with(".framework")
-                || component_str.ends_with(".appex")
-            {
+        let mut prefix = root_bundle.to_path_buf();
+        for component in relative.components() {
+            prefix.push(component);
+            if crate::bundle::is_nested_bundle_dir(&prefix) {
                 depth += 1;
             }
         }
@@ -752,7 +746,7 @@ impl<'a> IpaSigner<'a> {
 
     /// Find Mach-O binaries that belong directly to this bundle (not nested bundles).
     ///
-    /// This excludes binaries inside nested .framework or .appex directories.
+    /// This excludes binaries inside nested-code bundle directories.
     fn find_immediate_macho_binaries(
         &self,
         bundle_path: &Path,
@@ -770,7 +764,9 @@ impl<'a> IpaSigner<'a> {
             .into_iter()
             .filter_entry(|e| {
                 let path = e.path();
-                if path != bundle_path && e.file_type().is_dir() && Self::is_bundle_directory(path)
+                if path != bundle_path
+                    && e.file_type().is_dir()
+                    && crate::bundle::is_nested_bundle_dir(path)
                 {
                     return false;
                 }
@@ -2049,6 +2045,84 @@ mod tests {
         assert!(
             !output.exists(),
             "no output may be written for an ambiguous archive"
+        );
+    }
+
+    #[test]
+    fn test_xpc_service_is_discovered_and_signed_as_nested_bundle() {
+        use zsign_core::codesign::verify::parse_superblob;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let xpc = app.join("XPCServices").join("Foo.xpc");
+        std::fs::create_dir_all(&xpc).unwrap();
+        std::fs::write(
+            xpc.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.test.foo.xpc</string>
+    <key>CFBundleExecutable</key><string>Foo</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(xpc.join("Foo"), crate::test_util::minimal_macho()).unwrap();
+
+        // `.xpc` is not in the {app, framework, appex} whitelist: only the
+        // Info.plist/location arms can discover this bundle.
+        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        assert!(
+            bundles.iter().any(|(p, d)| p == &xpc && *d == 1),
+            "the XPC service must be collected as a depth-1 nested bundle: {bundles:?}"
+        );
+
+        IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect("a folder containing an XPC service must sign");
+        assert!(
+            xpc.join("_CodeSignature/CodeResources").exists(),
+            "the XPC bundle must be sealed with its own CodeResources"
+        );
+
+        let foo = std::fs::read(xpc.join("Foo")).unwrap();
+        let m = crate::macho::MachOFile::parse(foo.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let sb = parse_superblob(&foo[sig_off..sig_off + sig_len]).unwrap();
+        let cd = sb
+            .code_directory
+            .as_ref()
+            .expect("primary CodeDirectory must be present");
+        assert_eq!(
+            cd.identifier(),
+            Some("com.test.foo.xpc"),
+            "the XPC binary must carry its bundle identifier, not its file stem"
+        );
+        let info_hash = cd
+            .special_slot_hash(1)
+            .expect("nested bundle main executable must bind its Info.plist slot -1");
+        assert!(
+            info_hash.iter().any(|&b| b != 0),
+            "slot -1 must hold a real Info.plist hash"
+        );
+        assert!(
+            sb.entries.iter().all(|e| e.slot != 0x0005),
+            "a nested bundle binary must be signed without entitlements"
+        );
+
+        let vreport = crate::verify::verify_bundle(&app).expect("verify must run");
+        assert!(
+            vreport.valid(),
+            "ipa sign→verify must pass: {:?}",
+            vreport.bundle.as_ref().map(|b| &b.errors)
+        );
+        let bundle = vreport.bundle.as_ref().unwrap();
+        assert_eq!(bundle.nested.len(), 1, "exactly the XPC service is nested");
+        assert_eq!(
+            bundle.nested[0].path, "XPCServices/Foo.xpc",
+            "the verifier must recognize the XPC bundle by the same predicate"
         );
     }
 }

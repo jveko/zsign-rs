@@ -10,8 +10,9 @@
 //! - The bundle's `_CodeSignature/CodeResources` is checked bidirectionally:
 //!   every sealed file must hash to its recorded value, and every on-disk file
 //!   must be sealed (or belong to the rules' omission set).
-//! - Nested bundles (`.framework`, `.appex`, nested `.app`) are verified
-//!   recursively, mirroring the signer's depth-first walk.
+//! - Nested-code bundles recognized by
+//!   [`crate::bundle::is_nested_bundle_dir`] are verified recursively,
+//!   mirroring the signer's depth-first walk.
 //!
 //! # Examples
 //!
@@ -79,7 +80,7 @@ pub struct BundleVerification {
     pub binaries: Vec<BinaryVerification>,
     /// CodeResources check (present when the bundle has a `_CodeSignature`).
     pub code_resources: Option<CodeResourcesVerification>,
-    /// Nested bundles (`.framework`, `.appex`, nested `.app`).
+    /// Nested-code bundles recognized by [`crate::bundle::is_nested_bundle_dir`].
     pub nested: Vec<BundleVerification>,
     /// Bundle-level errors (e.g. missing Info.plist for an app bundle).
     pub errors: Vec<String>,
@@ -139,29 +140,20 @@ impl VerifyReport {
     }
 }
 
-/// Bundle directory extensions recognized as nested bundles.
-fn is_bundle_dir(path: &Path) -> bool {
-    path.extension()
-        .map(|e| {
-            matches!(
-                e.to_string_lossy().to_lowercase().as_str(),
-                "app" | "framework" | "appex"
-            )
-        })
-        .unwrap_or(false)
-}
-
-/// True when any component of `rel` names a nested bundle directory. With
-/// `ignore_last` the final component is exempt, which lets a directory entry
-/// itself be the bundle while its ancestors must not be.
-fn has_nested_bundle_component(rel: &Path, ignore_last: bool) -> bool {
+/// True when any ancestor component of `rel` (relative to the bundle dir
+/// `dir` currently being verified) names a nested-code bundle directory.
+/// With `ignore_last` the final component is exempt, which lets a
+/// directory entry itself be the bundle while its ancestors must not be.
+fn has_nested_bundle_component(dir: &Path, rel: &Path, ignore_last: bool) -> bool {
     let mut components: Vec<_> = rel.components().collect();
     if ignore_last {
         components.pop();
     }
-    components
-        .iter()
-        .any(|c| is_bundle_dir(Path::new(c.as_os_str())))
+    let mut prefix = dir.to_path_buf();
+    components.iter().any(|c| {
+        prefix.push(c);
+        crate::bundle::is_nested_bundle_dir(&prefix)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -453,7 +445,9 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         }
         let rel_dir = p.strip_prefix(dir).unwrap_or(p);
         if entry.file_type().is_dir() {
-            if is_bundle_dir(p) && !has_nested_bundle_component(rel_dir, true) {
+            if crate::bundle::is_nested_bundle_dir(p)
+                && !has_nested_bundle_component(dir, rel_dir, true)
+            {
                 nested_dirs.push(p.to_path_buf());
             }
             continue;
@@ -463,7 +457,7 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         if rel_str.contains("_CodeSignature/") {
             continue;
         }
-        if has_nested_bundle_component(rel_dir, false) {
+        if has_nested_bundle_component(dir, rel_dir, false) {
             continue;
         }
         if is_macho_file(p)? {
