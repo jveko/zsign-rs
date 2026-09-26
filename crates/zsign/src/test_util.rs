@@ -25,7 +25,15 @@ pub(crate) fn minimal_macho_encrypted() -> Vec<u8> {
     data
 }
 
-/// Self-signed RSA-2048 credentials with `team_id=Some("TESTTEAM")`.
+/// `minimal_macho()` with the Mach-O filetype patched to `MH_DYLIB` (6).
+pub(crate) fn minimal_dylib() -> Vec<u8> {
+    let mut data = minimal_macho();
+    data[12..16].copy_from_slice(&6u32.to_le_bytes());
+    data
+}
+
+/// Self-issued RSA-2048 credentials (`Profile::Leaf`, codeSigning EKU) with
+/// `team_id=Some("TESTTEAM")`.
 pub(crate) fn test_credentials() -> crate::SigningCredentials {
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
     use rsa::RsaPrivateKey;
@@ -45,17 +53,25 @@ pub(crate) fn test_credentials() -> crate::SigningCredentials {
     let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
     let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
-    let cert = CertificateBuilder::new(
-        Profile::Root,
+    let mut builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: subject.clone(),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
         serial,
         validity,
         subject,
         pub_key,
         &signing_key,
     )
-    .unwrap()
-    .build::<rsa::pkcs1v15::Signature>()
     .unwrap();
+    builder
+        .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
+            spki::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+        ]))
+        .unwrap();
+    let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
     crate::SigningCredentials {
         certificate: cert,

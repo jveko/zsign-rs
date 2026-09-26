@@ -63,6 +63,7 @@ use crate::crypto::SigningCredentials;
 use crate::macho::{sign_any_macho, sign_macho, MachOFile};
 use crate::{Error, Result};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
@@ -385,6 +386,7 @@ impl<'a> IpaSigner<'a> {
         dylibs
             .par_iter()
             .try_for_each(|dylib_path| self.sign_standalone_dylib(bundle_path, dylib_path))?;
+        let already_signed: HashSet<PathBuf> = dylibs.iter().cloned().collect();
 
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
 
@@ -397,6 +399,7 @@ impl<'a> IpaSigner<'a> {
                 is_main_bundle,
                 if is_main_bundle { entitlements } else { None },
                 if is_main_bundle { profile_data } else { None },
+                &already_signed,
             )?;
         }
 
@@ -687,11 +690,12 @@ impl<'a> IpaSigner<'a> {
         copy_provisioning_profile: bool,
         entitlements: Option<&[u8]>,
         profile_data: Option<&[u8]>,
+        already_signed: &HashSet<PathBuf>,
     ) -> Result<()> {
         let identifier = self.get_bundle_identifier(bundle_path)?;
         let main_executable = self.get_main_executable(bundle_path)?;
 
-        let binaries = self.find_immediate_macho_binaries(bundle_path)?;
+        let binaries = self.find_immediate_macho_binaries(bundle_path, already_signed)?;
 
         let non_main_binaries: Vec<_> =
             binaries.iter().filter(|p| *p != &main_executable).collect();
@@ -749,7 +753,11 @@ impl<'a> IpaSigner<'a> {
     /// Find Mach-O binaries that belong directly to this bundle (not nested bundles).
     ///
     /// This excludes binaries inside nested .framework or .appex directories.
-    fn find_immediate_macho_binaries(&self, bundle_path: &Path) -> Result<Vec<PathBuf>> {
+    fn find_immediate_macho_binaries(
+        &self,
+        bundle_path: &Path,
+        already_signed: &HashSet<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
         let mut binaries = Vec::new();
 
         let main_executable = self.get_main_executable(bundle_path)?;
@@ -780,7 +788,10 @@ impl<'a> IpaSigner<'a> {
                 continue;
             }
 
-            if path != main_executable && self.is_macho_binary(path)? {
+            if path != main_executable
+                && !already_signed.contains(&path.to_path_buf())
+                && self.is_macho_binary(path)?
+            {
                 binaries.push(path.to_path_buf());
             }
         }
@@ -1693,10 +1704,17 @@ mod tests {
             !dylibs.contains(&link),
             "a symlinked dylib must not be discovered: {dylibs:?}"
         );
-        let binaries = signer.find_immediate_macho_binaries(&app).unwrap();
+        let processed: std::collections::HashSet<_> = dylibs.iter().cloned().collect();
+        let binaries = signer
+            .find_immediate_macho_binaries(&app, &processed)
+            .unwrap();
         assert!(
             !binaries.contains(&link),
             "a symlinked dylib must not be a signing target: {binaries:?}"
+        );
+        assert!(
+            !binaries.contains(&app.join("real.dylib")),
+            "a standalone-signed dylib must not be re-offered by the immediate walk: {binaries:?}"
         );
 
         IpaSigner::new(&crate::test_util::test_credentials())
@@ -1707,6 +1725,129 @@ mod tests {
             before,
             "external dylib target must stay untouched"
         );
+    }
+
+    #[test]
+    fn test_standalone_dylib_signed_exactly_once() {
+        use zsign_core::codesign::verify::parse_superblob;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        std::fs::create_dir_all(app.join("Frameworks")).unwrap();
+        std::fs::write(
+            app.join("Frameworks").join("libfoo.dylib"),
+            crate::test_util::minimal_dylib(),
+        )
+        .unwrap();
+
+        let creds = crate::test_util::test_credentials();
+        IpaSigner::new(&creds)
+            .sign_folder_in_place(&app)
+            .expect("folder containing a Frameworks dylib must sign");
+
+        let data = std::fs::read(app.join("Frameworks").join("libfoo.dylib")).unwrap();
+        let m = crate::macho::MachOFile::parse(data.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let sb = parse_superblob(&data[sig_off..sig_off + sig_len]).unwrap();
+        let cd = sb
+            .code_directory
+            .as_ref()
+            .expect("primary CodeDirectory must be present");
+
+        assert_eq!(
+            cd.identifier(),
+            Some("libfoo"),
+            "the standalone pass's file-stem identifier must be the on-disk identifier"
+        );
+        assert!(
+            sb.entries.iter().any(|e| e.slot == 0x1000),
+            "the standalone pass's dual code directories must survive: a second \
+             sha256-only pass over the same file would leave a single SHA-256 CD"
+        );
+        assert!(
+            sb.entries.iter().all(|e| e.slot != 0x0005),
+            "no entitlements blob may be applied to a dylib"
+        );
+
+        // Per-binary pins, one level up from verify_signed_binary_round_trip
+        // (macho/verify.rs:948-980): identity-signed output is anchor-gated, so
+        // "sign→verify passes" = each binary's ONLY failure is the anchor
+        // message, with signed + pages Matched + cms signature/message_digest/
+        // cdhash/chain each ok — any structural defect (pages, slots, sealing)
+        // would add a second error or flip these pins. No report-level
+        // valid() assertion (supervisor AMEND refinement); bundle-level pins
+        // stay structural: no bundle errors and a sealed CodeResources.
+        let report = crate::verify::verify_bundle(&app).expect("verify must run");
+        let bundle = report.bundle.as_ref().expect("bundle verification");
+        assert!(
+            bundle.errors.is_empty(),
+            "bundle-level errors must be empty: {:?}",
+            bundle.errors
+        );
+        let cr = bundle
+            .code_resources
+            .as_ref()
+            .expect("bundle CodeResources verification");
+        assert!(
+            cr.valid(),
+            "sealed CodeResources must verify: mismatched={:?} missing={:?} unsealed={:?}",
+            cr.mismatched,
+            cr.missing,
+            cr.unsealed
+        );
+        for binary in &bundle.binaries {
+            let slice = &binary
+                .report
+                .as_ref()
+                .unwrap_or_else(|| panic!("Mach-O report for {}", binary.path))
+                .slices[0];
+            assert!(
+                slice.signed,
+                "{}: output must carry a signature",
+                binary.path
+            );
+            assert!(
+                !slice.adhoc,
+                "{}: credential-signed output must not be ad-hoc",
+                binary.path
+            );
+            assert_eq!(
+                slice.pages,
+                zsign_core::codesign::verify::PageCheck::Matched,
+                "{}: page hashes must match",
+                binary.path
+            );
+            assert_eq!(
+                slice.errors.len(),
+                1,
+                "{}: only the anchor gate may fail, got {:?}",
+                binary.path,
+                slice.errors
+            );
+            assert!(
+                slice.errors[0].contains("not anchored to a trusted root"),
+                "{}: unexpected gate: {}",
+                binary.path,
+                slice.errors[0]
+            );
+            let cms = slice.cms.as_ref().expect("CMS report");
+            assert!(
+                cms.signature_ok
+                    && cms.message_digest_ok
+                    && cms.cdhash_v1_ok
+                    && cms.cdhash_v2_ok
+                    && cms.chain_ok,
+                "{}: cms: {cms:?}",
+                binary.path
+            );
+            assert!(
+                !cms.anchored,
+                "{}: not anchored without an injected root",
+                binary.path
+            );
+        }
     }
 
     #[cfg(unix)]
