@@ -379,7 +379,8 @@ pub(crate) fn decrypt_key_bag(value: &[u8], password: &str) -> Result<Vec<u8>> {
 /// Block-cipher CBC decrypt with PKCS#7 removal, generic over the cipher so the traditional
 /// PEM decoder can reuse the same code path as PKCS#12. The name predates that reuse;
 /// `des::TdesEde3` satisfies the same `BlockDecrypt + KeyInit` bounds
-/// (`des-0.8.1/src/des3.rs:27-42`, and `des` re-exports `cipher` at `src/lib.rs:26`).
+/// (`des-0.8.1/src/tdes.rs:21-31` for `BlockCipher`/`KeySizeUser`/`KeyInit`, and `des` re-exports
+/// `cipher` at `src/lib.rs:26` and `TdesEde3` at `:33`).
 pub(crate) fn aes_decrypt<C>(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>>
 where
     C: BlockDecrypt + KeyInit,
