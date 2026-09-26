@@ -741,7 +741,8 @@ and look only for NEW material defects.
 - Determinism bullet claimed "error lists are sorted" — no counterpart in current
   source (repo-wide `errors.sort*` search empty; the design doc's `mod.rs:825-835`
   citation now points at a doc comment). Clause dropped; `BTreeMap` + pinned-clock
-  halves kept (verified at `bundle/code_resources.rs:67`, `cert.rs:402-409`).
+  halves kept (verified at `bundle/code_resources.rs:67`, `cms_verify.rs:1710-1717`,
+  mirrored at `crypto/cert.rs:412`).
 - "is rejected by tests" implied named guard tests for `signingTime`/`RandomizedSigner`
   (they exist only in the module's contract comment). Reworded to "would make the
   module's byte-identical tests fail" — mutation-proven true per the crypto design doc.
