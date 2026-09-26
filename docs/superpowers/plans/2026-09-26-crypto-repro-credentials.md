@@ -581,7 +581,7 @@ echo "fixtures verified"
     #[test]
     fn dek_info_aes256_yields_a_pkcs1_key() {
         let pem = pem_fixture(TRAD_RSA_AES256);
-        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
         assert_eq!(der[0], 0x30, "plaintext must be a DER SEQUENCE");
         assert!(
             rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok(),
@@ -593,7 +593,7 @@ echo "fixtures verified"
     #[test]
     fn dek_info_aes128_yields_a_sec1_ec_key() {
         let pem = pem_fixture(TRAD_EC_AES128);
-        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
         assert!(
             p256::SecretKey::from_sec1_der(&der).is_ok(),
             "traditional EC PEM must decrypt to SEC1, got {} bytes",
@@ -604,7 +604,7 @@ echo "fixtures verified"
     #[test]
     fn dek_info_3des_yields_a_pkcs1_key() {
         let pem = pem_fixture(TRAD_RSA_DES3);
-        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
         assert!(rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok());
     }
 
@@ -612,7 +612,7 @@ echo "fixtures verified"
     fn wrong_password_is_reported_as_a_password_failure() {
         for blob in [TRAD_RSA_AES256, TRAD_RSA_DES3, TRAD_EC_AES128] {
             let pem = pem_fixture(blob);
-            let res = decrypt_pem_fixture(&pem, Some("not-the-password"));
+            let res = decrypt_traditional_pem(&pem, Some("not-the-password"));
             assert!(
                 matches!(res, Err(Error::InvalidPassword)),
                 "a wrong passphrase must be a password failure, got {:?}",
@@ -624,7 +624,7 @@ echo "fixtures verified"
     #[test]
     fn missing_password_asks_for_one() {
         let pem = pem_fixture(TRAD_RSA_AES256);
-        let res = decrypt_pem_fixture(pem, None);
+        let res = decrypt_traditional_pem(pem, None);
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("requires a password")),
             "an encrypted key without a password must say so, got {:?}",
@@ -644,7 +644,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        let res = decrypt_pem_fixture(pem, Some("x"));
+        let res = decrypt_traditional_pem(pem, Some("x"));
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("AES-128-CTR")),
             "unsupported ciphers must be named, got {:?}",
@@ -661,7 +661,7 @@ echo "fixtures verified"
                 label = format!("RSA {}", "PRIVATE KEY"),
                 cipher = cipher,
             );
-            let res = decrypt_pem_fixture(&pem, Some("x"));
+            let res = decrypt_traditional_pem(&pem, Some("x"));
             assert!(
                 matches!(&res, Err(Error::Certificate(m)) if m.contains(cipher) && m.contains("unsupported")),
                 "{cipher} must be refused by name, got {:?}",
@@ -679,7 +679,7 @@ echo "fixtures verified"
         let pem = std::str::from_utf8(key.to_pkcs1_der().unwrap().as_bytes()).unwrap();
         let wrapped = pem_text("RSA PRIVATE KEY", key.to_pkcs1_der().unwrap().as_bytes());
         assert!(
-            matches!(decrypt_pem_fixture(&wrapped, Some("testpassword")), Ok(None)),
+            matches!(decrypt_traditional_pem(&wrapped, Some("testpassword")), Ok(None)),
             "a plaintext PKCS#1 container must fall through, not error"
         );
     }
@@ -692,7 +692,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        assert!(matches!(decrypt_pem_fixture(pem, Some("x")), Ok(None)),
+        assert!(matches!(decrypt_traditional_pem(pem, Some("x")), Ok(None)),
             "DEK-Info without Proc-Type is not a traditional encrypted PEM");
     }
 
@@ -705,7 +705,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        let res = decrypt_pem_fixture(pem, Some("x"));
+        let res = decrypt_traditional_pem(pem, Some("x"));
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("DEK-Info")),
             "a bad IV must be a framing error, got {:?}",
@@ -1355,7 +1355,7 @@ git commit -m "feat(cli): decrypt encrypted pem keys instead of rejecting the pa
 ## Tasks 8-10: corrections applied during implementation
 
 The snippets in Tasks 8-10 below were written from the RFC text before any OCSP code was compiled.
-Implementing them surfaced ten defects; each is listed with what shipped, and the shipped code —
+Implementing them surfaced eleven defects; each is listed with what shipped, and the shipped code —
 not the snippet — is the authority. The snippets are kept in place because the surrounding tests
 and the fixture recipe are unchanged.
 
@@ -1393,6 +1393,13 @@ and the fixture recipe are unchanged.
    budget. Shipped code splits host/port (`split_authority`, with `[ipv6]` support), takes a
    numeric-literal fast path off the resolver, and threads the budget into connect/read/write.
 
+10. **The scheme filter moved from AIA extraction into `check`.** The snippet filtered in
+    `ocsp_responder_url` (`url.starts_with("http://").then_some(url)`), which made `UnusableUrl`
+    unreachable — a non-`http:` responder would have been indistinguishable from a certificate
+    with no OCSP pointer at all. Shipped code returns the AIA text whatever its scheme
+    (`revocation.rs:162-178`) and `check` short-circuits `UnusableUrl` *before* the issuer lookup
+    (`:801-803`), so an `https:` AIA with no issuer reports `UnusableUrl`, not
+    `NoIssuerCertificate`. Both snippets below are corrected to that ordering.
 11. **Shared certificate verifier, wider delegate algorithm set.** Deleting `revocation.rs`'s
     duplicate `verify_cert_signature` in favour of promoting `cms_verify::verify_cert_signature`
     (`:1518`) to `pub(crate)` also widened the signature algorithms a *delegated responder
@@ -1404,14 +1411,6 @@ and the fixture recipe are unchanged.
     stays local to `revocation.rs` (`:675`): `cms_verify.rs` has no OCSPSigning helper, only
     codeSigning-purpose checks.
 
-12. **The scheme filter moved from AIA extraction into `check`.** The snippet filtered in
-    `ocsp_responder_url` (`url.starts_with("http://").then_some(url)`), which made `UnusableUrl`
-    unreachable — a non-`http:` responder would have been indistinguishable from a certificate
-    with no OCSP pointer at all. Shipped code returns the AIA text whatever its scheme
-    (`revocation.rs:162-178`) and `check` short-circuits `UnusableUrl` *before* the issuer lookup
-    (`:801-803`), so an `https:` AIA with no issuer reports `UnusableUrl`, not
-    `NoIssuerCertificate`. Both snippets below are corrected to that ordering.
-
 Two plan-side claims were also wrong and are corrected above where they appear: the snippet's
 expected request was `SEQUENCE x3` around the CertID where RFC 6960 has four levels
 (`OCSPRequest / tbsRequest / requestList / Request`), and the foreign-issuer-key case is not pinned
@@ -1419,7 +1418,6 @@ to one variant. A foreign issuer changes the recomputed `CertID`, so it fails th
 signature check, and the shipped test asserts only `NotChecked(_)`
 (`revocation.rs:1335-1338`, with a `Good` control at `:1351`); `NoMatchingCertId` is pinned for a
 *serial* mismatch only (`:1364-1367`).
-
 
 ## Task 8: OCSP request construction and AIA extraction
 
