@@ -773,25 +773,6 @@ fn read_credential_file(
         .map_err(|e| format!("failed to read {label} '{}': {e}", path.display()).into())
 }
 
-/// Fails explicitly on encrypted PEM/DER key material, or on any non-empty
-/// password supplied to a key route: `from_pem`'s password parameter is
-/// rejection-only (it never decrypts), so a password here can only ever mean
-/// encrypted key material. The PKCS#12 routes are deliberately excluded — they
-/// use the password normally.
-fn reject_encrypted_key(cli: &Cli, key_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let password = cli.password.as_deref().unwrap_or_default();
-    let encrypted_marker = key_data
-        .windows(b"ENCRYPTED PRIVATE KEY".len())
-        .any(|w| w == b"ENCRYPTED PRIVATE KEY")
-        || key_data
-            .windows(b"Proc-Type: 4,ENCRYPTED".len())
-            .any(|w| w == b"Proc-Type: 4,ENCRYPTED");
-    if encrypted_marker || !password.is_empty() {
-        return Err("encrypted PEM keys are unsupported (see ZSN-18)".into());
-    }
-    Ok(())
-}
-
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
     if let Some(p12_path) = &cli.pkcs12 {
         let p12_data = read_credential_file(p12_path, "pkcs12")?;
@@ -807,12 +788,11 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
     };
     let key_data = read_credential_file(key_path, "private key")?;
     if key_data.starts_with(b"-----BEGIN") {
-        reject_encrypted_key(cli, &key_data)?;
         let Some(cert_path) = &cli.certificate else {
             return Err("--certificate <FILE> is required with a PEM private key".into());
         };
         let cert_data = read_credential_file(cert_path, "certificate")?;
-        let creds = SigningCredentials::from_pem(&cert_data, &key_data, None)?;
+        let creds = SigningCredentials::from_pem(&cert_data, &key_data, cli.password.as_deref())?;
         return Ok(creds);
     }
 
@@ -842,10 +822,13 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
                     use --pkcs12"
                     .into());
             }
-            reject_encrypted_key(cli, &key_data)?;
             let cert_data = read_credential_file(cert_path, "certificate")?;
             let wrapped = pem_wrap_der(&key_data);
-            let creds = SigningCredentials::from_pem(&cert_data, wrapped.as_bytes(), None)?;
+            let creds = SigningCredentials::from_pem(
+                &cert_data,
+                wrapped.as_bytes(),
+                cli.password.as_deref(),
+            )?;
             Ok(creds)
         }
         // no PEM marker + no certificate => PKCS#12 content
@@ -1072,6 +1055,24 @@ mod tests {
 
     const EMPTY_PASSWORD_P12: &[u8] =
         include_bytes!("../../zsign-core/src/crypto/fixtures/empty_password.p12");
+
+    // Encrypted-key fixtures are committed as base64 blobs of byte-exact OpenSSL output: the
+    // repository's private-key commit gate refuses every private-key PEM file, PBES2 included.
+    // The certificate is committed readable, because a certificate is not a key.
+    const RSA_CERT: &[u8] = include_bytes!("../../zsign-core/src/crypto/fixtures/pem_rsa_cert.pem");
+    const ENC_TRAD_RSA: &str =
+        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_dekinfo_aes256.pem.b64");
+    const ENC_PKCS8_RSA: &str =
+        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_pbes2_sha256.pem.b64");
+
+    /// Decodes one committed encrypted-key fixture back to its PEM text.
+    fn pem_fixture(blob: &str) -> String {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(blob.trim())
+            .expect("fixture must be valid base64");
+        String::from_utf8(bytes).expect("fixture must be UTF-8 PEM text")
+    }
 
     #[test]
     fn verify_valid_input_exits_zero() {
@@ -1666,42 +1667,94 @@ mod tests {
     }
 
     #[test]
-    fn password_with_key_route_fails_explicitly() {
-        // content sniff fires before any parsing, so no real cert is needed
+    fn encrypted_pem_routes_through_the_password_flow() {
         let dir = TempDir::new().unwrap();
-        let key = dir.path().join("key.pem");
-        std::fs::write(
-            &key,
-            concat!("-----BEGIN ", "ENCRYPTED PRIVATE KEY-----", "\n"),
-        )
-        .unwrap();
         let input = dir.path().join("in.bin");
         std::fs::write(&input, MINIMAL_MACHO).unwrap();
-        // encrypted content, no password: still the explicit unsupported error
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&key, pem_fixture(ENC_TRAD_RSA)).unwrap();
+        std::fs::write(&cert, RSA_CERT).unwrap();
+        let out = dir.path().join("o.bin");
+
+        // No password: the loader says exactly what it needs.
         let r = run_cli(
             &[
                 OsStr::new("-k"),
                 key.as_os_str(),
+                OsStr::new("-c"),
+                cert.as_os_str(),
                 OsStr::new("-o"),
-                dir.path().join("o.bin").as_os_str(),
+                out.as_os_str(),
                 input.as_os_str(),
             ],
             &[],
         );
         assert_eq!(r.code, 1, "stderr: {}", r.stderr);
         assert!(
-            r.stderr.contains("encrypted PEM keys are unsupported"),
+            r.stderr.contains("requires a password"),
             "stderr: {}",
             r.stderr
         );
-        // password supplied with an unencrypted key: same explicit failure, never silence
-        std::fs::write(&key, concat!("-----BEGIN ", "PRIVATE KEY-----", "\n")).unwrap();
+
+        // Wrong password: an explicit password failure, not a generic parse error.
         let r = run_cli(
             &[
                 OsStr::new("-k"),
                 key.as_os_str(),
+                OsStr::new("-c"),
+                cert.as_os_str(),
                 OsStr::new("-p"),
-                OsStr::new("pw"),
+                OsStr::new("nope"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("Invalid password"),
+            "stderr: {}",
+            r.stderr
+        );
+
+        // Correct password: the key loads and the binary signs.
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-c"),
+                cert.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert!(out.exists(), "signed output missing");
+    }
+
+    #[test]
+    fn pbes2_pem_wrong_password_is_a_password_error_at_the_cli_too() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&key, pem_fixture(ENC_PKCS8_RSA)).unwrap();
+        std::fs::write(&cert, RSA_CERT).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-c"),
+                cert.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("nope"),
                 OsStr::new("-o"),
                 dir.path().join("o.bin").as_os_str(),
                 input.as_os_str(),
@@ -1710,8 +1763,58 @@ mod tests {
         );
         assert_eq!(r.code, 1, "stderr: {}", r.stderr);
         assert!(
-            r.stderr.contains("encrypted PEM keys are unsupported"),
-            "stderr: {}",
+            r.stderr.contains("Invalid password"),
+            "a PBES2 wrong password must be explicit at the CLI too, stderr: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn password_on_an_unencrypted_pem_key_is_now_accepted() {
+        // The deleted reject path failed *any* password on the key route before looking at the
+        // key at all. A well-formed but undecodable plaintext PEM now reaches the loader, so the
+        // only failures left are the ordinary parse/pairing ones. The label is split so no
+        // source line carries a private-key header.
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(
+            &key,
+            concat!(
+                "-----BEGIN ",
+                "PRIVATE KEY-----\n",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+                "-----END ",
+                "PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&cert, RSA_CERT).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-c"),
+                cert.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("irrelevant"),
+                OsStr::new("-o"),
+                dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            !r.stderr.contains("encrypted PEM keys are unsupported"),
+            "the old reject path must be gone, stderr: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("Failed to parse private key"),
+            "a password on an unencrypted key must be ignored, not rejected, stderr: {}",
             r.stderr
         );
     }
