@@ -15,10 +15,10 @@
 
 use crate::{Error, Result};
 use goblin::mach::fat::FatArch;
-use goblin::mach::header::{MH_CIGAM_64, MH_MAGIC_64};
+use goblin::mach::header::{MH_CIGAM, MH_CIGAM_64, MH_MAGIC, MH_MAGIC_64};
 use goblin::mach::load_command::{
-    CommandVariant, LinkeditDataCommand, SegmentCommand64, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB,
-    LC_SEGMENT, LC_SEGMENT_64,
+    CommandVariant, LinkeditDataCommand, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_SEGMENT,
+    LC_SEGMENT_64,
 };
 use goblin::mach::{Mach, MachO, MultiArch};
 
@@ -45,6 +45,18 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LINKEDIT_DATA_COMMAND_SIZE: u32 = 16;
 const PAGE_SIZE: usize = 4096;
 const CODE_SIGN_PADDING: usize = 16384;
+
+/// Little-endian 32-bit images are signable. Big-endian 32-bit (`MH_CIGAM`,
+/// m68k/PowerPC-era) is rejected with an actionable message; 64-bit behavior
+/// (either endianness) is unchanged.
+fn ensure_signable_bitness(is_64: bool, is_big_endian: bool) -> Result<()> {
+    if !is_64 && is_big_endian {
+        return Err(Error::MachO(
+            "big-endian 32-bit Mach-O (MH_CIGAM) is not supported; sign a little-endian i386/armv7 or a 64-bit binary instead".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// End of the signature range currently declared by the LC_CODE_SIGNATURE
 /// command, read from the buffer's own bytes at the command offset.
@@ -91,7 +103,7 @@ pub fn calculate_signature_space(code_length: usize) -> usize {
 ///
 /// Returns [`Error::MachO`] if:
 /// - The binary format is invalid
-/// - The binary is 32-bit (not supported)
+/// - The binary is big-endian 32-bit (not supported)
 /// - No `__LINKEDIT` segment exists
 /// - No space for `LC_CODE_SIGNATURE` in load commands area
 pub fn realloc_code_sign_space(data: &[u8], code_length: usize) -> Result<Vec<u8>> {
@@ -131,12 +143,10 @@ fn realloc_code_sign_space_single(
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
     let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
-    if !is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    ensure_signable_bitness(is_64, is_big_endian)?;
 
     let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
-    let mut linkedit_cmd: Option<(usize, SegmentCommand64)> = None;
+    let mut linkedit_cmd: Option<(usize, u64, u64, u64)> = None;
     let mut max_load_cmd_end: usize = 0;
 
     for lc in &macho.load_commands {
@@ -149,8 +159,19 @@ fn realloc_code_sign_space_single(
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
-                linkedit_cmd = Some((lc.offset, *seg));
+            // Only a command whose width matches the header can be rewritten at
+            // the right field offsets; a mixed-width image is left uncaptured so
+            // the write path fails closed instead of corrupting sizes.
+            CommandVariant::Segment64(seg) if is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
+            }
+            CommandVariant::Segment32(seg) if !is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((
+                    lc.offset,
+                    seg.fileoff as u64,
+                    seg.vmsize as u64,
+                    seg.filesize as u64,
+                ));
             }
             _ => {}
         }
@@ -179,9 +200,8 @@ fn realloc_code_sign_space_single(
 
     let mut output = data[..code_length].to_vec();
 
-    if let Some((offset, seg)) = linkedit_cmd {
-        let linkedit_fileoff = seg.fileoff as usize;
-        let old_vmsize = seg.vmsize;
+    if let Some((offset, linkedit_fileoff, old_vmsize, _old_filesize)) = linkedit_cmd {
+        let linkedit_fileoff = linkedit_fileoff as usize;
         let size_increase = required - data.len();
         let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;
         let new_filesize = required
@@ -189,8 +209,14 @@ fn realloc_code_sign_space_single(
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
             as u64;
 
-        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
-        write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
+        write_linkedit_sizes(
+            &mut output,
+            offset,
+            new_vmsize,
+            new_filesize,
+            is_64,
+            is_big_endian,
+        )?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
@@ -519,12 +545,11 @@ fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) 
 
 fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Result<Vec<u8>> {
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
-    if !is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
+    ensure_signable_bitness(is_64, is_big_endian)?;
 
     let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
-    let mut linkedit_cmd: Option<(usize, SegmentCommand64)> = None;
+    let mut linkedit_cmd: Option<(usize, u64, u64, u64)> = None;
     let mut max_load_cmd_end: usize = 0;
 
     for lc in &macho.load_commands {
@@ -537,22 +562,37 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
-                linkedit_cmd = Some((lc.offset, *seg));
+            // Only a command whose width matches the header can be rewritten at
+            // the right field offsets; a mixed-width image is left uncaptured so
+            // the write path fails closed instead of corrupting sizes.
+            CommandVariant::Segment64(seg) if is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
+            }
+            CommandVariant::Segment32(seg) if !is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((
+                    lc.offset,
+                    seg.fileoff as u64,
+                    seg.vmsize as u64,
+                    seg.filesize as u64,
+                ));
             }
             _ => {}
         }
     }
 
-    let code_length = if let Some((_, cs)) = code_sig_cmd {
-        cs.dataoff as usize
+    // Provenance matters for the error: with no LC_CODE_SIGNATURE the length
+    // comes from the widest segment's file extent, not from a signature command.
+    let (code_length, from_code_sig_cmd) = if let Some((_, cs)) = code_sig_cmd {
+        (cs.dataoff as usize, true)
     } else {
-        find_code_end(macho, data.len())
+        (find_code_end(macho, data.len()), false)
     };
     if code_length > data.len() {
-        return Err(Error::MachO(
-            "LC_CODE_SIGNATURE dataoff exceeds file length".into(),
-        ));
+        return Err(Error::MachO(if from_code_sig_cmd {
+            "LC_CODE_SIGNATURE dataoff exceeds file length".into()
+        } else {
+            "segment file extent exceeds file length".into()
+        }));
     }
 
     let sig_offset = align_to(code_length, 16);
@@ -584,14 +624,14 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
         )?;
     }
 
-    if let Some((offset, seg)) = linkedit_cmd {
+    if let Some((offset, seg_fileoff, _seg_vmsize, _seg_filesize)) = linkedit_cmd {
         let sig_end = (sig_offset as u64)
             .checked_add(signature.len() as u64)
             .ok_or_else(|| Error::MachO("signature end overflow".into()))?;
         let new_filesize = sig_end
-            .checked_sub(seg.fileoff)
+            .checked_sub(seg_fileoff)
             .ok_or_else(|| Error::MachO("signature end precedes the __LINKEDIT segment".into()))?;
-        update_linkedit_segment(&mut output, offset, new_filesize)?;
+        update_linkedit_segment(&mut output, offset, new_filesize, is_64)?;
     }
 
     Ok(output)
@@ -609,7 +649,8 @@ fn find_code_end(macho: &MachO, file_size: usize) -> usize {
                 }
             }
             CommandVariant::Segment32(seg) => {
-                let seg_end = (seg.fileoff + seg.filesize) as u64;
+                // Widen before adding: a 32-bit file extent can exceed u32.
+                let seg_end = u64::from(seg.fileoff) + u64::from(seg.filesize);
                 if seg_end > max_end {
                     max_end = seg_end;
                 }
@@ -691,37 +732,52 @@ fn add_code_signature_command(
 }
 
 /// Injects an `LC_LOAD_DYLIB` (or `LC_LOAD_WEAK_DYLIB` when `weak`) command into
-/// a single 64-bit Mach-O slice, returning a new binary of identical length with
-/// the command written into the slack between the last load command and the
-/// first segment.
+/// a single Mach-O slice, returning a new binary of identical length with the
+/// command written into the slack between the last load command and the first
+/// segment. Both 64-bit and little-endian 32-bit slices are accepted; the
+/// load-command walk selects the field widths of the slice's own header and
+/// segment commands.
 ///
 /// # Errors
 ///
-/// Returns [`Error::MachO`] if the input is not a 64-bit Mach-O or there is no
-/// room for the command between the last load command and the first segment.
+/// Returns [`Error::MachO`] if the input is not a signable Mach-O (including
+/// big-endian 32-bit) or there is no room for the command between the last load
+/// command and the first segment.
 fn inject_dylib_thin(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
-    const HEADER_SIZE: usize = 32;
+    const HEADER_SIZE_64: usize = 32;
+    const HEADER_SIZE_32: usize = 28;
     const DYLIB_FIXED_SIZE: usize = 24;
     const DEFAULT_FIRST_SEGMENT_OFFSET: usize = 4096;
 
-    if input.len() < HEADER_SIZE {
-        return Err(Error::MachO(
-            "binary too short for a 64-bit Mach-O header".into(),
-        ));
+    if input.len() < HEADER_SIZE_32 {
+        return Err(Error::MachO("binary too short for a Mach-O header".into()));
     }
 
     let magic = read_u32(input, 0, false)?;
-    if magic != MH_MAGIC_64 && magic != MH_CIGAM_64 {
-        return Err(Error::MachO("not a 64-bit Mach-O binary".into()));
+    let is_64 = magic == MH_MAGIC_64 || magic == MH_CIGAM_64;
+    if !is_64 && magic != MH_MAGIC {
+        if magic == MH_CIGAM {
+            ensure_signable_bitness(false, true)?;
+        }
+        return Err(Error::MachO("not a Mach-O binary".into()));
     }
     let is_big_endian = super::parser::is_big_endian_macho(input, 0);
+    let header_size = if is_64 {
+        HEADER_SIZE_64
+    } else {
+        HEADER_SIZE_32
+    };
+
+    if input.len() < header_size {
+        return Err(Error::MachO("binary too short for a Mach-O header".into()));
+    }
 
     let ncmds = read_u32(input, 16, is_big_endian)? as usize;
 
     // Walk the load commands to find the end of the region and the smallest
     // segment fileoff, which bounds where a new command may be inserted.
-    let mut offset = HEADER_SIZE;
-    let mut max_load_cmd_end = HEADER_SIZE;
+    let mut offset = header_size;
+    let mut max_load_cmd_end = header_size;
     let mut first_segment_offset = usize::MAX;
 
     for _ in 0..ncmds {
@@ -901,8 +957,9 @@ fn inject_dylib_thin(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u
 /// For a FAT binary, returns [`Error::MachO`] if the arch table is unreadable or
 /// inconsistent with the container, or if any slice cannot take the new command
 /// (the failing slice's error is propagated). For a thin binary, returns
-/// [`Error::MachO`] if the input is not a 64-bit Mach-O or there is no room for
-/// the command between the last load command and the first segment.
+/// [`Error::MachO`] if the input is not a signable Mach-O (32-bit slices are
+/// supported) or there is no room for the command between the last load command
+/// and the first segment.
 pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Result<Vec<u8>> {
     if let Ok(Mach::Fat(fat)) = Mach::parse(input) {
         let arches: Vec<FatArch> = fat
@@ -971,20 +1028,68 @@ fn find_first_segment_offset(macho: &MachO) -> usize {
     }
 }
 
-fn update_linkedit_segment(data: &mut [u8], offset: usize, new_filesize: u64) -> Result<()> {
-    let filesize_offset = offset + 48;
-    let vmsize_offset = offset + 32;
+/// Writes a `__LINKEDIT` segment's `vmsize` and `filesize` at the offsets the
+/// segment command's own width defines: `LC_SEGMENT_64` stores both as `u64` at
+/// `+32`/`+48`, `LC_SEGMENT` as `u32` at `+28`/`+36`.
+fn write_linkedit_sizes(
+    data: &mut [u8],
+    lc_offset: usize,
+    vmsize: u64,
+    filesize: u64,
+    is_64: bool,
+    is_big_endian: bool,
+) -> Result<()> {
+    if is_64 {
+        write_u64(data, lc_offset + 32, vmsize, is_big_endian)?;
+        write_u64(data, lc_offset + 48, filesize, is_big_endian)?;
+    } else {
+        write_u32(
+            data,
+            lc_offset + 28,
+            checked_u32(vmsize as usize, "__LINKEDIT vmsize")?,
+            is_big_endian,
+        )?;
+        write_u32(
+            data,
+            lc_offset + 36,
+            checked_u32(filesize as usize, "__LINKEDIT filesize")?,
+            is_big_endian,
+        )?;
+    }
+    Ok(())
+}
 
+/// Reads a `__LINKEDIT` segment's `vmsize` at the offset matching its width.
+fn read_linkedit_vmsize(
+    data: &[u8],
+    lc_offset: usize,
+    is_64: bool,
+    is_big_endian: bool,
+) -> Result<u64> {
+    if is_64 {
+        read_u64(data, lc_offset + 32, is_big_endian)
+    } else {
+        Ok(read_u32(data, lc_offset + 28, is_big_endian)? as u64)
+    }
+}
+
+fn update_linkedit_segment(
+    data: &mut [u8],
+    offset: usize,
+    new_filesize: u64,
+    is_64: bool,
+) -> Result<()> {
     let is_big_endian = super::parser::is_big_endian_macho(data, 0);
 
-    write_u64(data, filesize_offset, new_filesize, is_big_endian)?;
-
-    let original_vmsize = read_u64(data, vmsize_offset, is_big_endian)?;
+    let original_vmsize = read_linkedit_vmsize(data, offset, is_64, is_big_endian)?;
     let aligned_vmsize = align_to(new_filesize as usize, 0x4000) as u64;
-    write_u64(
+
+    write_linkedit_sizes(
         data,
-        vmsize_offset,
+        offset,
         aligned_vmsize.max(original_vmsize),
+        new_filesize,
+        is_64,
         is_big_endian,
     )?;
 
@@ -1026,7 +1131,8 @@ pub(crate) fn checked_u32(value: usize, field_name: &str) -> Result<u32> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::MachO`] if the binary is invalid or 32-bit.
+/// Returns [`Error::MachO`] if the binary is invalid, big-endian 32-bit, or
+/// missing `__LINKEDIT`.
 pub fn prepare_code_for_signing(
     data: &[u8],
     estimated_signature_size: usize,
@@ -1072,12 +1178,11 @@ fn prepare_code_single(
     estimated_signature_size: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
     let is_64 = macho.header.magic == MH_MAGIC_64 || macho.header.magic == MH_CIGAM_64;
-    if !is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    let is_big_endian = super::parser::is_big_endian_macho(data, 0);
+    ensure_signable_bitness(is_64, is_big_endian)?;
 
     let mut code_sig_cmd: Option<(usize, LinkeditDataCommand)> = None;
-    let mut linkedit_cmd: Option<(usize, SegmentCommand64)> = None;
+    let mut linkedit_cmd: Option<(usize, u64, u64, u64)> = None;
     let mut max_load_cmd_end: usize = 0;
 
     for lc in &macho.load_commands {
@@ -1090,22 +1195,37 @@ fn prepare_code_single(
             CommandVariant::CodeSignature(cs) => {
                 code_sig_cmd = Some((lc.offset, *cs));
             }
-            CommandVariant::Segment64(seg) if seg.segname.starts_with(b"__LINKEDIT") => {
-                linkedit_cmd = Some((lc.offset, *seg));
+            // Only a command whose width matches the header can be rewritten at
+            // the right field offsets; a mixed-width image is left uncaptured so
+            // the write path fails closed instead of corrupting sizes.
+            CommandVariant::Segment64(seg) if is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
+            }
+            CommandVariant::Segment32(seg) if !is_64 && seg.segname.starts_with(b"__LINKEDIT") => {
+                linkedit_cmd = Some((
+                    lc.offset,
+                    seg.fileoff as u64,
+                    seg.vmsize as u64,
+                    seg.filesize as u64,
+                ));
             }
             _ => {}
         }
     }
 
-    let code_length = if let Some((_, cs)) = code_sig_cmd {
-        cs.dataoff as usize
+    // Provenance matters for the error: with no LC_CODE_SIGNATURE the length
+    // comes from the widest segment's file extent, not from a signature command.
+    let (code_length, from_code_sig_cmd) = if let Some((_, cs)) = code_sig_cmd {
+        (cs.dataoff as usize, true)
     } else {
-        find_code_end(macho, data.len())
+        (find_code_end(macho, data.len()), false)
     };
     if code_length > data.len() {
-        return Err(Error::MachO(
-            "LC_CODE_SIGNATURE dataoff exceeds file length".into(),
-        ));
+        return Err(Error::MachO(if from_code_sig_cmd {
+            "LC_CODE_SIGNATURE dataoff exceeds file length".into()
+        } else {
+            "segment file extent exceeds file length".into()
+        }));
     }
 
     let sig_offset = align_to(code_length, 16);
@@ -1130,15 +1250,15 @@ fn prepare_code_single(
         )?;
     }
 
-    if let Some((offset, seg)) = linkedit_cmd {
+    if let Some((offset, seg_fileoff, _seg_vmsize, _seg_filesize)) = linkedit_cmd {
         let sig_end = sig_offset
             .checked_add(estimated_signature_size)
             .ok_or_else(|| Error::MachO("signature end overflow".into()))?
             as u64;
-        let new_filesize = sig_end.checked_sub(seg.fileoff).ok_or_else(|| {
+        let new_filesize = sig_end.checked_sub(seg_fileoff).ok_or_else(|| {
             Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
         })?;
-        update_linkedit_segment(&mut prepared, offset, new_filesize)?;
+        update_linkedit_segment(&mut prepared, offset, new_filesize, is_64)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
@@ -1161,7 +1281,7 @@ use super::parser::MachOMetadata;
 /// # Errors
 ///
 /// Returns [`Error::MachO`] if:
-/// - The binary is 32-bit (not supported)
+/// - The binary is big-endian 32-bit (not supported)
 /// - No `__LINKEDIT` segment exists
 /// - No space for `LC_CODE_SIGNATURE` in load commands area
 /// - The signature reserve end overflows `usize`
@@ -1171,9 +1291,7 @@ pub fn realloc_code_sign_space_with_metadata(
     code_length: usize,
     estimated_signature_size: usize,
 ) -> Result<(Vec<u8>, MachOMetadata)> {
-    if !metadata.is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    ensure_signable_bitness(metadata.is_64, metadata.is_big_endian)?;
 
     if code_length > data.len() {
         return Err(Error::MachO(format!(
@@ -1216,8 +1334,14 @@ pub fn realloc_code_sign_space_with_metadata(
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
             as u64;
 
-        write_u64(&mut output, offset + 32, new_vmsize, is_big_endian)?;
-        write_u64(&mut output, offset + 48, new_filesize, is_big_endian)?;
+        write_linkedit_sizes(
+            &mut output,
+            offset,
+            new_vmsize,
+            new_filesize,
+            metadata.is_64,
+            is_big_endian,
+        )?;
 
         updated_metadata.linkedit_cmd = Some((offset, fileoff, new_vmsize, new_filesize));
     } else {
@@ -1306,15 +1430,13 @@ pub fn realloc_code_sign_space_with_metadata(
 ///
 /// # Errors
 ///
-/// Returns [`Error::MachO`] if the binary is 32-bit or missing `__LINKEDIT`.
+/// Returns [`Error::MachO`] if the binary is big-endian 32-bit or missing `__LINKEDIT`.
 pub fn prepare_code_with_metadata(
     data: &[u8],
     metadata: &MachOMetadata,
     estimated_signature_size: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
-    if !metadata.is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    ensure_signable_bitness(metadata.is_64, metadata.is_big_endian)?;
 
     let code_length = if let Some((_offset, dataoff, _datasize)) = metadata.code_sig_cmd {
         dataoff as usize
@@ -1365,7 +1487,7 @@ pub fn prepare_code_with_metadata(
         let new_filesize = sig_end.checked_sub(fileoff).ok_or_else(|| {
             Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
         })?;
-        update_linkedit_segment(&mut prepared, offset, new_filesize)?;
+        update_linkedit_segment(&mut prepared, offset, new_filesize, metadata.is_64)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
@@ -1424,16 +1546,14 @@ fn add_code_signature_command_with_metadata(
 ///
 /// # Errors
 ///
-/// Returns [`Error::MachO`] if `__LINKEDIT` is missing or the binary is 32-bit.
+/// Returns [`Error::MachO`] if `__LINKEDIT` is missing or the binary is big-endian 32-bit.
 pub fn prepare_code_in_place(
     buf: &mut Vec<u8>,
     metadata: &MachOMetadata,
     code_length: usize,
     estimated_signature_size: usize,
 ) -> Result<(usize, usize)> {
-    if !metadata.is_64 {
-        return Err(Error::MachO("32-bit Mach-O binaries not supported".into()));
-    }
+    ensure_signable_bitness(metadata.is_64, metadata.is_big_endian)?;
 
     let sig_offset = align_to(code_length, 16);
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
@@ -1473,7 +1593,7 @@ pub fn prepare_code_in_place(
         let new_filesize = sig_end.checked_sub(fileoff).ok_or_else(|| {
             Error::MachO("__LINKEDIT fileoff lies beyond the signature end".into())
         })?;
-        update_linkedit_segment(buf, offset, new_filesize)?;
+        update_linkedit_segment(buf, offset, new_filesize, metadata.is_64)?;
     } else {
         return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
@@ -1571,6 +1691,20 @@ fn write_u64(data: &mut [u8], offset: usize, value: u64, big_endian: bool) -> Re
 mod tests {
     use super::*;
     use crate::macho::fixtures::{make_fat_macho, make_minimal_macho, test_signing_credentials};
+
+    #[test]
+    fn bitness_helper_typed_rejection_for_big_endian_32bit() {
+        let res: crate::Result<()> = ensure_signable_bitness(false, true);
+        let err = res.expect_err("big-endian 32-bit must be rejected");
+        assert!(
+            matches!(&err, crate::Error::MachO(m)
+                if m.contains("big-endian") && m.contains("i386/armv7")),
+            "typed actionable message required, got {err:?}"
+        );
+        ensure_signable_bitness(false, false).expect("little-endian 32-bit is supported");
+        ensure_signable_bitness(true, false).expect("64-bit behavior unchanged");
+        ensure_signable_bitness(true, true).expect("64-bit endianness unchanged");
+    }
 
     #[test]
     fn test_align_to() {
@@ -2624,8 +2758,146 @@ mod tests {
         let err = inject_dylib_command(&fat_tight, "/usr/lib/libzsigntest.dylib", false)
             .expect_err("tight slice must refuse injection");
         assert!(
-            !err.to_string().contains("not a 64-bit"),
-            "FAT must not fall into the thin magic guard: {err}"
+            err.to_string().contains("FAT slice"),
+            "FAT slice errors must come from the per-slice wrapper, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_inject_dylib_command_accepts_32bit_thin_and_fat() {
+        let dylib = "/usr/lib/libzsigntest.dylib";
+        let thin32 = crate::macho::fixtures::make_minimal_macho_32();
+        let injected = inject_dylib_command(&thin32, dylib, false)
+            .expect("little-endian 32-bit thin injection must succeed");
+        assert!(
+            injected.windows(dylib.len()).any(|w| w == dylib.as_bytes()),
+            "injected dylib path must appear in output"
+        );
+        let m = crate::macho::MachOFile::parse(injected).unwrap();
+        assert_eq!(m.slices().len(), 1);
+
+        let fat = crate::macho::fixtures::make_fat_macho(
+            &[
+                crate::macho::fixtures::make_minimal_macho_32(),
+                crate::macho::fixtures::make_minimal_macho(),
+            ],
+            &[12, 12],
+        );
+        let injected = inject_dylib_command(&fat, dylib, false)
+            .expect("FAT containing a 32-bit slice must inject");
+        assert!(injected.windows(dylib.len()).any(|w| w == dylib.as_bytes()));
+        let m = crate::macho::MachOFile::parse(injected).unwrap();
+        assert_eq!(m.slices().len(), 2, "both slices must survive injection");
+    }
+
+    /// The public single-path entry points accept little-endian 32-bit input:
+    /// expansion and signature embedding return still-parseable 32-bit images,
+    /// and preparation rewrites the 32-bit header in place.
+    #[test]
+    fn test_single_path_entry_points_accept_32bit_image() {
+        let data = crate::macho::fixtures::make_minimal_macho_32();
+        let estimate = 0x1000usize;
+
+        let expanded =
+            realloc_code_sign_space(&data, estimate).expect("32-bit expansion must succeed");
+        let m = crate::macho::MachOFile::parse(expanded).expect("expanded 32-bit image must parse");
+        assert!(
+            !m.slices()[0].is_64,
+            "expansion must preserve 32-bit header width"
+        );
+
+        let (prepared, sig_offset, code_length) =
+            prepare_code_for_signing(&data, estimate).expect("32-bit preparation must succeed");
+        // Preparation returns the hashed buffer, whose LC_CODE_SIGNATURE range
+        // lies past its end, so assert on the header it rewrote rather than
+        // reparsing it as a whole image.
+        assert_eq!(
+            read_u32(&prepared, 0, false).expect("prepared header magic"),
+            MH_MAGIC,
+            "preparation must keep the 32-bit header magic"
+        );
+        // The unsigned fixture carries no LC_CODE_SIGNATURE, so preparation
+        // inserts one: ncmds must grow by exactly one.
+        assert_eq!(
+            read_u32(&prepared, 16, false).expect("prepared ncmds"),
+            read_u32(&data, 16, false).expect("input ncmds") + 1,
+            "preparation must add exactly one load command"
+        );
+        assert_eq!(prepared.len(), code_length);
+        assert_eq!(sig_offset % 16, 0, "signature offset must be aligned");
+        assert!(sig_offset >= code_length);
+
+        // Embed a differently sized real superblob so the signature range and
+        // __LINKEDIT sizes are genuinely rewritten rather than copied through.
+        let signed = crate::macho::sign_macho(
+            &crate::macho::MachOFile::parse(data).expect("32-bit fixture parses"),
+            "com.example",
+            None,
+            &test_signing_credentials(),
+            None,
+            None,
+            false,
+        )
+        .expect("32-bit image must sign");
+        let replacement = signature_bytes();
+        let re_embedded = embed_signature(&signed, &replacement)
+            .expect("32-bit signature embedding must succeed");
+        let m = crate::macho::MachOFile::parse(re_embedded).expect("re-embedded image must parse");
+        let sl = &m.slices()[0];
+        assert!(!sl.is_64, "embedding must preserve 32-bit header width");
+        assert_eq!(
+            sl.code_sig_size.expect("signature size declared"),
+            replacement.len() as u32,
+            "LC_CODE_SIGNATURE datasize must follow the embedded blob"
+        );
+        let sig_off = sl.code_sig_offset.expect("signature offset declared") as usize;
+        assert_eq!(
+            &m.slice_data(sl)[sig_off..sig_off + replacement.len()],
+            replacement.as_slice(),
+            "the replacement superblob must be the bytes actually embedded"
+        );
+        assert_eq!(
+            m.slice_data(sl).len(),
+            sig_off + replacement.len(),
+            "embedding must size the image to the replacement signature"
+        );
+    }
+
+    /// A `__LINKEDIT` command whose width disagrees with the header cannot be
+    /// rewritten at the right field offsets; signing must refuse it rather than
+    /// write sizes into the wrong bytes.
+    #[test]
+    fn mixed_width_linkedit_segment_is_rejected_not_corrupted() {
+        let data = crate::macho::fixtures::make_minimal_macho_32_mixed_linkedit();
+        let macho = crate::macho::MachOFile::parse(data).expect("mixed fixture parses");
+        let creds = test_signing_credentials();
+        let res =
+            crate::macho::sign_macho(&macho, "com.example.mixed", None, &creds, None, None, false);
+        assert!(
+            matches!(&res, Err(crate::Error::MachO(m)) if m.contains("__LINKEDIT")),
+            "mixed-width __LINKEDIT must fail closed with a __LINKEDIT error, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    /// A 32-bit `__TEXT` whose `fileoff + filesize` exceeds `u32::MAX` must be
+    /// rejected cleanly. Any such pair necessarily also fails goblin's own
+    /// segment-size bound (a `filesize` past `u32::MAX - fileoff` is larger than
+    /// the whole file), so the image is refused during parsing, one layer above
+    /// `find_code_end`'s widened addition — which stays as defense in depth for
+    /// any future caller that hands the writer a segment extent directly.
+    #[test]
+    fn overflow_32bit_fileoff_plus_filesize_is_rejected_not_truncated() {
+        let mut data = crate::macho::fixtures::make_minimal_macho_32();
+        // __TEXT LC at 28: fileoff at +32, filesize at +36.
+        data[60..64].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        data[64..68].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+
+        let res = embed_signature(&data, &signature_bytes());
+        assert!(
+            matches!(&res, Err(crate::Error::MachO(_))),
+            "a 32-bit file extent beyond u32::MAX must fail closed, got {:?}",
+            res.map(|v| v.len())
         );
     }
 }

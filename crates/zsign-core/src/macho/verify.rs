@@ -556,7 +556,7 @@ mod tests {
     };
     use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
-    use crate::macho::fixtures::make_minimal_macho;
+    use crate::macho::fixtures::{make_fat_macho, make_minimal_macho};
     use crate::macho::{
         sign_any_macho, sign_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile,
     };
@@ -974,6 +974,102 @@ mod tests {
         let injected = cms_report_with_test_anchor(&signed, &creds);
         assert!(injected.valid, "cms errors: {:?}", injected.errors);
         assert!(injected.anchored);
+    }
+
+    #[test]
+    fn verify_signed_32bit_armv7_round_trip() {
+        let creds = rsa_credentials();
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho_32()).unwrap();
+        assert!(!macho.slices()[0].is_64, "fixture must be 32-bit");
+        let signed = sign_macho(&macho, "com.example", None, &creds, None, None, false).unwrap();
+        assert_eq!(
+            &signed[..4],
+            &0xfeedfaceu32.to_le_bytes(),
+            "32-bit magic must survive signing"
+        );
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        let slice = &report.slices[0];
+        assert!(slice.signed, "32-bit slice must carry a signature");
+        assert!(!slice.adhoc);
+        assert_eq!(slice.pages, PageCheck::Matched, "{:?}", slice.errors);
+        assert_eq!(
+            slice.errors.len(),
+            1,
+            "self-signed fixture may fail anchoring only: {:?}",
+            slice.errors
+        );
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        let cms = slice.cms.as_ref().expect("cms report");
+        assert!(
+            cms.signature_ok
+                && cms.message_digest_ok
+                && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok
+                && cms.chain_ok
+        );
+        let injected = cms_report_with_test_anchor(&signed, &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+    }
+
+    #[test]
+    fn verify_signed_fat_armv7_arm64_round_trip() {
+        let creds = rsa_credentials();
+        let fat = make_fat_macho(
+            &[
+                crate::macho::fixtures::make_minimal_macho_32(),
+                make_minimal_macho(),
+            ],
+            &[12, 12],
+        );
+        let macho = MachOFile::parse(fat).unwrap();
+        assert!(macho.is_fat() && macho.slices().len() == 2);
+        let signed =
+            sign_any_macho(&macho, "com.example.fat", None, &creds, None, None, false).unwrap();
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(report.fat);
+        assert_eq!(report.slices.len(), 2, "both slices must report");
+        for (i, slice) in report.slices.iter().enumerate() {
+            assert!(slice.signed, "slice {i} must be signed");
+            assert_eq!(
+                slice.pages,
+                PageCheck::Matched,
+                "slice {i}: {:?}",
+                slice.errors
+            );
+            assert!(
+                slice
+                    .errors
+                    .iter()
+                    .all(|e| e.contains("not anchored to a trusted root")),
+                "slice {i}: unexpected errors {:?}",
+                slice.errors
+            );
+        }
+        let cms = report.slices[0].cms.as_ref().expect("32-bit slice cms");
+        assert!(
+            cms.signature_ok
+                && cms.message_digest_ok
+                && cms.cdhash_v1_ok
+                && cms.cdhash_v2_ok
+                && cms.chain_ok,
+            "32-bit slice cms: {:?}",
+            cms
+        );
+    }
+
+    #[test]
+    fn sign_rejects_big_endian_32bit_with_typed_error() {
+        let data = crate::macho::fixtures::make_minimal_macho_32_be();
+        let macho = MachOFile::parse(data).expect("big-endian 32-bit fixture parses");
+        let slice = &macho.slices()[0];
+        assert!(!slice.is_64, "fixture must be 32-bit");
+        let creds = rsa_credentials();
+        let res = sign_any_macho(&macho, "com.example.be32", None, &creds, None, None, false);
+        assert!(
+            matches!(&res, Err(crate::Error::MachO(m)) if m.contains("big-endian")),
+            "typed big-endian rejection required, got {:?}",
+            res.as_ref().err()
+        );
     }
 
     #[test]
