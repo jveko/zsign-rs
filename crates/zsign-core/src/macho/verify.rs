@@ -754,29 +754,9 @@ mod tests {
         );
     }
 
-    fn build_two_slice_fat() -> Vec<u8> {
-        let a = make_minimal_macho();
-        let b = make_minimal_macho();
-        let mut out = Vec::new();
-        out.extend_from_slice(&0xcafebabeu32.to_be_bytes()); // FAT_MAGIC
-        out.extend_from_slice(&2u32.to_be_bytes());
-        for (offset, size) in [(0x1000u32, a.len() as u32), (0x3000u32, b.len() as u32)] {
-            out.extend_from_slice(&0x0100_000cu32.to_be_bytes()); // CPU_TYPE_ARM64
-            out.extend_from_slice(&0u32.to_be_bytes());
-            out.extend_from_slice(&offset.to_be_bytes());
-            out.extend_from_slice(&size.to_be_bytes());
-            out.extend_from_slice(&12u32.to_be_bytes()); // align 2^12
-        }
-        out.resize(0x1000, 0);
-        out.extend_from_slice(&a);
-        out.resize(0x3000, 0);
-        out.extend_from_slice(&b);
-        out
-    }
-
     #[test]
     fn fat_code_limit_beyond_slice_is_rejected() {
-        let fat = build_two_slice_fat();
+        let fat = make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
         assert_eq!(macho.slices().len(), 2);
         let creds = rsa_credentials();

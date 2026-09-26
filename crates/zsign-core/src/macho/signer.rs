@@ -1591,41 +1591,16 @@ mod tests {
         );
     }
 
-    /// Builds a FAT binary: plain arm64 slice at offset 0x1000 and an
-    /// encrypted arm64 slice at offset 0x3000 (per-slice load commands).
-    fn make_fat_with_encrypted_second_slice() -> Vec<u8> {
-        let plain = make_minimal_macho();
-        let encrypted = make_minimal_macho_encrypted(1, 0x1000);
-        assert_eq!(plain.len(), encrypted.len());
-
-        let mut b = Vec::with_capacity(0x3000 + plain.len());
-        // FAT header (big-endian): magic, nfat_arch
-        b.extend_from_slice(&0xcafebabeu32.to_be_bytes());
-        b.extend_from_slice(&2u32.to_be_bytes());
-        // fat_arch[0]: cputype, cpusubtype, offset, size, align (BE)
-        b.extend_from_slice(&0x0100_000cu32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0x1000u32.to_be_bytes());
-        b.extend_from_slice(&(plain.len() as u32).to_be_bytes());
-        b.extend_from_slice(&12u32.to_be_bytes());
-        // fat_arch[1]
-        b.extend_from_slice(&0x0100_000cu32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0x3000u32.to_be_bytes());
-        b.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
-        b.extend_from_slice(&12u32.to_be_bytes());
-        // slice data
-        b.resize(0x1000, 0);
-        b.extend_from_slice(&plain);
-        b.resize(0x3000, 0);
-        b.extend_from_slice(&encrypted);
-        b
-    }
-
     #[test]
     fn test_sign_refuses_fat_with_encrypted_slice() {
-        let macho = MachOFile::parse(make_fat_with_encrypted_second_slice())
-            .expect("FAT binary must parse");
+        let fat = make_fat_macho(
+            &[
+                make_minimal_macho(),
+                make_minimal_macho_encrypted(1, 0x1000),
+            ],
+            &[12, 12],
+        );
+        let macho = MachOFile::parse(fat).expect("FAT binary must parse");
         assert!(macho.is_fat());
         assert_eq!(macho.slices().len(), 2);
         assert!(

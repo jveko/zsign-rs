@@ -481,6 +481,37 @@ pub fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<u8> {
     data
 }
 
+/// Tiny 32-bit (armv7) MH_EXECUTE whose only load command is
+/// `LC_ENCRYPTION_INFO` (cmd 0x21, 20 B, cryptid 1) — the 32-bit FairPlay
+/// shape for the `EncryptionInfo32` parse arm. No segments; file length 0x80.
+pub fn make_minimal_macho_32_encrypted() -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x80);
+    macro_rules! u32 {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
+
+    // mach_header (28 bytes)
+    u32!(0xfeedface); // MH_MAGIC
+    u32!(0x0000_000c); // CPU_TYPE_ARM
+    u32!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+    u32!(2); // MH_EXECUTE
+    u32!(1); // ncmds
+    u32!(20); // sizeofcmds
+    u32!(0x1); // MH_NOUNDEFS
+
+    // LC_ENCRYPTION_INFO (20 bytes)
+    u32!(0x21);
+    u32!(20);
+    u32!(0x1000); // cryptoff
+    u32!(0x2000); // cryptsize
+    u32!(1); // cryptid
+
+    b.resize(0x80, 0);
+    b
+}
+
 /// Realistic two-segment arm64 Mach-O with `__TEXT.fileoff == 0` (the layout
 /// produced by the linker) and a `__text` section inside `__TEXT`.
 /// With `tight_gap`, the section starts only 8 bytes after the last load
@@ -597,6 +628,49 @@ pub fn make_fat_macho(slices: &[Vec<u8>], aligns: &[u32]) -> Vec<u8> {
         out.extend_from_slice(slice);
     }
     out
+}
+
+/// Tiny 64-bit LE Mach-O: header + one unsectioned `LC_SEGMENT_64 __TEXT`
+/// (72 B) whose `fileoff` is `segment_fileoff`, padded to 0x1004 with 0xCC.
+/// No `__LINKEDIT`, no signature — a bare container for load-command surgery.
+pub fn make_text_segment_macho(segment_fileoff: u64) -> Vec<u8> {
+    // 32-byte header + one 72-byte LC_SEGMENT_64 command
+    let mut data = vec![0u8; 104];
+    macro_rules! u32w {
+        ($off:expr, $v:expr) => {
+            data[$off..$off + 4].copy_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
+    macro_rules! u64w {
+        ($off:expr, $v:expr) => {
+            data[$off..$off + 8].copy_from_slice(&($v as u64).to_le_bytes())
+        };
+    }
+
+    u32w!(0, 0xfeed_facf); // MH_MAGIC_64
+    u32w!(4, 0x0100_000c); // CPU_TYPE_ARM64
+    u32w!(8, 0); // cpusubtype
+    u32w!(12, 2); // MH_EXECUTE
+    u32w!(16, 1); // ncmds
+    u32w!(20, 72); // sizeofcmds
+    u32w!(24, 0); // flags
+    u32w!(28, 0); // reserved
+
+    let seg_off = 32usize;
+    u32w!(seg_off, 0x19); // LC_SEGMENT_64
+    u32w!(seg_off + 4, 72);
+    data[seg_off + 8..seg_off + 15].copy_from_slice(b"__TEXT\0"); // segname
+    u64w!(seg_off + 24, 0); // vmaddr
+    u64w!(seg_off + 32, 0x1000); // vmsize
+    u64w!(seg_off + 40, segment_fileoff); // fileoff
+    u64w!(seg_off + 48, 0x1000); // filesize
+    u32w!(seg_off + 56, 7); // maxprot
+    u32w!(seg_off + 60, 7); // initprot
+    u32w!(seg_off + 64, 0); // nsects
+    u32w!(seg_off + 68, 0); // flags
+
+    data.resize(0x1004, 0xCC);
+    data
 }
 
 #[cfg(test)]

@@ -1808,41 +1808,9 @@ mod tests {
         assert!(has_enough_signature_space(&[0u8; 1000], 1000, 0));
     }
 
-    /// Builds a tiny 64-bit LE Mach-O: header plus one `LC_SEGMENT_64` __TEXT
-    /// command (72 bytes), padded to 0x1004 bytes. The segment's `fileoff` is
-    /// given by `segment_fileoff`.
-    fn build_test_binary(segment_fileoff: u64) -> Vec<u8> {
-        // 32-byte header + one 72-byte LC_SEGMENT_64 command
-        let mut data = vec![0u8; 104];
-        write_u32(&mut data, 0, 0xfeed_facf, false).unwrap(); // MH_MAGIC_64
-        write_u32(&mut data, 4, 0x0100_000c, false).unwrap(); // CPU_TYPE_ARM64
-        write_u32(&mut data, 8, 0, false).unwrap(); // cpusubtype
-        write_u32(&mut data, 12, 2, false).unwrap(); // MH_EXECUTE
-        write_u32(&mut data, 16, 1, false).unwrap(); // ncmds
-        write_u32(&mut data, 20, 72, false).unwrap(); // sizeofcmds
-        write_u32(&mut data, 24, 0, false).unwrap(); // flags
-        write_u32(&mut data, 28, 0, false).unwrap(); // reserved
-
-        let seg_off = 32usize;
-        write_u32(&mut data, seg_off, 0x19, false).unwrap(); // LC_SEGMENT_64
-        write_u32(&mut data, seg_off + 4, 72, false).unwrap();
-        data[seg_off + 8..seg_off + 15].copy_from_slice(b"__TEXT\0"); // segname
-        write_u64(&mut data, seg_off + 24, 0, false).unwrap(); // vmaddr
-        write_u64(&mut data, seg_off + 32, 0x1000, false).unwrap(); // vmsize
-        write_u64(&mut data, seg_off + 40, segment_fileoff, false).unwrap(); // fileoff
-        write_u64(&mut data, seg_off + 48, 0x1000, false).unwrap(); // filesize
-        write_u32(&mut data, seg_off + 56, 7, false).unwrap(); // maxprot
-        write_u32(&mut data, seg_off + 60, 7, false).unwrap(); // initprot
-        write_u32(&mut data, seg_off + 64, 0, false).unwrap(); // nsects
-        write_u32(&mut data, seg_off + 68, 0, false).unwrap(); // flags
-
-        data.resize(0x1004, 0xCC);
-        data
-    }
-
     #[test]
     fn test_inject_dylib_command() {
-        let input = build_test_binary(0x1000);
+        let input = crate::macho::fixtures::make_text_segment_macho(0x1000);
         let insertion_point = 32 + 72; // end of the single load command
 
         let name = "libtest.dylib"; // 13 bytes + NUL = 14
@@ -1912,7 +1880,7 @@ mod tests {
     fn test_inject_dylib_command_no_slack() {
         // The segment starts exactly where the load-command region ends: no
         // room for another command.
-        let input = build_test_binary(104);
+        let input = crate::macho::fixtures::make_text_segment_macho(104);
         match inject_dylib_command(&input, "libtest.dylib", false) {
             Err(Error::MachO(msg)) => {
                 assert!(msg.contains("no space"), "unexpected error: {}", msg);
@@ -1923,7 +1891,7 @@ mod tests {
 
     #[test]
     fn test_inject_dylib_command_cmdsize_alignment() {
-        let input = build_test_binary(0x1000);
+        let input = crate::macho::fixtures::make_text_segment_macho(0x1000);
         let name = "abc1234"; // 7 bytes + NUL = 8
         let output = inject_dylib_command(&input, name, false).unwrap();
 
