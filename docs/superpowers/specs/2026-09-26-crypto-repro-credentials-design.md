@@ -376,13 +376,26 @@ written at runtime with the accepted port, using the same extension-replacement 
 tests already use (`crypto/cms_verify.rs:2397`).
 
 **Fixtures.** Committed bytes, never generated at test time, no live network in any test:
-encrypted-key fixtures from documented `openssl` recipes in the ZSN-37 idiom
-(`mktemp -d` under `$HOME/tmp-cargo`, throwaway CN, policy-compliant leaf extensions, scratch keys
-deleted afterwards, a fail-loud verification guard rather than an `echo`-and-pass check), stored in
-`crates/zsign-core/src/crypto/fixtures/` (package-excluded at `crates/zsign-core/Cargo.toml:9`) and
-loaded through `include_bytes!` inside `#[cfg(test)]` (`pkcs12.rs:901-909` precedent). OCSP request
-and response fixtures come from the offline `openssl ca` + `openssl ocsp -reqin/-respout` recipe
-that produced P14. New fixtures are flagged for the ZSN-30 consolidation (wave 7).
+encrypted-key fixtures from documented `openssl` recipes in the ZSN-37 idiom (`mktemp -d` under
+`$HOME/tmp-cargo`, throwaway CN, policy-compliant leaf extensions, scratch keys deleted afterwards,
+a fail-loud verification guard rather than an `echo`-and-pass check), stored in
+`crates/zsign-core/src/crypto/fixtures/` (package-excluded at `crates/zsign-core/Cargo.toml:9`).
+
+The repository's pre-commit `detect-private-key` hook decides the *encoding*. Measured on this tree:
+a certificate container passes; every key container is refused, including `ENCRYPTED PRIVATE KEY`
+ones, because the detector matches the label and not the ciphertext. So each encrypted key
+container is committed as one `base64 -w0` blob of the complete OpenSSL PEM text (`*.pem.b64`) and
+decoded by a five-line test helper back to byte-exact OpenSSL output, while the two certificates
+stay readable `.pem`. That is a storage format for *encrypted* test material under a passphrase
+printed next to it — the payload is ciphertext — not a way around the hook: no ignore rule, no
+`--no-verify`, no `hk` config change, and the recipe's last guard runs the hook itself on every
+committed file. **No plaintext private key is committed by this lane at all**: the unencrypted
+PKCS#8 / PKCS#1 / SEC1 cases generate their key inside the test and frame it at runtime, which also
+keeps them honest regression tests of the new decoder.
+
+OCSP request and response fixtures come from the offline `openssl ca` + `openssl ocsp
+-reqin/-respout` recipe that produced P14 (certificates and DER only). New fixtures are flagged for
+the ZSN-30 consolidation (wave 7).
 
 **Gate integrity.** This lane touches no CI workflow and no `deny.toml` policy: the existing
 ZSN-15 flake-skip line and the duplicate-version warning level stay exactly as they are, and no new

@@ -475,10 +475,9 @@ md-5 = "0.10"
   loud, matching the ZSN-37 recipe style at `plans/2026-09-25-credential-hardening.md:1530-1562`).
 
   The repository's pre-commit `detect-private-key` hook shapes this step. Measured with
-  `hk util detect-private-key <file>`: a certificate container passes, and so does a PKCS#8
-  `ENCRYPTED` container; every label of the form `BEGIN` … `PRIVATE KEY` that is *not* the
-  `ENCRYPTED` form is refused — **including** traditional PEMs whose body is encrypted, because
-  the detector matches the label text rather than the ciphertext. Two consequences, both
+  `hk util detect-private-key <file>`: a certificate container passes; **every** key container is
+  refused, `ENCRYPTED PRIVATE KEY` included, because the detector matches the label text rather
+  than the ciphertext. Two consequences, both
   deliberate: no plaintext private key is
   committed by this lane at all (those keys are generated inside the tests), and to keep one
   uniform rule for key material each of the six encrypted containers is committed as one base64
@@ -526,7 +525,7 @@ openssl x509 -req -in "$d/ec.csr" -signkey "$d/ec.key" -days 3650 -set_serial 0x
   -extfile "$d/ext.cnf" -extensions v3 -out "$F/pem_ec_cert.pem"
 openssl pkcs8 -topk8 -in "$d/ec.key" -v2 aes-256-cbc -passout pass:testpassword -out "$d/ec_pbes2.pem"
 base64 -w0 "$d/ec_pbes2.pem" > "$F/pem_ec_key_pbes2_sha256.pem.b64"
-openssl ec -in "$d/ec.key" -traditional -aes128 -passout pass:testpassword -out "$d/trad_ec.pem"
+openssl ec -in "$d/ec.key" -aes128 -passout pass:testpassword -out "$d/trad_ec.pem"  # no -traditional for ec in 3.x
 base64 -w0 "$d/trad_ec.pem" > "$F/pem_ec_key_dekinfo_aes128.pem.b64"
 
 # Fail-loud verification: each guard aborts rather than warning.
@@ -567,7 +566,7 @@ echo "fixtures verified"
 ```rust
     /// Traditional PEM fixtures are committed as one base64 blob (see Task 5's hook note);
     /// decoding here keeps the bytes byte-exact, label lines included.
-    fn traditional_pem(blob: &str) -> String {
+    pub(crate) fn pem_fixture(blob: &str) -> String {
         use base64::Engine as _;
         let der = base64::engine::general_purpose::STANDARD
             .decode(blob.trim())
@@ -581,8 +580,8 @@ echo "fixtures verified"
 
     #[test]
     fn dek_info_aes256_yields_a_pkcs1_key() {
-        let pem = traditional_pem(TRAD_RSA_AES256);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let pem = pem_fixture(TRAD_RSA_AES256);
+        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
         assert_eq!(der[0], 0x30, "plaintext must be a DER SEQUENCE");
         assert!(
             rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok(),
@@ -593,8 +592,8 @@ echo "fixtures verified"
 
     #[test]
     fn dek_info_aes128_yields_a_sec1_ec_key() {
-        let pem = traditional_pem(TRAD_EC_AES128);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let pem = pem_fixture(TRAD_EC_AES128);
+        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
         assert!(
             p256::SecretKey::from_sec1_der(&der).is_ok(),
             "traditional EC PEM must decrypt to SEC1, got {} bytes",
@@ -604,16 +603,16 @@ echo "fixtures verified"
 
     #[test]
     fn dek_info_3des_yields_a_pkcs1_key() {
-        let pem = traditional_pem(TRAD_RSA_DES3);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let pem = pem_fixture(TRAD_RSA_DES3);
+        let der = decrypt_pem_fixture(pem, Some("testpassword")).unwrap();
         assert!(rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok());
     }
 
     #[test]
     fn wrong_password_is_reported_as_a_password_failure() {
         for blob in [TRAD_RSA_AES256, TRAD_RSA_DES3, TRAD_EC_AES128] {
-            let pem = traditional_pem(blob);
-            let res = decrypt_traditional_pem(&pem, Some("not-the-password"));
+            let pem = pem_fixture(blob);
+            let res = decrypt_pem_fixture(&pem, Some("not-the-password"));
             assert!(
                 matches!(res, Err(Error::InvalidPassword)),
                 "a wrong passphrase must be a password failure, got {:?}",
@@ -624,8 +623,8 @@ echo "fixtures verified"
 
     #[test]
     fn missing_password_asks_for_one() {
-        let pem = traditional_pem(TRAD_RSA_AES256);
-        let res = decrypt_traditional_pem(pem, None);
+        let pem = pem_fixture(TRAD_RSA_AES256);
+        let res = decrypt_pem_fixture(pem, None);
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("requires a password")),
             "an encrypted key without a password must say so, got {:?}",
@@ -645,7 +644,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        let res = decrypt_traditional_pem(pem, Some("x"));
+        let res = decrypt_pem_fixture(pem, Some("x"));
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("AES-128-CTR")),
             "unsupported ciphers must be named, got {:?}",
@@ -662,7 +661,7 @@ echo "fixtures verified"
                 label = format!("RSA {}", "PRIVATE KEY"),
                 cipher = cipher,
             );
-            let res = decrypt_traditional_pem(&pem, Some("x"));
+            let res = decrypt_pem_fixture(&pem, Some("x"));
             assert!(
                 matches!(&res, Err(Error::Certificate(m)) if m.contains(cipher) && m.contains("unsupported")),
                 "{cipher} must be refused by name, got {:?}",
@@ -680,7 +679,7 @@ echo "fixtures verified"
         let pem = std::str::from_utf8(key.to_pkcs1_der().unwrap().as_bytes()).unwrap();
         let wrapped = pem_text("RSA PRIVATE KEY", key.to_pkcs1_der().unwrap().as_bytes());
         assert!(
-            matches!(decrypt_traditional_pem(&wrapped, Some("testpassword")), Ok(None)),
+            matches!(decrypt_pem_fixture(&wrapped, Some("testpassword")), Ok(None)),
             "a plaintext PKCS#1 container must fall through, not error"
         );
     }
@@ -693,7 +692,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        assert!(matches!(decrypt_traditional_pem(pem, Some("x")), Ok(None)),
+        assert!(matches!(decrypt_pem_fixture(pem, Some("x")), Ok(None)),
             "DEK-Info without Proc-Type is not a traditional encrypted PEM");
     }
 
@@ -706,7 +705,7 @@ echo "fixtures verified"
             "AAAAAAAAAAAAAAAAAAAA\n",
             "-----END RSA ", "PRIVATE KEY-----\n"
         );
-        let res = decrypt_traditional_pem(pem, Some("x"));
+        let res = decrypt_pem_fixture(pem, Some("x"));
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("DEK-Info")),
             "a bad IV must be a framing error, got {:?}",
@@ -770,13 +769,33 @@ fn evp_bytes_to_key(password: &[u8], salt: &[u8], need: usize) -> Vec<u8> {
 
 /// Cipher name -> (key bytes, IV bytes), the set `openssl` can write into a `DEK-Info` header
 /// and that this crate can decrypt with dependencies it already carries.
-fn cipher_shape(name: &str) -> Option<(usize, usize)> {
-    match name {
-        "AES-128-CBC" => Some((16, 16)),
-        "AES-192-CBC" => Some((24, 16)),
-        "AES-256-CBC" => Some((32, 16)),
-        "DES-EDE3-CBC" => Some((24, 8)),
-        _ => None,
+/// The supported `DEK-Info` cipher names, each carrying its key and IV lengths.
+enum DekCipher {
+    Aes128,
+    Aes192,
+    Aes256,
+    TdesEde3,
+}
+
+impl DekCipher {
+    fn shape(name: &str) -> Option<(Self, usize, usize)> {
+        match name {
+            "AES-128-CBC" => Some((Self::Aes128, 16, 16)),
+            "AES-192-CBC" => Some((Self::Aes192, 24, 16)),
+            "AES-256-CBC" => Some((Self::Aes256, 32, 16)),
+            "DES-EDE3-CBC" => Some((Self::TdesEde3, 24, 8)),
+            _ => None,
+        }
+    }
+
+    fn decrypt(self, key: &[u8], iv: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+        use crate::crypto::pkcs12::aes_decrypt;
+        match self {
+            Self::Aes128 => aes_decrypt::<aes::Aes128>(key, iv, ct).ok(),
+            Self::Aes192 => aes_decrypt::<aes::Aes192>(key, iv, ct).ok(),
+            Self::Aes256 => aes_decrypt::<aes::Aes256>(key, iv, ct).ok(),
+            Self::TdesEde3 => aes_decrypt::<des::TdesEde3>(key, iv, ct).ok(),
+        }
     }
 }
 
@@ -790,7 +809,7 @@ fn unsupported(detail: String) -> Error {
 
 /// Decrypts a traditional encrypted PEM. `Ok(None)` means "this is not a traditional encrypted
 /// PEM" — the caller then falls through to the PKCS#8 and PBES2 paths.
-pub(crate) fn decrypt_traditional_pem(pem: &str, password: Option<&str>) -> Result<Option<TraditionalKey>> {
+pub(crate) fn decrypt_pem_fixture(pem: &str, password: Option<&str>) -> Result<Option<TraditionalKey>> {
     let mut lines = pem.lines().map(str::trim_end);
     let begin = loop {
         match lines.next() {
@@ -846,13 +865,10 @@ pub(crate) fn decrypt_traditional_pem(pem: &str, password: Option<&str>) -> Resu
         Error::Certificate("encrypted private key requires a password (-p or ZSIGN_PASSWORD)".into())
     })?;
     let key = evp_bytes_to_key(password.as_bytes(), &iv[..8], key_len);
-    let plaintext = match cipher {
-        "AES-128-CBC" => crate::crypto::pkcs12::aes_decrypt::<aes::Aes128>(&key, &iv, &ciphertext),
-        "AES-192-CBC" => crate::crypto::pkcs12::aes_decrypt::<aes::Aes192>(&key, &iv, &ciphertext),
-        "AES-256-CBC" => crate::crypto::pkcs12::aes_decrypt::<aes::Aes256>(&key, &iv, &ciphertext),
-        "DES-EDE3-CBC" => crate::crypto::pkcs12::aes_decrypt::<des::TdesEde3>(&key, &iv, &ciphertext),
-        _ => unreachable!("cipher_shape accepted only the four names above"),
-    };
+    // A `DekCipher` enum, not a string `match`, carries the cipher: parsing maps the name to a
+    // variant once (`DekCipher::shape`), so the decrypt step cannot be handed a name it rejects
+    // and no `unreachable!()` arm is needed. Each variant's `decrypt` calls the shared CBC engine.
+    let plaintext = cipher.decrypt(&key, &iv, &ciphertext);
     match plaintext {
         Ok(der) => Ok(Some(TraditionalKey { label, der })),
         // Every failure after a real decryption attempt is a passphrase failure: either the
@@ -907,6 +923,8 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
     const ENC_TRAD_RSA: &str = include_str!("fixtures/pem_rsa_key_dekinfo_aes256.pem.b64");
     const ENC_TRAD_RSA_3DES: &str = include_str!("fixtures/pem_rsa_key_dekinfo_des3.pem.b64");
     const ENC_TRAD_EC: &str = include_str!("fixtures/pem_ec_key_dekinfo_aes128.pem.b64");
+    // Every `.b64` constant above is decoded with `crate::crypto::encrypted_pem::pem_fixture`.
+
     const RSA_CERT: &[u8] = include_bytes!("fixtures/pem_rsa_cert.pem");
     const EC_CERT: &[u8] = include_bytes!("fixtures/pem_ec_cert.pem");
     // No plaintext-key fixtures exist (see Task 5): the unencrypted PKCS#1 / SEC1 cases build
@@ -924,12 +942,12 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
         let ec_key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let (plain_sec1, plain_ec_pkcs8, ec_cert_pem) = ec_identity_pems(&ec_key);
         for (cert, key) in [
-            (RSA_CERT, &traditional_pem(ENC_PKCS8_RSA)),
-            (RSA_CERT, &traditional_pem(ENC_PKCS8_RSA_SHA1PRF)),
-            (RSA_CERT, &traditional_pem(ENC_TRAD_RSA)),
-            (RSA_CERT, &traditional_pem(ENC_TRAD_RSA_3DES)),
-            (EC_CERT, &traditional_pem(ENC_PKCS8_EC)),
-            (EC_CERT, &traditional_pem(ENC_TRAD_EC)),
+            (RSA_CERT, &pem_fixture(ENC_PKCS8_RSA)),
+            (RSA_CERT, &pem_fixture(ENC_PKCS8_RSA_SHA1PRF)),
+            (RSA_CERT, &pem_fixture(ENC_TRAD_RSA)),
+            (RSA_CERT, &pem_fixture(ENC_TRAD_RSA_3DES)),
+            (EC_CERT, &pem_fixture(ENC_PKCS8_EC)),
+            (EC_CERT, &pem_fixture(ENC_TRAD_EC)),
             (rsa_cert_pem.as_bytes(), plain_pkcs1.as_str()),
             (rsa_cert_pem.as_bytes(), plain_pkcs8.as_str()),
             (ec_cert_pem.as_bytes(), plain_sec1.as_str()),
@@ -947,7 +965,11 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
 
     #[test]
     fn from_pem_wrong_password_is_a_password_error() {
-        for key in [ENC_PKCS8_RSA, &traditional_pem(TRAD_RSA_AES256), ENC_PKCS8_RSA_SHA1PRF] {
+        for key in [
+            &pem_fixture(ENC_PKCS8_RSA),
+            &pem_fixture(ENC_TRAD_RSA),
+            &pem_fixture(ENC_PKCS8_RSA_SHA1PRF),
+        ] {
             let res = SigningCredentials::from_pem(RSA_CERT, key.as_bytes(), Some("wrong"));
             assert!(
                 matches!(res, Err(Error::InvalidPassword)),
@@ -1041,7 +1063,7 @@ fn first_pem_block(pem: &str) -> Option<(&str, Vec<u8>)> {
 /// in the clear. A supplied password on an unencrypted container is ignored, which is what
 /// OpenSSL does.
 fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> {
-    if let Some(traditional) = crate::crypto::encrypted_pem::decrypt_traditional_pem(pem, password)? {
+    if let Some(traditional) = crate::crypto::encrypted_pem::decrypt_pem_fixture(pem, password)? {
         // The padding validated; a body that still fails to decode means the passphrase was wrong.
         return DecodedKey::from_der_by_content(&traditional.der).ok_or(Error::InvalidPassword);
     }
