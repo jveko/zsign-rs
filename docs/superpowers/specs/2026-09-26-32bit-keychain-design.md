@@ -18,7 +18,7 @@ The writer rejects every 32-bit Mach-O with a bare `Error::MachO("32-bit Mach-O 
 | Parser already parses 32-bit and records `is_64=false`; armv7 fixture test exists | `macho/parser.rs:236`, `:360`, `:703-741` |
 | `linkedit_cmd` metadata is a width-neutral tuple `(offset, fileoff, vmsize, filesize)`; only the `Segment32` capture arm is missing | `macho/parser.rs:58`, populated at `:282-285` (Segment64) vs `:290-303` (Segment32, no capture) |
 | Header-size ternaries 32/28 already written but unreachable | `macho/writer.rs:216`, `:1247` |
-| Manual load-command walker already has a correct LC_SEGMENT (32-bit) arm | `macho/writer.rs:789-832` |
+| Manual load-command walker already has a correct LC_SEGMENT (32-bit) arm | `macho/writer.rs:787-822` |
 | `LC_CODE_SIGNATURE` is byte-identical 16-byte `linkedit_data_command` both widths | xnu `EXTERNAL_HEADERS/mach-o/loader.h:1192-1202` (goblin `SIZEOF_LINKEDIT_DATA_COMMAND=16`) |
 | Header 28 vs 32 B; `segment_command` u32 fields at `vmaddr@24 vmsize@28 fileoff@32 filesize@36`; `segment_command_64` u64 at `vmaddr@24 vmsize@32 fileoff@40 filesize@48`; cmdsize multiple-of-4 vs multiple-of-8 | `loader.h:54-85`, `:355-388`, `:238-241` |
 | CodeDirectory has no bitness field; one emission path for both widths | ldid.cpp `:1118-1149`, `:2664-2682`; upstream zsign `src/signing.cpp:449-494` |
@@ -32,7 +32,7 @@ The writer rejects every 32-bit Mach-O with a bare `Error::MachO("32-bit Mach-O 
 ### 2.2 Supported subset (precise)
 
 - **Sign:** little-endian 32-bit Mach-O (`MH_MAGIC`, e.g. armv7/i386), thin and as FAT slices alongside 64-bit slices, through every writer entry point the ticket exposes: realloc, prepare, embed, and dylib injection.
-- **Reject with typed, actionable error:** big-endian 32-bit (`MH_CIGAM`) — message names `big-endian` and points at the little-endian/64-bit alternatives. Shared helper `ensure_supported_bitness(is_64, is_big_endian)` replaces the six bare guards.
+- **Reject with typed, actionable error:** big-endian 32-bit (`MH_CIGAM`) — message names `big-endian` and points at the little-endian/64-bit alternatives. Shared helper `ensure_signable_bitness(is_64, is_big_endian)` replaces the six bare guards.
 - **Unchanged status quo:** `MH_CIGAM_64` (big-endian 64-bit) keeps passing exactly as today — untested before, untested after, out of scope.
 - 64-bit behavior byte-identical; existing suite green.
 
@@ -40,7 +40,7 @@ The writer rejects every 32-bit Mach-O with a bare `Error::MachO("32-bit Mach-O 
 
 - **P1** thin LE armv7 fixture → `sign_macho*` succeeds; zsign's own `verify_macho` reports valid; output still has 32-bit magic and an `LC_CODE_SIGNATURE`.
 - **P2** FAT `[armv7, arm64]` (built with existing `make_fat_macho`) → both slices signed, container verifies; failure semantics stay all-or-nothing (no partial output).
-- **P3** `ensure_supported_bitness(false, true)` → error whose text contains `big-endian` (pins the typed rejection replacing the bare one).
+- **P3** two layers pin the typed rejection: the `ensure_signable_bitness(false, true)` unit call returns an error whose text contains `big-endian`, AND an end-to-end attempt on a big-endian 32-bit fixture (`make_minimal_macho_32_be`, `MH_CIGAM`) through `sign_any_macho` fails with `Error::MachO` containing `big-endian` (replacing the bare one).
 - **P4** dylib injection (`inject_dylib_command`) succeeds on a thin 32-bit input and on a 32-bit FAT slice.
 - **P5** no bare `32-bit Mach-O binaries not supported` string remains anywhere in `crates/`.
 - **P6** `cargo test --workspace --no-fail-fast` green (no skips).
@@ -81,16 +81,16 @@ No new `zsign_core::Error` variant. `zsign-wasm`'s `code_for_core_error` is a do
 
 - Added to the `credentials` `ArgGroup` (`main.rs:19-21`, stays `.multiple(true)`), so `required_unless_present_any = ["adhoc", "verify", "credentials"]` on `-k`/`--pkcs12` accepts it as the credential source.
 - `conflicts_with_all = ["pkcs12", "certificate", "private_key"]` on the new flag (same one-directional declaration style `pkcs12` already uses, `main.rs:40`).
-- Appended to `-V`'s explicit 18-name `conflicts_with_all` list (`main.rs:152-171`).
+- Appended to `-V`'s explicit 19-name `conflicts_with_all` list (`main.rs:152-171`).
 - Help text names the producer command: `macOS keychain codesigning identity (name or SHA-1 hash from security find-identity -v -p codesigning)`.
 - Not in conflict with `-a/--adhoc` or `-p/--password`: consistent with how `-k` behaves today (parses, unused when adhoc); `-p`/`ZSIGN_PASSWORD` is simply not consulted on the keychain path.
 
 ### 3.3 Loading flow (macOS)
 
 1. `crypto::keychain::load(identity)` runs `/usr/bin/security find-identity -v -p codesigning`.
-2. Pure parser (cross-platform `&str` fn) yields `Vec<IdentityLine { hash: [u8;20], name: String }>`; selector resolves `<NAME_OR_HASH>`: 40-hex → case-insensitive hash match; otherwise exact name match; 0 matches → error listing available identities; >1 → error listing candidate hashes (mirrors the `from_p12` ambiguity style at `cert.rs:319-323`). Summary/`REVOKED` lines simply fail the line regex.
+2. Pure parser (cross-platform `&str` fn) yields `Vec<IdentityLine { hash: [u8;20], name: String }>`; selector resolves `<NAME_OR_HASH>`: 40-hex → case-insensitive hash match; otherwise exact name match; 0 matches → error listing available identities; >1 → error listing candidate hashes (mirrors the `from_p12` ambiguity style at `cert.rs:319-323`). Summary/noise lines fail the line shape and are skipped; a trailing marker after the closing quote (e.g. `[REVOKED]`) is excluded from the extracted name — harmless in practice because the command always runs with `-v`, which lists only valid identities (the fixture pins both behaviors).
 3. `/usr/bin/security export -t identities -f pkcs12 -P "" -o <temp>` (export-all; **cannot select one** — see §3.1). Temp file: `std::env::temp_dir()` (honors `TMPDIR`) + pid + counter; read; best-effort `remove_file` on all paths.
-4. `SigningCredentials::from_p12` path with a leaf-certificate SHA-1 selector: `from_p12(data, pw)` refactors into `from_p12_impl(data, pw, selector: Option<[u8;20]>)`; the selector pre-filters certBags (SHA-1 over the bag's DER bytes = the find-identity hash) **before** the existing `select_identity` pairing, so every load-time check (§3.1 last row) runs on the selected pair — no check bypass is possible by choosing this source.
+4. `SigningCredentials::from_p12` path with a leaf-certificate SHA-1 selector: `from_p12`'s post-selection tail (RSA ≥ 2048 gate, code-signing policy, chain build, team id) is extracted into a shared private `finish_p12(decoded, certificate, rest)`; the new `from_p12_with_leaf_sha1(data, pw, hash)` partitions certBags by SHA-1 (the find-identity hash), runs the existing `select_identity` pairing on the matched subset, then rebuilds `rest` from every non-matching certificate so the export-provided chain still feeds `build_chain_from_leaf`. Every load-time check (§3.1 last row) runs on the selected pair — no check bypass is possible by choosing this source.
 5. Exported container contains *all* identities; the SHA-1 filter reduces it to the selected pair (its chain certs stay as `rest` for `build_chain_from_leaf`). Zero-match after filtering → `Error::Certificate` naming the hash and the cause.
 
 ### 3.4 Error design
@@ -129,7 +129,7 @@ Module-local `KeychainError` (`thiserror`) in `crypto/keychain.rs` — again to 
 
 ### 3.8 Credential-policy coverage & gaps (seams)
 
-- **Covered:** SPKI pairing, RSA ≥ 2048, code-signing EKU/KU/basicConstraints, validity (not-before/expiry), chain build with embedded WWDR/Apple roots, team-id — all run identically because the source converges on `from_p12` (§3.3.4).
+- **Covered:** SPKI pairing, RSA ≥ 2048, code-signing EKU/KU/basicConstraints, validity (not-before/expiry), chain build with embedded WWDR/Apple roots, team-id — all run identically because the source converges on `from_p12` (§3.3.4). The weak-key and policy gates are additionally *proven* end-to-end through the selector by tests on the existing `WEAK_RSA1024` and non-policy `modern_pbes2_aes256.p12` fixtures; expiry is the same `code_signing_policy_violation` call already exercised directly by the existing validity tests (`cert.rs:474-489`).
 - **Gap 1 (seam):** non-exportable / token-backed keys cannot be exported by `security export` (mechanism: `import -x`; error text undocumented); ldid solves this with PKCS#11 (`-K pkcs11:…`) — out of scope, documented.
 - **Gap 2 (seam):** first use of a key may trigger a GUI ACL/passphrase prompt (CI recipes answer it with `security set-key-partition-list`); headless runs pass `-P ""` so only the key ACL can prompt. Live behavior unverifiable on Linux — [INFERENCE] flagged honestly.
 - **Gap 3 (seam):** which keychain the export searches is the default search list — same list `find-identity` used, so selection and export stay consistent by construction.

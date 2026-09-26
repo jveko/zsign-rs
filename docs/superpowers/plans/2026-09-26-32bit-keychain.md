@@ -119,6 +119,87 @@ pub(crate) fn make_minimal_macho_32() -> Vec<u8> {
 }
 ```
 
+- [ ] **Step 1.1b:** Add the big-endian 32-bit twin right after `make_minimal_macho_32` (mirror `make_minimal_macho_be` at `fixtures.rs:140` — every integer via `to_be_bytes`, so the header magic reads back as `MH_CIGAM`):
+
+```rust
+/// Byte-for-byte layout of [`make_minimal_macho_32`], with every integer
+/// encoded big-endian (`MH_CIGAM`) — the typed-rejection input.
+pub(crate) fn make_minimal_macho_32_be() -> Vec<u8> {
+    let mut b = Vec::new();
+    macro_rules! u32be {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_be_bytes())
+        };
+    }
+    macro_rules! name {
+        ($s:expr, $len:expr) => {
+            let mut n = [0u8; 16];
+            n[..$s.len()].copy_from_slice($s.as_bytes());
+            b.extend_from_slice(&n[..$len]);
+        };
+    }
+
+    // mach_header (28 bytes, big-endian)
+    u32be!(0xfeedface); // MH_CIGAM once read little-endian
+    u32be!(0x0000_000c); // CPU_TYPE_ARM
+    u32be!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+    u32be!(2); // MH_EXECUTE
+    u32be!(3); // ncmds
+    u32be!(124 + 56 + 24); // sizeofcmds
+    u32be!(0x1); // MH_NOUNDEFS
+
+    // LC_SEGMENT "__TEXT" (124 bytes: 56-byte command + one 68-byte section)
+    u32be!(0x01);
+    u32be!(124);
+    name!("__TEXT", 16);
+    u32be!(0x1000); // vmaddr
+    u32be!(0x1000); // vmsize
+    u32be!(0x1000); // fileoff
+    u32be!(0x1000); // filesize
+    u32be!(7); // maxprot
+    u32be!(7); // initprot
+    u32be!(1); // nsects
+    u32be!(0); // flags
+    name!("__text", 16);
+    name!("__TEXT", 16);
+    u32be!(0x1000); // addr
+    u32be!(4); // size
+    u32be!(0x1000); // offset
+    u32be!(0); // align
+    u32be!(0); // reloff
+    u32be!(0); // nreloc
+    u32be!(0); // flags
+    u32be!(0); // reserved1
+    u32be!(0); // reserved2
+
+    // LC_SEGMENT "__LINKEDIT" (56 bytes, no sections)
+    u32be!(0x01);
+    u32be!(56);
+    name!("__LINKEDIT", 16);
+    u32be!(0x2000); // vmaddr
+    u32be!(0x1000); // vmsize
+    u32be!(0x2000); // fileoff
+    u32be!(0); // filesize
+    u32be!(1); // maxprot
+    u32be!(1); // initprot
+    u32be!(0); // nsects
+    u32be!(0); // flags
+
+    // LC_BUILD_VERSION (24 bytes)
+    u32be!(0x32);
+    u32be!(24);
+    u32be!(1); // platform
+    u32be!(0x000f_0000); // minos 15.0
+    u32be!(0x000f_0000); // sdk 15.0
+    u32be!(0); // ntools
+
+    b.resize(0x1000, 0);
+    b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+    b.resize(0x2000, 0);
+    b
+}
+```
+
 - [ ] **Step 1.2:** Add red round-trip tests to `macho/verify.rs` tests module (imports at `verify.rs:557-562` already include `sign_any_macho`, `sign_macho`, `make_minimal_macho`; add `make_fat_macho` and `make_minimal_macho_32` to that `use` if absent). Mirror `verify_signed_binary_round_trip` (`verify.rs:946-975`):
 
 ```rust
@@ -192,6 +273,25 @@ pub(crate) fn make_minimal_macho_32() -> Vec<u8> {
             cms.signature_ok && cms.message_digest_ok && cms.cdhash_v1_ok && cms.cdhash_v2_ok && cms.chain_ok,
             "32-bit slice cms: {:?}",
             cms
+        );
+    }
+```
+
+- [ ] **Step 1.2b:** Add the end-to-end typed-rejection test to the same `macho/verify.rs` tests module (pins design P3 through a real `MH_CIGAM` input, not just the helper):
+
+```rust
+    #[test]
+    fn sign_rejects_big_endian_32bit_with_typed_error() {
+        let data = crate::macho::fixtures::make_minimal_macho_32_be();
+        let macho = MachOFile::parse(data).expect("big-endian 32-bit fixture parses");
+        let slice = &macho.slices()[0];
+        assert!(!slice.is_64, "fixture must be 32-bit");
+        let creds = rsa_credentials();
+        let res = sign_any_macho(&macho, "com.example.be32", None, &creds, None, None, false);
+        assert!(
+            matches!(&res, Err(crate::Error::MachO(m)) if m.contains("big-endian")),
+            "typed big-endian rejection required, got {:?}",
+            res.as_ref().err()
         );
     }
 ```
@@ -349,7 +449,7 @@ fn ensure_signable_bitness(is_64: bool, is_big_endian: bool) -> Result<()> {
   1. Read the LE magic from `data[0..4]`. Accept `MH_MAGIC` and the already-accepted 64-bit magics. If `MH_CIGAM` → `ensure_signable_bitness(false, true)?` (same typed message). Any other magic keeps a `"not a Mach-O binary"`-style error.
   2. `let header_size = if is_64 { 32 } else { 28 };` used for the too-short check (message becomes `binary too short for a Mach-O header`) and for the load-command insertion base (`lc_start = header_size`, currently hardcoded 32-byte assumptions — grep `HEADER_SIZE` inside the fn and replace with the local).
   3. `ncmds`/`sizeofcmds` are at header offsets 16/20 at both widths — no change there.
-  4. The manual command walk after the gate already has a correct `LC_SEGMENT` arm (`writer.rs:789-832`) — untouched.
+  4. The manual command walk after the gate already has a correct `LC_SEGMENT` arm (`writer.rs:787-822`) — untouched.
   5. Alignment: confirm the inserted `LC_LOAD_DYLIB` `cmdsize` is a multiple of 8 (existing padding behavior) — that satisfies both the 32-bit multiple-of-4 and 64-bit multiple-of-8 rules (`loader.h:238-241`); if the code pads to 4 anywhere, leave it — 4 is legal for both. Do not add width branching unless a test fails.
   6. Update the FAT error wrapper test comment context if needed: the existing pin at `writer.rs:2626-2629` (FAT must not hit the thin guard) stays valid.
 
@@ -459,6 +559,37 @@ not a security output line
 
   Add test-module helpers next to the existing fixture consts (`cert.rs:744-758`): `fn sha1_of(der: &[u8]) -> [u8; 20]` using `sha1::{Digest, Sha1}` (`Sha1::digest(der).into()`), and `use der::Encode;` if `to_der()` is not already in scope. Confirm `extract_p12` is reachable (`crypto/pkcs12.rs:107` `pub(crate)` ✓) and that `P12Contents.certs` is the raw-DER bag list — adjust field access to the actual shape when compiling.
 
+- [ ] **Step 5.2b:** Red tests proving the load-time policy/weak-key gates cannot be bypassed through the selector (uses existing committed fixtures: `WEAK_RSA1024` and the non-policy `modern_pbes2_aes256.p12`, both already rejected by `from_p12` in `from_p12_rejects_weak_rsa_key` / `from_p12_rejects_non_policy_fixture`). Add beside Step 5.2:
+
+```rust
+    #[test]
+    fn from_p12_with_leaf_sha1_enforces_weak_key_gate() {
+        let contents = extract_p12(WEAK_RSA1024, "testpassword").expect("fixture parses");
+        let leaf_sha1 = sha1_of(&contents.certs[0]);
+        let res = SigningCredentials::from_p12_with_leaf_sha1(WEAK_RSA1024, "testpassword", &leaf_sha1);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
+            "keychain selector must not bypass the RSA minimum, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_enforces_code_signing_policy() {
+        let p12: &[u8] = include_bytes!("fixtures/modern_pbes2_aes256.p12");
+        let contents = extract_p12(p12, "testpassword").expect("fixture parses");
+        let leaf_sha1 = sha1_of(&contents.certs[0]);
+        let res = SigningCredentials::from_p12_with_leaf_sha1(p12, "testpassword", &leaf_sha1);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning")),
+            "keychain selector must not bypass the code-signing policy, got {:?}",
+            res.as_ref().err()
+        );
+    }
+```
+
+  (If `certs[0]` is not the leaf in a given fixture, locate the leaf as the certificate `select_identity` pairs with the container key — the existing `from_p12` tests on the same fixtures document which cert that is.)
+
 - [ ] **Step 5.3:** Red CLI tests in `main.rs` tests (fail today: unknown argument / no `MacOsOnly`):
 
 ```rust
@@ -551,8 +682,9 @@ not a security output line
     /// Load from PKCS#12 selecting the identity whose leaf certificate's
     /// SHA-1 matches `leaf_sha1` (the hash printed by
     /// `security find-identity`). Every load-time check that [`Self::from_p12`]
-    /// performs runs on the selected pair; an export that does not contain the
-    /// certificate is rejected with an actionable message.
+    /// performs runs on the selected pair; the export-provided chain stays in
+    /// `rest`, and an export that does not contain the certificate is rejected
+    /// with an actionable message.
     pub(crate) fn from_p12_with_leaf_sha1(
         p12_data: &[u8],
         password: &str,
@@ -560,25 +692,31 @@ not a security output line
     ) -> Result<Self> {
         let contents = super::pkcs12::extract_p12(p12_data, password)
             .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
-        let selected: Vec<Vec<u8>> = contents
-            .certs
-            .iter()
-            .filter(|c| Sha1::digest(c).as_slice() == leaf_sha1)
-            .cloned()
-            .collect();
+        let matches_leaf = |c: &[u8]| Sha1::digest(c).as_slice() == leaf_sha1;
+        let selected: Vec<Vec<u8>> = contents.certs.iter().filter(|c| matches_leaf(c)).cloned().collect();
         if selected.is_empty() {
             return Err(Error::Certificate(format!(
                 "no certificate in PKCS#12 has SHA-1 {} (the selected keychain identity was not exported)",
                 hex_upper(leaf_sha1)
             )));
         }
-        let (decoded, certificate, rest) = select_identity(&contents.keys, &selected)?;
+        // Pair the key against the selected leaf only, then rebuild `rest`
+        // from every non-leaf certificate so the export-provided chain still
+        // feeds build_chain_from_leaf (select_identity's `rest` would only
+        // cover the slice it was handed).
+        let (decoded, certificate, _matched_rest) = select_identity(&contents.keys, &selected)?;
+        let rest: Vec<Certificate> = contents
+            .certs
+            .iter()
+            .filter(|c| !matches_leaf(c))
+            .filter_map(|d| Certificate::from_der(d).ok())
+            .collect();
         Self::finish_p12(decoded, certificate, rest)
     }
 ```
 
-  Add a tiny `fn hex_upper(bytes: &[u8; 20]) -> String` beside it (`bytes.iter().map(|b| format!("{b:02X}")).collect()`). Match the exact `extract_p12` error wrapping used by `from_p12` at `:604-605`.
-  Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core from_p12_with_leaf` → both tests GREEN (this closes the Task 5.2 red).
+  Add a tiny `fn hex_upper(bytes: &[u8; 20]) -> String` beside it (`bytes.iter().map(|b| format!("{b:02X}")).collect()`). Match the exact `extract_p12` error wrapping used by `from_p12` at `:604-605`; `Certificate::from_der` needs `der::Decode`, already imported in `cert.rs`. The `.ok()` skip semantics mirror `select_identity`'s own per-cert parse (`cert.rs:250-257`).
+  Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core from_p12_with_leaf` → all four tests GREEN (Steps 5.2 + 5.2b; this closes those reds).
 
 - [ ] **Step 6.3:** Create `crates/zsign-core/src/crypto/keychain.rs`. Module structure (one file, same-file split mirrors `revocation.rs`):
 
@@ -634,11 +772,14 @@ pub mod keychain;
     }
 
     #[test]
-    fn parse_find_identity_skips_summary_noise_and_revoked_suffixes() {
+    fn parse_find_identity_handles_summary_noise_and_trailing_markers() {
         assert!(super::parse_find_identity(ZERO).is_empty());
         let lines = super::parse_find_identity(RAGGED);
         assert_eq!(lines.len(), 1, "summary + noise lines must not match");
-        assert_eq!(lines[0].name, "Apple Development: carol@example.com (TEAM999999)");
+        assert_eq!(
+            lines[0].name, "Apple Development: carol@example.com (TEAM999999)",
+            "a trailing marker after the closing quote is excluded from the name"
+        );
     }
 
     #[test]
