@@ -133,6 +133,14 @@ struct Cli {
     #[arg(short = 'w', long)]
     weak: bool,
 
+    /// Check the signing certificate's revocation status via OCSP and print a
+    /// warning if an authenticated responder says it is revoked. Signing always
+    /// proceeds — this is a signal, not a gate. One bounded network request
+    /// (3s budget) per run; unreachable responders and offline use stay silent.
+    /// Ignored for ad-hoc signing and verification.
+    #[arg(short = 'C', long)]
+    check_revocation: bool,
+
     /// Verify a signed Mach-O, app bundle, or IPA the way
     /// `codesign --verify --deep --strict` does: code-page hashes, special
     /// slots, CodeResources, and the CMS signature + certificate chain.
@@ -203,6 +211,12 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         ZSign::new().adhoc(true)
     } else {
         let credentials = load_credentials(&cli)?;
+        if cli.check_revocation {
+            zsign_rs::crypto::revocation::warn_revocation(
+                &credentials.certificate,
+                &credentials.cert_chain,
+            );
+        }
         ZSign::new().credentials(credentials)
     }
     .compression_level(cli.zip_level);
@@ -1461,6 +1475,42 @@ mod tests {
             "error must name the missing flag, not the generic fallthrough: {}",
             r.stderr
         );
+    }
+
+    #[test]
+    fn check_revocation_flag_never_gates_a_signing_run() {
+        // The flag is exposed in help (user-visible surface), and with -C the
+        // run still exits 0 — the warn-only contract ZSN-21 promises. The
+        // test identity's certificate names no OCSP responder, so the
+        // lookup short-circuits without touching the network; either way
+        // the signing result must be identical to a run without -C.
+        let help = run_cli(&[OsStr::new("--help")], &[]);
+        assert_eq!(help.code, 0);
+        assert!(
+            help.stdout.contains("--check-revocation"),
+            "flag missing from help: {}",
+            help.stdout
+        );
+
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let out = dir.path().join("out.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-C"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[("ZSIGN_PASSWORD", "testpassword")],
+        );
+        assert_eq!(r.code, 0, "-C must never gate signing: {}", r.stderr);
+        assert!(out.exists());
     }
 
     #[test]
