@@ -88,11 +88,13 @@ pub enum RevocationStatus {
 /// the absence of an answer is never reported as a revoked certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotCheckedReason {
-    /// The certificate's AIA extension names no `http:` OCSP responder.
+    /// The certificate's AIA extension carries no `id-ad-ocsp` location at
+    /// all, so no responder was ever addressed.
     NoOcspUrl,
     /// The chain carried no certificate that could be the leaf's issuer.
     NoIssuerCertificate,
-    /// The AIA OCSP location is not a plaintext `http:` URI this module speaks.
+    /// The AIA `id-ad-ocsp` location is not a plaintext `http://` URI this
+    /// module speaks, so it was found but never contacted.
     UnusableUrl,
     /// The transport failed; the payload is the reported error.
     Transport(String),
@@ -149,9 +151,14 @@ pub trait OcspTransport {
     fn post(&self, url: &str, body: &[u8]) -> std::result::Result<Vec<u8>, TransportError>;
 }
 
-/// The `id-ad-ocsp` access location of the leaf's AIA extension, when it is a
-/// plaintext `http:` URI. Decoded with the typed `x509_cert` extension, so no
-/// hand-rolled AIA parser exists here.
+/// The `id-ad-ocsp` `uniformResourceIdentifier` text of the leaf's AIA
+/// extension, whatever its scheme, or `None` when the certificate names no
+/// OCSP access location at all. Whether the text is one this module can
+/// actually speak is the caller's decision: [`check`] reports a non-`http://`
+/// location as [`NotCheckedReason::UnusableUrl`], which keeps "no responder
+/// named" and "responder named but unreachable by this module" distinguishable.
+/// Decoded with the typed `x509_cert` extension, so no hand-rolled AIA parser
+/// exists here.
 pub fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
     use x509_cert::ext::pkix::AuthorityInfoAccessSyntax;
     let value = ext_value(leaf, const_oid::db::rfc5280::ID_PE_AUTHORITY_INFO_ACCESS)?;
@@ -163,8 +170,7 @@ pub fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
         match &desc.access_location {
             // GeneralName `uniformResourceIdentifier` is `[6] IMPLICIT IA5String`.
             x509_cert::ext::pkix::name::GeneralName::UniformResourceIdentifier(uri) => {
-                let url = uri.to_string();
-                url.starts_with("http://").then_some(url)
+                Some(uri.to_string())
             }
             _ => None,
         }
@@ -517,11 +523,17 @@ fn walk_response(
         // certStatus first: good [0] IMPLICIT NULL, revoked [1] IMPLICIT
         // RevokedInfo, unknown [2] IMPLICIT UnknownInfo.
         let (cs_tag, cs_body) = single.read_tlv().ok()?;
-        let revoked_at = if cs_tag == 0xa1 {
-            let (when_tag, when) = DerReader::new(cs_body).read_tlv().ok()?;
-            Some(parse_time(when_tag, when)?)
+        let (revoked_at, reason) = if cs_tag == 0xa1 {
+            // `RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime,
+            //     revocationReason [0] EXPLICIT CRLReason OPTIONAL }`; the
+            // reason is genuinely optional, so a responder that omits it
+            // yields `None` rather than an invented one.
+            let mut ri = DerReader::new(cs_body);
+            let (when_tag, when) = ri.read_tlv().ok()?;
+            let reason = revocation_reason(&mut ri);
+            (Some(parse_time(when_tag, when)?), reason)
         } else {
-            None
+            (None, None)
         };
         let (tu_tag, tu_value) = single.read_tlv().ok()?;
         let this_update = parse_time(tu_tag, tu_value)?;
@@ -551,10 +563,7 @@ fn walk_response(
         }
         return Some(match cs_tag {
             0x80 => RevocationStatus::Good,
-            0xa1 => RevocationStatus::Revoked {
-                revoked_at,
-                reason: None,
-            },
+            0xa1 => RevocationStatus::Revoked { revoked_at, reason },
             0x82 => RevocationStatus::NotChecked(NotCheckedReason::Malformed(
                 "responder answered unknown(2)".into(),
             )),
@@ -572,6 +581,49 @@ fn walk_response(
 /// so a `CertID` can be compared as a whole rather than against its contents.
 fn single_span_of_body(body: &[u8]) -> Option<Vec<u8>> {
     Some(tlv(0x30, body))
+}
+
+/// The RFC 6960 §4.2.1 `revocationReason [0] EXPLICIT CRLReason OPTIONAL` of a
+/// `RevokedInfo`, labelled per RFC 5280 §5.3.1.
+///
+/// The wrapper is `[0] EXPLICIT`, so the `CRLReason` ENUMERATED sits inside it;
+/// a truncated or absent field yields `None`, and a value outside the
+/// registry is reported as `unknown(n)` rather than guessed at. A reason the
+/// responder did not send is never fabricated.
+fn revocation_reason(ri: &mut DerReader<'_>) -> Option<String> {
+    // RFC 5280 §5.3.1: the registry is 0..=6, then 8..=10. Value 7 is
+    // unassigned, so it must not borrow a neighbour's label.
+    if ri.peek_tag() != Some(0xa0) {
+        return None;
+    }
+    let (wrapper_tag, wrapper) = ri.read_tlv().ok()?;
+    if wrapper_tag != 0xa0 {
+        return None;
+    }
+    let (tag, value) = DerReader::new(wrapper).read_tlv().ok()?;
+    if tag != 0x0a {
+        return None;
+    }
+    // DER encodes `unspecified(0)` as an ENUMERATED with *no* content octets.
+    let code = match value {
+        [] => 0,
+        [only] => *only,
+        _ => return None,
+    };
+    let label = match code {
+        0 => "unspecified",
+        1 => "keyCompromise",
+        2 => "CACompromise",
+        3 => "affiliationChanged",
+        4 => "superseded",
+        5 => "cessationOfOperation",
+        6 => "certificateHold",
+        8 => "removeFromCRL",
+        9 => "privilegeWithdrawn",
+        10 => "AACompromise",
+        _ => return Some(format!("unknown({code})")),
+    };
+    Some(label.to_string())
 }
 
 /// Chooses the key that must have signed the response (RFC 6960 §4.2.2.2): the
@@ -745,6 +797,9 @@ pub fn check(
     let Some(url) = ocsp_responder_url(leaf) else {
         return RevocationStatus::NotChecked(NotCheckedReason::NoOcspUrl);
     };
+    if !url.starts_with("http://") {
+        return RevocationStatus::NotChecked(NotCheckedReason::UnusableUrl);
+    }
     let Some(issuer) = issuer else {
         return RevocationStatus::NotChecked(NotCheckedReason::NoIssuerCertificate);
     };
@@ -1224,7 +1279,11 @@ mod tests {
     fn revoked_response_reports_the_revocation_time() {
         let (leaf, issuer) = fixture_pair();
         let status = parse_and_verify(REVOKED_DER, &leaf, &issuer, now_in_window());
-        let RevocationStatus::Revoked { revoked_at, .. } = status else {
+        let RevocationStatus::Revoked {
+            revoked_at,
+            ref reason,
+        } = status
+        else {
             panic!("expected Revoked, got {status:?}");
         };
         assert_eq!(
@@ -1232,6 +1291,8 @@ mod tests {
             Some(1_767_225_600),
             "the recipe stamps 2026-01-01T00:00:00Z via the index.txt revocation date"
         );
+        // The responder emitted no `revocationReason`, so none is invented.
+        assert_eq!(*reason, None);
         assert!(status.warning().is_some_and(|w| w.contains("revoked")));
     }
 
@@ -1493,6 +1554,61 @@ mod tests {
         .is_some());
     }
 
+    #[test]
+    fn the_optional_revocation_reason_is_labelled_or_absent() {
+        // `revocationReason [0] EXPLICIT CRLReason OPTIONAL`, hand-framed
+        // because no committed fixture carries the field.
+        let reason_tlv = |code: u8| tlv(0xa0, &tlv(0x0a, &[code]));
+        let cases: [(u8, Option<&str>); 11] = [
+            (0, Some("unspecified")),
+            (1, Some("keyCompromise")),
+            (2, Some("CACompromise")),
+            (3, Some("affiliationChanged")),
+            (4, Some("superseded")),
+            (5, Some("cessationOfOperation")),
+            (6, Some("certificateHold")),
+            (8, Some("removeFromCRL")),
+            (9, Some("privilegeWithdrawn")),
+            (10, Some("AACompromise")),
+            // 7 is unused in RFC 5280 and must not borrow a neighbour's label.
+            (7, Some("unknown(7)")),
+        ];
+        for (code, expected) in cases {
+            // The reader sits *after* the revocationTime, on the optional field.
+            let body = reason_tlv(code);
+            assert_eq!(
+                revocation_reason(&mut DerReader::new(&body)),
+                expected.map(str::to_string),
+                "CRLReason {code}"
+            );
+        }
+        // Canonical DER: `unspecified(0)` carries no content octets at all.
+        let empty = tlv(0xa0, &tlv(0x0a, &[]));
+        assert_eq!(
+            revocation_reason(&mut DerReader::new(&empty)),
+            Some("unspecified".to_string())
+        );
+        // Absent field: nothing after the revocationTime, so no reason is
+        // invented.
+        assert_eq!(revocation_reason(&mut DerReader::new(&[])), None);
+        // Truncated wrappers must degrade to `None`, never panic.
+        for truncated in [
+            vec![0xa0],
+            vec![0xa0, 0x02],
+            vec![0xa0, 0x01, 0x0a],
+            vec![0xa0, 0x02, 0x0a, 0x01],
+        ] {
+            assert_eq!(
+                revocation_reason(&mut DerReader::new(&truncated)),
+                None,
+                "truncated {truncated:02x?}"
+            );
+        }
+        // A non-ENUMERATED inside the wrapper is not a reason.
+        let wrong_inner = tlv(0xa0, &tlv(0x04, &[0x01]));
+        assert_eq!(revocation_reason(&mut DerReader::new(&wrong_inner)), None);
+    }
+
     // --- Task 10: check() and the warning surface ---
 
     #[test]
@@ -1664,6 +1780,50 @@ mod tests {
                 critical: false,
                 extn_value: der::asn1::OctetString::new(bytes).unwrap(),
             });
+        }
+
+        #[test]
+        fn a_non_http_responder_is_unusable_but_absent_aia_is_not() {
+            struct Never;
+            impl OcspTransport for Never {
+                fn post(
+                    &self,
+                    _u: &str,
+                    _b: &[u8],
+                ) -> std::result::Result<Vec<u8>, TransportError> {
+                    panic!("an unusable URL must not reach the transport")
+                }
+            }
+            let (mut leaf, issuer) = fixture_pair();
+            rewrite_ocsp_uri(&mut leaf, "https://ocsp.invalid.test/ocsp");
+            assert_eq!(
+                ocsp_responder_url(&leaf).as_deref(),
+                Some("https://ocsp.invalid.test/ocsp"),
+                "the AIA text is reported whatever its scheme"
+            );
+            let status = check(&leaf, Some(&issuer), &Never, Some(now_in_window()));
+            assert_eq!(
+                status,
+                RevocationStatus::NotChecked(NotCheckedReason::UnusableUrl),
+                "got {status:?}"
+            );
+            assert!(status.warning().is_none());
+
+            // A leaf naming no OCSP responder at all must stay distinguishable.
+            let (mut no_aia, issuer) = fixture_pair();
+            let exts = no_aia
+                .tbs_certificate
+                .extensions
+                .get_or_insert_with(Vec::new);
+            exts.retain(|e| e.extn_id != const_oid::db::rfc5280::ID_PE_AUTHORITY_INFO_ACCESS);
+            assert_eq!(ocsp_responder_url(&no_aia), None);
+            let status = check(&no_aia, Some(&issuer), &Never, Some(now_in_window()));
+            assert_eq!(
+                status,
+                RevocationStatus::NotChecked(NotCheckedReason::NoOcspUrl),
+                "got {status:?}"
+            );
+            assert!(status.warning().is_none());
         }
 
         /// A one-shot HTTP/1.1 responder on the loopback interface: the AIA URI
