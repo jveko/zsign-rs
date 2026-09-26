@@ -668,7 +668,7 @@ not a security output line
         if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
             return Err(Error::Certificate(violation));
         }
-        let cert_chain = build_chain_from_leaf(&certificate, rest)?;
+        let cert_chain = build_chain_from_leaf(&certificate, rest);
         let team_id = extract_team_id(&certificate);
         Ok(Self { certificate, signing_key, cert_chain, team_id })
     }
@@ -995,5 +995,5 @@ pub mod keychain;
 
 - [x] **Spec coverage:** design §2.3 P1–P6 → Tasks 1–4 (P5 = Step 4.6/10.2, P6 = Step 10.1); design §3.6 tests → Tasks 5–8; flag design §3.2 → Task 7; error design §3.4 → Task 6.3; cfg gating §3.5 → Steps 6.4, 8.2; macOS recipe → Task 8.
 - [x] **Placeholder scan:** no TBD/TODO; every code step shows code or exact anchors with the live source named as authoritative where line numbers drift.
-- [x] **Type consistency:** `ensure_signable_bitness(bool, bool)` used identically at all seven guard sites; `from_p12_with_leaf_sha1(&[u8], &str, &[u8;20])` consistent between cert.rs and keychain.rs; `SecurityRunner` method names identical across trait, live impl, fake; `KeychainError` variant names consistent across definition and all `matches!` tests; CLI flag id `keychain_identity` consistent between arg, group, conflicts lists, and tests.
+- [x] **Type consistency:** `ensure_signable_bitness(bool, bool)` used at all guard sites (six `32-bit Mach-O binaries not supported` sites per design §2.2, plus the `inject_dylib_thin` magic gate as the seventh call site — not a seventh bare guard); `from_p12_with_leaf_sha1(&[u8], &str, &[u8;20])` consistent between cert.rs and keychain.rs; `SecurityRunner` method names identical across trait, live impl, fake; `KeychainError` variant names consistent across definition and all `matches!` tests; CLI flag id `keychain_identity` consistent between arg, group, conflicts lists, and tests.
 - [x] **Sequencing:** red before green per ticket; commits only on green; docs commit precedes cold review.
