@@ -1000,6 +1000,116 @@ mod tests {
         }
     }
 
+    /// RFC 6979 A.2.5 P-256 scalar, quoted from
+    /// <https://www.rfc-editor.org/rfc/rfc6979.txt#appendix-A.2.5>.
+    const RFC6979_P256_SCALAR: [u8; 32] = [
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6,
+        0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f,
+        0x67, 0x21,
+    ];
+
+    /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`.
+    const OID_CODE_SIGNING: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+
+    fn fixed_unix_time(unix: u64) -> x509_cert::time::Time {
+        x509_cert::time::Time::try_from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix),
+        )
+        .unwrap()
+    }
+
+    /// Fixed-scalar ECDSA credentials with a pinned validity window, so the whole
+    /// signed binary is a pure function of its inputs. Mirrors
+    /// `cms.rs`'s `build_fixed_ecdsa_credentials`; test-only helpers are duplicated
+    /// across these modules rather than widening a `#[cfg(test)]` surface.
+    fn ecdsa_credentials_for_determinism() -> crate::crypto::SigningCredentials {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::Decode;
+        use p256::ecdsa::SigningKey;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let ecdsa_key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("fixed scalar");
+        let subject = Name::from_str("CN=ECDSA Determinism Signer,OU=TESTTEAM").unwrap();
+        let validity = Validity {
+            not_before: fixed_unix_time(1_700_000_000),
+            not_after: fixed_unix_time(4_000_000_000),
+        };
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&ecdsa_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(442u32),
+            validity,
+            subject,
+            pub_key,
+            &ecdsa_key,
+        )
+        .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<p256::ecdsa::DerSignature>().unwrap();
+
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Ecdsa(ecdsa_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
+    }
+
+    #[test]
+    fn sign_macho_ecdsa_is_byte_identical_twice() {
+        let credentials = ecdsa_credentials_for_determinism();
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho()).unwrap();
+        let identifier = "com.zsign.ecdsa.determinism";
+        let entitlements = Some(b"<plist><dict/></plist>".as_slice());
+
+        let first = sign_macho(
+            &macho,
+            identifier,
+            entitlements,
+            &credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("first ECDSA sign");
+        let second = sign_macho(
+            &macho,
+            identifier,
+            entitlements,
+            &credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("second ECDSA sign");
+        assert_eq!(
+            first, second,
+            "embedding a P-256 signature twice must reproduce the binary byte for byte"
+        );
+        // Reparsing proves the bytes are a real signature, not identical garbage.
+        let reparsed = MachOFile::parse(second).expect("signed output must reparse");
+        assert!(!reparsed.slices().is_empty());
+    }
+
     #[test]
     fn test_sha256_only_signature_omits_sha1_code_directory() {
         use crate::codesign::constants::{

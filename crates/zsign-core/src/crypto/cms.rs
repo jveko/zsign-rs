@@ -11,6 +11,17 @@
 //! - **CDHash v1** ([`APPLE_CDHASH_OID`]): XML plist containing SHA-1 and SHA-256 hashes
 //! - **CDHash v2** ([`APPLE_CDHASH_V2_OID`]): DER-encoded ASN.1 sequence with hash algorithm and value
 //!
+//! # Reproducibility contract
+//!
+//! Output bytes are a pure function of the inputs: the RSA arm is PKCS#1 v1.5, which is
+//! deterministic, and the ECDSA arm is RFC 6979 deterministic because the CMS builder is
+//! bounded on the non-randomized `signature::Signer` trait. Adding a `signingTime` signed attribute
+//! (`cms::builder::SignerInfoBuilder::create_signing_time_attribute`) or switching the
+//! ECDSA arm to `signature::RandomizedSigner` breaks byte-reproducible output and is
+//! rejected by the tests in this module. Upstream `zsign` inherits OpenSSL's randomized
+//! nonce; this implementation deliberately does not, so identical inputs reproduce the
+//! signed IPA byte for byte.
+//!
 //! # Examples
 //!
 //! ```ignore
@@ -1083,5 +1094,150 @@ mod tests {
             cert_chain: vec![],
             team_id: Some("TESTTEAM".to_string()),
         }
+    }
+
+    /// RFC 6979 A.2.5 (NIST P-256 + SHA-256) known-answer vectors, quoted from
+    /// <https://www.rfc-editor.org/rfc/rfc6979.txt#appendix-A.2.5>. The private key
+    /// scalar and the two (r, s) pairs are the RFC's; the expected DER is those
+    /// integers framed as `SEQUENCE { INTEGER r, INTEGER s }`.
+    const RFC6979_P256_SCALAR: [u8; 32] = [
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6,
+        0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f,
+        0x67, 0x21,
+    ];
+    const RFC6979_SAMPLE_DER: [u8; 72] = [
+        0x30, 0x46, 0x02, 0x21, 0x00, 0xef, 0xd4, 0x8b, 0x2a, 0xac, 0xb6, 0xa8, 0xfd, 0x11, 0x40,
+        0xdd, 0x9c, 0xd4, 0x5e, 0x81, 0xd6, 0x9d, 0x2c, 0x87, 0x7b, 0x56, 0xaa, 0xf9, 0x91, 0xc3,
+        0x4d, 0x0e, 0xa8, 0x4e, 0xaf, 0x37, 0x16, 0x02, 0x21, 0x00, 0xf7, 0xcb, 0x1c, 0x94, 0x2d,
+        0x65, 0x7c, 0x41, 0xd4, 0x36, 0xc7, 0xa1, 0xb6, 0xe2, 0x9f, 0x65, 0xf3, 0xe9, 0x00, 0xdb,
+        0xb9, 0xaf, 0xf4, 0x06, 0x4d, 0xc4, 0xab, 0x2f, 0x84, 0x3a, 0xcd, 0xa8,
+    ];
+    const RFC6979_TEST_DER: [u8; 71] = [
+        0x30, 0x45, 0x02, 0x21, 0x00, 0xf1, 0xab, 0xb0, 0x23, 0x51, 0x83, 0x51, 0xcd, 0x71, 0xd8,
+        0x81, 0x56, 0x7b, 0x1e, 0xa6, 0x63, 0xed, 0x3e, 0xfc, 0xf6, 0xc5, 0x13, 0x2b, 0x35, 0x4f,
+        0x28, 0xd3, 0xb0, 0xb7, 0xd3, 0x83, 0x67, 0x02, 0x20, 0x01, 0x9f, 0x41, 0x13, 0x74, 0x2a,
+        0x2b, 0x14, 0xbd, 0x25, 0x92, 0x6b, 0x49, 0xc6, 0x49, 0x15, 0x5f, 0x26, 0x7e, 0x60, 0xd3,
+        0x81, 0x4b, 0x4c, 0x0c, 0xc8, 0x42, 0x50, 0xe4, 0x6f, 0x00, 0x83,
+    ];
+
+    #[test]
+    fn ecdsa_signing_matches_rfc6979_known_answers() {
+        use p256::ecdsa::{DerSignature, SigningKey};
+        use signature::{SignatureEncoding, Signer};
+
+        let key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("RFC 6979 scalar");
+        // The annotation is what pins the trait arm: `DerSignature` is the exact type
+        // `sign_code_directory` hands to the CMS builder (`cms.rs:334`), so these are the
+        // bytes that land in the SignerInfo signature BIT STRING.
+        // UFCS because `SigningKey` implements `Signer<Signature<C>>` (signing.rs:171) and
+        // `Signer<der::Signature<C>>` (signing.rs:272) for the same key type.
+        let sample_sig: DerSignature =
+            <SigningKey as Signer<DerSignature>>::sign(&key, b"sample" as &[u8]);
+        let test_sig: DerSignature =
+            <SigningKey as Signer<DerSignature>>::sign(&key, b"test" as &[u8]);
+        assert_eq!(
+            sample_sig.to_vec().as_slice(),
+            RFC6979_SAMPLE_DER.as_slice(),
+            "P-256 SHA-256 signature over \"sample\" must be the RFC 6979 deterministic value"
+        );
+        assert_eq!(
+            test_sig.to_vec().as_slice(),
+            RFC6979_TEST_DER.as_slice(),
+            "P-256 SHA-256 signature over \"test\" must be the RFC 6979 deterministic value"
+        );
+    }
+
+    /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`. `cms_verify`'s copy of this constant is
+    /// private to that module, so the determinism helper declares its own.
+    const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+
+    fn fixed_unix_time(unix: u64) -> x509_cert::time::Time {
+        x509_cert::time::Time::try_from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix),
+        )
+        .unwrap()
+    }
+
+    /// Fixed-scalar ECDSA credentials for the reproducibility tests: the key is the RFC 6979
+    /// scalar and the certificate DER is pinned by a constant validity window, so the CMS bytes
+    /// are identical in every process. Self-issued `Profile::Leaf`, matching the crate's own
+    /// `rsa_credentials` idiom (`cms_verify.rs:1741-1776`), with the codeSigning EKU the verify
+    /// path requires so the same helper can feed a round trip.
+    fn build_fixed_ecdsa_credentials() -> SigningCredentials {
+        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
+        use der::Decode;
+        use p256::ecdsa::SigningKey;
+        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::Validity;
+
+        let ecdsa_key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("fixed scalar");
+        let subject = Name::from_str("CN=ECDSA Determinism Signer,OU=TESTTEAM").unwrap();
+        let validity = Validity {
+            // x509-cert 0.2.5 has no `Time::from_unix_duration`; `Time::try_from(SystemTime)`
+            // is the in-repo idiom (`cms_verify.rs:2913-2915`).
+            not_before: fixed_unix_time(1_700_000_000),
+            not_after: fixed_unix_time(4_000_000_000),
+        };
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            p256::ecdsa::VerifyingKey::from(&ecdsa_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(442u32),
+            validity,
+            subject,
+            pub_key,
+            &ecdsa_key,
+        )
+        .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<p256::ecdsa::DerSignature>().unwrap();
+
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Ecdsa(ecdsa_key),
+            cert_chain: vec![],
+            team_id: Some("TESTTEAM".to_string()),
+        }
+    }
+
+    #[test]
+    fn cms_ecdsa_signature_is_byte_identical_five_times() {
+        let credentials = build_fixed_ecdsa_credentials();
+        let code_dir = b"deterministic code directory bytes";
+        let cdhash_sha1: [u8; 20] = [0x11; 20];
+        let cdhash_sha256: [u8; 32] = [0x22; 32];
+
+        let first = sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &cdhash_sha256)
+            .unwrap();
+        for run in 2..=5 {
+            let again =
+                sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &cdhash_sha256)
+                    .unwrap();
+            assert_eq!(first, again, "CMS run {run} differs from run 1");
+        }
+        // Negative control: the test cannot pass by ignoring its input.
+        let other: [u8; 32] = [0x33; 32];
+        let changed =
+            sign_code_directory(code_dir, &credentials, Some(&cdhash_sha1), &other).unwrap();
+        assert_ne!(
+            first, changed,
+            "a different CDHash must change the CMS bytes"
+        );
     }
 }
