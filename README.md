@@ -435,7 +435,7 @@ cargo build --release
 cargo test
 
 # Build WASM package (requires wasm-pack)
-wasm-pack build crates/zsign-wasm --target web
+wasm-pack build crates/zsign-wasm --target web --release
 
 # Generate documentation
 cargo doc --open
@@ -443,17 +443,34 @@ cargo doc --open
 
 ## Development
 
-Tools are pinned with [mise](https://mise.jdx.dev) and git hooks run through [hk](https://hk.jdx.dev):
+Tools are pinned with [mise](https://mise.jdx.dev) and git hooks run through
+[hk](https://hk.jdx.dev):
 
 ```bash
-mise install        # install pinned tools and register git hooks
-hk check --all      # run all lint steps (fmt, clippy, hygiene, actionlint)
-hk fix              # auto-fix what hk can
+mise install   # install pinned tools and register git hooks
+hk check --all # full local gate: file hygiene, `cargo fmt --all -- --check`,
+               # actionlint, `cargo clippy --workspace --all-targets -- -D warnings`,
+               # `cargo test --workspace`
+hk fix         # auto-fix what the lint steps can
 ```
 
-Pre-commit runs file hygiene, `cargo fmt`, and `actionlint` on your workflows;
-pre-push runs `cargo clippy --workspace --all-targets -- -D warnings`.
-The full test suite runs in CI.
+Pre-commit runs file hygiene, `cargo fmt`, and `actionlint`; pre-push runs
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
+**Tests:** 740 passing, 0 failing, 13 ignored as of 2026-09-27 (`cargo test
+--workspace`, measured on this branch) — 679 unit tests (zsign-cli 46, zsign-core
+433, zsign-rs 189, zsign-wasm 11) plus 61 doctests. The 12 ignored doctests need real
+key material and one ignored test streams >4 GiB; the wasm crate's
+`unsupported = test` cases run natively under `cargo test`, while wasm-target cases
+run via `wasm-pack test --node`. Run the suite with `cargo test`; keep `TMPDIR`
+inside the worktree if `/tmp` is tight.
+
+**CI** (`.github/workflows/`): `ci.yml` runs lint (`hk`), the debug test job
+(`cargo test --workspace`, full suite), a release-profile test job, Windows
+`cargo check`, wasm check/build/`wasm-pack test --node`, the macOS
+`codesign --verify --deep --strict` interop (`scripts/verify-apple-interop.sh`),
+`cargo-deny`, and an MSRV 1.88 check. Separate workflows: weekly fuzz smoke, weekly
+web-example build, and tag-gated crates.io/npm publishing.
 
 ## Learning Resources
 
@@ -475,6 +492,10 @@ This project serves as a learning exercise for:
 | CMS Signatures | `zsign-core::crypto::cms` — Apple-specific signed attributes |
 | Certificate Handling | `zsign-core::crypto::cert` — PKCS#12, PEM, X.509 parsing |
 | WASM Bindings | `zsign-wasm` — Browser-compatible signing via `wasm-bindgen` |
+|CMS Verification|`zsign-core::crypto::cms_verify` — Apple-order checks + trust anchoring|
+|Revocation (OCSP)|`zsign-core::crypto::revocation` — warn-only probe, 3s budget|
+|macOS Keychain|`zsign-core::crypto::keychain` — `security` shell-out + identity selector|
+|Full verification (`-V`)|`zsign::verify` — bundle/Mach-O/IPA report engine|
 
 ## References
 
@@ -496,7 +517,9 @@ This project serves as a learning exercise for:
 
 ## License
 
-This project is licensed under the MIT License — see the original [zsign](https://github.com/zhlynn/zsign) project.
+MIT, as declared in the crate manifests (`license = "MIT"` in each
+`crates/*/Cargo.toml`). This project ports [zhlynn/zsign](https://github.com/zhlynn/zsign),
+which is MIT-licensed.
 
 ## Acknowledgments
 
