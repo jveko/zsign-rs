@@ -328,21 +328,102 @@ Resolution order for PKCS#12 material:
 
 ### WASM (Browser)
 
+Whole-IPA signing with no JS-side zip handling:
+
 ```javascript
 import init, { WasmSigner } from 'zsign-wasm';
 
 await init();
 
 const signer = new WasmSigner(p12Bytes, "password", profileBytes);
-signer.set_main_executable("App");
-
-// Hash resource files
-signer.hash_file("Assets.car", assetData);
-
-// Build CodeResources and sign the binary
-const codeResources = signer.build_code_resources();
-const signed = signer.sign_macho_fat(machoData, "com.example.app", infoPlist, codeResources);
+const signedIpa = signer.sign_ipa(
+    ipaBytes,             // complete IPA as bytes
+    "com.example.newid",  // optional bundle_id rewrite
+    "New Name",           // optional bundle_name
+    "2.0.1",              // optional bundle_version
+    6,                    // optional compression_level (0-9, default 6)
+);                        // -> Uint8Array (signed IPA)
 ```
+
+- **Size caps:** input ≤ 512 MiB; declared uncompressed per entry ≤ 512 MiB and total
+  ≤ 2 GiB (violations throw `ZSIGN_INPUT_TOO_LARGE`). Existing caps unchanged:
+  Mach-O 512 MiB, hash input 128 MiB, plists/profiles 16 MiB, PKCS#12 4 MiB.
+- **Errors:** every thrown error is a real `Error` with a stable `error.code` — match
+  on the code, never the message. The family: `ZSIGN_INVALID_MACHO`,
+  `ZSIGN_ENCRYPTED_BINARY`, `ZSIGN_SIGNING_FAILED`, `ZSIGN_INVALID_CERTIFICATE`,
+  `ZSIGN_INVALID_PASSWORD`, `ZSIGN_MISSING_CREDENTIALS`, `ZSIGN_CONFIG`,
+  `ZSIGN_INVALID_PROFILE`, `ZSIGN_INVALID_PLIST`, `ZSIGN_DER_ENCODING`,
+  `ZSIGN_VERIFICATION`, `ZSIGN_INPUT_TOO_LARGE`, `ZSIGN_INVALID_ENTITLEMENTS`,
+  `ZSIGN_UNFINISHED_HASHES`, `ZSIGN_PATH_ALREADY_FINALIZED`,
+  `ZSIGN_PATH_IN_PROGRESS`, `ZSIGN_FAT_UNSUPPORTED`, `ZSIGN_INTERNAL`.
+  `sign_ipa` adds no new codes: a malformed archive maps to `ZSIGN_SIGNING_FAILED`;
+  **declared-size** cap violations throw `ZSIGN_INPUT_TOO_LARGE`, while **actual-byte**
+  overruns caught mid-stream (a zip header that lies about its size) surface as
+  `ZSIGN_SIGNING_FAILED`.
+- **Memory:** peak ≈ input + uncompressed tree + output plus per-file working set;
+  linear memory never shrinks, so a large sign leaves a per-tab watermark — use a
+  desktop-class browser above ~100 MiB inputs.
+- Contract: `docs/superpowers/specs/2026-09-26-wasm-ipa-bytes-design.md`.
+
+The fine-grained per-entry API remains available and is what `examples/web`
+demonstrates: `hash_file`/`hash_file_chunk`, `build_code_resources`, `sign_macho`
+(SHA-256-only, thin input — FAT input is rejected), `sign_macho_fat` (the explicit
+dual SHA-1+SHA-256 opt-in for FAT/Universal input), `parse_macho`, `parse_info_plist`.
+
+## Migrating from upstream zsign
+
+`zsign-cli` restores upstream flag meanings where it could, and diverges deliberately
+elsewhere (contract: `docs/superpowers/specs/2026-09-25-cli-surface-design.md`):
+
+|Flag|Upstream zsign|zsign-rs|
+|---|---|---|
+|`-p/--password`|password string|**now the password too** — in zsign-rs it was the PKCS#12 path short until 0.1.x; also reads `ZSIGN_PASSWORD`|
+|`-k/--private-key`|PEM or DER key (PKCS#12 tried last)|PEM / DER / PKCS#12 **detected by content**; use `-k` alone for PKCS#12|
+|`--pkcs12`|—|the PKCS#12 path flag, **long-only** (no `-p` short anymore)|
+|`-z/--zip-level`|0–9, default `0`, rejects out-of-range|0–9, **default `6`**, rejects out-of-range (never clamps)|
+|`-f/--force`|bypass the folder re-sign cache|override the FairPlay-encryption refusal (zsign-rs has no cache layer)|
+|`-C`|standalone certificate report whose exit codes scripts may depend on|**warning-only** OCSP probe while signing; never gates|
+|exit codes|`0` / catch-all `255`|`0` / `1` / `2` contract above|
+
+There is no compatibility shim: old `zsign-cli -p cert.p12 …` invocations fail loudly
+at parse time. `zsign-cli --help` ends with the same reminder:
+`upstream users: -p/-k now match upstream; --pkcs12 is long-only`.
+
+Upstream flags with **no** zsign-rs equivalent — transcribed from upstream
+`src/zsign.cpp` (long-option table + `usage()`, commit `614caa8d`, 2026-08-21) by
+this lane's upstream parity research; upstream source is not vendored in this tree:
+`-d -q -i -t -D -x -I -S -M -E -W -U
+-P -v` (debug dumps, quiet, ideviceinstaller install, temp folder, dylib removal,
+metadata/icon extraction, Files-app toggles, MinimumOSVersion, extension/watch/
+UISupportedDevices cleanup, extension injection, version print), plus the
+`.zsign_cache` fast re-sign layer. zsign-rs extensions with no upstream counterpart:
+`--pkcs12`, `--keychain-identity`, `--profile-map`, `--entitlements-dir`, `--json`,
+`-V/--verify`, `ZSIGN_PASSWORD`.
+
+**Versioning:** the `-p`/`-k` re-meaning is a breaking CLI change; the next release
+bumps the pre-1.0 crates from 0.1.x to **0.2.0** (manifest versions change at release
+time, not with this documentation).
+
+## Deterministic output
+
+Signing the same input twice produces byte-identical output. The mechanisms:
+
+- **Sorted zip entries** — archive names sorted bytewise (parents before children,
+  `Payload/` first, pass-through roots like `SwiftSupport/` included) in
+  `crates/zsign/src/ipa/archive.rs`.
+- **Pinned timestamps** — every zip entry carries 1980-01-01 (`zip::DateTime::default()`).
+- **Deterministic signatures** — RFC 6979 ECDSA nonces and PKCS#1 v1.5 RSA; adding a
+  `signingTime` attribute or moving ECDSA to a randomized signer is rejected by tests
+  (contract in `crates/zsign-core/src/crypto/cms.rs`). Upstream zsign inherits OpenSSL's
+  randomized nonce, so its output is not reproducible run to run.
+- **Ordered structures** — CodeResources files live in a `BTreeMap`; error lists are
+  sorted; the wasm build uses a pinned clock (cert-validity checks only).
+
+Pinned by tests: `test_create_ipa_writes_entries_in_sorted_order`,
+`test_create_ipa_from_root_is_byte_identical_across_creation_order`,
+`cms_ecdsa_signature_is_byte_identical_five_times`,
+`sign_macho_ecdsa_is_byte_identical_twice`, and `test_ipa_signing_is_deterministic`
+— the CI debug test job runs the full suite, this test included.
 
 ## Building
 
