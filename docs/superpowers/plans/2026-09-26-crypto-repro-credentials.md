@@ -737,11 +737,12 @@ labels, headers, the key-only `EVP_BytesToKey`, the header IV rule, and the ciph
 use crate::{Error, Result};
 use md5::{Digest, Md5};
 
-/// A traditional encrypted PEM split into the three things the decoder needs.
-pub(crate) struct TraditionalKey<'a> {
-    /// PEM label without the `PRIVATE KEY` suffix, e.g. `RSA`, `EC`, or empty for PKCS#8.
-    pub label: &'a str,
-    /// Plaintext DER of the inner key encoding.
+/// A traditional encrypted PEM that decrypted cleanly: just the plaintext DER of the inner
+/// key encoding. The PEM label is deliberately not returned — routing is by content, so a
+/// `PRIVATE KEY` label that arrives from the CLI's own DER wrapper must not steer the
+/// decoder, and an unused field is a `dead_code` warning under the lane's own clippy gate.
+pub(crate) struct TraditionalKey {
+    /// Plaintext DER of the inner key encoding (PKCS#1, SEC1 or PKCS#8).
     pub der: Vec<u8>,
 }
 
@@ -914,10 +915,8 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
 
 ```rust
     const ENC_PKCS8_RSA: &str = include_str!("fixtures/pem_rsa_key_pbes2_sha256.pem.b64");
-    // `traditional_pem` is `pub(crate)` on `encrypted_pem` so `cert.rs` and the CLI tests decode
-    // the same way; alias it here rather than duplicating the base64 call.
-    // `traditional_pem` is `pub(crate)` on `encrypted_pem` so `cert.rs` and the CLI tests decode
-    // the same way; alias it here rather than duplicating the base64 call.
+    // `encrypted_pem`'s `pem_fixture` helper is what decodes these; `cert.rs`'s test module
+    // declares the same three lines rather than importing a private test helper across modules.
     const ENC_PKCS8_RSA_SHA1PRF: &str = include_str!("fixtures/pem_rsa_key_pbes2_sha1prf.pem.b64");
     const ENC_PKCS8_EC: &str = include_str!("fixtures/pem_ec_key_pbes2_sha256.pem.b64");
     const ENC_TRAD_RSA: &str = include_str!("fixtures/pem_rsa_key_dekinfo_aes256.pem.b64");
