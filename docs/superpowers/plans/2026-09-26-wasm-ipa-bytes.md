@@ -153,9 +153,15 @@ Next to the existing limit tests (the `ensure_size_*` block at
 `lib.rs:1104-1191`), add:
 
 ```rust
-    #[wasm_bindgen_test(unsupported = test)]
+    // Plain #[wasm_bindgen_test] (NOT `unsupported = test`): ensure_size's
+    // error path constructs the JsValue through js_err → js_sys::Error,
+    // whose import shim panics on non-wasm targets. Mirrors the existing
+    // error-path test ensure_size_rejects_one_byte_over_every_limit
+    // (lib.rs:1222), which is also plain; the Ok-path test at lib.rs:1206
+    // is the one that carries `unsupported = test`.
+    #[wasm_bindgen_test]
     fn sign_ipa_size_guard_rejects_one_byte_over() {
-        // Mirrors ensure_size_rejects_one_byte_over_every_limit (lib.rs:1120):
+        // Mirrors ensure_size_rejects_one_byte_over_every_limit (lib.rs:1222):
         // the guard is exercised directly rather than allocating a 513 MiB
         // input; sign_ipa applies it to input.len() as its first statement.
         ensure_size(MAX_IPA_BYTES, MAX_IPA_BYTES, "IPA input", "reduce the archive")
