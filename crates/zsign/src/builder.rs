@@ -317,18 +317,18 @@ impl ZSign {
                 .unwrap_or("unknown"),
         };
 
+        let entitlements = self.load_entitlements_from_profile()?;
         let signed_binary = if self.adhoc {
             crate::macho::sign_macho_adhoc(
                 &macho,
                 identifier,
-                None,
+                entitlements.as_deref(),
                 None,
                 None,
                 self.allow_encrypted,
             )?
         } else {
             let credentials = self.get_credentials()?;
-            let entitlements = self.load_entitlements_from_profile()?;
             if self.sha256_only {
                 crate::macho::sign_macho_sha256_only(
                     &macho,
@@ -947,6 +947,64 @@ mod tests {
             cd.identifier(),
             Some("com.zsign.forwarded"),
             "configured bundle_id must replace the file-stem identifier"
+        );
+    }
+    const PROFILE_FIXTURE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.zsign.test.entitlement</string>
+  </dict>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    #[test]
+    fn test_sign_macho_adhoc_applies_profile_entitlements() {
+        use crate::codesign::constants::CSSLOT_ENTITLEMENTS;
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("test.mobileprovision");
+        std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+
+        // Control: adhoc without a profile must not carry an entitlements slot.
+        let control = dir.path().join("control.bin");
+        ZSign::new()
+            .adhoc(true)
+            .sign_macho(&input, &control)
+            .expect("control");
+        let control_bytes = std::fs::read(&control).unwrap();
+        let control_sb = thin_code_signature(&control_bytes);
+        assert!(
+            !control_sb
+                .entries
+                .iter()
+                .any(|e| e.slot == CSSLOT_ENTITLEMENTS),
+            "control must not carry an entitlements slot"
+        );
+
+        // Treatment: the profile's entitlements must reach the signed output.
+        let out = dir.path().join("signed.bin");
+        ZSign::new()
+            .adhoc(true)
+            .provisioning_profile(&profile)
+            .sign_macho(&input, &out)
+            .expect("adhoc sign with profile");
+        let signed_bytes = std::fs::read(&out).unwrap();
+        let sb = thin_code_signature(&signed_bytes);
+        let ent = sb
+            .entries
+            .iter()
+            .find(|e| e.slot == CSSLOT_ENTITLEMENTS)
+            .expect("entitlements slot must be present");
+        assert!(
+            String::from_utf8_lossy(ent.blob).contains("com.zsign.test.entitlement"),
+            "entitlements slot must carry the profile's entitlements"
         );
     }
 }
