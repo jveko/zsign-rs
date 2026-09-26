@@ -133,6 +133,7 @@ Module-local `KeychainError` (`thiserror`) in `crypto/keychain.rs` — again to 
 - **Gap 1 (seam):** non-exportable / token-backed keys cannot be exported by `security export` (mechanism: `import -x`; error text undocumented); ldid solves this with PKCS#11 (`-K pkcs11:…`) — out of scope, documented.
 - **Gap 2 (seam):** first use of a key may trigger a GUI ACL/passphrase prompt (CI recipes answer it with `security set-key-partition-list`); headless runs pass `-P ""` so only the key ACL can prompt. Live behavior unverifiable on Linux — [INFERENCE] flagged honestly.
 - **Gap 3 (seam):** which keychain the export searches is the default search list — same list `find-identity` used, so selection and export stay consistent by construction.
+- **Gap 4 (seam):** the export temp file (containing unencrypted key material) is removed best-effort on every path, but a process kill or a failing `remove_file` can leak it (worst case under a world-readable `$TMPDIR`); hardening options (private 0700 directory, `create_new` placeholder) recorded as a follow-up — no correctness defect.
 
 ## 4. Cross-lane seams & deferred needs
 
