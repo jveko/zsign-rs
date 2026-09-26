@@ -451,10 +451,14 @@ impl ZSign {
         self.validate()?;
 
         let mut signer = if self.adhoc {
-            crate::ipa::IpaSigner::new_adhoc().sha256_only(self.sha256_only)
+            crate::ipa::IpaSigner::new_adhoc()
+                .compression_level(self.compression_level)
+                .sha256_only(self.sha256_only)
         } else {
             let credentials = self.get_credentials()?;
-            crate::ipa::IpaSigner::new(credentials).sha256_only(self.sha256_only)
+            crate::ipa::IpaSigner::new(credentials)
+                .compression_level(self.compression_level)
+                .sha256_only(self.sha256_only)
         };
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
@@ -866,6 +870,35 @@ mod tests {
         assert!(
             has_sha1_directory(&thin_code_signature(&treatment_exe)),
             "sha256_only(false) must be forwarded as a dual directory"
+        );
+    }
+    #[test]
+    fn test_sign_bundle_forwards_compression_level() {
+        use crate::test_util::{minimal_macho, test_credentials};
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        let mut f = std::fs::File::create(app.join("data.bin")).unwrap();
+        f.write_all(&[0xCD; 2048]).unwrap();
+
+        let out = dir.path().join("out.ipa");
+        ZSign::new()
+            .credentials(test_credentials())
+            .compression_level(0)
+            .sign_bundle(&app, Some(&out))
+            .expect("folder to ipa must succeed");
+
+        let f = std::fs::File::open(&out).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let entry = zip.by_name("Payload/Test.app/Info.plist").unwrap();
+        assert_eq!(
+            entry.compression(),
+            zip::CompressionMethod::Stored,
+            "compression_level(0) must reach the repack as Stored"
         );
     }
 }
