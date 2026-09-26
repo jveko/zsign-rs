@@ -234,8 +234,97 @@ zsign-cli -V Test.app
 zsign-cli -V Test
 ```
 
-Exit status: `0` valid, `1` invalid (issues printed), `2` hard error
-(unreadable/unsupported input).
+### Exit status
+
+|Code|Signing|`--verify`|
+|---|---|---|
+|`0`|signed successfully|verification completed, input **valid**|
+|`1`|any signing or credential failure|verification completed, input **invalid** (issues printed)|
+|`2`|usage/parse errors (clap)|could not complete — unreadable/unsupported input, or a report with top-level errors (e.g. a slot that cannot be verified without bundle context); also usage/parse errors (clap)|
+
+- With `--json`, failures are JSON objects on **stderr**
+  (`{"status":"error","error":"…"}`); clap usage errors stay human-readable by design.
+- The report-based exit-2 class applies to bare-Mach-O inputs; bundle/IPA problems are
+  completed-negative verdicts exiting `1`.
+- Sign failures deliberately stay `1` so they remain distinguishable from clap's
+  hardcoded usage exit `2`
+  (`docs/superpowers/specs/2026-09-25-cli-surface-design.md`).
+
+### JSON output (`--json`)
+
+One compact (single-line) JSON document per run: successes on stdout, failures on
+stderr. Schema v1 — field names and enum spellings are stable; renaming one is a
+breaking change (source: `docs/superpowers/specs/2026-09-25-cli-surface-design.md`,
+§ “JSON schema v1”; DTOs in `crates/zsign-cli/src/main.rs`):
+
+- Sign: `{"status":"signed","output":"<path>"}`
+- Verify: `{"status":"valid"|"invalid"|"error","input":"<path as given>","report":{…}}`
+- Error (stderr): `{"status":"error","error":"<message>"}`
+- “Could not complete” emits both: the verify document on stdout with
+  `"status":"error"` **and** the error object on stderr.
+
+`report` = `{"valid":bool,"macho":{…}|null,"bundle":{…}|null,"errors":[…]}`:
+
+- `macho`: `{"fat":bool,"slices":[{arch,signed,identifier,adhoc,valid,pages,special_slots,cms,errors,warnings}]}` — `null` for bundle/IPA inputs
+- `pages`: `{"kind":"matched"}` | `{"kind":"empty"}` | `{"kind":"mismatch","page_index":n}` | `{"kind":"count_mismatch","stored":n,"computed":n}`
+- `special_slots`: `[{slot,name,check}]` — `slot` is synthesized `-1`…`-7` with labels `Info.plist`, `requirements`, `CodeResources`, `application`, `entitlements`, `rep-specific`, `der entitlements`; `check` ∈ `matched` | `not_checked` | `mismatch` | `missing`
+- `cms`: `{valid,no_signature,signer_subject,signer_serial,message_digest_ok,cdhash_v1_ok,cdhash_v2_ok,signature_ok,chain_ok,anchored,chain_reason,chain,errors,warnings}` — `null` only for early-failed slices
+- `bundle`: `{path,valid,binaries:[{path,valid,report,errors}],code_resources:{valid,matched,mismatched,missing,unsealed}|null,errors,nested:[…]}` — `nested` is recursive; `bundle` is `null` for bare-Mach-O inputs
+
+`status` is authoritative for machine consumers; exit codes remain the human/shell
+signal. Deliberately absent: `report.warnings`, `exit_code`, `problem_count` (the
+first has no writers, the others are derivable).
+
+### Password channels
+
+Resolution order for PKCS#12 material:
+
+1. `-p/--password` — beats the environment (clap consults `ZSIGN_PASSWORD` only when
+   the flag is absent).
+2. `ZSIGN_PASSWORD` environment variable — its value is never echoed in help or errors
+   (`hide_env_values`).
+3. Empty-password trial — an empty password is valid and never triggers a prompt.
+4. One interactive prompt (`PKCS#12 password: `) — only when stdin is a terminal, and
+   only on PKCS#12 paths (`--pkcs12`, or `-k` pointing at PKCS#12 content).
+5. Otherwise the error names both channels:
+   `… no password supplied: pass -p/--password or set ZSIGN_PASSWORD (stdin is not a terminal, cannot prompt)`.
+
+- PEM and bare-DER key paths never prompt — pass `-p`/`ZSIGN_PASSWORD` if the key is
+  encrypted (encrypted PEM is accepted with the right password).
+- argv exposure: `-p secret` is visible to other users in process listings — prefer
+  `ZSIGN_PASSWORD`.
+- Misuse guard: PKCS#12 content passed to `-k` **together with** `-c` fails with an
+  error telling you to pass `-k` alone or use `--pkcs12`.
+
+### Revocation checking (`-C/--check-revocation`)
+
+- **Warn-only, never a gate:** only an *authenticated* responder saying “revoked”
+  prints `warning: …` to stderr; signing always proceeds and exit codes never change.
+  Every other outcome — good, unreachable, offline, missing OCSP URL, budget expired —
+  stays silent.
+- One bounded network request per run with a 3s budget covering connect/read/write
+  (DNS runs on a short-lived native worker thread under the same budget); native
+  targets only.
+- Known limits, recorded rather than papered over: plaintext `http:` OCSP proves the
+  responder's key, not the channel; `https:` responder URLs are not fetched (reported
+  as a distinct reason); no `nextUpdate` freshness ceiling when the responder omits it;
+  CRL, stapling, and hard-fail modes are out of scope
+  (`docs/superpowers/specs/2026-09-26-crypto-repro-credentials-design.md`).
+- Conflicts `-V` and `-a`; ad-hoc signing runs no credential check at all.
+
+### Keychain identities (`--keychain-identity`, macOS only)
+
+- Select by identity name or 40-hex hash from `security find-identity -v -p
+  codesigning`; an ambiguous name errors with the candidate hashes.
+- Loads through the same PKCS#12 pipeline (`security export` → selector → `from_p12`),
+  so every load-time policy check (RSA ≥ 2048, EKU/KU, leaf rules) still runs.
+- Non-macOS platforms fail with `--keychain-identity is only available on macOS; use
+  --pkcs12, -k/--private-key, or -c/--certificate on this platform` (exit 1).
+  `-p`/`ZSIGN_PASSWORD` is never consulted on this path.
+- A macOS CI job recipe (create-keychain → import identity p12 → `cargo test -p
+  zsign-core keychain`) is recorded in
+  `docs/superpowers/specs/2026-09-26-32bit-keychain-design.md` §3.6 — it is **not**
+  wired into CI yet and needs a CI-held identity secret.
 
 ### WASM (Browser)
 
