@@ -1789,6 +1789,84 @@ mod tests {
         cd
     }
 
+    /// Reads a big-endian u32 CodeDirectory header field.
+    fn cd_u32(cd: &[u8], off: usize) -> u32 {
+        let bytes = cd
+            .get(off..off + 4)
+            .expect("CodeDirectory header field in range");
+        u32::from_be_bytes(bytes.try_into().expect("4 bytes"))
+    }
+
+    /// Builds a CodeDirectory whose code slots hash `code` in `2^log2`-byte
+    /// pages. The real builder always writes pageSize log2 = 12 and 4096-byte
+    /// slots, so the header fields and the slot bytes are both patched here;
+    /// the declared length is kept honest because `parse` bounds-checks it.
+    fn cd_with_log2_pages(code: &[u8], log2: u8) -> Vec<u8> {
+        let mut cd = CodeDirectoryBuilder::new("com.example.pages16k", code).build_sha256();
+        let page = 1usize << log2;
+        let slots = code.len().div_ceil(page);
+        let hash_offset = cd_u32(&cd, 16) as usize; // hashOffset
+        let hash_size = cd[36] as usize; // hashSize (32 for SHA-256)
+        cd[39] = log2; // pageSize log2
+                       // Never shrink: the builder emits ceil(len/4096) slots, which can exceed
+                       // the 16 KiB-page count. The declared length below trims the surplus.
+        cd.resize(cd.len().max(hash_offset + slots * hash_size), 0);
+        for (i, chunk) in code.chunks(page).enumerate() {
+            let digest = Sha256::digest(chunk);
+            let at = hash_offset + i * hash_size;
+            cd[at..at + hash_size].copy_from_slice(&digest);
+        }
+        cd[28..32].copy_from_slice(&(slots as u32).to_be_bytes()); // nCodeSlots
+        let new_len = (hash_offset + slots * hash_size) as u32;
+        cd[4..8].copy_from_slice(&new_len.to_be_bytes()); // declared length
+        cd
+    }
+
+    #[test]
+    fn check_code_pages_accepts_16k_pages() {
+        // 16 KiB pages must hash the region in 16384-byte chunks, not 4096.
+        let code = vec![0x33u8; 16384 * 2 + 1000];
+        let cd_bytes = cd_with_log2_pages(&code, 14);
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(check_code_pages(&cd, &code), PageCheck::Matched);
+
+        // Exact multiple of the page size: no partial trailing page.
+        let exact = vec![0x44u8; 16384 * 2];
+        let cd_exact_bytes = cd_with_log2_pages(&exact, 14);
+        let cd_exact = CodeDirectory::parse(&cd_exact_bytes).unwrap();
+        assert_eq!(check_code_pages(&cd_exact, &exact), PageCheck::Matched);
+
+        // Corrupting a byte in the second 16 KiB page is reported as page 1 —
+        // proof the check walked 16384-byte pages and not 4096-byte ones
+        // (under 4 KiB pages this byte would be page 4).
+        let mut bad = code.clone();
+        bad[20000] ^= 1;
+        assert_eq!(
+            check_code_pages(&cd, &bad),
+            PageCheck::Mismatch { page_index: 1 }
+        );
+    }
+
+    #[test]
+    fn check_code_pages_16k_count_mismatch() {
+        // One partial page of a 16 KiB-page region: computed slots = 2, but a
+        // tampered directory claims 3. The declared length is patched with the
+        // slot count so `parse` still accepts the widened hash region.
+        let code = vec![0x55u8; 16384 + 10];
+        let mut cd_bytes = cd_with_log2_pages(&code, 14);
+        let hash_offset = cd_u32(&cd_bytes, 16) as usize;
+        cd_bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        cd_bytes[4..8].copy_from_slice(&((hash_offset + 3 * 32) as u32).to_be_bytes());
+        let cd = CodeDirectory::parse(&cd_bytes).unwrap();
+        assert_eq!(
+            check_code_pages(&cd, &code),
+            PageCheck::CountMismatch {
+                stored: 3,
+                computed: 2
+            }
+        );
+    }
+
     #[test]
     fn parse_rejects_page_size_log2_above_16() {
         for log2 in [17u8, 20, 63, 64, 127, 255] {

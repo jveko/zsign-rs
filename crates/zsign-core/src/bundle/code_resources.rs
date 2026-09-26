@@ -826,6 +826,117 @@ mod tests {
     }
 
     #[test]
+    fn should_exclude_table() {
+        let mut builder = CodeResourcesBuilder::new();
+        builder.exclude("TestData/");
+        // Nested bundle files are sealed by the parent, so they are not excluded.
+        // Pinned as-is: the verifier drops nested _CodeSignature entries by
+        // substring (zsign/src/verify.rs:457 tests
+        // `rel_str.contains("_CodeSignature/")`), so a nested signature file is
+        // skipped there while this root-anchored prefix test declines to
+        // exclude it. "Fixing" this row alone would desync signer and
+        // verifier; changing both is out of scope here.
+        for (path, excluded, why) in [
+            ("_CodeSignature/CodeResources", true, "own signature dir"),
+            ("_CodeSignature", true, "signature dir itself"),
+            (
+                "_CodeSignature/CodeResources",
+                true,
+                "the CodeResources file is excluded twice over",
+            ),
+            ("TestData/a.bin", true, "custom exclusion prefix hit"),
+            (
+                "TestDataX/a.bin",
+                false,
+                "the pattern's trailing slash keeps the near-miss out",
+            ),
+            ("TestData", false, "the bare directory name lacks the slash"),
+            ("data.bin", false, "ordinary resource"),
+            (
+                "Frameworks/Sub.framework/Sub",
+                false,
+                "nested bundle files belong to the parent's seal",
+            ),
+            (
+                "Frameworks/Sub.framework/_CodeSignature/CodeResources",
+                false,
+                "the _CodeSignature prefix is anchored at the bundle root",
+            ),
+        ] {
+            assert_eq!(builder.should_exclude(path), excluded, "{path}: {why}");
+        }
+    }
+
+    #[test]
+    fn main_executable_is_excluded_and_near_miss_is_not() {
+        // The main executable carries its own embedded signature, so it is
+        // never sealed by the parent's CodeResources.
+        let mut builder = CodeResourcesBuilder::new();
+        builder.set_main_executable("Test");
+        assert!(builder.should_exclude("Test"), "the main executable");
+        assert!(
+            !builder.should_exclude("TestData/a.bin"),
+            "prefix near-miss"
+        );
+        assert!(!builder.should_exclude("Test2"), "different file");
+    }
+
+    #[test]
+    fn add_symlink_honors_exclusions() {
+        let mut builder = CodeResourcesBuilder::new();
+        let (sha1, sha256) = CodeResourcesBuilder::hash_data(b"Versions/Current/Test");
+
+        assert!(
+            !builder.add_symlink(
+                "_CodeSignature/CodeResources",
+                "Versions/Current/Test",
+                sha1,
+                sha256
+            ),
+            "an excluded path must be refused"
+        );
+        assert!(builder.files().next().is_none(), "nothing was inserted");
+
+        assert!(
+            builder.add_symlink(
+                "Frameworks/Test.framework/Test",
+                "Versions/Current/Test",
+                sha1,
+                sha256
+            ),
+            "a sealable path is accepted"
+        );
+        let bytes = builder.build().unwrap();
+        let value: Value = plist::from_bytes(&bytes).unwrap();
+        let files2 = value
+            .as_dictionary()
+            .unwrap()
+            .get("files2")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        let entry = files2
+            .get("Frameworks/Test.framework/Test")
+            .expect("the symlink is sealed")
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            entry.get("symlink").and_then(|v| v.as_string()),
+            Some("Versions/Current/Test"),
+            "the symlink target is observable in the built plist"
+        );
+        // The legacy SHA-1 dict never carries symlinks.
+        let files = value
+            .as_dictionary()
+            .unwrap()
+            .get("files")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert!(!files.contains_key("Frameworks/Test.framework/Test"));
+    }
+
+    #[test]
     fn test_rule_action_weights_and_ties() {
         let rules2 = standard_rules2();
         assert_eq!(rule_action(&rules2, "data.bin"), Some(RuleAction::Include));

@@ -887,6 +887,87 @@ mod tests {
             m.slices().iter().all(|s| s.code_sig_offset.is_some()),
             "both slices must be signed"
         );
+
+        // Dual-pin: without injected anchors the report is anchor-gated, so
+        // "signed and verifiable" = every slice verifies with the anchoring
+        // gate as its only problem, and its code pages match.
+        let report = crate::verify::verify_macho_file(&output).unwrap();
+        let macho = report.macho.as_ref().expect("Mach-O report");
+        assert!(macho.fat, "verify must see a FAT container");
+        assert_eq!(macho.slices.len(), 2);
+        for (i, slice) in macho.slices.iter().enumerate() {
+            assert!(slice.signed, "slice {i} must verify as signed");
+            assert_eq!(
+                slice.pages,
+                zsign_core::codesign::verify::PageCheck::Matched,
+                "slice {i}: {:?}",
+                slice.errors
+            );
+            assert!(
+                slice
+                    .errors
+                    .iter()
+                    .all(|e| e.contains("not anchored to a trusted root")),
+                "slice {i}: {:?}",
+                slice.errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_sign_macho_fat_verify_detects_tampered_second_slice() {
+        // Power check for the per-slice verify assertions above: tamper only
+        // slice 1's code region (the container offsets stay valid, so the
+        // container still parses and both slices still carry a signature) and
+        // require exactly that slice to be reported as a page mismatch. A
+        // verifier that ignored per-slice page state, or that only checked the
+        // first slice, would pass this file off as clean.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_two_arch_fat_fixture(dir.path());
+        let output = dir.path().join("universal_signed");
+        ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .sign_macho(&input, &output)
+            .expect("sign FAT");
+
+        let container = crate::macho::MachOFile::parse(std::fs::read(&output).unwrap()).unwrap();
+        let victim = &container.slices()[1];
+        // Land past the load commands but inside the region the CodeDirectory
+        // actually hashes: `check_code_pages` covers the first `code_limit`
+        // bytes of the slice, and the signer sets codeLimit to the __TEXT
+        // segment size. A byte beyond that would report CountMismatch (or
+        // nothing) instead of the page mismatch this test is pinning.
+        let code_limit = victim.text_segment_size as usize;
+        let page_covered = 0x100usize;
+        assert!(
+            page_covered < code_limit,
+            "tamper point {page_covered} must lie below codeLimit {code_limit}"
+        );
+
+        let mut bytes = std::fs::read(&output).unwrap();
+        bytes[victim.offset as usize + page_covered] ^= 0x01;
+        let tampered = dir.path().join("universal_tampered");
+        std::fs::write(&tampered, &bytes).unwrap();
+
+        let report = crate::verify::verify_macho_file(&tampered).unwrap();
+        let macho = report.macho.as_ref().expect("Mach-O report");
+        assert!(macho.fat, "the container must still parse as FAT");
+        assert_eq!(macho.slices.len(), 2);
+        // Exact page index: 0x100 falls in the first 4096-byte page. A verifier
+        // that walked the wrong page size, or attributed the mismatch to the
+        // wrong architecture, cannot produce this value.
+        assert_eq!(
+            macho.slices[1].pages,
+            zsign_core::codesign::verify::PageCheck::Mismatch { page_index: 0 },
+            "slice 1 must be reported as a page mismatch"
+        );
+        // Control: the untouched architecture must stay clean, so the report
+        // attributes the damage to the tampered slice alone.
+        assert_eq!(
+            macho.slices[0].pages,
+            zsign_core::codesign::verify::PageCheck::Matched,
+            "the untampered slice must still verify"
+        );
     }
 
     #[test]

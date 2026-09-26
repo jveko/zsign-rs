@@ -1550,4 +1550,71 @@ mod tests {
             bundle.errors
         );
     }
+
+    #[test]
+    fn signed_ipa_verifies_end_to_end() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = td.path().join("Test.app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
+        fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
+        let creds = crate::test_util::test_credentials();
+        ZSign::new()
+            .credentials(creds.clone())
+            .sign_bundle(&app, None)
+            .expect("sign in place");
+
+        let ipa = td.path().join("signed.ipa");
+        crate::create_ipa(&app, &ipa, crate::CompressionLevel::DEFAULT).unwrap();
+        let report = verify_ipa(&ipa).expect("signed IPA must extract and verify");
+
+        // Dual-pin: report.valid() is anchor-gated, so pin the problem list.
+        let bundle = report.bundle.as_ref().expect("bundle report");
+        assert!(bundle.errors.is_empty(), "errors: {:?}", bundle.errors);
+        assert!(
+            !bundle.binaries.is_empty(),
+            "the executable must be verified"
+        );
+        for binary in &bundle.binaries {
+            let slice = &binary.report.as_ref().expect("Mach-O report").slices[0];
+            assert_eq!(slice.errors.len(), 1, "binaries: {:?}", binary.errors);
+            assert!(slice.errors[0].contains("not anchored to a trusted root"));
+        }
+        let cr = bundle.code_resources.as_ref().expect("CodeResources check");
+        assert!(
+            cr.valid(),
+            "mismatched={:?} missing={:?} unsealed={:?}",
+            cr.mismatched,
+            cr.missing,
+            cr.unsealed
+        );
+
+        // Anchored half: the signed executable (signed in place above; the same
+        // bytes the zip was made from) verifies against the injected test root.
+        let exe = fs::read(app.join("Test")).unwrap();
+        let injected = cms_report_with_test_anchor(&exe, &creds);
+        assert!(injected.valid, "cms errors: {:?}", injected.errors);
+        assert!(injected.anchored);
+    }
+
+    #[test]
+    fn verify_ipa_rejects_unsigned_bundle() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = td.path().join("Test.app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
+        fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
+        let ipa = td.path().join("unsigned.ipa");
+        crate::create_ipa(&app, &ipa, crate::CompressionLevel::DEFAULT).unwrap();
+        let report = verify_ipa(&ipa).expect("unsigned IPA still extracts");
+        assert!(!report.valid(), "an unsigned bundle must not verify");
+        let bundle = report.bundle.as_ref().expect("bundle report");
+        assert!(!bundle.binaries.is_empty());
+        for binary in &bundle.binaries {
+            assert!(
+                !binary.report.as_ref().expect("Mach-O report").slices[0].signed,
+                "unsigned slice must not report as signed"
+            );
+        }
+    }
 }
