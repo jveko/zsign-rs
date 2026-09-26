@@ -81,7 +81,7 @@ today — `macho/signer.rs:973` and `cert.rs:1219` are RSA-only):
 
 | Test | Level | What it pins |
 |---|---|---|
-| `ecdsa_signature_matches_rfc6979_a25_vector` | the CMS trait method | DER of `Signer::<DerSignature>::sign(b"sample")` and `sign(b"test")` under the RFC's key equals the A.2.5 bytes (P11). Fails if the nonce source *or* the DER framing changes, in any process. Independent transcription check: `p256-0.13.2/src/ecdsa.rs:96-117` asserts the same pair. |
+| `ecdsa_signing_matches_rfc6979_known_answers` | the CMS trait method | DER of `Signer::<DerSignature>::sign(b"sample")` and `sign(b"test")` under the RFC's key equals the A.2.5 bytes (P11). Fails if the nonce source *or* the DER framing changes, in any process. Independent transcription check: `p256-0.13.2/src/ecdsa.rs:96-117` asserts the same pair. |
 | `cms_ecdsa_signature_is_byte_identical_five_times` | `sign_code_directory` | the ticket's acceptance, plus a negative control: changing `cdhash_sha256` changes the output, so the test cannot pass by ignoring its input. |
 | `sign_macho_ecdsa_is_byte_identical_twice` | `macho::signer::sign_macho` | blob-level reproducibility through the real slice pipeline, ECDSA credentials, no zip involved (so it is immune to the ZSN-15 entry-order flake). |
 
@@ -145,8 +145,9 @@ once the in-tree path exists. Choosing one PBES2 implementation over two also ke
 `keyLength`/iteration policy consistent between `.p12` and `.pem`.
 
 **D18.3. Traditional framing is necessarily ours.** `der`/`pem-rfc7468` deliberately reject RFC 7468
-headers (`der-0.7.10/src/pem/decoder.rs:31`, `:237-243` — `Proc-Type` exists there only as a
-negative fixture), and no RustCrypto crate implements `EVP_BytesToKey` (registry-wide search; the
+headers (`pem-rfc7468-0.7.0/src/decoder.rs:31`, `:240-244` — the reader's own
+`Error::HeaderDisallowed`; header detection is colon-based, so any `Name: value` line before the
+base64 is rejected), and no RustCrypto crate implements `EVP_BytesToKey` (registry-wide search; the
 only hit is `aws-lc-sys`'s bundled C). Two implementation details are pinned by P8 and must not be
 "fixed" later: the IV is the `DEK-Info` hex string (the derived IV corrupts the first block), and
 only `keyLen` bytes of the `EVP_BytesToKey` output are consumed.
@@ -238,7 +239,7 @@ pub enum RevocationStatus {
 }
 pub enum NotCheckedReason {                 // every variant here stays silent
     NoOcspUrl, NoIssuerCertificate, UnusableUrl, Transport(String), Malformed(String),
-    Unverified, OutsideValidityWindow, BudgetExpired,
+    NoMatchingCertId, Unverified, OutsideValidityWindow, BudgetExpired,
 }
 impl RevocationStatus {
     /// The user-facing warning: `Some` only for an authenticated `Revoked`.
@@ -254,9 +255,9 @@ pub trait OcspTransport {
 pub fn ocsp_responder_url(leaf: &Certificate) -> Option<String>;
 pub fn build_request(leaf: &Certificate, issuer: &Certificate) -> Result<Vec<u8>>;
 pub fn parse_and_verify(response_der: &[u8], leaf: &Certificate, issuer: &Certificate,
-                        now: time::OffsetDateTime) -> Result<RevocationStatus>;
+                        now: time::OffsetDateTime) -> RevocationStatus;
 pub fn check(leaf: &Certificate, issuer: Option<&Certificate>, transport: &dyn OcspTransport,
-             now: Option<time::OffsetDateTime>) -> RevocationStatus;   // never Err for network causes
+             now: Option<time::OffsetDateTime>) -> RevocationStatus;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn warn_revocation(leaf: &Certificate, chain: &[Certificate]);      // the CLI-callable sink
 ```
@@ -334,6 +335,12 @@ nothing for the wasm half of the workspace and every added crate is a permanent
   latency, and Apple's iOS-signing CRLs are not a redistributable list.
 - **Response caching, stapling, must-staple enforcement, OCSP signing-nonce echoing (§3.2.3),
   tryLater retry:** out of scope for a best-effort warning.
+- **Hard freshness ceiling when the responder omits `nextUpdate`:** not enforced. RFC 6960 makes
+  `nextUpdate` OPTIONAL and the fixture responder omits it, so the rule implemented here is
+  `thisUpdate <= now` plus `now < nextUpdate` when present. A captured-old `good` answer therefore
+  stays credible indefinitely to this code, which is acceptable only because the outcome is a
+  warning and the response still has to carry the issuer's signature. Recorded as a known limit,
+  not as a policy claim.
 - **A hard-fail mode:** forbidden by the ticket ("a signal, not a gate").
 
 ## Cross-cutting decisions

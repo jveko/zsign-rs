@@ -90,26 +90,33 @@ new `revocation.rs` whose network edge is a trait with a native `std::net` imple
     #[test]
     fn ecdsa_signing_matches_rfc6979_known_answers() {
         use p256::ecdsa::{DerSignature, SigningKey};
-        use signature::Signer;
+        use signature::{SignatureEncoding, Signer};
 
         let key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("RFC 6979 scalar");
-        let sample: Vec<u8> = key.sign(b"sample" as &[u8]).to_vec();
-        let test: Vec<u8> = key.sign(b"test" as &[u8]).to_vec();
-        let _: Option<DerSignature> = None; // type anchor: the CMS signature form
+        // The annotation is what pins the trait arm: `DerSignature` is the exact type
+        // `sign_code_directory` hands to the CMS builder (`cms.rs:334`), so these are the
+        // bytes that land in the SignerInfo signature BIT STRING.
+        // UFCS because `SigningKey` implements `Signer<Signature<C>>` (signing.rs:171) and
+        // `Signer<der::Signature<C>>` (signing.rs:272) for the same key type.
+        let sample_sig: DerSignature =
+            <SigningKey as Signer<DerSignature>>::sign(&key, b"sample" as &[u8]);
+        let test_sig: DerSignature =
+            <SigningKey as Signer<DerSignature>>::sign(&key, b"test" as &[u8]);
         assert_eq!(
-            sample.as_slice(),
+            sample_sig.to_vec().as_slice(),
             RFC6979_SAMPLE_DER.as_slice(),
             "P-256 SHA-256 signature over \"sample\" must be the RFC 6979 deterministic value"
         );
         assert_eq!(
-            test.as_slice(),
+            test_sig.to_vec().as_slice(),
             RFC6979_TEST_DER.as_slice(),
             "P-256 SHA-256 signature over \"test\" must be the RFC 6979 deterministic value"
         );
     }
 ```
 
-  `signature::Signer` is already a dependency of `zsign-core` (`Cargo.toml:28`).
+  `signature` 2.2 is a direct `zsign-core` dependency (`crates/zsign-core/Cargo.toml:28`), so
+  `signature::{Signer, SignatureEncoding}` resolve without going through `p256`'s re-export.
 
 - [ ] **Step 2: Run it and confirm it passes on the untouched tree**
 
@@ -132,7 +139,7 @@ randomized trait in a scratch edit that is NOT committed:
 ```
 
 `RandomizedSigner<der::Signature<C>>` is implemented for `SigningKey<C>`
-(`ecdsa-0.16.9/src/signing.rs:428`), so the annotation above is what makes the scratch edit
+(`ecdsa-0.16.9/src/signing.rs:325`), so the annotation above is what makes the scratch edit
 compile; the explicit type is also what proves the mutation swapped the nonce source and not the
 signature encoding.
 
@@ -141,22 +148,19 @@ Expected: FAIL — the randomized nonce produces different `r`/`s`, so the asser
 the scratch edit and re-run Step 2 to green. Report the observed failure text as the red evidence
 for this ticket.
 
-- [ ] **Step 4: Scoped gate + commit**
+- [ ] **Step 4: Scoped gate, then commit (after reverting the scratch edit and re-running Step 2)**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto::cms -- --skip test_ipa_signing_is_deterministic`
-Expected: all `crypto::cms` tests pass, none skipped by this lane.
+Expected: every `crypto::cms` test passes, including the new one, with no skip added by this lane.
 
 ```
 git add crates/zsign-core/src/crypto/cms.rs
 git commit -m "test(crypto): pin rfc 6979 deterministic p-256 signatures with a known-answer test"
 ```
 
-- [ ] **Step 5: Commit (after reverting the scratch edit and re-running Step 2)**
-
-```
-git add crates/zsign-core/src/crypto/cms.rs
-git commit -m "test(crypto): pin rfc 6979 deterministic p-256 signatures with a known-answer test"
-```
+The three byte arrays above were checked against the signer's own output and against
+`openssl asn1parse` during design (P11); treat a mismatch here as a transcription error to fix in
+the test, never as a reason to weaken the assertion.
 
 ---
 
@@ -171,8 +175,11 @@ git commit -m "test(crypto): pin rfc 6979 deterministic p-256 signatures with a 
   the certificate DER is identical in every process (`Validity::from_now` would move the bytes):
 
 ```rust
-    /// Fixed-scalar ECDSA credentials: the certificate DER is pinned by a constant validity
-    /// window, so the CMS bytes it produces are reproducible across processes.
+    /// Fixed-scalar ECDSA credentials for the reproducibility tests: the key is the RFC 6979
+    /// scalar and the certificate DER is pinned by a constant validity window, so the CMS bytes
+    /// are identical in every process. Self-issued `Profile::Leaf`, matching the crate's own
+    /// `rsa_credentials` idiom (`cms_verify.rs:1741-1776`), with the codeSigning EKU the verify
+    /// path requires so the same helper can feed a round trip.
     fn build_fixed_ecdsa_credentials() -> SigningCredentials {
         use crate::crypto::cert::{SigningCredentials, SigningKeyType};
         use der::Decode;
@@ -180,31 +187,40 @@ git commit -m "test(crypto): pin rfc 6979 deterministic p-256 signatures with a 
         use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
         use std::str::FromStr;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
-        use x509_cert::time::{Time, Validity};
+        use x509_cert::time::Validity;
 
         let ecdsa_key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("fixed scalar");
-        let verifying_key = p256::ecdsa::VerifyingKey::from(&ecdsa_key);
         let subject = Name::from_str("CN=ECDSA Determinism Signer,OU=TESTTEAM").unwrap();
         let validity = Validity {
-            not_before: Time::from_unix_duration(std::time::Duration::from_secs(1_700_000_000))
-                .unwrap(),
-            not_after: Time::from_unix_duration(std::time::Duration::from_secs(4_000_000_000))
-                .unwrap(),
+            // x509-cert 0.2.5 has no `Time::from_unix_duration`; `Time::try_from(SystemTime)`
+            // is the in-repo idiom (`cms_verify.rs:2913-2915`).
+            not_before: fixed_unix_time(1_700_000_000),
+            not_after: fixed_unix_time(4_000_000_000),
         };
         let pub_key = SubjectPublicKeyInfoOwned::from_der(
-            verifying_key.to_public_key_der().unwrap().as_ref(),
+            p256::ecdsa::VerifyingKey::from(&ecdsa_key)
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
         )
         .unwrap();
         let cert = CertificateBuilder::new(
-            Profile::Root,
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             SerialNumber::from(442u32),
             validity,
             subject,
             pub_key,
             &ecdsa_key,
         )
+        .unwrap()
+        .add_extension(&ExtendedKeyUsage(vec![super::cms_verify::OID_CODE_SIGNING]))
         .unwrap()
         .build::<p256::ecdsa::DerSignature>()
         .unwrap();
@@ -218,11 +234,15 @@ git commit -m "test(crypto): pin rfc 6979 deterministic p-256 signatures with a 
     }
 ```
 
-  If `x509_cert::time::Time::from_unix_duration` is not the available constructor at 0.2.5, use the
-  existing `cms_verify.rs:2913` `fixed_time` idiom
-  (`Time::try_from(UNIX_EPOCH + Duration::from_secs(n))`) — same pinned window, and `Profile::Root`
-  is deliberate: the loader's code-signing policy only applies to `from_p12`/`from_pem`, and the
-  determinism tests construct `SigningCredentials` directly.
+  `fixed_unix_time` is the same one-liner the verify tests already use
+  (`Time::try_from(UNIX_EPOCH + Duration::from_secs(n))`): add it as a local test helper in
+  `cms.rs` rather than importing the private one in `cms_verify.rs` (test helpers are duplicated
+  across these modules already — `time_now`/`ext_value` precedent,
+  `specs/2026-09-25-credential-hardening-design.md:147-152`). `OID_CODE_SIGNING` is
+  `1.3.6.1.5.5.7.3.3`; if `cms_verify::OID_CODE_SIGNING` is not visible, declare the same
+  `ObjectIdentifier::new_unwrap` constant locally. Validity is pinned because
+  `Validity::from_now` would move the embedded certificate DER with the machine clock and make
+  the byte comparison time-dependent. `OU=TESTTEAM` keeps `team_id` extraction meaningful.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -282,16 +302,26 @@ git commit -m "test(crypto): prove p-256 cms output is byte-identical across rep
     #[test]
     fn sign_macho_ecdsa_is_byte_identical_twice() {
         let credentials = ecdsa_credentials_for_determinism();
-        let macho = crate::macho::fixtures::make_minimal_macho();
-        let first = sign_macho(&macho, &credentials, None).unwrap();
-        let second = sign_macho(&macho, &credentials, None).unwrap();
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho()).unwrap();
+        let identifier = "com.zsign.ecdsa.determinism";
+        let entitlements = Some(b"<plist><dict/></plist>".as_slice());
+
+        let first = sign_macho(&macho, identifier, entitlements, &credentials, None, None, false)
+            .expect("first ECDSA sign");
+        let second = sign_macho(&macho, identifier, entitlements, &credentials, None, None, false)
+            .expect("second ECDSA sign");
         assert_eq!(
-            first.as_slice(),
-            second.as_slice(),
+            first, second,
             "embedding a P-256 signature twice must reproduce the binary byte for byte"
         );
+        // Reparsing proves the bytes are a real signature, not identical garbage.
+        let reparsed = MachOFile::parse(second).expect("signed output must reparse");
+        assert!(!reparsed.slices().is_empty());
     }
 ```
+
+  Argument order and the `MachOFile::parse` step follow the existing call at
+  `macho/signer.rs:1303-1313`; `first`/`second` are `Vec<u8>`.
 
   Implement `ecdsa_credentials_for_determinism()` in that test module by copying the
   `cms.rs` helper body from Task 2 verbatim and renaming it (repo convention for test-only
@@ -337,30 +367,92 @@ git commit -m "test(macho): pin byte-identical p-256 macho signing and document 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/pkcs12.rs:793` (one visibility change)
 
-- [ ] **Step 1: Widen `decrypt_key_bag`** — it already parses `EncryptedPrivateKeyInfo`
-  (`SEQUENCE { AlgorithmIdentifier, OCTET STRING }`) and routes PBES2 through the PRF/keyLength
-  dispatch, so ZSN-18 needs only visibility, not new code:
+- [ ] **Step 1: Widen the PBES2 engine and add the shared helpers.** This is the only task that
+  changes `pkcs12.rs` visibility; Tasks 5, 6 and 9 consume it and widen nothing themselves.
 
 ```rust
 /// pkcs8ShroudedKeyBag ::= EncryptedPrivateKeyInfo
 pub(crate) fn decrypt_key_bag(value: &[u8], password: &str) -> Result<Vec<u8>> {
 ```
 
-  Nothing else in the module changes: `pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`,
-  `unpad_pkcs7`, `aes_decrypt`, `DerReader` and `mod oid` stay module-private and are reached
-  through this one entry point.
+```rust
+/// Block-cipher CBC decrypt with PKCS#7 removal, generic over the cipher so the traditional
+/// PEM decoder can reuse the same code path as PKCS#12. The name predates that reuse;
+/// `des::TdesEde3` satisfies the same `BlockDecrypt + KeyInit` bounds
+/// (`des-0.8.1/src/des3.rs:27-42`, and `des` re-exports `cipher` at `src/lib.rs:26`).
+pub(crate) fn aes_decrypt<C>(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>>
+where
+    C: BlockDecrypt + KeyInit,
+{
+```
+
+```rust
+/// Translates a container failure into the credential error a caller reports. PBES2 inside
+/// PKCS#12 and inside an encrypted PKCS#8 PEM share this machinery: a decryption failure is a
+/// passphrase failure, an unknown algorithm is a policy refusal, anything else is a malformed
+/// container.
+pub(crate) fn pem_load_error(e: P12Error) -> Error {
+    match e {
+        P12Error::Mac | P12Error::Decrypt(_) => Error::InvalidPassword,
+        P12Error::Unsupported(msg) => {
+            Error::Certificate(format!("unsupported key encryption: {msg}"))
+        }
+        P12Error::Der(msg) => {
+            Error::Certificate(format!("failed to parse encrypted private key: {msg}"))
+        }
+    }
+}
+```
+
+  `pkcs12.rs` currently imports nothing from `crate` except through its own `Result<T, E =
+  P12Error>` alias (`:94`), so `pem_load_error` needs `use crate::Error;` added to the import
+  block at `:18-29`. `P12Error` is already `pub(crate)` (`:71`). Promote the reader as well,
+  because Tasks 8 and 9 walk DER with it:
+
+```rust
+pub(crate) struct DerReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DerReader<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self { … }              // was private
+    pub(crate) fn peek_tag(&self) -> Option<u8> { … }           // exists at :183, widen only
+    pub(crate) fn read_tlv(&mut self) -> Result<(u8, &'a [u8])> { … }   // was private
+    pub(crate) fn read_sequence(&mut self) -> Result<&'a [u8]> { … }    // was private
+    pub(crate) fn read_oid(&mut self) -> Result<ObjectIdentifier> { … }  // was private
+    pub(crate) fn read_octet_string(&mut self) -> Result<&'a [u8]> { … } // was private
+
+    /// Reads the next TLV and returns its **full encoded bytes** (tag, length, value), not just
+    /// the value. Signature verification must cover the bytes as the responder wrote them, so
+    /// the value-only `read_tlv` cannot be used for that.
+    pub(crate) fn span_of_next_tlv(&mut self) -> Option<&'a [u8]> {
+        let start = self.pos;
+        self.read_tlv().ok()?;
+        self.buf.get(start..self.pos)
+    }
+}
+```
+
+  Each `…` above is "keep the existing body, change only the visibility" — `peek_tag`, `read_tlv`,
+  `read_sequence`, `read_oid` and `read_octet_string` already exist at `:183`, `:188`, `:228`,
+  `:249` and `:232`; only `span_of_next_tlv` is new code. Everything else in the module
+  (`pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`, `unpad_pkcs7`, `mod oid`, `read_explicit`,
+  `read_any`, `read_integer_u32`, `read_len`, `expect_tag`, `remaining`) stays module-private, and
+  the PBES2 machinery is reached through `decrypt_key_bag`.
 
 - [ ] **Step 2: Verify the module still compiles and its tests pass**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto::pkcs12 -- --skip test_ipa_signing_is_deterministic`
-Expected: all pass (behaviour unchanged). A `dead_code` warning here would mean the entry point is
-not yet wired — that is Task 6's job, so keep the two tasks in adjacent commits.
+Expected: all pass, unchanged behaviour. A `dead_code` warning on the widened helpers is expected
+until Tasks 5/6/9 add callers; do not add `#[allow]` — the lane's final clippy gate runs after
+they land.
 
 - [ ] **Step 3: Commit**
 
 ```
 git add crates/zsign-core/src/crypto/pkcs12.rs
-git commit -m "refactor(crypto): expose the pkcs-5 v2.0 key-bag decryptor for pem key loading"
+git commit -m "refactor(crypto): expose the pkcs-5 v2.0 decrypt path for pem key loading"
 ```
 
 ---
@@ -456,6 +548,7 @@ grep -q 'RC2\|AES-128-CTR' "$FIX/pem_rsa_key_dekinfo_des3.pem" && { echo "unexpe
   "$(openssl pkey -in "$FIX/pem_rsa_key_pkcs8.pem" -pubout | openssl pkey -pubin -outform DER | sha256sum)" ]
 [ "$(openssl x509 -in "$FIX/pem_ec_cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)" = \
   "$(openssl pkey -in "$FIX/pem_ec_key_pkcs8.pem" -pubout | openssl pkey -pubin -outform DER | sha256sum)" ]
+ls -1 "$F" | grep -c '^pem_' | grep -qx 12 || { echo "expected 12 pem fixtures"; exit 1; }
 echo "fixtures verified"
 ```
 
@@ -541,6 +634,23 @@ echo "fixtures verified"
             "unsupported ciphers must be named, got {:?}",
             res.as_ref().err()
         );
+    }
+
+    #[test]
+    fn weak_and_legacy_dek_info_ciphers_are_refused_by_name() {
+        // Design D18.4: single DES and RC2 spellings are refused, not silently accepted.
+        for cipher in ["DES-CBC", "RC2-CBC", "RC2-40-CBC"] {
+            let pem = format!(
+                "-----BEGIN RSA {}PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: {},0011223344556677\nAAAAAAAAAAAAAAAAAAAA\n-----END RSA {}PRIVATE KEY-----\n",
+                " ", cipher, " "
+            );
+            let res = decrypt_traditional_pem(&pem, Some("x"));
+            assert!(
+                matches!(&res, Err(Error::Certificate(m)) if m.contains(cipher) && m.contains("unsupported")),
+                "{cipher} must be refused by name, got {:?}",
+                res.as_ref().err()
+            );
+        }
     }
 
     #[test]
@@ -766,7 +876,7 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
     const PASS: &str = "testpassword";
 
     #[test]
-    fn from_pem_loads_pbks8_pbesh2_and_traditional_keys() {
+    fn from_pem_loads_every_supported_key_form() {
         for (cert, key) in [
             (RSA_CERT, ENC_PKCS8_RSA),
             (RSA_CERT, ENC_PKCS8_RSA_SHA1PRF),
@@ -827,10 +937,6 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
         );
     }
 ```
-
-  Rename the first test to `from_pem_loads_pbcs8_pbesh2_and_traditional_keys`… **no**: use this exact
-  name, it is what the suite will show: `from_pem_loads_pbkdf2_pbesh2_and_traditional_keys` is also
-  wrong — the name is `from_pem_loads_pbkdf2_pkcs8_pbes2_and_traditional_keys`.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -929,7 +1035,7 @@ fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> 
     }
 ```
 
-- [ ] **Step 6: Update the docs that promised the opposite.** `crypto/cert.rs:3-26` module doc
+- [ ] **Step 5: Update the docs that promised the opposite.** `crypto/cert.rs:3-26` module doc
   ("**PEM**: Separate certificate and private key files (unencrypted keys only)"), the `from_pem`
   doc comment (`:431-464`, including the `password` argument line "Reserved for future encrypted
   key support (must be `None`)" and the `# Errors` bullet "A password is provided (encrypted keys
@@ -937,16 +1043,16 @@ fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> 
   the new behaviour: PBES2 + traditional encrypted PEM supported, password optional, unencrypted
   containers ignore a supplied password.
 
-- [ ] **Step 7: Run the scoped gate**
+- [ ] **Step 6: Run the scoped gate**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto:: -- --skip test_ipa_signing_is_deterministic`
 Expected: every `crypto::` test passes, including the 13 pre-existing PKCS#12 fixture tests and the
 33-test `cms_verify` module — a regression here means the routing changed an unencrypted path.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```
-git add crates/zsign-core/src/crypto/cert.rs crates/zsign-core/src/crypto/pkcs12.rs
+git add crates/zsign-core/src/crypto/cert.rs
 git commit -m "feat(crypto): load encrypted pem private keys through the existing password flow"
 ```
 
@@ -1024,6 +1130,59 @@ git commit -m "feat(crypto): load encrypted pem private keys through the existin
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         assert!(out.exists(), "signed output missing");
     }
+
+    #[test]
+    fn pbes2_pem_wrong_password_is_a_password_error_at_the_cli_too() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&key, ENC_PKCS8_RSA).unwrap();
+        std::fs::write(&cert, RSA_CERT).unwrap();
+        let r = run_cli(
+            &[
+                OsStr::new("-k"), key.as_os_str(),
+                OsStr::new("-c"), cert.as_os_str(),
+                OsStr::new("-p"), OsStr::new("nope"),
+                OsStr::new("-o"), dir.path().join("o.bin").as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("Invalid password"),
+            "a PBES2 wrong password must be explicit at the CLI too, stderr: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn password_on_an_unencrypted_pem_key_is_now_accepted() {
+        // The deleted reject path failed any password on the key route; the flow now behaves
+        // like OpenSSL and lets the load proceed.
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&key, PLAIN_PKCS8).unwrap();
+        std::fs::write(&cert, RSA_CERT).unwrap();
+        let out = dir.path().join("o.bin");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"), key.as_os_str(),
+                OsStr::new("-c"), cert.as_os_str(),
+                OsStr::new("-p"), OsStr::new("irrelevant"),
+                OsStr::new("-o"), out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert!(out.exists(), "signed output missing");
+    }
 ```
 
   Fixture constants at the top of the test module, next to the existing cross-crate
@@ -1032,6 +1191,10 @@ git commit -m "feat(crypto): load encrypted pem private keys through the existin
 ```rust
     const ENC_TRAD_RSA: &str =
         include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_dekinfo_aes256.pem");
+    const ENC_PKCS8_RSA: &str =
+        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_pbes2_sha256.pem");
+    const PLAIN_PKCS8: &str =
+        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_pkcs8.pem");
     const RSA_CERT: &[u8] = include_bytes!("../../zsign-core/src/crypto/fixtures/pem_rsa_cert.pem");
 ```
 
@@ -1099,6 +1262,11 @@ keyUsage = critical,digitalSignature
 extendedKeyUsage = codeSigning
 subjectKeyIdentifier = hash
 authorityInfoAccess = OCSP;URI:http://ocsp.invalid.test/ocsp
+[ delegate ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = OCSPSigning
+subjectKeyIdentifier = hash
 [ ca ]
 default_ca = CA_default
 [ CA_default ]
@@ -1141,7 +1309,27 @@ openssl ocsp -reqin req.der -respout revoked.der -index index.txt -CA ca.pem -rs
 openssl ocsp -respin revoked.der -text -noverify 2>&1 | grep -q 'Cert Status: revoked'
 openssl ocsp -respin revoked.der -text -noverify 2>&1 | grep -q 'Revocation Time: Jan  1 00:00:00 2026 GMT'
 openssl ocsp -respin good.der -text -noverify 2>&1 | grep -q 'Cert Status: good'
-cp ca.pem issued_leaf.pem req.der good.der revoked.der "$R/"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out delegate.key
+openssl req -new -key delegate.key -subj "/CN=zsign test ocsp responder" -out delegate.csr
+openssl x509 -req -in delegate.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -days 3650 -sha256 -extfile ca.cnf -extensions delegate -out delegate.pem
+openssl ocsp -reqin req.der -respout good_delegate.der -index index.txt -CA ca.pem \
+  -rsigner delegate.pem -rkey delegate.key -noverify
+openssl ocsp -reqin req.der -respout good_delegate_nocert.der -index index.txt -CA ca.pem \
+  -rsigner delegate.pem -rkey delegate.key -noverify -resp_no_certs
+# The delegated responder must appear in one answer and not the other, or the two fixtures
+# are the same file and the trust tests prove nothing.
+openssl ocsp -respin good_delegate.der -text -noverify 2>&1 | grep -q 'Responder Cert'
+if openssl ocsp -respin good_delegate_nocert.der -text -noverify 2>&1 \
+     | grep -q 'Responder Cert'; then
+  echo "nocert fixture still embeds a responder certificate"; exit 1
+fi
+cp ca.pem issued_leaf.pem req.der good.der revoked.der good_delegate.der \
+   good_delegate_nocert.der "$R/"
+ls -1 "$R" | grep -c . | grep -qx 8 || { echo "expected 8 revocation fixtures"; exit 1; }
+# thisUpdate is stamped with the generation date; the tests below anchor their clock to the
+# fixture instead of a constant so nothing rots. Printed for the reader, asserted nowhere.
+openssl ocsp -respin good.der -text -noverify 2>&1 | grep 'This Update'
 echo "revocation fixtures written"
 ```
 
@@ -1172,9 +1360,14 @@ echo "revocation fixtures written"
             REQ_DER.windows(cid.len()).any(|w| w == cid),
             "our CertID is not a byte-substring of openssl's request"
         );
-        // And the two hashes must be the SHA-1 values openssl recorded.
-        assert_eq!(hex(&sha1::Sha1::digest(leaf.tbs_certificate.issuer.to_der().unwrap())),
-                   "0b33e087f49437454e41a6acc82dff34bb1ba0ab");
+        // Independent check of the hash *input*, not just the framing: hashing the issuer DN
+        // as stored in the leaf must differ from hashing the leaf's own subject, which is the
+        // easy mistake here. Both are compared at runtime so the test survives a regenerated
+        // fixture with a different CA DN.
+        let name_hash = sha1::Sha1::digest(leaf.tbs_certificate.issuer.to_der().unwrap()).to_vec();
+        let subject_hash = sha1::Sha1::digest(leaf.tbs_certificate.subject.to_der().unwrap()).to_vec();
+        assert_eq!(name_hash.len(), 20);
+        assert_ne!(name_hash, subject_hash, "by construction these differ; if they ever match, the fixture is degenerate");
     }
 
     #[test]
@@ -1184,15 +1377,19 @@ echo "revocation fixtures written"
         let a = build_request(&leaf, &issuer).unwrap();
         let b = build_request(&leaf, &issuer).unwrap();
         assert_eq!(a, b, "request bytes must be reproducible");
-        // A single Request, no nonce, no optionalSignature: 69 bytes for this pair.
-        assert_eq!(a.len(), 69);
+        // One Request, no nonce, no requestExtensions, no optionalSignature. The length is
+        // derived from the fixture rather than hardcoded, so regenerating the CA/leaf pair
+        // cannot silently date this assertion.
+        let expected = tlv(0x30, &tlv(0x30, &tlv(0x30, &cert_id(&leaf, &issuer).unwrap())));
+        assert_eq!(a, expected);
     }
 ```
 
 - [ ] **Step 3: Implement `cert_id`, `build_request`, `ocsp_responder_url` and the framing
-  helpers.** The code below is the version that produced the P12/P13 measurements
-  (`.tmptmp/research/reference-ocsp.rs` holds the runnable copy); the field order and the two
-  hash inputs are the parts that must not drift.
+  The code below is the version that was compiled and run against the generated fixtures
+  during design; the field order and the two hash inputs are the parts that must not drift.
+  Design scratch lived in an untracked temp directory, so nothing here depends on it:
+  everything that matters is reproduced in this document.
 
 ```rust
 /// DER framing for a definite, minimally-encoded length. Indefinite lengths (0x80) are
@@ -1251,35 +1448,43 @@ fn build_request(leaf: &Certificate, issuer: &Certificate) -> Option<Vec<u8>> {
     Some(tlv(0x30, &tbs_request))
 }
 
-/// The `id-ad-ocsp` access location of the leaf's AIA extension, when it is an `http:` URI.
+/// The `id-ad-ocsp` access location of the leaf's AIA extension, when it is a plaintext `http:`
+/// URI. Decoded with the typed extension `x509-cert` already ships
+/// (`ext/pkix/access.rs:19` `AuthorityInfoAccessSyntax`, re-exported at `ext/pkix.rs:17`), so no
+/// hand-rolled AIA parser exists here.
 fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
-    let exts = leaf.tbs_certificate.extensions.as_ref()?;
-    let aia = exts
-        .iter()
-        .find(|e| e.extn_id == ID_PE_AUTHORITY_INFO_ACCESS)?;
-    let descs = DerReader::new(aia.extn_value.as_bytes()).read_sequence().ok()?;
-    let mut reader = DerReader::new(descs);
-    while let Ok((tag, body)) = reader.read_description() {
-        let _ = tag;
-        let mut d = DerReader::new(body);
-        let Ok(method) = d.read_oid() else { continue };
-        let Ok((loc_tag, value)) = d.read_tlv() else { continue };
-        // GeneralName uniformResourceIdentifier is `[6] IMPLICIT IA5String`.
-        if method == ID_AD_OCSP && loc_tag == 0x86 {
-            let url = String::from_utf8_lossy(value).into_owned();
-            return url.starts_with("http://").then_some(url);
+    use x509_cert::ext::pkix::AuthorityInfoAccessSyntax;
+    let value = ext_value(leaf, ID_PE_AUTHORITY_INFO_ACCESS)?;
+    let aia = AuthorityInfoAccessSyntax::from_der(value).ok()?;
+    aia.0.iter().find_map(|desc| {
+        if desc.access_method != ID_AD_OCSP {
+            return None;
         }
-    }
-    None
+        match desc.access_location {
+            // GeneralName `uniformResourceIdentifier` is `[6] IMPLICIT IA5String`.
+            x509_cert::ext::pkix::name::GeneralName::UniformResourceIdentifier(ref uri) => {
+                let url = uri.to_string();
+                url.starts_with("http://").then_some(url)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The DER value of extension `id`, or `None` when absent. Duplicated from
+/// `cert.rs:329`/`cms_verify.rs:1572` rather than widened across modules, following the
+/// precedent recorded in `specs/2026-09-25-credential-hardening-design.md:147-152`.
+fn ext_value(cert: &Certificate, id: ObjectIdentifier) -> Option<&[u8]> {
+    let exts = cert.tbs_certificate.extensions.as_ref()?;
+    exts.iter()
+        .find(|e| e.extn_id == id)
+        .map(|e| e.extn_value.as_bytes())
 }
 ```
 
-  Two support items are needed in `revocation.rs`: a local `read_description`-style loop is just
-  `read_tlv` on each element (write it directly rather than adding a method to `pkcs12::DerReader`),
-  and `ID_PE_AUTHORITY_INFO_ACCESS` / `ID_AD_OCSP` come from
-  `const_oid::db::rfc5280::ID_PE_AUTHORITY_INFO_ACCESS` and
-  `const_oid::db::rfc5280::ID_AD_OCSP`; `OID_SHA1` is `1.3.14.3.2.26` (encode with the same
-  `oid_tlv` helper used in `pkcs12.rs`'s test builders). `integer_from_magnitude` re-encodes the
+  `ID_PE_AUTHORITY_INFO_ACCESS` and `ID_AD_OCSP` come from
+  `const_oid::db::rfc5280::*`; `OID_SHA1` is `1.3.14.3.2.26` and `oid_tlv`/`tlv` are the module's
+  own framing helpers above. `integer_from_magnitude` re-encodes the
   serial as an unsigned DER INTEGER — leading zero bytes are stripped and one is re-added when the
   top bit is set, which is what RFC 6960's `CertificateSerialNumber` requires.
 
@@ -1301,20 +1506,49 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/revocation.rs`
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (promote `verify_cert_signature` `:1518`
+  and `OID_KP_OCSP_SIGNING`-style EKU lookup to `pub(crate)`; no logic change)
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Declare the fixture constants and the shared test helpers** at the top of
+  `revocation.rs`'s test module — every test below uses them:
 
 ```rust
+    const CA_PEM: &str = include_str!("fixtures/revocation/ca.pem");
+    const LEAF_PEM: &str = include_str!("fixtures/revocation/issued_leaf.pem");
+    const REQ_DER: &[u8] = include_bytes!("fixtures/revocation/req.der");
+    const GOOD_DER: &[u8] = include_bytes!("fixtures/revocation/good.der");
+    const REVOKED_DER: &[u8] = include_bytes!("fixtures/revocation/revoked.der");
+    const GOOD_DELEGATE_DER: &[u8] = include_bytes!("fixtures/revocation/good_delegate.der");
+    const GOOD_DELEGATE_NOCERT_DER: &[u8] =
+        include_bytes!("fixtures/revocation/good_delegate_nocert.der");
+
+    /// The committed leaf/CA pair every test checks a status for.
+    fn fixture_pair() -> (Certificate, Certificate) {
+        (
+            Certificate::from_pem(LEAF_PEM.as_bytes()).expect("fixture leaf"),
+            Certificate::from_pem(CA_PEM.as_bytes()).expect("fixture ca"),
+        )
+    }
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+```rust
+    /// Reads the `thisUpdate` that the responder actually stamped, so the window tests are
+    /// anchored to the committed fixture instead of a date that rots, and are independent of
+    /// the machine clock.
+    fn fixture_this_update() -> time::OffsetDateTime {
+        this_update_of(GOOD_DER).expect("fixture carries a parsable thisUpdate")
+    }
+
     fn now_in_window() -> time::OffsetDateTime {
-        // Both fixtures were produced with thisUpdate "20260926…"; a clock inside the
-        // window keeps the test independent of the machine's wall clock.
-        time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+        fixture_this_update() + time::Duration::seconds(60)
     }
 
     #[test]
     fn good_response_verifies_and_reports_good() {
         let (leaf, issuer) = fixture_pair();
-        let status = parse_and_verify(GOOD_DER, &leaf, &issuer, now_in_window()).unwrap();
+        let status = parse_and_verify(GOOD_DER, &leaf, &issuer, now_in_window());
         assert!(
             matches!(status, RevocationStatus::Good),
             "expected Good, got {status:?}"
@@ -1324,14 +1558,14 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
     #[test]
     fn revoked_response_reports_the_revocation_time() {
         let (leaf, issuer) = fixture_pair();
-        let status = parse_and_verify(REVOKED_DER, &leaf, &issuer, now_in_window()).unwrap();
+        let status = parse_and_verify(REVOKED_DER, &leaf, &issuer, now_in_window());
         let RevocationStatus::Revoked { revoked_at, .. } = status else {
             panic!("expected Revoked, got {status:?}");
         };
         assert_eq!(
             revoked_at.map(|t| t.unix_timestamp()),
             Some(1_767_225_600),
-            "fixture revokes at 2026-01-01T00:00:00Z"
+            "the recipe stamps 2026-01-01T00:00:00Z via the index.txt revocation date"
         );
         assert!(status.warning().is_some_and(|w| w.contains("revoked")));
     }
@@ -1340,14 +1574,21 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
     fn a_tampered_signature_is_not_trusted() {
         let (leaf, issuer) = fixture_pair();
         let mut bad = GOOD_DER.to_vec();
-        // Offset 400 sits inside the signature BIT STRING of this 1276-byte response.
-        bad[400] ^= 0x01;
+        // Locate the 2048-bit signature BIT STRING by its framing rather than by a fixed
+        // offset, so a regenerated fixture cannot turn this into a vacuous pass: the search
+        // itself panics with a clear message if the shape ever changes.
+        let marker = [0x03u8, 0x82, 0x01, 0x01, 0x00];
+        let at = bad
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("fixture must contain a 256-byte signature BIT STRING");
+        bad[at + marker.len() + 8] ^= 0x01;
         let status = parse_and_verify(&bad, &leaf, &issuer, now_in_window());
         assert!(
-            matches!(status, Ok(RevocationStatus::NotChecked(NotCheckedReason::Unverified))),
+            matches!(status, RevocationStatus::NotChecked(NotCheckedReason::Unverified)),
             "a forged answer must be Unverified, got {status:?}"
         );
-        assert!(status.unwrap().warning().is_none());
+        assert!(status.warning().is_none());
     }
 
     #[test]
@@ -1357,7 +1598,7 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
             super::assets::APPLE_WWDR_CA_G3_CERT.as_bytes(),
         )
         .unwrap();
-        let status = parse_and_verify(GOOD_DER, &leaf, &unrelated, now_in_window()).unwrap();
+        let status = parse_and_verify(GOOD_DER, &leaf, &unrelated, now_in_window());
         assert!(
             matches!(status, RevocationStatus::NotChecked(NotCheckedReason::Unverified)),
             "verification must bind to the real issuer key, got {status:?}"
@@ -1370,27 +1611,57 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
         let mut other = leaf.clone();
         other.tbs_certificate.serial_number =
             x509_cert::serial_number::SerialNumber::new(&[0x7f]).unwrap();
-        let status = parse_and_verify(GOOD_DER, &other, &issuer, now_in_window()).unwrap();
+        let status = parse_and_verify(GOOD_DER, &other, &issuer, now_in_window());
         assert!(
             matches!(
                 status,
-                RevocationStatus::NotChecked(NotCheckedReason::Malformed(_))
+                RevocationStatus::NotChecked(NotCheckedReason::NoMatchingCertId)
             ),
             "a certID mismatch must not produce a status, got {status:?}"
         );
     }
 
     #[test]
+    fn a_delegated_responder_is_trusted_only_with_a_verified_certificate() {
+        let (leaf, issuer) = fixture_pair();
+        // responderID names the delegate and the answer embeds its certificate, which the CA
+        // issued and which carries id-kp-OCSPSigning: trusted, through the delegate's key.
+        let with_cert = parse_and_verify(GOOD_DELEGATE_DER, &leaf, &issuer, now_in_window());
+        assert!(matches!(with_cert, RevocationStatus::Good), "got {with_cert:?}");
+        // The same responderID with the certificate stripped binds that name to no key the
+        // issuer vouches for, so the answer must come back unverified, not trusted.
+        let without = parse_and_verify(GOOD_DELEGATE_NOCERT_DER, &leaf, &issuer, now_in_window());
+        assert!(
+            matches!(without, RevocationStatus::NotChecked(NotCheckedReason::Unverified)),
+            "a delegate without its certificate must not be trusted, got {without:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_next_update_bounds_nothing_by_design() {
+        // The fixture responder omits nextUpdate (RFC 6960 makes it OPTIONAL), so the only
+        // freshness rule left is `thisUpdate <= now`. Pinned so the limit is a documented
+        // decision rather than an accident: an old but signed `good` stays credible.
+        let (leaf, issuer) = fixture_pair();
+        let far_future = fixture_this_update() + time::Duration::days(400);
+        assert!(matches!(
+            parse_and_verify(GOOD_DER, &leaf, &issuer, far_future),
+            RevocationStatus::Good
+        ));
+    }
+
+    #[test]
     fn validity_window_is_enforced() {
         let (leaf, issuer) = fixture_pair();
-        let later = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
-        let status = parse_and_verify(GOOD_DER, &leaf, &issuer, later).unwrap();
+        // An hour before the responder said anything: outside the window by definition.
+        let earlier = fixture_this_update() - time::Duration::hours(1);
+        let status = parse_and_verify(GOOD_DER, &leaf, &issuer, earlier);
         assert!(
             matches!(
                 status,
                 RevocationStatus::NotChecked(NotCheckedReason::OutsideValidityWindow)
             ),
-            "an answer past its freshness must not be reused, got {status:?}"
+            "an answer from after `thisUpdate` must not be reused, got {status:?}"
         );
     }
 
@@ -1400,11 +1671,11 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
         let malformed = parse_and_verify(b"not der at all", &leaf, &issuer, now_in_window());
         assert!(matches!(
             malformed,
-            Ok(RevocationStatus::NotChecked(NotCheckedReason::Malformed(_)))
+            RevocationStatus::NotChecked(NotCheckedReason::Malformed(_))
         ));
         // responseStatus = internalError(2) with no responseBytes.
         let refused = vec![0x30, 0x03, 0x0a, 0x01, 0x02];
-        let status = parse_and_verify(&refused, &leaf, &issuer, now_in_window()).unwrap();
+        let status = parse_and_verify(&refused, &leaf, &issuer, now_in_window());
         assert!(matches!(
             status,
             RevocationStatus::NotChecked(NotCheckedReason::Malformed(_))
@@ -1413,9 +1684,9 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail** (`parse_and_verify` does not exist yet).
+- [ ] **Step 3: Run them to verify they fail** (`parse_and_verify` does not exist yet).
 
-- [ ] **Step 3: Implement the parser.** The field order below is the substance of this task; the
+- [ ] **Step 4: Implement the parser.** The field order below is the substance of this task; the
   measured behaviour is P12-P14 plus the four negative controls above. Reuse the crate's own
   `pkcs12::DerReader` for the walk (promote it to `pub(crate)` — it already exposes
   `read_sequence`, `read_oid`, `read_tlv`-style primitives and the peek helpers this needs) rather
@@ -1424,24 +1695,40 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
 ```rust
 /// Parses and verifies one `OCSPResponse` for `leaf`/`issuer`.
 ///
-/// `Ok(status)` always means "the answer, or the reason there is no answer": the function never
-/// returns `Err` for anything a responder can do, because a revocation check must not be able to
-/// fail a signing run. The signature is verified over the `tbsResponseData` DER bytes exactly as
-/// they appear in the response (`RFC 6960 §3.2`, `RFC 6960 §4.2.2.2`).
+/// This function cannot fail: every outcome, including a garbage response and a response whose
+/// CertID cannot even be built, is a `RevocationStatus`, and only an authenticated `Revoked`
+/// carries a warning. A revocation check must never be able to fail a signing run.
 pub fn parse_and_verify(
     response_der: &[u8],
     leaf: &Certificate,
     issuer: &Certificate,
     now: time::OffsetDateTime,
-) -> Result<RevocationStatus> {
-    let want_cid = cert_id(leaf, issuer)
-        .ok_or_else(|| Error::Verification("cannot build CertID".into()))?;
-    let Some(outcome) = walk_response(response_der, &want_cid, issuer, now) else {
-        return Ok(RevocationStatus::NotChecked(NotCheckedReason::Malformed(
-            "response is not a parseable OCSPResponse for this certificate".into(),
-        )));
+) -> RevocationStatus {
+    let Some(want_cid) = cert_id(leaf, issuer) else {
+        return RevocationStatus::NotChecked(NotCheckedReason::Malformed(
+            "cannot encode CertID for this certificate pair".into(),
+        ));
     };
-    Ok(outcome)
+    walk_response(response_der, &want_cid, issuer, now)
+        .unwrap_or_else(|| RevocationStatus::NotChecked(NotCheckedReason::Malformed(
+            "response is not a parseable OCSPResponse for this certificate".into(),
+        )))
+}
+
+/// Compares two DER `CertID`s field by field rather than byte by byte: a responder is free to
+/// encode the serial with a different (still valid) INTEGER length or a non-minimal length form,
+/// and a byte compare would silently downgrade a legitimate answer to `Malformed`.
+fn cert_ids_match(a: &[u8], b: &[u8]) -> bool {
+    fn fields(cid: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let body = DerReader::new(cid).read_sequence().ok()?;
+        let mut r = DerReader::new(body);
+        let alg = r.read_sequence().ok()?.to_vec();
+        let name = r.read_octet_string().ok()?.to_vec();
+        let key = r.read_octet_string().ok()?.to_vec();
+        let serial = r.read_tlv().ok()?.1.trim_start_matches([0]).to_vec();
+        Some((alg, name, key, serial))
+    }
+    fields(a).is_some() && fields(a) == fields(b)
 }
 ```
 
@@ -1528,7 +1815,9 @@ fn walk_response(
                 NotCheckedReason::OutsideValidityWindow,
             ));
         }
-        let signer = pick_signer(rid_value, responder_by_name, issuer, &embedded)?;
+        let _ = &responder_id;
+        }
+        let signer = pick_signer(&responder_id, issuer, &embedded)?;
         if !verify_signature(&signer, &sig_alg_oid.to_string(), tbs_bytes, signature) {
             return Some(RevocationStatus::NotChecked(NotCheckedReason::Unverified));
         }
@@ -1543,34 +1832,78 @@ fn walk_response(
             ))),
         });
     }
-    None
+    Some(RevocationStatus::NotChecked(NotCheckedReason::NoMatchingCertId))
 }
 
-/// Chooses the key that must have signed the response: the issuer itself when
-/// `responderID` names it, otherwise an embedded certificate that the issuer issued
-/// and that carries `id-kp-OCSPSigning` (RFC 6960 §4.2.2.2).
-fn pick_signer(
-    rid_value: &[u8], by_name: bool, issuer: &Certificate, embedded: &[Certificate],
-) -> Option<Certificate> {
-    if by_name {
-        let names = DerReader::new(rid_value).read_sequence().ok()?;
-        let mut n = DerReader::new(names);
-        let (tag, value) = n.read_tlv().ok()?;
-        if tag != 0x86 && tag != 0x30 {
-            return None;
-        }
-        let rid_der = tlv(0x30, value);
-        if tlv(0x30, issuer.tbs_certificate.subject.to_der().ok()?.as_slice()) == rid_der {
-            return Some(issuer.clone());
-        }
+/// `responderID CHOICE { byName [1] Name, byKey [2] KeyHash }` (RFC 6960 §4.2.1).
+enum ResponderId {
+    ByName(Name),
+    ByKey(Vec<u8>),
+}
+
+/// The `thisUpdate` stamped by the responder on the first `SingleResponse`, for tests that must
+/// anchor a clock to the committed fixture instead of a date that rots. Reuses the same walk as
+/// `parse_and_verify` so the two can never disagree.
+fn this_update_of(response_der: &[u8]) -> Option<time::OffsetDateTime> {
+    let top = DerReader::new(response_der).read_sequence().ok()?;
+    let mut r = DerReader::new(top);
+    r.read_tlv().ok()?; // responseStatus
+    let (_, wrapped) = r.read_tlv().ok()?;
+    let rb = DerReader::new(wrapped).read_sequence().ok()?;
+    let mut rbr = DerReader::new(rb);
+    rbr.read_oid().ok()?; // responseType
+    let (_, basic_tlv) = rbr.read_tlv().ok()?;
+    let basic = DerReader::new(basic_tlv).read_sequence().ok()?;
+    let mut b = DerReader::new(basic);
+    let tbs = b.span_of_next_tlv()?.to_vec();
+    let body = DerReader::new(&tbs).read_sequence().ok()?;
+    let mut d = DerReader::new(body);
+    if d.peek_tag() == Some(0xa0) {
+        d.read_tlv().ok()?; // version
     }
-    embedded.iter().find(|c| {
-        c.tbs_certificate.issuer == issuer.tbs_certificate.subject
-            && has_ocsp_signing_eku(c)
-            && verify_cert_signature(c, issuer)
-    })
-    .cloned()
-    .or(by_name.then(|| issuer.clone()))
+    d.read_tlv().ok()?; // responderID
+    d.read_tlv().ok()?; // producedAt
+    let responses = d.read_sequence().ok()?;
+    let mut rs = DerReader::new(responses);
+    let single_der = rs.read_sequence().ok()?;
+    let mut single = DerReader::new(single_der);
+    single.read_tlv().ok()?; // certID
+    single.read_tlv().ok()?; // certStatus
+    parse_time(single.read_tlv().ok()?.1)
+}
+
+/// Chooses the key that must have signed the response (RFC 6960 §4.2.2.2): the issuer itself
+/// when `responderID` is `ByName [1]` naming the issuer, otherwise one embedded certificate that
+/// the issuer issued and that carries `id-kp-OCSPSigning`. There is no fallback: a `responderID`
+/// that names some other CA, or a `ByKey [2]` hash that matches no candidate, is `None` and the
+/// answer is `Unverified`.
+fn pick_signer(
+    rid: &ResponderId, issuer: &Certificate, embedded: &[Certificate],
+) -> Option<Certificate> {
+    match rid {
+        ResponderId::ByName(name) if name == &issuer.tbs_certificate.subject => Some(issuer.clone()),
+        ResponderId::ByName(name) => embedded.iter().find(|c| {
+            &c.tbs_certificate.subject == name
+                && accepted_delegate(c, issuer)
+        }).cloned(),
+        ResponderId::ByKey(hash) => embedded.iter().find(|c| {
+            let key_bits = c
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .raw_bytes();
+            sha1::Sha1::digest(key_bits).as_slice() == hash.as_slice()
+                && accepted_delegate(c, issuer)
+        }).cloned(),
+    }
+}
+
+/// A delegated responder must be issued by this CA, carry `id-kp-OCSPSigning`, and actually
+/// verify under the CA's key — all three, or it is not trusted.
+fn accepted_delegate(candidate: &Certificate, issuer: &Certificate) -> bool {
+    candidate.tbs_certificate.issuer == issuer.tbs_certificate.subject
+        && has_ocsp_signing_eku(candidate)
+        && verify_cert_signature(candidate, issuer)
 }
 ```
 
@@ -1588,12 +1921,12 @@ fn pick_signer(
   `parse_time` accepts both UTCTime and GeneralizedTime (RFC 6960 allows either) and returns an
   `OffsetDateTime`; `parse_generalized_time` is its GeneralizedTime-only helper.
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 5: Run the tests**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core revocation -- --skip test_ipa_signing_is_deterministic`
 Expected: Task 8's four plus these seven pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```
 git add crates/zsign-core/src/crypto/revocation.rs crates/zsign-core/src/crypto/pkcs12.rs crates/zsign-core/src/crypto/cms_verify.rs
@@ -1621,7 +1954,6 @@ git commit -m "feat(crypto): verify ocsp responses before trusting a revocation 
             }
         }
         let (leaf, issuer) = fixture_pair();
-        let creds = credentials_with_chain(&leaf, &issuer);
         let status = check(&leaf, Some(&issuer), &Stub(REVOKED_DER), Some(now_in_window()));
         assert!(matches!(status, RevocationStatus::Revoked { .. }), "got {status:?}");
     }
@@ -1708,15 +2040,40 @@ git commit -m "feat(crypto): verify ocsp responses before trusting a revocation 
         }
 
         #[test]
+        fn a_response_that_never_arrives_costs_only_the_budget() {
+            // Accept the connection and then say nothing: only the caller's budget can save us.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let sink = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            });
+            let (mut leaf, issuer) = fixture_pair();
+            rewrite_ocsp_uri(&mut leaf, &format!("http://127.0.0.1:{port}/ocsp"));
+            let started = std::time::Instant::now();
+            let transport = HttpTransport { budget: std::time::Duration::from_millis(300) };
+            let status = check(&leaf, Some(&issuer), &transport, Some(now_in_window()));
+            assert!(
+                matches!(status, RevocationStatus::NotChecked(NotCheckedReason::BudgetExpired)),
+                "got {status:?}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "budget not enforced");
+            drop(sink);
+        }
+
+        #[test]
         fn an_unreachable_responder_is_not_checked() {
-            // Port 1 on loopback refuses immediately: no DNS, no internet, no flake.
+            // Port 1 on loopback normally refuses at once. Where a firewall queues it instead,
+            // the same assertion still holds: only the variant of `Transport(_)` would differ.
             let (mut leaf, issuer) = fixture_pair();
             rewrite_ocsp_uri(&mut leaf, "http://127.0.0.1:1/ocsp");
             let status = check(&leaf, Some(&issuer), &HttpTransport::default(), Some(now_in_window()));
-            assert!(matches!(
-                status,
-                RevocationStatus::NotChecked(NotCheckedReason::Transport(_))
-            ));
+            assert!(
+                matches!(status, RevocationStatus::NotChecked(NotCheckedReason::Transport(_))),
+                "got {status:?}"
+            );
         }
     }
 ```
@@ -1755,6 +2112,15 @@ const DEFAULT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// OCSP responses are a few hundred bytes to ~2 KiB; a larger answer is not credible.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Every transport outcome maps to a silent `NotChecked`; the mapping is exhaustive on purpose
+/// so a new `TransportError` variant cannot fall through into a warning.
+pub(crate) fn transport_reason(e: TransportError) -> NotCheckedReason {
+    match e {
+        TransportError::Timeout => NotCheckedReason::BudgetExpired,
+        other => NotCheckedReason::Transport(format!("{other:?}")),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl OcspTransport for HttpTransport {
     fn post(&self, url: &str, body: &[u8]) -> std::result::Result<Vec<u8>, TransportError> {
@@ -1773,6 +2139,45 @@ impl OcspTransport for HttpTransport {
     }
 }
 ```
+
+  and `check` ties it together, with the mapping table above as the only `TransportError` consumer:
+
+```rust
+/// Runs one OCSP lookup through `transport`. Never fails: every problem is a silent
+/// `NotChecked`, and only an authenticated `Revoked` yields a warning.
+pub fn check(
+    leaf: &Certificate,
+    issuer: Option<&Certificate>,
+    transport: &dyn OcspTransport,
+    now: Option<time::OffsetDateTime>,
+) -> RevocationStatus {
+    let Some(url) = ocsp_responder_url(leaf) else {
+        return RevocationStatus::NotChecked(NotCheckedReason::NoOcspUrl);
+    };
+    let Some(issuer) = issuer else {
+        return RevocationStatus::NotChecked(NotCheckedReason::NoIssuerCertificate);
+    };
+    let now = match cms_verify::resolve_now(now) {
+        Ok(t) => t,
+        Err(_) => return RevocationStatus::NotChecked(NotCheckedReason::Malformed(
+            "no clock available for the validity window".into(),
+        )),
+    };
+    let Ok(request) = build_request(leaf, issuer) else {
+        return RevocationStatus::NotChecked(NotCheckedReason::Malformed(
+            "cannot encode CertID".into(),
+        ));
+    };
+    match transport.post(&url, &request) {
+        Ok(response) => parse_and_verify(&response, leaf, issuer, now),
+        Err(e) => RevocationStatus::NotChecked(transport_reason(e)),
+    }
+}
+```
+
+  `resolve_now` is `pub(crate)` in `cms_verify.rs:1681`, so the wasm "no wall clock" rule is
+  inherited rather than re-invented; `cms_verify.rs` is already a sibling module, and no re-export
+  is needed beyond `use super::cms_verify;`.
 
   `post_blocking` does the literal work: parse `http://host[:port]/path`, resolve with
   `ToSocketAddrs`, `TcpStream::connect_timeout(&addr, 1s)`, `set_write_timeout`/`set_read_timeout`,
@@ -1819,8 +2224,11 @@ git commit -m "feat(crypto): add a bounded native ocsp transport and a warn-only
 - [ ] **Step 1: Record the CLI seam precisely** in `docs/superpowers/specs/` (append to the design
   doc's ZSN-21 section, not to code comments): the one-line call
   `zsign_core::crypto::revocation::warn_revocation(&creds.certificate, &creds.cert_chain);` belongs
-  in `crates/zsign-cli/src/main.rs::load_credentials` immediately before each `return Ok(creds)`.
-  It is not applied here because lane zsn40 owns that file this wave.
+  in `crates/zsign-cli/src/main.rs::load_credentials` immediately before each of its four
+  `return Ok(creds)` sites (`:800` `--pkcs12`, `:816` PEM route, `:849` DER route, `:855`
+  PKCS#12-via-`-k`), so exactly one check runs per successful credential load. Task 7 edits two of
+  those four paths, and the seam covers all four. It is not applied here because lane zsn40 owns
+  that file this wave.
 
 - [ ] **Step 2: Lane gate** (the only place the full gates run):
 
@@ -1832,6 +2240,27 @@ cargo check -p zsign-wasm --target wasm32-unknown-unknown
 ```
 
   Expected: clean output from each, and the test summary showing zero failures. Report the verbatim
+
+- [ ] **Step 3: Assemble the evidence list for the final report, naming tests, not summaries.**
+  Per ticket the report must state:
+  - **ZSN-14:** `ecdsa_signing_matches_rfc6979_known_answers` and
+    `cms_ecdsa_signature_is_byte_identical_five_times` passing; the Task 1 mutation failure text
+    as the red evidence; `sign_macho_ecdsa_is_byte_identical_twice` as the blob-level proof;
+    `ecdsa_code_signature_round_trips_with_der_signer_info` and
+    `attached_profile_envelope_accepts_der_ecdsa_signer` (`cms_verify.rs:3064`, `:3087`)
+    unchanged — those two are the "verify path unchanged" proof; and RSA untouched via
+    `cms_signature_is_deterministic_for_identical_inputs` (`macho/signer.rs:973`),
+    `test_sign_macho_is_deterministic` (`crypto/cert.rs:1219`), `test_estimate_cms_size_rsa_2048`
+    (`cms.rs:876`). State plainly that no cross-process and no IPA-level determinism test was
+    added: determinism is proven five times within one process, twice at blob level, and
+    cross-process only in the sense that the KAT pins RFC-published constants rather than
+    self-generated bytes.
+  - **ZSN-18:** which fixture each test loads; the three distinct outcomes (missing password,
+    wrong password, unsupported cipher) at unit *and* CLI level; the PKCS#8 unencrypted path
+    unchanged while PKCS#1/SEC1 in the clear become newly accepted (D18.5).
+  - **ZSN-21:** that every revocation test is offline — canned DER plus loopback `127.0.0.1`
+    sockets — and that the design's live Apple probe (P13) is a one-time network observation,
+    not reproducible evidence, and depended on by no test.
   output in the final report, together with the red→green evidence collected in Tasks 1-10.
 
 ---
@@ -1855,21 +2284,22 @@ cargo check -p zsign-wasm --target wasm32-unknown-unknown
 | D21.1 library capability + reported seam | 8, 9, 10, 11 |
 | D21 verification posture (signature, certID, window, delegated responder) | 9 |
 | D21 bounded transport, DNS guarded by a worker thread | 10 |
-| Hermetic two-layer revocation coverage | 9, 10 |
+| Hermetic two-layer revocation coverage | 8, 9, 10 |
 | One new crate (`md-5`), no `deny.toml` change | 5 |
 | No CI/skip change, deterministic-by-construction tests | ground rules, 11 |
 
 Checked and consistent: `RevocationStatus`/`NotCheckedReason` names match between Tasks 8-10 and
-the design doc; `parse_and_verify` returns `Result<RevocationStatus>` everywhere, and its `Err` arm
-is reserved for "we could not even build the CertID" (an internal bug), never for responder behaviour;
-`check` and `warn_revocation` never propagate `Err`. Fixture names are identical in Tasks 5, 6 and 7.
+the design doc, including `NoMatchingCertId`; `parse_and_verify`, `check` and `warn_revocation`
+return values rather than `Result`, so no revocation outcome can reach a caller's `?`; the only
+`Err` in the module is `build_request`'s "cannot encode CertID", which no production path treats as
+fatal. Fixture names are identical in Tasks 5, 6 and 7.
 `cert_id`, `build_request`, `ocsp_responder_url`, `tlv`, `parse_and_verify`, `warning`,
 `NotCheckedReason::Malformed(String)` are defined once (Tasks 8-9) and reused later.
 
 ## Seams and follow-ups (report, do not implement here)
 
 1. **CLI revocation wiring.** `warn_revocation` is the intended call; the insertion points are the
-   three `return Ok(creds)` sites in `crates/zsign-cli/src/main.rs::load_credentials` (`:800`,
+   four `return Ok(creds)` sites in `crates/zsign-cli/src/main.rs::load_credentials` (`:800`,
    `:816`, `:849`, `:855`). Owned by lane zsn40's file; no flag is needed.
 2. **TTY prompt parity for encrypted PEM keys.** `resolve_p12_password` (`main.rs:865-892`) prompts
    for PKCS#12 only; after this lane an encrypted PEM without `-p`/`ZSIGN_PASSWORD` gets an explicit
