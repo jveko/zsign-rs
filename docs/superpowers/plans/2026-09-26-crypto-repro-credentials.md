@@ -870,7 +870,7 @@ pub(crate) fn decrypt_pem_fixture(pem: &str, password: Option<&str>) -> Result<O
     // and no `unreachable!()` arm is needed. Each variant's `decrypt` calls the shared CBC engine.
     let plaintext = cipher.decrypt(&key, &iv, &ciphertext);
     match plaintext {
-        Ok(der) => Ok(Some(TraditionalKey { label, der })),
+        Ok(der) => Ok(Some(TraditionalKey { der })),
         // Every failure after a real decryption attempt is a passphrase failure: either the
         // PKCS#7 padding is invalid, or (one in 256 times) it is valid and the DER is nonsense,
         // which the caller's decoder also reports as such.
@@ -1087,6 +1087,9 @@ fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> 
   `p256::SecretKey::from_sec1_der` is an inherent method already enabled by the crate's current
   `p256` features (`pkcs8` pulls `sec1`), so **no new dependency and no new feature** is required.
 
+  `DecodedKey::from_pkcs8_pem` is deleted in the same commit: after this routing it has no
+  caller, and a label-locked decoder left behind would be exactly the wrong convention to keep.
+
   and add the by-content decoder to `DecodedKey`:
 
 ```rust
@@ -1300,6 +1303,53 @@ git commit -m "feat(cli): decrypt encrypted pem keys instead of rejecting the pa
 ```
 
 ---
+
+## Tasks 8-10: corrections applied during implementation
+
+The snippets in Tasks 8-10 below were written from the RFC text before any OCSP code was compiled.
+Implementing them surfaced nine defects; each is listed with what shipped, and the shipped code —
+not the snippet — is the authority. The snippets are kept in place because the surrounding tests
+and the fixture recipe are unchanged.
+
+1. **`nextUpdate` is `[0] EXPLICIT`.** The snippet peeked `0x80` and read a bare
+   `GeneralizedTime`, so the branch could never fire and a signed answer could be replayed past its
+   own expiry. Shipped code peeks `0xa0` and reads the time inside the wrapper, and the fixture set
+   gained `good_nextupdate.der` (recipe flag `-nmin 60`, guarded by a `Next Update` grep) with
+   tests on both sides of the window.
+2. **`span_of_next_tlv` takes no argument** and returns one slice; the snippet's
+   `span_of_next_tlv(basic)?` with a tuple destructure does not compile.
+3. **`ResponderId` must actually be built.** The snippet bound `rid_tag`/`rid_value`, defined the
+   enum, and then never constructed it, leaving the delegated-responder path unreachable. Shipped
+   code binds a `ResponderId` from the walked bytes and `pick_signer` consumes it, with no fallback
+   to the issuer key after a failed delegated-responder check (proved by `good_delegate_nocert.der`).
+4. **Framing helpers have to exist.** `concat`, `oid_tlv` and `integer_from_magnitude` were used
+   but never defined; all three are now local, and `integer_from_magnitude` encodes an empty or
+   all-zero magnitude as `02 01 00`, never `02 00`.
+5. **`issuerNameHash` must cover the stored bytes.** Walking `read_sequence()` once returns the
+   `TBSCertificate` *content*, which is still a TLV, so the first walk read the certificate's
+   signature instead of the issuer `Name`. The shipped walk steps into the TBS TLV first, and the
+   digest now equals OpenSSL's (`0b33e087…`), with tests proving the wrong recipes differ.
+6. **`parse_time` needed an OCSP-shaped parser.** RFC 3339/RFC 2822 formatters cannot read
+   `YYMMDDHHMMSSZ`; and because OpenSSL emits a two-digit-year `GeneralizedTime` for
+   `revocationTime`, keying the year width off the ASN.1 tag produced year 4601. The shipped
+   parser takes the digit count from the value.
+7. **One envelope walk, not two.** `walk_response` and `this_update_of` each re-walked the
+   response, so the clock a test anchored to could come from a different message than the one
+   verified. Both now share one `basic_response` helper.
+8. **`warning_of` is not a stub.** The snippet returned `None` unconditionally. It is now the real
+   network-free composition of `issuer_of` + `check` over a caller-supplied transport, available on
+   every target; `warn_revocation` remains the only function that opens a socket.
+9. **The transport had two latent hangs.** `(authority, 80)` was resolved as a whole authority
+   string (already containing `:port`), so the port in the AIA URI was ignored and the loopback
+   test could never connect; and the socket timeouts used `DEFAULT_BUDGET` instead of the caller's
+   budget. Shipped code splits host/port (`split_authority`, with `[ipv6]` support), takes a
+   numeric-literal fast path off the resolver, and threads the budget into connect/read/write.
+
+Two plan-side claims were also wrong and are corrected above where they appear: the snippet's
+expected request was `SEQUENCE x3` around the CertID where RFC 6960 has four levels
+(`OCSPRequest / tbsRequest / requestList / Request`), and a foreign issuer key yields
+`NoMatchingCertId` rather than `Unverified`, because the CertID is recomputed from that foreign
+issuer's own key.
 
 ## Task 8: OCSP request construction and AIA extraction
 

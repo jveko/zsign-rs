@@ -253,9 +253,10 @@ pub trait OcspTransport {
 }
 
 pub fn ocsp_responder_url(leaf: &Certificate) -> Option<String>;
-pub fn build_request(leaf: &Certificate, issuer: &Certificate) -> Result<Vec<u8>>;
+pub fn build_request(leaf: &Certificate, issuer: &Certificate) -> Option<Vec<u8>>;
 pub fn parse_and_verify(response_der: &[u8], leaf: &Certificate, issuer: &Certificate,
                         now: time::OffsetDateTime) -> RevocationStatus;
+
 pub fn check(leaf: &Certificate, issuer: Option<&Certificate>, transport: &dyn OcspTransport,
              now: Option<time::OffsetDateTime>) -> RevocationStatus;
 #[cfg(not(target_arch = "wasm32"))]
