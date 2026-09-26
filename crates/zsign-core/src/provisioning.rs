@@ -383,6 +383,24 @@ fn entitlements_to_xml(dict: &plist::Dictionary) -> Result<Option<Vec<u8>>> {
 /// Returns `Ok(None)` if the plist is valid but contains no `Entitlements` key.
 /// Returns `Err` for parse failures (no XML found, invalid plist, serialization error).
 pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<Vec<u8>>> {
+    let plist = profile_document(profile_data)?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| Error::ProvisioningProfile("Profile plist is not a dictionary".into()))?;
+    entitlements_to_xml(dict)
+}
+
+/// Reads the XML document embedded in a provisioning profile WITHOUT any
+/// cryptographic or expiry validation. For metadata that only needs to be
+/// consistent with the profile bytes about to be embedded (App ID prefix,
+/// team, distribution shape); trust decisions belong to
+/// [`validate_and_extract_profile`].
+///
+/// Returns [`Err`] when no embedded XML plist is found, no closing
+/// `</plist>` tag is found, the boundaries are inverted, or the slice fails
+/// to parse. The document is returned as-is; a dictionary guarantee belongs
+/// to the caller that needs one.
+pub fn profile_document(profile_data: &[u8]) -> Result<plist::Value> {
     let plist_start = profile_data
         .windows(6)
         .position(|w| w == b"<?xml ")
@@ -397,18 +415,64 @@ pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<V
             "Invalid plist boundaries".into(),
         ));
     }
-    let plist_slice = &profile_data[plist_start..plist_end];
-    let plist: plist::Value = plist::from_bytes(plist_slice)
+    let plist: plist::Value = plist::from_bytes(&profile_data[plist_start..plist_end])
         .map_err(|e| Error::ProvisioningProfile(format!("Failed to parse plist: {}", e)))?;
-    let dict = plist
-        .as_dictionary()
-        .ok_or_else(|| Error::ProvisioningProfile("Profile plist is not a dictionary".into()))?;
-    entitlements_to_xml(dict)
+    Ok(plist)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_document_returns_full_profile_dict() {
+        // Wrapped in binary noise, as a real CMS-wrapped profile is.
+        let profile = br#"BINARY HEADER<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Name</key>
+    <string>Test Profile</string>
+    <key>TeamIdentifier</key>
+    <array><string>TESTTEAM</string></array>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>TESTTEAM.com.test.app</string>
+    </dict>
+</dict>
+</plist>BINARY FOOTER"#;
+        let doc = profile_document(profile).expect("the embedded plist must parse");
+        let dict = doc
+            .as_dictionary()
+            .expect("the document must be a dictionary");
+        assert_eq!(
+            dict.get("Name").unwrap().as_string().unwrap(),
+            "Test Profile"
+        );
+        assert_eq!(
+            dict.get("TeamIdentifier").unwrap().as_array().unwrap()[0]
+                .as_string()
+                .unwrap(),
+            "TESTTEAM"
+        );
+        assert_eq!(
+            dict.get("Entitlements")
+                .unwrap()
+                .as_dictionary()
+                .unwrap()
+                .get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.test.app"
+        );
+    }
+
+    #[test]
+    fn profile_document_rejects_data_without_plist() {
+        assert!(profile_document(b"not xml data").is_err());
+    }
 
     #[test]
     fn test_extract_entitlements_no_xml() {

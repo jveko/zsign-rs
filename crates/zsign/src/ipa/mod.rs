@@ -78,6 +78,165 @@ type ProfilePayload = (Option<Vec<u8>>, Option<Vec<u8>>);
 /// resolved for it, and the profile bytes to embed (absent when it resolves none).
 type BundlePlan = (PathBuf, Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// Rewrites `value` when it IS the old id or a sub-id of it
+/// (`old.<suffix>`); never a bare substring (com.a must not match com.ab).
+fn replace_id_prefix(value: &str, old: &str, new: &str) -> Option<String> {
+    if value == old {
+        return Some(new.to_string());
+    }
+    let rest = value.strip_prefix(old)?.strip_prefix('.')?;
+    Some(format!("{new}.{rest}"))
+}
+
+/// `replace_id_prefix` on a present top-level string key; returns whether
+/// it rewrote.
+fn rewrite_string_key(dict: &mut plist::Dictionary, key: &str, old: &str, new: &str) -> bool {
+    let Some(current) = dict.get(key).and_then(|v| v.as_string()).map(str::to_owned) else {
+        return false;
+    };
+    match replace_id_prefix(&current, old, new) {
+        Some(rewritten) => {
+            dict.insert(key.to_string(), plist::Value::String(rewritten));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Aligns signature entitlements with a changed bundle id (design §3.5
+/// stage 2). Keys outside the documented rewrite set — including
+/// `com.apple.security.application-groups` — are byte-preserved; bundles
+/// with no entitlements never reach here and none are invented.
+fn rewrite_entitlements_for_id(
+    ents: &[u8],
+    old_id: &str,
+    new_id: &str,
+    prefix: Option<&str>,
+    drop_get_task_allow: bool,
+) -> Result<Vec<u8>> {
+    let mut value: plist::Value = plist::from_bytes(ents).map_err(|e| {
+        Error::Core(zsign_core::Error::Config(format!(
+            "resolved entitlements are not a valid plist: {e}"
+        )))
+    })?;
+    let dict = value.as_dictionary_mut().ok_or_else(|| {
+        Error::Core(zsign_core::Error::Config(
+            "resolved entitlements must be a dictionary".into(),
+        ))
+    })?;
+    // iOS uses `application-identifier`, macOS the legacy
+    // `com.apple.application-identifier`. Only a key that is already present is
+    // rewritten, and it is rewritten under its OWN name — creating the
+    // canonical key for a legacy-only profile is out of scope.
+    let app_id_key = if dict.contains_key("application-identifier") {
+        "application-identifier"
+    } else if dict.contains_key("com.apple.application-identifier") {
+        "com.apple.application-identifier"
+    } else {
+        ""
+    };
+    let existing_prefix = dict
+        .get(app_id_key)
+        .and_then(|v| v.as_string())
+        .and_then(|s| s.split('.').next())
+        .map(str::to_owned);
+    if !app_id_key.is_empty() {
+        if let Some(prefix) = prefix.map(str::to_owned).or(existing_prefix) {
+            dict.insert(
+                app_id_key.to_string(),
+                plist::Value::String(format!("{prefix}.{new_id}")),
+            );
+            if let Some(groups) = dict
+                .get_mut("keychain-access-groups")
+                .and_then(|v| v.as_array_mut())
+            {
+                for group in groups.iter_mut() {
+                    let Some(text) = group.as_string().map(str::to_owned) else {
+                        continue;
+                    };
+                    let Some(dot) = text.find('.') else {
+                        continue;
+                    };
+                    let suffix = &text[dot + 1..];
+                    let suffix = replace_id_prefix(suffix, old_id, new_id)
+                        .unwrap_or_else(|| suffix.to_owned());
+                    *group = plist::Value::String(format!("{prefix}.{suffix}"));
+                }
+            }
+        }
+    }
+    if drop_get_task_allow {
+        dict.remove("get-task-allow");
+    }
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, &value).map_err(|e| {
+        Error::Core(zsign_core::Error::Config(format!(
+            "failed to serialize rewritten entitlements: {e}"
+        )))
+    })?;
+    Ok(buf)
+}
+
+/// App-ID prefix chain (design §3.5/D7): own profile's Entitlements app-id
+/// prefix, then the root profile's, then either profile's
+/// `TeamIdentifier[0]`, then `None` (transform falls back to the resolved
+/// entitlements' own prefix). Never assumes prefix == TeamID (TN2415:461).
+fn app_id_prefix(own: Option<&[u8]>, root: Option<&[u8]>) -> Option<String> {
+    fn document(profile: &[u8]) -> Option<plist::Value> {
+        zsign_core::provisioning::profile_document(profile).ok()
+    }
+    for profile in own.iter().chain(root.iter()) {
+        let Some(doc) = document(profile) else {
+            continue;
+        };
+        let app_id = doc
+            .as_dictionary()
+            .and_then(|d| d.get("Entitlements"))
+            // plist 1.7 has no `Value::get`, so the nested dict is taken first.
+            .and_then(|e| e.as_dictionary())
+            .and_then(|d| {
+                d.get("application-identifier")
+                    .or_else(|| d.get("com.apple.application-identifier"))
+            })
+            .and_then(|v| v.as_string())
+            .and_then(|s| s.split('.').next())
+            .map(str::to_owned);
+        if app_id.is_some() {
+            return app_id;
+        }
+    }
+    for profile in own.iter().chain(root.iter()) {
+        let Some(doc) = document(profile) else {
+            continue;
+        };
+        let team = doc
+            .as_dictionary()
+            .and_then(|d| d.get("TeamIdentifier"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_string())
+            .map(str::to_owned);
+        if team.is_some() {
+            return team;
+        }
+    }
+    None
+}
+
+/// Distribution detection (design D7): a resolved profile that lacks
+/// `ProvisionedDevices`. No resolved profile ⇒ never drop get-task-allow.
+fn profile_is_distribution(profile_data: Option<&[u8]>) -> bool {
+    let Some(profile) = profile_data else {
+        return false;
+    };
+    match zsign_core::provisioning::profile_document(profile) {
+        Ok(doc) => doc
+            .as_dictionary()
+            .is_some_and(|d| !d.contains_key("ProvisionedDevices")),
+        Err(_) => false,
+    }
+}
+
 /// High-level IPA signing workflow.
 ///
 /// Provides a builder-style interface for signing IPA files, handling
@@ -551,55 +710,98 @@ impl<'a> IpaSigner<'a> {
     ///    `embedded.mobileprovision` (whichever bundles resolved one)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
     fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
-        if let Some(ref new_id) = self.bundle_id {
-            self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
-        }
-        if let Some(ref name) = self.bundle_name {
-            self.rewrite_plist_string(bundle_path, "CFBundleDisplayName", name)?;
-        }
-        if let Some(ref version) = self.bundle_version {
-            self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
-        }
+        // --- read-only resolution: nothing below this line has written yet ---
+        let old_root_id = self.get_bundle_identifier(bundle_path)?;
+        // The root's FINAL id is knowable without writing the plist, so the
+        // plan build can key on the post-rewrite id (design §3.5 stage 3).
+        let root_id_final = self
+            .bundle_id
+            .clone()
+            .unwrap_or_else(|| old_root_id.clone());
 
         // `collect_nested_bundles` is a pure read, so it runs before the dylib
         // pass: plan build must precede the first sign write.
         let mut bundles = self.collect_nested_bundles(bundle_path)?;
         bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
 
+        // Stage 1 (design §3.5): compute each nested bundle's FINAL id in
+        // memory. Nothing is written here; the cascade's writes happen in the
+        // requested-rewrite phase below, so an option rejection above leaves
+        // every plist byte-untouched.
+        let mut id_pairs: HashMap<PathBuf, (String, String)> = HashMap::new();
+        if let Some(ref new_root) = self.bundle_id {
+            for (path, _depth) in &bundles {
+                if path == bundle_path {
+                    continue; // root rewritten by the existing requested rewrite
+                }
+                let old = match self.read_bundle_identifier(path) {
+                    Some(id) => id,
+                    None => continue, // plist-less extension arm: nothing to cascade
+                };
+                if let Some(new) = replace_id_prefix(&old, &old_root_id, new_root) {
+                    id_pairs.insert(path.clone(), (old, new));
+                }
+            }
+        }
+
         // --- plan build: read-only; every rejection lands here ---
-        // The entitlements directory is keyed by the POST-rewrite bundle id, so
-        // resolution follows the rewrites above.
-        let root_id = self.get_bundle_identifier(bundle_path)?;
         let (root_profile_data, root_profile_ent) = self.load_profile()?;
-        let root_entitlements = self
-            .load_entitlements_override()?
-            .or(self.dir_hit(&root_id)?)
-            .or(root_profile_ent);
-        let profile_map = self.load_bundle_profiles(&root_id)?;
+        let root_entitlements = match self.load_entitlements_override()? {
+            // The directory is consulted only when the explicit override did
+            // not win — §3.2 precedence must not let a losing tier fail the sign.
+            Some(override_ents) => Some(override_ents),
+            None => self.dir_hit(&root_id_final)?.or(root_profile_ent),
+        };
+        let profile_map = self.load_bundle_profiles(&root_id_final)?;
         let mut plan: Vec<BundlePlan> = Vec::with_capacity(bundles.len());
         let mut nested_ids: Vec<String> = Vec::new();
         for (path, _depth) in &bundles {
-            if path == bundle_path {
-                plan.push((
-                    path.clone(),
+            let (old_id, final_id, mut entitlements, profile_bytes) = if path == bundle_path {
+                (
+                    old_root_id.clone(),
+                    root_id_final.clone(),
                     root_entitlements.clone(),
                     root_profile_data.clone(),
-                ));
-                continue;
+                )
+            } else {
+                // No pair: a bundle whose id does not follow the old root keeps
+                // its own. The tolerant read is deliberately NOT used here —
+                // plan build must keep HEAD's semantics, where a plist-less
+                // nested bundle is a hard error and a key-less plist falls back
+                // to the file stem.
+                let final_id = match id_pairs.get(path) {
+                    Some((_, new)) => new.clone(),
+                    None => self.get_bundle_identifier(path)?,
+                };
+                nested_ids.push(final_id.clone());
+                let mapped = profile_map.get(&final_id);
+                let old_id = id_pairs
+                    .get(path)
+                    .map(|(old, _)| old.clone())
+                    .unwrap_or_else(|| final_id.clone());
+                (
+                    old_id,
+                    final_id.clone(),
+                    self.dir_hit(&final_id)?
+                        .or_else(|| mapped.and_then(|(_, ent)| ent.clone())),
+                    // `ProfilePayload`'s profile bytes are always `Some` for a
+                    // mapped key, so flatten rather than nest an empty option.
+                    mapped.and_then(|(data, _)| data.clone()),
+                )
+            };
+            if self.bundle_id.is_some() {
+                if let Some(ents) = entitlements.take() {
+                    let root_profile = root_profile_data.as_deref();
+                    entitlements = Some(rewrite_entitlements_for_id(
+                        &ents,
+                        &old_id,
+                        &final_id,
+                        app_id_prefix(profile_bytes.as_deref(), root_profile).as_deref(),
+                        profile_is_distribution(profile_bytes.as_deref().or(root_profile)),
+                    )?);
+                }
             }
-            let id = self.get_bundle_identifier(path)?;
-            nested_ids.push(id.clone());
-            let mapped = profile_map.get(&id);
-            let entitlements = self
-                .dir_hit(&id)?
-                .or_else(|| mapped.and_then(|(_, ent)| ent.clone()));
-            plan.push((
-                path.clone(),
-                entitlements,
-                // `ProfilePayload`'s profile bytes are always `Some` for a
-                // mapped key, so flatten rather than nest an empty option.
-                mapped.and_then(|(data, _)| data.clone()),
-            ));
+            plan.push((path.clone(), entitlements, profile_bytes));
         }
         let mut unused: Vec<&String> = profile_map
             .keys()
@@ -611,6 +813,22 @@ impl<'a> IpaSigner<'a> {
             return Err(Error::Core(zsign_core::Error::Config(format!(
                 "provisioning profile map keys matched no bundle: {unused:?}; nested bundle ids: {nested_ids:?}"
             ))));
+        }
+
+        // --- requested-rewrite phase: the first writes of this sign. Root
+        // first, then nested, so a failure can at worst leave the root
+        // rewritten -- the same exposure HEAD has for a broken root. ---
+        if let Some(ref new_id) = self.bundle_id {
+            self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
+        }
+        if let Some(ref name) = self.bundle_name {
+            self.rewrite_plist_string(bundle_path, "CFBundleDisplayName", name)?;
+        }
+        if let Some(ref version) = self.bundle_version {
+            self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
+        }
+        if let Some(ref new_root) = self.bundle_id {
+            self.rewrite_nested_identifiers(&bundles, bundle_path, &old_root_id, new_root)?;
         }
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
@@ -629,6 +847,90 @@ impl<'a> IpaSigner<'a> {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Reads a nested bundle's `CFBundleIdentifier` without writing anything.
+    ///
+    /// `is_nested_bundle_dir` also matches plist-less `.framework`/`.appex`
+    /// directories, so absence is a legitimate `None` here rather than an
+    /// error: such a bundle simply has no id to cascade from.
+    fn read_bundle_identifier(&self, bundle_path: &Path) -> Option<String> {
+        let info_plist = Self::resolve_relative(bundle_path, "Info.plist").ok()?;
+        let data = fs::read(&info_plist).ok()?;
+        let value: plist::Value = plist::from_bytes(&data).ok()?;
+        let dict = value.as_dictionary()?;
+        dict.get("CFBundleIdentifier")
+            .and_then(|v| v.as_string())
+            .map(str::to_owned)
+    }
+
+    /// Cascades a bundle-id change into nested identity plists (design §3.5
+    /// stage 1): `CFBundleIdentifier`, `WKCompanionAppBundleIdentifier`,
+    /// top-level and `NSExtension→NSExtensionAttributes`
+    /// `WKAppBundleIdentifier`. Runs in the requested-rewrite phase, after
+    /// every option rejection has already surfaced.
+    fn rewrite_nested_identifiers(
+        &self,
+        bundles: &[(PathBuf, usize)],
+        root: &Path,
+        old: &str,
+        new: &str,
+    ) -> Result<()> {
+        for (path, _depth) in bundles {
+            if path == root {
+                continue; // root rewritten by the existing requested rewrite
+            }
+            let info_plist = Self::resolve_relative(path, "Info.plist")?;
+            // A plist-less extension-arm directory has no id to cascade from.
+            let Ok(data) = fs::read(&info_plist) else {
+                continue;
+            };
+            let mut value: plist::Value = plist::from_bytes(&data).map_err(|e| {
+                Error::Core(zsign_core::Error::Signing(format!(
+                    "Failed to parse Info.plist for {}: {e}",
+                    info_plist.display()
+                )))
+            })?;
+            let dict = match value.as_dictionary_mut() {
+                Some(dict) => dict,
+                None => continue,
+            };
+            let mut modified = false;
+            if let Some(current) = dict
+                .get("CFBundleIdentifier")
+                .and_then(|v| v.as_string())
+                .map(str::to_owned)
+            {
+                if let Some(rewritten) = replace_id_prefix(&current, old, new) {
+                    dict.insert(
+                        "CFBundleIdentifier".to_string(),
+                        plist::Value::String(rewritten),
+                    );
+                    modified = true;
+                }
+            }
+            modified |= rewrite_string_key(dict, "WKCompanionAppBundleIdentifier", old, new);
+            modified |= rewrite_string_key(dict, "WKAppBundleIdentifier", old, new);
+            if let Some(attrs) = dict
+                .get_mut("NSExtension")
+                .and_then(|v| v.as_dictionary_mut())
+                .and_then(|d| d.get_mut("NSExtensionAttributes"))
+                .and_then(|v| v.as_dictionary_mut())
+            {
+                modified |= rewrite_string_key(attrs, "WKAppBundleIdentifier", old, new);
+            }
+            if modified {
+                let mut buf = Vec::new();
+                plist::to_writer_xml(&mut buf, &value).map_err(|e| {
+                    Error::Core(zsign_core::Error::Signing(format!(
+                        "failed to serialize Info.plist for {}: {e}",
+                        path.display()
+                    )))
+                })?;
+                fs::write(&info_plist, &buf)?;
+            }
+        }
         Ok(())
     }
 
@@ -3052,6 +3354,717 @@ mod tests {
         assert!(
             message.contains("nope.mobileprovision") && message.contains("com.test.app.ext"),
             "the error must name both the bundle and the path: {message}"
+        );
+    }
+
+    /// A development profile: `TESTTEAM` prefix, a keychain group carrying the
+    /// bundle id, and `ProvisionedDevices` (the development marker).
+    const DEV_PROFILE_FIXTURE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.test.app</string>
+    <key>keychain-access-groups</key>
+    <array>
+      <string>TESTTEAM.com.test.app</string>
+      <string>TESTTEAM.sharedgroup</string>
+    </array>
+    <key>get-task-allow</key>
+    <true/>
+    <key>com.apple.security.application-groups</key>
+    <array><string>group.com.test.shared</string></array>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM</string></array>
+  <key>ProvisionedDevices</key>
+  <array><string>00008030-000000000000001E</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    /// The same profile without `ProvisionedDevices`: a distribution profile.
+    const DIST_PROFILE_FIXTURE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM.com.test.app</string>
+    <key>get-task-allow</key>
+    <true/>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    /// Root `com.test.app` + `PlugIns/Ext.appex` (`com.test.app.ext`) +
+    /// `Watch/1/Companion.app` carrying a `WKCompanionAppBundleIdentifier`, plus
+    /// an `NSExtension → NSExtensionAttributes → WKAppBundleIdentifier` chain.
+    fn create_bundle_with_watch(dir: &Path) -> PathBuf {
+        let (app, _appex) = create_bundle_with_appex(dir);
+        let watch = app.join("Watch").join("1").join("Companion.app");
+        std::fs::create_dir_all(&watch).unwrap();
+        std::fs::write(
+            watch.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.test.app.watch</string>
+    <key>CFBundleExecutable</key><string>Companion</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>WKCompanionAppBundleIdentifier</key><string>com.test.app</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key><string>com.apple.watchkit</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>WKAppBundleIdentifier</key><string>com.test.app.watch</string>
+            <key>WKWatchOnly</key><true/>
+        </dict>
+    </dict>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(watch.join("Companion"), crate::test_util::minimal_macho()).unwrap();
+        app
+    }
+
+    /// The watch app's `WKCompanionAppBundleIdentifier` after signing.
+    fn watch_companion_id(app: &Path) -> String {
+        let data = std::fs::read(app.join("Watch/1/Companion.app/Info.plist")).unwrap();
+        let value: plist::Value = plist::from_bytes(&data).unwrap();
+        value
+            .as_dictionary()
+            .unwrap()
+            .get("WKCompanionAppBundleIdentifier")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The watch companion's `NSExtensionAttributes.WKAppBundleIdentifier`.
+    fn watch_wk_app_bundle_id(app: &Path) -> String {
+        let data = std::fs::read(app.join("Watch/1/Companion.app/Info.plist")).unwrap();
+        let value: plist::Value = plist::from_bytes(&data).unwrap();
+        value
+            .as_dictionary()
+            .unwrap()
+            .get("NSExtension")
+            .unwrap()
+            .as_dictionary()
+            .unwrap()
+            .get("NSExtensionAttributes")
+            .unwrap()
+            .as_dictionary()
+            .unwrap()
+            .get("WKAppBundleIdentifier")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A sibling bundle whose id merely STARTS WITH the root id
+    /// (`com.test.app` vs `com.test.appprefixguard`) but is not a sub-id of it.
+    fn plant_prefix_guard_sibling(app: &Path) -> PathBuf {
+        let sibling = app.join("PlugIns").join("Guard.appex");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(
+            sibling.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.test.appprefixguard</string>
+    <key>CFBundleExecutable</key><string>Guard</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(sibling.join("Guard"), crate::test_util::minimal_macho()).unwrap();
+        sibling
+    }
+
+    #[test]
+    fn test_without_bundle_id_change_entitlements_not_reserialized() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("dev.mobileprovision");
+        std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
+        let ent_xml = zsign_core::extract_entitlements_from_profile(DEV_PROFILE_FIXTURE)
+            .unwrap()
+            .unwrap();
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The directory entry is stored as a BINARY plist. Canonical XML
+        // round-trips byte-identically through the transform's re-
+        // serialization, so only a differently-encoded input makes "the
+        // transform never ran" observable: the transform would emit XML,
+        // while the untouched pass forwards these exact bytes into the slot.
+        let ent_value: plist::Value = plist::from_bytes(&ent_xml).unwrap();
+        let mut churned = Vec::new();
+        plist::to_writer_binary(&mut churned, &ent_value).expect("binary plist encodes");
+        std::fs::write(dir.join("com.test.app.plist"), &churned).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("signing without a bundle-id change must succeed");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("entitlements slot must exist");
+        assert_eq!(
+            &blob[8..],
+            churned.as_slice(),
+            "with no -b the signed slot must carry the directory entry's exact bytes, not a re-serialization"
+        );
+        let ents = plist::Value::from_reader(std::io::Cursor::new(&blob[8..]))
+            .unwrap()
+            .into_dictionary()
+            .unwrap();
+        assert_eq!(
+            ents.get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.test.app",
+            "with no -b the app id keeps the directory entry's value"
+        );
+        assert!(
+            ents.contains_key("get-task-allow"),
+            "with no -b a development-shaped directory entry keeps get-task-allow"
+        );
+    }
+
+    /// Legacy-only app-id entitlements: `com.apple.application-identifier`
+    /// with no canonical `application-identifier` key.
+    const LEGACY_APPID_PROFILE_FIXTURE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>com.apple.application-identifier</key>
+    <string>TESTTEAM.com.test.app</string>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#;
+
+    #[test]
+    fn test_bundle_id_change_rewrites_legacy_app_id_key() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("legacy.mobileprovision");
+        std::fs::write(&profile, LEGACY_APPID_PROFILE_FIXTURE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let ents = entitlements_slot_dict(&app.join("Test"))
+            .expect("the root binary must carry entitlements");
+        assert_eq!(
+            ents.get("com.apple.application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.new.app",
+            "the legacy key must be updated in place"
+        );
+        assert!(
+            !ents.contains_key("application-identifier"),
+            "creating the canonical key is out of scope for a legacy-only profile"
+        );
+        // The 8-byte slot header is binary, so only the payload is scanned.
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .unwrap();
+        let payload = String::from_utf8_lossy(&blob[8..]);
+        assert!(
+            !payload.contains("com.test.app"),
+            "no stale old id may survive anywhere in the entitlements: {payload}"
+        );
+    }
+
+    #[test]
+    fn test_plistless_extension_errors_like_head() {
+        // A plist-less `.appex` matches the extension arm of
+        // is_nested_bundle_dir, so the sign loop reaches it and HEAD's
+        // get_bundle_identifier error surfaces. The tolerant skip belongs ONLY
+        // to the cascade preview, which runs earlier — if the preview errored
+        // instead, the message would be a bare IO error, not this one.
+        for bundle_id in [None, Some("com.new.app")] {
+            let temp = TempDir::new().unwrap();
+            let app = create_bundle_with_appex(temp.path()).0;
+            std::fs::create_dir_all(app.join("PlugIns").join("Empty.appex")).unwrap();
+
+            let mut signer = IpaSigner::new_adhoc();
+            if let Some(id) = bundle_id {
+                signer = signer.bundle_id(id);
+            }
+            let err = signer
+                .sign_folder_in_place(&app)
+                .expect_err("a nested bundle with no Info.plist must fail the sign");
+            assert!(
+                err.to_string().contains("Info.plist not found in bundle"),
+                "the error must be HEAD's, and independent of the trigger: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_nested_identifiers_tolerates_plistless_bundle() {
+        // Pinned at the method itself: through the sign path this bundle is
+        // already rejected by plan build, so the cascade's tolerant skip would
+        // otherwise be unobservable.
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let empty = app.join("PlugIns").join("Empty.appex");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        IpaSigner::new_adhoc()
+            .rewrite_nested_identifiers(
+                &[(app.clone(), 0), (appex.clone(), 1), (empty.clone(), 1)],
+                &app,
+                "com.test.app",
+                "com.new.app",
+            )
+            .expect("a plist-less extension must be skipped, not error");
+
+        let value: plist::Value =
+            plist::from_bytes(&std::fs::read(appex.join("Info.plist")).unwrap()).unwrap();
+        assert_eq!(
+            value
+                .as_dictionary()
+                .unwrap()
+                .get("CFBundleIdentifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "com.new.app.ext",
+            "the sibling bundle must still be cascaded"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_override_shields_invalid_dir_file() {
+        use crate::test_util::minimal_macho;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST_FOR_OVERRIDE).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+
+        // The directory holds a GARBAGE entry for this very bundle id, so a
+        // losing tier is able to fail the sign unless the winning override
+        // short-circuits the lookup (design §3.2 precedence).
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("com.test.app.plist"), b"not a plist").unwrap();
+        let override_ents = temp.path().join("custom.entitlements");
+        std::fs::write(
+            &override_ents,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+    <key>com.zsign.override.wins</key><true/>
+</dict></plist>"#,
+        )
+        .unwrap();
+
+        IpaSigner::new_adhoc()
+            .entitlements(&override_ents)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("a winning -e override must shield the directory tier");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root binary must carry the override");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.override.wins"),
+            "the override must be the signed entitlements: {blob:?}"
+        );
+    }
+
+    /// Info.plist declaring `com.test.app`, for the override-shielding test.
+    const FIXTURE_PLIST_FOR_OVERRIDE: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Test</string>
+  <key>CFBundleIdentifier</key><string>com.test.app</string>
+</dict></plist>"#;
+
+    #[test]
+    fn test_bundle_id_change_rejection_leaves_every_plist_untouched() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let root_before = std::fs::read(app.join("Info.plist")).unwrap();
+        let appex_before = std::fs::read(app.join("PlugIns/Ext.appex/Info.plist")).unwrap();
+        let profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        // A map entry naming the appex's NEW id plus one bogus key: the bogus
+        // key must be rejected before ANY plist is written.
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![
+                ("com.new.app.ext".to_string(), profile.clone()),
+                ("com.new.app.nope".to_string(), profile),
+            ])
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect_err("an unused map key must fail the sign");
+        assert!(
+            err.to_string().contains("com.new.app.nope"),
+            "the error must still name the unused key: {err}"
+        );
+        assert_eq!(
+            std::fs::read(app.join("Info.plist")).unwrap(),
+            root_before,
+            "an option rejection must leave the root plist byte-untouched"
+        );
+        assert_eq!(
+            std::fs::read(app.join("PlugIns/Ext.appex/Info.plist")).unwrap(),
+            appex_before,
+            "an option rejection must leave nested plists byte-untouched"
+        );
+    }
+
+    #[test]
+    fn test_bundle_id_change_never_rewrites_prefix_lookalike_sibling() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let sibling = plant_prefix_guard_sibling(&app);
+
+        IpaSigner::new_adhoc()
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("signing must succeed");
+
+        let data = std::fs::read(sibling.join("Info.plist")).unwrap();
+        let value: plist::Value = plist::from_bytes(&data).unwrap();
+        assert_eq!(
+            value
+                .as_dictionary()
+                .unwrap()
+                .get("CFBundleIdentifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "com.test.appprefixguard",
+            "an id that merely starts with the old root is not a sub-id and must not move"
+        );
+    }
+
+    #[test]
+    fn test_without_bundle_id_change_nested_identifiers_untouched() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let before = std::fs::read(app.join("PlugIns/Ext.appex/Info.plist")).unwrap();
+
+        IpaSigner::new_adhoc()
+            .sign_folder_in_place(&app)
+            .expect("signing without a bundle-id change must succeed");
+
+        assert_eq!(
+            std::fs::read(app.join("PlugIns/Ext.appex/Info.plist")).unwrap(),
+            before,
+            "with no -b a nested Info.plist must not be re-serialized at all"
+        );
+    }
+
+    #[test]
+    fn test_bundle_id_change_rewrites_nested_identifiers() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_watch(temp.path());
+        // The Watch companion must be discovered as a nested bundle, or the
+        // cascade would legitimately never see it.
+        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        assert!(
+            bundles
+                .iter()
+                .any(|(p, _)| p.ends_with("Watch/1/Companion.app")),
+            "the watch companion must be a discovered nested bundle: {bundles:?}"
+        );
+
+        IpaSigner::new_adhoc()
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let appex: plist::Value =
+            plist::from_bytes(&std::fs::read(app.join("PlugIns/Ext.appex/Info.plist")).unwrap())
+                .unwrap();
+        assert_eq!(
+            appex
+                .as_dictionary()
+                .unwrap()
+                .get("CFBundleIdentifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "com.new.app.ext",
+            "a sub-id of the old root must follow the new prefix"
+        );
+        assert_eq!(
+            watch_companion_id(&app),
+            "com.new.app",
+            "WKCompanionAppBundleIdentifier must cascade"
+        );
+        assert_eq!(
+            watch_wk_app_bundle_id(&app),
+            "com.new.app.watch",
+            "the nested NSExtensionAttributes WKAppBundleIdentifier must cascade"
+        );
+        // A key that was absent must not be invented by the rewrite.
+        let watch: plist::Value = plist::from_bytes(
+            &std::fs::read(app.join("Watch/1/Companion.app/Info.plist")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            watch
+                .as_dictionary()
+                .unwrap()
+                .get("WKAppBundleIdentifier")
+                .is_none(),
+            "a top-level WKAppBundleIdentifier that never existed must stay absent"
+        );
+    }
+
+    #[test]
+    fn test_bundle_id_change_rewrites_entitlements_identifiers() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("dev.mobileprovision");
+        std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let ents = entitlements_slot_dict(&app.join("Test"))
+            .expect("the root binary must carry entitlements");
+        assert_eq!(
+            ents.get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.new.app",
+            "the app id must follow the new bundle id"
+        );
+        let groups: Vec<String> = ents
+            .get("keychain-access-groups")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_string().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                "TESTTEAM.com.new.app".to_string(),
+                "TESTTEAM.sharedgroup".to_string()
+            ],
+            "only the group carrying the old id is rewritten; the shared one is kept"
+        );
+        assert!(
+            ents.contains_key("get-task-allow"),
+            "a development profile keeps get-task-allow"
+        );
+    }
+
+    #[test]
+    fn test_distribution_profile_drops_get_task_allow() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("dist.mobileprovision");
+        std::fs::write(&profile, DIST_PROFILE_FIXTURE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let ents = entitlements_slot_dict(&app.join("Test"))
+            .expect("the root binary must carry entitlements");
+        assert_eq!(
+            ents.get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.new.app",
+            "the app id must still be rewritten"
+        );
+        assert!(
+            !ents.contains_key("get-task-allow"),
+            "a distribution profile must not carry get-task-allow"
+        );
+    }
+
+    #[test]
+    fn test_app_groups_never_rewritten() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("dev.mobileprovision");
+        std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let ents = entitlements_slot_dict(&app.join("Test"))
+            .expect("the root binary must carry entitlements");
+        let groups: Vec<String> = ents
+            .get("com.apple.security.application-groups")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_string().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["group.com.test.shared".to_string()],
+            "app groups are outside the rewrite set and must be byte-preserved"
+        );
+    }
+
+    #[test]
+    fn test_nested_app_id_uses_own_profile_prefix() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        // The appex's mapped profile carries a DIFFERENT prefix than the root's,
+        // so the own-profile tier must win over the root tier.
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(
+            &ext_profile,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>TESTTEAM2.com.test.app.ext</string>
+    <key>get-task-allow</key>
+    <true/>
+  </dict>
+  <key>TeamIdentifier</key>
+  <array><string>TESTTEAM2</string></array>
+  <key>ProvisionedDevices</key>
+  <array><string>00008030-000000000000001E</string></array>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+</dict></plist>"#,
+        )
+        .unwrap();
+        let root_profile = temp.path().join("root.mobileprovision");
+        std::fs::write(&root_profile, OVERRIDE_TEST_PROFILE).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&root_profile)
+            // The map is keyed by the post-rewrite id, exactly as the sibling
+            // integration test pins.
+            .bundle_profiles(vec![("com.new.app.ext".to_string(), ext_profile)])
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("a bundle-id change must sign");
+
+        let ents =
+            entitlements_slot_dict(&appex.join("Ext")).expect("the appex must carry entitlements");
+        assert_eq!(
+            ents.get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM2.com.new.app.ext",
+            "a nested bundle's app id must use ITS OWN profile's prefix"
+        );
+    }
+
+    #[test]
+    fn test_bundle_id_change_child_profile_resolves_by_rewritten_id() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        // The map key is the POST-rewrite id, so the cascade must run before
+        // plan build for this to resolve at all.
+        IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.new.app.ext".to_string(), ext_profile.clone())])
+            .bundle_id("com.new.app")
+            .sign_folder_in_place(&app)
+            .expect("the mapped profile must resolve by the rewritten id");
+
+        assert_eq!(
+            std::fs::read(appex.join("embedded.mobileprovision")).unwrap(),
+            std::fs::read(&ext_profile).unwrap(),
+            "the appex must embed the profile mapped to its rewritten id"
+        );
+    }
+
+    /// The entitlements blob of `binary` parsed as a plist dictionary. A
+    /// superblob slot entry carries an 8-byte magic+length header ahead of the
+    /// payload, so it is stripped before parsing.
+    fn entitlements_slot_dict(binary: &Path) -> Option<plist::Dictionary> {
+        let blob =
+            signature_slot_blob(binary, zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS)?;
+        let value: plist::Value = plist::from_bytes(&blob[8..]).ok()?;
+        value.as_dictionary().cloned()
+    }
+
+    #[test]
+    fn test_without_bundle_id_change_entitlements_verbatim() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_appex(temp.path()).0;
+        let profile = temp.path().join("dev.mobileprovision");
+        std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
+        let before = std::fs::read(&profile).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .sign_folder_in_place(&app)
+            .expect("signing without a bundle-id change must succeed");
+
+        let ents = entitlements_slot_dict(&app.join("Test"))
+            .expect("the root binary must carry entitlements");
+        assert_eq!(
+            ents.get("application-identifier")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "TESTTEAM.com.test.app",
+            "with no -b the app id must be left exactly as the profile has it"
+        );
+        assert!(
+            ents.contains_key("get-task-allow"),
+            "with no -b get-task-allow must be left alone"
+        );
+        assert_eq!(
+            std::fs::read(&profile).unwrap(),
+            before,
+            "the profile bytes on disk are never modified"
         );
     }
 }

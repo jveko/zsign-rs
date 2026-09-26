@@ -46,6 +46,7 @@ pub mod verify;
 
 // Re-export core modules that don't need native wrapping
 pub use zsign_core::provisioning::extract_entitlements_from_profile;
+pub use zsign_core::provisioning::profile_document;
 pub use zsign_core::{codesign, crypto, SigningCredentials};
 
 #[cfg(test)]
