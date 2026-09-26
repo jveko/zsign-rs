@@ -73,7 +73,7 @@ The README must not present the release-CI skip as a contributor instruction.
 ## Architecture
 Workspace members (root `Cargo.toml` `members` array; package names in each `crates/*/Cargo.toml`): `crates/zsign-core`, `crates/zsign` (package **`zsign-rs`**), `crates/zsign-wasm`, `crates/zsign-cli`, `fuzz` (`zsign-fuzz`, `publish = false`).
 
-- **`zsign-core`** (`crates/zsign-core/`) — pure engine: `macho` (parse/sign/write; little-endian 32-bit + 64-bit + FAT; big-endian 32-bit rejected with a typed error), `codesign` (CodeDirectory, SuperBlob, DER, verification), `crypto` (certificates, CMS signing **and** verification, OCSP revocation, macOS keychain, encrypted PEM), `bundle` (CodeResources), `provisioning`. Compiles to `wasm32-unknown-unknown`: keychain exec, the OCSP transport, and its budget thread are `cfg`-gated off wasm32; rayon is an unconditional dependency and executes sequentially there via its runtime wasm shim (the explicit cfg-gated rayon arms live in the facade's `bundle`/`ipa`).
+- **`zsign-core`** (`crates/zsign-core/`) — pure engine: `macho` (parse/sign/write; little-endian 32-bit + 64-bit + FAT; big-endian 32-bit rejected with a typed error), `codesign` (CodeDirectory, SuperBlob, DER, verification), `crypto` (certificates, CMS signing **and** verification, OCSP revocation, macOS keychain, encrypted PEM), `bundle` (CodeResources), `provisioning`. Compiles to `wasm32-unknown-unknown`: nothing on the wasm path reaches `std::fs`/`std::net`/`std::thread` — keychain exec, the OCSP transport, and its budget thread are `cfg`-gated off wasm32; rayon is an unconditional dependency and executes sequentially there via its runtime wasm shim (the explicit cfg-gated rayon arms live in the facade's `bundle`/`ipa`).
 - **`zsign-rs`** (`crates/zsign/`) — native facade over `zsign-core`: `builder` (high-level `ZSign` API), `bundle`, `ipa` (zip extract/create), `macho` (filesystem wrapper over the core parser), `store` (`Store` trait — stateless `FsStore` ZST + `MemStore`, all-`&self` + `Sync` so rayon closures capture `&S` unchanged), `verify` (the `-V` engine), `error`. Re-exports `codesign`, `crypto`, `SigningCredentials` from core.
 - **`zsign-wasm`** (`crates/zsign-wasm/`) — `wasm-bindgen` bindings: `WasmSigner` per-entry CodeResources API plus whole-IPA `sign_ipa` bytes-to-bytes; stable `ZSIGN_*` error codes surface as `error.code` (match via `Reflect`, never string-match messages).
 - **`zsign-cli`** (`crates/zsign-cli/`) — single `main.rs`, clap derive; exit contract 0/1/2 and `--json` schema v1 live here.
@@ -482,9 +482,9 @@ at parse time. `zsign-cli --help` ends with the same reminder:
 `upstream users: -p/-k now match upstream; --pkcs12 is long-only`.
 
 Upstream flags with **no** zsign-rs equivalent — transcribed from upstream
-`src/zsign.cpp` @ `614caa8` (2026-08-21) as recorded in
-`docs/superpowers/specs/2026-09-25-cli-surface-design.md` (upstream source is not
-vendored in this tree): `-d -q -i -t -D -x -I -S -M -E -W -U
+`src/zsign.cpp` (long-option table + `usage()`, commit `614caa8d`, 2026-08-21) by
+this lane's upstream parity research; upstream source is not vendored in this tree:
+`-d -q -i -t -D -x -I -S -M -E -W -U
 -P -v` (debug dumps, quiet, ideviceinstaller install, temp folder, dylib removal,
 metadata/icon extraction, Files-app toggles, MinimumOSVersion, extension/watch/
 UISupportedDevices cleanup, extension injection, version print), plus the
@@ -724,7 +724,14 @@ git commit -m "docs: apply cross-check fixes to readme and agents"
 | 4 | material | WASM cap errors: declared vs actual-byte overrun differ | Split into `ZSIGN_INPUT_TOO_LARGE` (declared) vs `ZSIGN_SIGNING_FAILED` (streaming backstop) |
 | 5 | nit | `Cargo.toml:3` single-line citation; license not in `fuzz/` | Members cited via root `members` array + `crates/*/Cargo.toml`; license text stays scoped to `crates/*` |
 | 6 | nit | Tree comment dropped "verification"; `store` reads public | Tree says "signing + verification"; `store` marked crate-private in tree and crate table |
-| 7 | nit | Upstream flag list second-hand | Provenance labeled (upstream `src/zsign.cpp` @ `614caa8` via the cli-surface design doc) |
+| 7 | nit | Upstream flag list second-hand | Provenance labeled (upstream `src/zsign.cpp` option table + `usage()` @ `614caa8d`, transcribed by this lane's upstream parity research; upstream not vendored here) |
 
 Round-2 reviewer: findings above are resolved — do not re-litigate; verify the fixes
 and look only for NEW material defects.
+
+## Round-2 cold-review ledger (both findings applied)
+
+| # | Severity | Finding | Fix applied |
+|---|---|---|---|
+| R2-1 | material | Plan cited `2026-09-25-cli-surface-design.md` for the 14-flag upstream no-equivalent list; that doc does not contain it, and the commit hash was mis-copied (`614caa8`) | Citation replaced with the true provenance: upstream `src/zsign.cpp` long-option table + `usage()` @ `614caa8d` (2026-08-21), transcribed by this lane's upstream parity research; ledger row 7 corrected in the same pass |
+| R2-2 | P2 | The rayon fix deleted the true invariant "nothing on the wasm path reaches `std::fs`/`std::net`/`std::thread`" from the AGENTS core row | Clause restored ahead of the keychain/OCSP gating and rayon-shim wording |
