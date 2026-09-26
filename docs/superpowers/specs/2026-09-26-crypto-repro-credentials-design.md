@@ -126,8 +126,10 @@ flag appears.
 | Format | Marker | Path | Evidence |
 |---|---|---|---|
 | Encrypted PKCS#8, PBES2 + PBKDF2 (PRF HMAC-SHA1/224/256/384/512, absent prf = SHA-1) + AES-128/192/256-CBC | ``ENCRYPTED PRIVATE KEY` label` | reuse the in-tree PBES2 stack: `pkcs12::decrypt_key_bag` (`pkcs12.rs:793`, already an `EncryptedPrivateKeyInfo` reader) → `pbes2_decrypt` (`:481`, PRF matrix `:525-545`, `keyLength` agreement check `:516-522`, `validate_iterations` `:382`) → plaintext PKCS#8 DER → existing `DecodedKey::from_pkcs8_der` (`cert.rs:118`) | P2, P5 |
-| Traditional OpenSSL encrypted PEM | `Proc-Type: 4,ENCRYPTED` + `DEK-Info: <cipher>,<hex IV>` on `PRIVATE KEY` / `RSA PRIVATE KEY` / `EC PRIVATE KEY` | new ~90-line decoder: header framing, `EVP_BytesToKey(MD5, iter = 1, salt = first 8 IV bytes)` for the **key bytes only**, decrypt CBC with the **header IV**, PKCS#7 unpad, then decode PKCS#8 / PKCS#1 / SEC1 by label | P6-P10 |
-| Unencrypted, unchanged behaviour | `PRIVATE KEY` | existing `DecodedKey::from_pkcs8_pem` (`cert.rs:126-132`) | P2 |
+| Traditional OpenSSL encrypted PEM | `Proc-Type: 4,ENCRYPTED` + `DEK-Info: <cipher>,<hex IV>` on `PRIVATE KEY` / `RSA PRIVATE KEY` / `EC PRIVATE KEY` | new header-framing decoder (`crypto/encrypted_pem.rs`, production half ~200 lines including
+the cipher table): header framing, `EVP_BytesToKey(MD5, iter = 1, salt = first 8 IV bytes)` for the **key bytes only**, decrypt CBC with the **header IV**, PKCS#7 unpad, then decode PKCS#8 / PKCS#1 / SEC1 by label | P6-P10 |
+| Unencrypted, unchanged behaviour | `PRIVATE KEY` | content-driven `DecodedKey::from_der_by_content` (`cert.rs:131`), which replaced the label-locked
+`from_pkcs8_pem` that this ticket deleted | P2 |
 
 Reusing `pkcs12`'s PBES2 engine is what the brief asks for ("reuse ZSN-37's PBKDF2 PRF/keyLength
 dispatch if it exposed reusable primitives"): it is a *visibility* change —
@@ -223,9 +225,10 @@ Why not default-on inside this wave:
   remains a device concern", and `pkcs12.rs:787` drops CRL bags.
 
 So an automatic version this wave means inventing an unowned sink in a file zsn40 owns — precisely
-the case the brief sends to a seam report. The seam note names the two-line patch
-(`builder.rs:264` → `if let Some(w) = revocation::warning_of(creds) { … }`) and the sink options, so
-the orchestrator can land it with the flag surface.
+the case the brief sends to a seam report. The seam note names the one-line patch
+(`load_credentials` → `revocation::warn_revocation(&creds.certificate, &creds.cert_chain);` —
+the argument list the shipped code actually offers) and the sink options, so the orchestrator
+can land it with the flag surface.
 
 ### Module surface
 
@@ -308,8 +311,10 @@ warning.
 ### Transport
 
 Native-only (`#[cfg(not(target_arch = "wasm32"))]`), HTTP/1.1 `POST` with
-`Content-Type: application/ocsp-request` over `std::net::TcpStream`: `connect_timeout(1.5 s)`,
-`set_write_timeout`/`set_read_timeout(2 s)`, response capped at 64 KiB, no redirects and no
+`Content-Type: application/ocsp-request` over `std::net::TcpStream`: one caller-supplied budget
+(`HttpTransport::budget`, defaulting to 3 s) is threaded into `connect_timeout` **and** the
+socket read and write timeouts, so no single phase can outlive it; response capped at 64 KiB,
+no redirects and no
 `chunked` bodies (both are `Transport` outcomes), `http:` URLs only — Apple's AIA URI is plaintext
 `http://ocsp.apple.com/ocsp03-applerootca` (P13), so a TLS stack would be dead weight.
 
@@ -336,6 +341,13 @@ nothing for the wasm half of the workspace and every added crate is a permanent
   latency, and Apple's iOS-signing CRLs are not a redistributable list.
 - **Response caching, stapling, must-staple enforcement, OCSP signing-nonce echoing (§3.2.3),
   tryLater retry:** out of scope for a best-effort warning.
+- **`https:` responder URIs:** not fetched. Adding a TLS stack is not defensible for a warning,
+  and every Apple AIA OCSP location inspected here is plaintext `http:`. The shipped code reports
+  that as `UnusableUrl`, deliberately distinct from `NoOcspUrl`, so a user can tell "a responder
+  this tool will not speak to" from "a certificate with no OCSP pointer".
+- **Revocation reason vocabulary:** the optional `[0] EXPLICIT CRLReason` is parsed and named
+  through the RFC 5280 §5.3.1 labels; an out-of-range number becomes `unknown(<n>)` rather than a
+  guess, and a response that omits the field yields no reason at all.
 - **Hard freshness ceiling when the responder omits `nextUpdate`:** not enforced. RFC 6960 makes
   `nextUpdate` OPTIONAL and the fixture responder omits it, so the rule implemented here is
   `thisUpdate <= now` plus `now < nextUpdate` when present. A captured-old `good` answer therefore
