@@ -25,7 +25,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       - name: Run hooks on changed files
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
