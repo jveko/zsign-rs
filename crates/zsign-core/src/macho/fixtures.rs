@@ -105,6 +105,246 @@ pub fn make_minimal_dylib() -> Vec<u8> {
     data
 }
 
+/// Minimal thin-armv7 (little-endian 32-bit) Mach-O bytes: `mach_header`
+/// (28 B), `LC_SEGMENT` (56 B + one 68 B section), 32-bit `__LINKEDIT`.
+/// No `LC_CODE_SIGNATURE` — an unsigned input for 32-bit signing tests.
+pub(crate) fn make_minimal_macho_32() -> Vec<u8> {
+    let mut b = Vec::new();
+    macro_rules! u32le {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
+    macro_rules! name {
+        ($s:expr, $len:expr) => {
+            let mut n = [0u8; 16];
+            n[..$s.len()].copy_from_slice($s.as_bytes());
+            b.extend_from_slice(&n[..$len]);
+        };
+    }
+
+    // mach_header (28 bytes, no reserved word)
+    u32le!(0xfeedface); // MH_MAGIC
+    u32le!(0x0000_000c); // CPU_TYPE_ARM
+    u32le!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+    u32le!(2); // MH_EXECUTE
+    u32le!(3); // ncmds
+    u32le!(124 + 56 + 24); // sizeofcmds
+    u32le!(0x1); // MH_NOUNDEFS
+
+    // LC_SEGMENT "__TEXT" (124 bytes: 56-byte command + one 68-byte section)
+    u32le!(0x01);
+    u32le!(124);
+    name!("__TEXT", 16);
+    u32le!(0x1000); // vmaddr
+    u32le!(0x1000); // vmsize
+    u32le!(0x1000); // fileoff: leaves room for load commands
+    u32le!(0x1000); // filesize
+    u32le!(7); // maxprot
+    u32le!(7); // initprot
+    u32le!(1); // nsects
+    u32le!(0); // flags
+    name!("__text", 16); // section sectname
+    name!("__TEXT", 16); // section segname
+    u32le!(0x1000); // addr
+    u32le!(4); // size
+    u32le!(0x1000); // offset
+    u32le!(0); // align
+    u32le!(0); // reloff
+    u32le!(0); // nreloc
+    u32le!(0); // flags
+    u32le!(0); // reserved1
+    u32le!(0); // reserved2
+
+    // LC_SEGMENT "__LINKEDIT" (56 bytes, no sections)
+    u32le!(0x01);
+    u32le!(56);
+    name!("__LINKEDIT", 16);
+    u32le!(0x2000); // vmaddr
+    u32le!(0x1000); // vmsize
+    u32le!(0x2000); // fileoff
+    u32le!(0); // filesize
+    u32le!(1); // maxprot
+    u32le!(1); // initprot
+    u32le!(0); // nsects
+    u32le!(0); // flags
+
+    // LC_BUILD_VERSION (24 bytes, identical layout at both widths)
+    u32le!(0x32);
+    u32le!(24);
+    u32le!(1); // platform
+    u32le!(0x000f_0000); // minos 15.0
+    u32le!(0x000f_0000); // sdk 15.0
+    u32le!(0); // ntools
+
+    // Same tail as the 64-bit fixture: load-command slack, 4-byte __text at
+    // 0x1000, zero-fill through the __LINKEDIT page.
+    b.resize(0x1000, 0);
+    b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+    b.resize(0x2000, 0);
+    b
+}
+
+/// [`make_minimal_macho_32`] whose `__LINKEDIT` load command is an
+/// `LC_SEGMENT_64` (72 B, `u64` sizes) inside a 32-bit header — a
+/// mixed-width image that must be rejected rather than signed.
+pub(crate) fn make_minimal_macho_32_mixed_linkedit() -> Vec<u8> {
+    let mut b = Vec::new();
+    macro_rules! u32le {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
+    macro_rules! u64le {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u64).to_le_bytes())
+        };
+    }
+    macro_rules! name {
+        ($s:expr, $len:expr) => {
+            let mut n = [0u8; 16];
+            n[..$s.len()].copy_from_slice($s.as_bytes());
+            b.extend_from_slice(&n[..$len]);
+        };
+    }
+
+    // mach_header (28 bytes, no reserved word)
+    u32le!(0xfeedface); // MH_MAGIC
+    u32le!(0x0000_000c); // CPU_TYPE_ARM
+    u32le!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+    u32le!(2); // MH_EXECUTE
+    u32le!(3); // ncmds
+    u32le!(124 + 72 + 24); // sizeofcmds: 64-bit __LINKEDIT instead of 56
+    u32le!(0x1); // MH_NOUNDEFS
+
+    // LC_SEGMENT "__TEXT" (124 bytes: 56-byte command + one 68-byte section)
+    u32le!(0x01);
+    u32le!(124);
+    name!("__TEXT", 16);
+    u32le!(0x1000); // vmaddr
+    u32le!(0x1000); // vmsize
+    u32le!(0x1000); // fileoff
+    u32le!(0x1000); // filesize
+    u32le!(7); // maxprot
+    u32le!(7); // initprot
+    u32le!(1); // nsects
+    u32le!(0); // flags
+    name!("__text", 16); // section sectname
+    name!("__TEXT", 16); // section segname
+    u32le!(0x1000); // addr
+    u32le!(4); // size
+    u32le!(0x1000); // offset
+    u32le!(0); // align
+    u32le!(0); // reloff
+    u32le!(0); // nreloc
+    u32le!(0); // flags
+    u32le!(0); // reserved1
+    u32le!(0); // reserved2
+
+    // LC_SEGMENT_64 "__LINKEDIT" (72 bytes) — width disagrees with the header.
+    u32le!(0x19);
+    u32le!(72);
+    name!("__LINKEDIT", 16);
+    u64le!(0x2000); // vmaddr
+    u64le!(0x1000); // vmsize
+    u64le!(0x2000); // fileoff
+    u64le!(0); // filesize
+    u32le!(1); // maxprot
+    u32le!(1); // initprot
+    u32le!(0); // nsects
+    u32le!(0); // flags
+
+    // LC_BUILD_VERSION (24 bytes, identical layout at both widths)
+    u32le!(0x32);
+    u32le!(24);
+    u32le!(1); // platform
+    u32le!(0x000f_0000); // minos 15.0
+    u32le!(0x000f_0000); // sdk 15.0
+    u32le!(0); // ntools
+
+    b.resize(0x1000, 0);
+    b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+    b.resize(0x2000, 0);
+    b
+}
+
+/// Byte-for-byte layout of [`make_minimal_macho_32`], with every integer
+/// encoded big-endian (`MH_CIGAM`) — the typed-rejection input.
+pub(crate) fn make_minimal_macho_32_be() -> Vec<u8> {
+    let mut b = Vec::new();
+    macro_rules! u32be {
+        ($v:expr) => {
+            b.extend_from_slice(&($v as u32).to_be_bytes())
+        };
+    }
+    macro_rules! name {
+        ($s:expr, $len:expr) => {
+            let mut n = [0u8; 16];
+            n[..$s.len()].copy_from_slice($s.as_bytes());
+            b.extend_from_slice(&n[..$len]);
+        };
+    }
+
+    // mach_header (28 bytes, big-endian)
+    u32be!(0xfeedface); // MH_CIGAM once read little-endian
+    u32be!(0x0000_000c); // CPU_TYPE_ARM
+    u32be!(0x0000_0009); // CPU_SUBTYPE_ARM_V7
+    u32be!(2); // MH_EXECUTE
+    u32be!(3); // ncmds
+    u32be!(124 + 56 + 24); // sizeofcmds
+    u32be!(0x1); // MH_NOUNDEFS
+
+    // LC_SEGMENT "__TEXT" (124 bytes: 56-byte command + one 68-byte section)
+    u32be!(0x01);
+    u32be!(124);
+    name!("__TEXT", 16);
+    u32be!(0x1000); // vmaddr
+    u32be!(0x1000); // vmsize
+    u32be!(0x1000); // fileoff
+    u32be!(0x1000); // filesize
+    u32be!(7); // maxprot
+    u32be!(7); // initprot
+    u32be!(1); // nsects
+    u32be!(0); // flags
+    name!("__text", 16);
+    name!("__TEXT", 16);
+    u32be!(0x1000); // addr
+    u32be!(4); // size
+    u32be!(0x1000); // offset
+    u32be!(0); // align
+    u32be!(0); // reloff
+    u32be!(0); // nreloc
+    u32be!(0); // flags
+    u32be!(0); // reserved1
+    u32be!(0); // reserved2
+
+    // LC_SEGMENT "__LINKEDIT" (56 bytes, no sections)
+    u32be!(0x01);
+    u32be!(56);
+    name!("__LINKEDIT", 16);
+    u32be!(0x2000); // vmaddr
+    u32be!(0x1000); // vmsize
+    u32be!(0x2000); // fileoff
+    u32be!(0); // filesize
+    u32be!(1); // maxprot
+    u32be!(1); // initprot
+    u32be!(0); // nsects
+    u32be!(0); // flags
+
+    // LC_BUILD_VERSION (24 bytes)
+    u32be!(0x32);
+    u32be!(24);
+    u32be!(1); // platform
+    u32be!(0x000f_0000); // minos 15.0
+    u32be!(0x000f_0000); // sdk 15.0
+    u32be!(0); // ntools
+
+    b.resize(0x1000, 0);
+    b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+    b.resize(0x2000, 0);
+    b
+}
+
 /// `make_minimal_macho` extended with an existing LC_CODE_SIGNATURE whose
 /// `slot_len`-byte slot begins at 0x2000 (inside `__LINKEDIT`, whose filesize
 /// covers the slot), filled with 0xAA. Builds a parseable already-signed image.

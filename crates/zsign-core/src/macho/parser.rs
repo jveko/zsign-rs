@@ -279,7 +279,10 @@ impl MachOFile {
                         text_segment_base = seg.vmaddr;
                         text_segment_fileoff = seg.fileoff;
                     }
-                    if seg.segname.starts_with(b"__LINKEDIT") {
+                    // A __LINKEDIT command whose width disagrees with the header
+                    // cannot be rewritten safely; refusing to capture it makes the
+                    // write paths fail closed rather than corrupt the image.
+                    if is_64 && seg.segname.starts_with(b"__LINKEDIT") {
                         meta_linkedit_cmd =
                             Some((lc.offset, seg.fileoff, seg.vmsize, seg.filesize));
                     }
@@ -292,6 +295,14 @@ impl MachOFile {
                         text_segment_size = seg.filesize as u64;
                         text_segment_base = seg.vmaddr as u64;
                         text_segment_fileoff = seg.fileoff as u64;
+                    }
+                    if !is_64 && seg.segname.starts_with(b"__LINKEDIT") {
+                        meta_linkedit_cmd = Some((
+                            lc.offset,
+                            seg.fileoff as u64,
+                            seg.vmsize as u64,
+                            seg.filesize as u64,
+                        ));
                     }
                     if seg.fileoff > 0
                         && seg.filesize > 0
@@ -739,6 +750,23 @@ mod tests {
         assert_eq!(enc.cryptoff, 0x1000);
         assert_eq!(enc.cryptsize, 0x2000);
         assert!(slice.is_encrypted(), "32-bit cryptid=1 must be encrypted");
+    }
+
+    #[test]
+    fn test_parse_32bit_linkedit_metadata() {
+        let data = crate::macho::fixtures::make_minimal_macho_32();
+        let file = MachOFile::parse(data).expect("32-bit fixture parses");
+        let slice = &file.slices()[0];
+        assert!(!slice.is_64);
+        let (lc_off, fileoff, vmsize, filesize) = slice
+            .metadata
+            .linkedit_cmd
+            .expect("__LINKEDIT must be captured from the Segment32 arm");
+        // 28-byte 32-bit header + 124-byte __TEXT command.
+        assert_eq!(lc_off, 152, "__LINKEDIT command offset");
+        assert_eq!(fileoff, 0x2000);
+        assert_eq!(vmsize, 0x1000);
+        assert_eq!(filesize, 0);
     }
 
     #[test]
