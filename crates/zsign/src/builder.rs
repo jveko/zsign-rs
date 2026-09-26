@@ -1015,4 +1015,39 @@ mod tests {
             "entitlements slot must carry the profile's entitlements"
         );
     }
+    #[test]
+    fn validate_failure_leaves_input_tree_untouched() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // .app: abort before any bundle mutation
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        let plist_before = std::fs::read(app.join("Info.plist")).unwrap();
+        let result = ZSign::new().sign_bundle(&app, None);
+        assert!(matches!(result, Err(Error::MissingCredentials(_))));
+        assert!(!app.join("_CodeSignature").exists());
+        assert_eq!(std::fs::read(app.join("Info.plist")).unwrap(), plist_before);
+
+        // .ipa: output must never be created, input bytes unchanged
+        let ipa = dir.path().join("in.ipa");
+        write_ipa_fixture(&ipa);
+        let ipa_before = std::fs::read(&ipa).unwrap();
+        let out = dir.path().join("out.ipa");
+        let result = ZSign::new().sign_ipa(&ipa, &out);
+        assert!(matches!(result, Err(Error::MissingCredentials(_))));
+        assert!(!out.exists());
+        assert_eq!(std::fs::read(&ipa).unwrap(), ipa_before);
+
+        // bare macho: output must never be created
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+        let out_bin = dir.path().join("signed.bin");
+        let result = ZSign::new().sign_macho(&input, &out_bin);
+        assert!(matches!(result, Err(Error::MissingCredentials(_))));
+        assert!(!out_bin.exists());
+    }
 }
