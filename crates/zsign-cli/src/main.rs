@@ -57,6 +57,14 @@ struct Cli {
     )]
     profile_map: Vec<(String, PathBuf)>,
 
+    /// Remove embedded.mobileprovision from every bundle before signing, so the
+    /// output's CodeResources never references it. The result carries no
+    /// provisioning profile, so it installs only where profile validation is
+    /// bypassed.
+    /// Applies to app bundles and IPAs; ignored for bare Mach-O input.
+    #[arg(short = 'R', long)]
+    remove_profile: bool,
+
     /// Custom entitlements file (replaces the profile's entitlements)
     #[arg(short = 'e', long)]
     entitlements: Option<PathBuf>,
@@ -139,6 +147,7 @@ struct Cli {
             "pkcs12",
             "profile",
             "profile_map",
+            "remove_profile",
             "entitlements",
             "entitlements_dir",
             "zip_level",
@@ -212,6 +221,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if !cli.profile_map.is_empty() {
         signer = signer.bundle_profiles(cli.profile_map.clone());
+    }
+
+    if cli.remove_profile {
+        signer = signer.remove_embedded_profile(true);
     }
 
     if let Some(bundle_id) = cli.bundle_id {
@@ -1745,6 +1758,36 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
         assert!(Cli::try_parse_from(["zsign", "-a", "--profile-map", "a=b", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn remove_profile_flag_parses_short_and_long() {
+        for args in [
+            ["zsign", "-a", "-R", "in.ipa"],
+            ["zsign", "-a", "--remove-profile", "in.ipa"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("must parse");
+            assert!(cli.remove_profile);
+        }
+        // The flag is a bool: it must be absent (false) by default.
+        let cli = Cli::try_parse_from(["zsign", "-a", "in.ipa"]).expect("must parse");
+        assert!(!cli.remove_profile);
+    }
+
+    #[test]
+    fn verify_conflicts_with_remove_profile() {
+        for extra in [
+            vec!["zsign", "-V", "-R", "in.ipa"],
+            vec!["zsign", "-R", "-V", "in.ipa"],
+        ] {
+            assert_eq!(
+                parse_err(&extra).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        // alone-valid controls
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-a", "-R", "in.ipa"]).is_ok());
     }
 
     #[test]

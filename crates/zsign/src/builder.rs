@@ -92,6 +92,8 @@ pub struct ZSign {
     entitlements_dir: Option<PathBuf>,
     /// Per-nested-bundle provisioning profiles keyed by bundle id
     bundle_profiles: Vec<(String, PathBuf)>,
+    /// Strip `embedded.mobileprovision` from every bundle before sealing
+    remove_embedded_profile: bool,
 }
 
 impl ZSign {
@@ -120,6 +122,7 @@ impl ZSign {
             entitlements: None,
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
+            remove_embedded_profile: false,
         }
     }
 
@@ -230,6 +233,29 @@ impl ZSign {
     /// ```
     pub fn bundle_profiles(mut self, profiles: Vec<(String, PathBuf)>) -> Self {
         self.bundle_profiles = profiles;
+        self
+    }
+
+    /// Strips `embedded.mobileprovision` from every bundle before sealing.
+    ///
+    /// A pre-existing profile is removed from the tree and no resolved profile
+    /// is embedded, at the root and in every nested bundle alike. Entitlements
+    /// are unaffected: they are still derived from whatever profiles were
+    /// configured, only the embedded file is withheld.
+    ///
+    /// The result carries no provisioning profile, so it installs only where
+    /// profile validation is bypassed (jailbroken devices, enterprise
+    /// re-signing flows); a stock device rejects it at install time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zsign_rs::ZSign;
+    ///
+    /// let zsign = ZSign::new().remove_embedded_profile(true);
+    /// ```
+    pub fn remove_embedded_profile(mut self, remove: bool) -> Self {
+        self.remove_embedded_profile = remove;
         self
     }
 
@@ -497,6 +523,7 @@ impl ZSign {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
         }
         signer = signer.allow_encrypted(self.allow_encrypted);
+        signer = signer.remove_embedded_profile(self.remove_embedded_profile);
 
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
@@ -562,6 +589,7 @@ impl ZSign {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
         }
         signer = signer.allow_encrypted(self.allow_encrypted);
+        signer = signer.remove_embedded_profile(self.remove_embedded_profile);
         if let Some(ref profile) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile);
         }
@@ -960,6 +988,15 @@ mod tests {
         let mut buf = Vec::new();
         zip.by_name(name).unwrap().read_to_end(&mut buf).unwrap();
         buf
+    }
+
+    /// Every entry name in an IPA.
+    fn ipa_entry_names(path: &std::path::Path) -> Vec<String> {
+        let f = std::fs::File::open(path).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
     }
 
     /// Locate the code signature of a thin Mach-O and parse its SuperBlob.
@@ -1730,6 +1767,68 @@ mod tests {
             ),
             std::fs::read(&ext_profile).unwrap(),
             "the mapped profile must be embedded in the signed IPA's appex"
+        );
+    }
+
+    #[test]
+    fn test_sign_bundle_forwards_remove_embedded_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        // Pre-seeded junk profile: it survives a sign that does NOT forward -R.
+        std::fs::write(app.join("embedded.mobileprovision"), b"junk").unwrap();
+
+        ZSign::new()
+            .adhoc(true)
+            .remove_embedded_profile(true)
+            .sign_bundle(&app, None)
+            .expect("sign_bundle must forward -R");
+
+        assert!(
+            !app.join("embedded.mobileprovision").exists(),
+            "sign_bundle must forward remove_embedded_profile to IpaSigner"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_forwards_remove_embedded_profile() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("in.ipa");
+        {
+            let file = std::fs::File::create(&input).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("Payload/Test.app/Info.plist", opts).unwrap();
+            zip.write_all(FIXTURE_PLIST).unwrap();
+            zip.start_file("Payload/Test.app/Test", opts).unwrap();
+            zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+            zip.start_file("Payload/Test.app/embedded.mobileprovision", opts)
+                .unwrap();
+            zip.write_all(b"junk").unwrap();
+            zip.finish().unwrap();
+        }
+        let out = dir.path().join("out.ipa");
+
+        ZSign::new()
+            .adhoc(true)
+            .remove_embedded_profile(true)
+            .sign_ipa(&input, &out)
+            .expect("sign_ipa must forward -R");
+
+        // `ipa_entry` unwraps, so the absence itself is the assertion: a
+        // forwarded -R leaves no such entry in the repacked archive.
+        let names = ipa_entry_names(&out);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with("embedded.mobileprovision")),
+            "sign_ipa must forward remove_embedded_profile to IpaSigner: {names:?}"
         );
     }
 }

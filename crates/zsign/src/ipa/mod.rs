@@ -305,6 +305,8 @@ pub struct IpaSigner<'a> {
     entitlements_dir: Option<PathBuf>,
     /// Per-nested-bundle provisioning profiles keyed by bundle id
     bundle_profiles: Vec<(String, PathBuf)>,
+    /// Strip `embedded.mobileprovision` from every bundle before sealing
+    remove_embedded_profile: bool,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -328,6 +330,7 @@ impl<'a> IpaSigner<'a> {
             entitlements_override: None,
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
+            remove_embedded_profile: false,
         }
     }
 
@@ -347,7 +350,23 @@ impl<'a> IpaSigner<'a> {
             entitlements_override: None,
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
+            remove_embedded_profile: false,
         }
+    }
+
+    /// Strips `embedded.mobileprovision` from every bundle before sealing.
+    ///
+    /// A pre-existing profile is removed from the tree and no resolved profile
+    /// is embedded, at the root and in every nested bundle alike. Entitlements
+    /// are unaffected: they are still derived from whatever profiles were
+    /// configured, only the embedded file is withheld.
+    ///
+    /// The result carries no provisioning profile, so it installs only where
+    /// profile validation is bypassed (jailbroken devices, enterprise
+    /// re-signing flows); a stock device rejects it at install time.
+    pub fn remove_embedded_profile(mut self, remove: bool) -> Self {
+        self.remove_embedded_profile = remove;
+        self
     }
 
     /// Sets the compression level for the output IPA.
@@ -1211,6 +1230,24 @@ impl<'a> IpaSigner<'a> {
         profile_data: Option<&[u8]>,
         already_signed: &HashSet<PathBuf>,
     ) -> Result<()> {
+        // Strip first: the removal must be visible to the CodeResources scan
+        // below, or the seal would record a file that is no longer there.
+        if self.remove_embedded_profile {
+            let embedded_path = Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
+            match fs::remove_file(&embedded_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to remove embedded provisioning profile '{}' (-R): {e}",
+                            embedded_path.display()
+                        ),
+                    )))
+                }
+            }
+        }
         let identifier = self.get_bundle_identifier(bundle_path)?;
         let main_executable = self.get_main_executable(bundle_path)?;
 
@@ -1235,7 +1272,7 @@ impl<'a> IpaSigner<'a> {
 
         // The plan build hands this bundle the profile it resolved, so embedding
         // is decided by presence rather than by a separate main-app flag.
-        if let Some(data) = profile_data {
+        if let Some(data) = profile_data.filter(|_| !self.remove_embedded_profile) {
             let embedded_path = Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
             fs::write(&embedded_path, data).map_err(|e| {
                 Error::Core(zsign_core::Error::Signing(format!(
@@ -4065,6 +4102,153 @@ mod tests {
             std::fs::read(&profile).unwrap(),
             before,
             "the profile bytes on disk are never modified"
+        );
+    }
+
+    #[test]
+    fn test_remove_embedded_profile_strips_every_bundle() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        // Source-shipped profiles: junk bytes at the root and in the appex.
+        let root_profile = app.join("embedded.mobileprovision");
+        let appex_profile = appex.join("embedded.mobileprovision");
+        std::fs::write(&root_profile, b"junk root profile").unwrap();
+        std::fs::write(&appex_profile, b"junk appex profile").unwrap();
+
+        IpaSigner::new_adhoc()
+            .remove_embedded_profile(true)
+            .sign_folder_in_place(&app)
+            .expect("signing with -R must succeed");
+
+        assert!(
+            !root_profile.exists(),
+            "the root embedded.mobileprovision must be stripped"
+        );
+        assert!(
+            !appex_profile.exists(),
+            "a nested embedded.mobileprovision must be stripped too"
+        );
+
+        // The result self-seals: CodeResources is computed after the strip, so
+        // no missing/mismatched entry may name the removed file. The walk
+        // covers the ROOT and every nested bundle — signing is deepest-first,
+        // so a strip-after-seal regression would poison the APPEX's own
+        // CodeResources, which a root-only check cannot see. Only this
+        // dimension is asserted: the self-signed test certificate is not
+        // anchored to a trusted root, so full `valid()` fails by construction.
+        let report = crate::verify::verify_bundle(&app).expect("verify must run");
+        let bundle = report
+            .bundle
+            .as_ref()
+            .expect("verify must report the bundle");
+        let sealed: Vec<&crate::verify::BundleVerification> = std::iter::once(bundle)
+            .chain(bundle.nested.iter())
+            .collect();
+        assert!(
+            sealed.iter().any(|b| b.path.contains("Ext.appex")),
+            "the appex must be among the verified nested bundles, or this walk \
+             proves nothing about it: {:?}",
+            sealed.iter().map(|b| &b.path).collect::<Vec<_>>()
+        );
+        let mut findings: Vec<String> = Vec::new();
+        for b in &sealed {
+            let Some(resources) = b.code_resources.as_ref() else {
+                continue;
+            };
+            findings.extend(
+                resources
+                    .missing
+                    .iter()
+                    .chain(resources.mismatched.iter())
+                    .chain(resources.unsealed.iter())
+                    .map(|f| format!("{}: {f}", b.path)),
+            );
+        }
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.contains("embedded.mobileprovision")),
+            "the stripped profile must not appear in any bundle's CodeResources \
+             findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_remove_embedded_profile_failure_names_the_path() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        // A DIRECTORY at the profile path: `fs::remove_file` answers
+        // IsADirectory, which is neither Ok nor NotFound, so this reaches the
+        // strip's error arm deterministically and without depending on DAC or
+        // on the test not running as root (the same idiom as the Task 2
+        // non-regular-entry pin).
+        let stuck = app.join("embedded.mobileprovision");
+        std::fs::create_dir(&stuck).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .remove_embedded_profile(true)
+            .sign_folder_in_place(&app)
+            .expect_err("an unremovable profile must fail the sign");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to remove embedded provisioning profile"),
+            "the error must name the failure: {message}"
+        );
+        assert!(
+            message.contains("embedded.mobileprovision"),
+            "the error must name the offending file: {message}"
+        );
+        assert!(
+            message.contains("-R"),
+            "the error must say which option produced it: {message}"
+        );
+    }
+
+    #[test]
+    fn test_remove_embedded_profile_skips_embed_but_keeps_derived_entitlements() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let root_profile = temp.path().join("root.mobileprovision");
+        std::fs::write(&root_profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        // Derive-but-don't-embed: entitlements still come from the profiles, but
+        // no profile bytes are written and none are left behind.
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&root_profile)
+            .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile)])
+            .remove_embedded_profile(true)
+            .sign_folder_in_place(&app)
+            .expect("signing with profiles and -R must succeed");
+
+        assert!(
+            !app.join("embedded.mobileprovision").exists(),
+            "the root profile must not be embedded under -R"
+        );
+        assert!(
+            !appex.join("embedded.mobileprovision").exists(),
+            "the mapped profile must not be embedded under -R"
+        );
+
+        let root_blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root binary must still carry derived entitlements");
+        assert!(
+            String::from_utf8_lossy(&root_blob).contains("com.zsign.profile.entitlement"),
+            "the root entitlements are still derived from the profile: {root_blob:?}"
+        );
+        let appex_blob = signature_slot_blob(
+            &appex.join("Ext"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the appex binary must still carry derived entitlements");
+        assert!(
+            String::from_utf8_lossy(&appex_blob).contains("com.zsign.ext.ent"),
+            "the appex entitlements are still derived from its mapped profile: {appex_blob:?}"
         );
     }
 }
