@@ -323,8 +323,12 @@ pub fn parse_and_verify(
 /// responder is free to encode the serial with a different (still valid)
 /// INTEGER length, and a byte compare would silently downgrade a legitimate
 /// answer to `Malformed`.
+/// The four compared fields of a DER `CertID`: hash algorithm, issuer name hash,
+/// issuer key hash, serial magnitude.
+type CertIdFields = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 fn cert_ids_match(a: &[u8], b: &[u8]) -> bool {
-    fn fields(cid: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    fn fields(cid: &[u8]) -> Option<CertIdFields> {
         let mut outer = DerReader::new(cid);
         let body = outer.read_sequence().ok()?;
         let mut r = DerReader::new(body);
@@ -346,7 +350,10 @@ fn cert_ids_match(a: &[u8], b: &[u8]) -> bool {
             .to_vec();
         Some((alg, name, key, serial))
     }
-    fields(a).is_some() && fields(a) == fields(b)
+    match (fields(a), fields(b)) {
+        (Some(a_fields), Some(b_fields)) => a_fields == b_fields,
+        _ => false,
+    }
 }
 
 /// `responderID CHOICE { byName [1] Name, byKey [2] KeyHash }` (RFC 6960 §4.2.1).
