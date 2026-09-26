@@ -30,7 +30,7 @@ spki = { version = "0.7", features = ["pem"] }
 rayon = "1.11"
 
 # PKCS#12 decryption (pure Rust, wasm-compatible)
-aes = "0.8"
+aes = "0.9"
 des = "0.8"
 rc2 = "0.8"
 pbkdf2 = "0.12"
