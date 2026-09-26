@@ -366,7 +366,8 @@ public shape — the credential-hardening spec froze it for structural reasons
 sites exist in tests/benches, zero in production.
 
 **Revocation coverage is hermetic in two layers.** Layer 1, every target: canned DER — the
-`build_request` output is compared byte-for-byte with openssl's own 106-byte request (P12), and
+`build_request` output is compared byte-for-byte with openssl's own 106-byte request (P12, the
+`CertID` as a byte-substring), and
 `parse_and_verify` is driven by the `good`/`revoked`/`stale`/`mis-signed` DER fixtures (P14) with an
 injected `now`. Layer 2, native only: a `TcpListener` bound to `127.0.0.1:0` inside the test serves
 the canned bytes through the real `HttpTransport`, so the header set, the size cap, the read timeout
