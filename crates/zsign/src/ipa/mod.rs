@@ -2049,6 +2049,51 @@ mod tests {
         out
     }
 
+    /// Permission bits recorded in the zip for `name`.
+    fn zip_entry_mode(bytes: &[u8], name: &str) -> u32 {
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entry = archive.by_name(name).expect("entry must exist");
+        entry
+            .unix_mode()
+            .unwrap_or_else(|| panic!("entry {name} carries no unix mode"))
+    }
+
+    /// A zip whose `Payload/Test.app/Test` is 0o755, the mode a real IPA
+    /// has for its main executable. `patch_central_dir_unix_mode`-style
+    /// rewriting is avoided here: the bytes fixture is built with the
+    /// permission-bearing `FileOptions` directly.
+    fn test_ipa_bytes_exec_mode(mode: u32) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(&mut buf);
+        let dir_options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", dir_options).unwrap();
+        zip.add_directory("Payload/Test.app/", dir_options).unwrap();
+        zip.start_file("Payload/Test.app/Info.plist", dir_options)
+            .unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleExecutable</key>
+    <string>Test</string>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+        let exec_options = SimpleFileOptions::default().unix_permissions(mode);
+        zip.start_file("Payload/Test.app/Test", exec_options)
+            .unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.start_file("Payload/Test.app/data.bin", dir_options)
+            .unwrap();
+        zip.write_all(&[0xAB; 4096]).unwrap();
+        zip.finish().unwrap();
+        buf.into_inner()
+    }
+
     #[test]
     fn test_sign_ipa_bytes_round_trip() {
         let input = test_ipa_bytes(&[(
@@ -2113,6 +2158,42 @@ mod tests {
                 .iter()
                 .any(|n| n == "SwiftSupport/iphoneos/libswiftCore.dylib"),
             "the carried root entry must survive; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_preserves_executable_mode() {
+        // The reviewer-proven divergence: a 0o755 executable came out 0o644
+        // through the bytes path because the store dropped the mode on rewrite.
+        let input = test_ipa_bytes_exec_mode(0o755);
+        assert_eq!(
+            zip_entry_mode(&input, "Payload/Test.app/Test") & 0o777,
+            0o755
+        );
+
+        let signed = IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_ipa_bytes(&input)
+            .expect("bytes signing must succeed");
+        assert_eq!(
+            zip_entry_mode(&signed, "Payload/Test.app/Test") & 0o777,
+            0o755,
+            "signing must not downgrade the main executable to the zip default"
+        );
+
+        // Stronger form: both paths must agree on the mode, not merely match
+        // the fixture's own 0o755.
+        let temp = TempDir::new().unwrap();
+        let input_path = temp.path().join("in.ipa");
+        fs::write(&input_path, &input).unwrap();
+        let native_out = temp.path().join("out.ipa");
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .sign(&input_path, &native_out)
+            .expect("native signing must succeed");
+        let native = fs::read(&native_out).unwrap();
+        assert_eq!(
+            zip_entry_mode(&native, "Payload/Test.app/Test") & 0o777,
+            zip_entry_mode(&signed, "Payload/Test.app/Test") & 0o777,
+            "the bytes path must match the native path's executable mode"
         );
     }
 

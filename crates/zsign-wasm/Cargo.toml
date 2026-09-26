@@ -24,4 +24,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-zip = "7.0"
+zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }

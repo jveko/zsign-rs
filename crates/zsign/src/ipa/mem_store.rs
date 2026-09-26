@@ -185,12 +185,15 @@ impl MemStore {
     /// Immediate children of `dir` in sorted name order.
     fn children(nodes: &BTreeMap<PathBuf, Node>, dir: &Path) -> Vec<(PathBuf, PathBuf, StoreKind)> {
         let mut out: Vec<(PathBuf, PathBuf, StoreKind)> = Vec::new();
-        for (key, node) in nodes {
-            if *key == dir {
-                continue;
-            }
+        // `PathBuf` orders component-wise, so `dir` and its whole subtree
+        // form one contiguous run starting at `dir`; the first key that no
+        // longer starts with `dir` ends it. A directory visit therefore
+        // scans one subtree block instead of the whole map, so a full walk
+        // costs O(nodes * depth) — linear for the shallow trees an IPA
+        // payload has, where the old full-map rescan cost O(nodes * dirs).
+        for (key, node) in nodes.range(dir.to_path_buf()..) {
             if !key.starts_with(dir) {
-                continue;
+                break;
             }
             let Some(parent) = key.parent() else { continue };
             if parent != dir {
@@ -272,11 +275,19 @@ impl Store for MemStore {
         let key = Self::normalize(path)?;
         let mut nodes = self.lock();
         Self::check_ancestors_dir(&nodes, &key)?;
+        // `fs::write` rewrites an existing file in place, so its mode
+        // survives. Carry the old node's mode onto the replacement so a
+        // rewrite of a 0o755 executable stays executable; a fresh path keeps
+        // `None`, which `create_dir_all`/`set_permissions` flows then fill in.
+        let unix_mode = match nodes.get(&key) {
+            Some(Node::File { unix_mode, .. }) => *unix_mode,
+            _ => None,
+        };
         nodes.insert(
             key,
             Node::File {
                 bytes: data.to_vec(),
-                unix_mode: None,
+                unix_mode,
             },
         );
         Ok(())
@@ -673,5 +684,41 @@ mod tests {
         s.remove_file(Path::new("d/f")).unwrap();
         assert!(!s.exists(Path::new("d/f")));
         assert!(s.remove_file(Path::new("d/f")).is_err());
+    }
+
+    #[test]
+    fn write_carries_existing_node_mode_and_set_permissions_overrides() {
+        let s = store();
+        s.create_dir_all(Path::new("d")).unwrap();
+        s.write(Path::new("d/bin"), b"first").unwrap();
+        // A fresh file has no mode yet: `create_dir_all`-style flows and
+        // `set_permissions` fill it in afterwards.
+        assert_eq!(s.metadata(Path::new("d/bin")).unwrap().unix_mode, None);
+
+        s.set_permissions(Path::new("d/bin"), 0o100755).unwrap();
+        s.write(Path::new("d/bin"), b"second").unwrap();
+        assert_eq!(s.read(Path::new("d/bin")).unwrap(), b"second");
+        assert_eq!(
+            s.metadata(Path::new("d/bin")).unwrap().unix_mode,
+            Some(0o100755),
+            "a rewrite must not drop the executable bit, as fs::write would not"
+        );
+
+        // set_permissions still wins over the carried mode.
+        s.set_permissions(Path::new("d/bin"), 0o100700).unwrap();
+        s.write(Path::new("d/bin"), b"third").unwrap();
+        assert_eq!(
+            s.metadata(Path::new("d/bin")).unwrap().unix_mode,
+            Some(0o100700)
+        );
+
+        // Another file in the same tree behaves identically.
+        s.write(Path::new("d/other"), b"o").unwrap();
+        s.set_permissions(Path::new("d/other"), 0o100600).unwrap();
+        s.write(Path::new("d/other"), b"p").unwrap();
+        assert_eq!(
+            s.metadata(Path::new("d/other")).unwrap().unix_mode,
+            Some(0o100600)
+        );
     }
 }
