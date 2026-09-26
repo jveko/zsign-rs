@@ -25,11 +25,18 @@
 //! - Main executable (has embedded signature via `CFBundleExecutable`)
 //! - Custom patterns added via [`CodeResourcesBuilder::exclude`]
 
+use crate::store::{FsStore, Store, StoreKind};
 use crate::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+
+/// Hash of a symlink's raw target bytes, plus the lossy string form recorded
+/// in the plist.
+type SymlinkHashes = ([u8; 20], [u8; 32], String);
+
+/// One `(PathBuf, StoreKind)` entry of a pre-collected walk.
+type WalkEntry = (PathBuf, StoreKind);
 
 /// A single file or symlink entry discovered during bundle scanning.
 struct ScannedEntry {
@@ -62,15 +69,17 @@ struct ScannedEntry {
 ///
 /// The builder automatically excludes:
 /// - `_CodeSignature/` directory (contains the signature itself)
-/// - The main executable specified in `Info.plist` (has embedded signature)
-pub struct CodeResourcesBuilder {
+pub struct CodeResourcesBuilder<'a> {
+    /// Storage medium the scan reads through: `FsStore` for the public
+    /// path-based constructor, the in-memory tree for the bytes pipeline.
+    store: &'a dyn Store,
     /// Root bundle path
     bundle_path: PathBuf,
     /// Core builder (data-driven, no filesystem)
     inner: zsign_core::bundle::CodeResourcesBuilder,
 }
 
-impl CodeResourcesBuilder {
+impl<'a> CodeResourcesBuilder<'a> {
     /// Creates a new [`CodeResourcesBuilder`] for the given bundle path.
     ///
     /// Automatically reads `Info.plist` to determine the main executable
@@ -85,23 +94,32 @@ impl CodeResourcesBuilder {
     /// # Ok::<(), zsign_rs::Error>(())
     /// ```
     pub fn new(bundle_path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_store(&FsStore, bundle_path)
+    }
+
+    /// Crate-internal constructor for the generic sign stage: the same
+    /// builder backed by an arbitrary store.
+    pub(crate) fn with_store(store: &'a dyn Store, bundle_path: impl AsRef<Path>) -> Result<Self> {
         let bundle_path = bundle_path.as_ref().to_path_buf();
         let mut inner = zsign_core::bundle::CodeResourcesBuilder::new();
 
         // Read main executable from Info.plist — propagate errors if file exists
-        match Self::read_main_executable(&bundle_path) {
+        match Self::read_main_executable(store, &bundle_path) {
             Ok(Some(exec_name)) => inner.set_main_executable(exec_name),
             Ok(None) => {}
             Err(e) => return Err(e),
         }
 
-        Ok(Self { bundle_path, inner })
+        Ok(Self {
+            store,
+            bundle_path,
+            inner,
+        })
     }
 
     /// Adds a custom exclusion pattern.
     ///
     /// Files with paths starting with this pattern will be excluded from hashing.
-    ///
     /// # Examples
     ///
     /// ```no_run
@@ -145,64 +163,28 @@ impl CodeResourcesBuilder {
     pub fn scan(&mut self) -> Result<&mut Self> {
         let bundle_path = self.bundle_path.clone();
         let inner = &self.inner;
+        let store = self.store;
 
-        // Collect all entries first (WalkDir is not Send, so we collect to Vec)
-        let entries: Vec<_> = WalkDir::new(&bundle_path)
-            .follow_links(false)
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                Error::Io(std::io::Error::other(format!(
-                    "Failed to walk directory: {}",
-                    e
-                )))
-            })?;
+        // Collect all entries first (the walk hands back owned data, so it is
+        // not Send); per-entry errors propagate as they do today.
+        let mut entries: Vec<WalkEntry> = Vec::new();
+        for entry in store.walk(&bundle_path)? {
+            let entry = entry?;
+            entries.push(entry);
+        }
 
         // Process entries in parallel
+        #[cfg(not(target_arch = "wasm32"))]
         let results: Vec<_> = entries
             .par_iter()
-            .map(|entry| -> Result<Option<ScannedEntry>> {
-                let path = entry.path();
-                let file_type = entry.file_type();
-                let is_symlink = file_type.is_symlink();
-
-                if !is_symlink && file_type.is_dir() {
-                    return Ok(None);
-                }
-
-                let relative_path = path
-                    .strip_prefix(&bundle_path)
-                    .map_err(|e| {
-                        Error::Io(std::io::Error::other(format!(
-                            "Failed to strip prefix: {}",
-                            e
-                        )))
-                    })?
-                    .to_string_lossy()
-                    .to_string();
-
-                if inner.should_exclude(&relative_path) {
-                    return Ok(None);
-                }
-
-                if is_symlink {
-                    let (sha1, sha256, target) = Self::hash_symlink_entry(path)?;
-                    Ok(Some(ScannedEntry {
-                        path: relative_path,
-                        sha1,
-                        sha256,
-                        symlink_target: Some(target),
-                    }))
-                } else {
-                    let (sha1, sha256) = hash_file_streaming(path)?;
-                    Ok(Some(ScannedEntry {
-                        path: relative_path,
-                        sha1,
-                        sha256,
-                        symlink_target: None,
-                    }))
-                }
-            })
+            .map(|(path, kind)| Self::hash_entry(store, &bundle_path, inner, path, *kind))
+            .collect::<Result<Vec<_>>>()?;
+        // rayon's thread pool cannot run on wasm32; output bytes are
+        // order-independent, so the sequential arm is equivalent.
+        #[cfg(target_arch = "wasm32")]
+        let results: Vec<_> = entries
+            .iter()
+            .map(|(path, kind)| Self::hash_entry(store, &bundle_path, inner, path, *kind))
             .collect::<Result<Vec<_>>>()?;
 
         for entry in results.into_iter().flatten() {
@@ -215,6 +197,55 @@ impl CodeResourcesBuilder {
         }
 
         Ok(self)
+    }
+
+    /// Hashes one walked bundle entry (or `None` when it is an excluded
+    /// directory), shared verbatim by the parallel and sequential scan arms.
+    fn hash_entry(
+        store: &dyn Store,
+        bundle_path: &Path,
+        inner: &zsign_core::bundle::CodeResourcesBuilder,
+        path: &Path,
+        kind: StoreKind,
+    ) -> Result<Option<ScannedEntry>> {
+        let is_symlink = kind == StoreKind::Symlink;
+
+        if !is_symlink && kind == StoreKind::Dir {
+            return Ok(None);
+        }
+
+        let relative_path = path
+            .strip_prefix(bundle_path)
+            .map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "Failed to strip prefix: {}",
+                    e
+                )))
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        if inner.should_exclude(&relative_path) {
+            return Ok(None);
+        }
+
+        if is_symlink {
+            let (sha1, sha256, target) = Self::hash_symlink_entry(store, path)?;
+            Ok(Some(ScannedEntry {
+                path: relative_path,
+                sha1,
+                sha256,
+                symlink_target: Some(target),
+            }))
+        } else {
+            let (sha1, sha256) = hash_file_streaming(store, path)?;
+            Ok(Some(ScannedEntry {
+                path: relative_path,
+                sha1,
+                sha256,
+                symlink_target: None,
+            }))
+        }
     }
 
     /// Builds the CodeResources plist as XML bytes.
@@ -243,14 +274,14 @@ impl CodeResourcesBuilder {
     }
 
     /// Read the main executable name from Info.plist (CFBundleExecutable)
-    fn read_main_executable(bundle_path: &Path) -> Result<Option<String>> {
+    fn read_main_executable(store: &dyn Store, bundle_path: &Path) -> Result<Option<String>> {
         let info_plist_path = bundle_path.join("Info.plist");
 
-        if !info_plist_path.exists() {
+        if !store.exists(&info_plist_path) {
             return Ok(None);
         }
 
-        let data = fs::read(&info_plist_path)?;
+        let data = store.read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&data)?;
 
         let dict = plist.as_dictionary().ok_or_else(|| {
@@ -267,35 +298,22 @@ impl CodeResourcesBuilder {
     }
 
     /// Hash a symlink by hashing its target path
-    #[cfg(unix)]
-    fn hash_symlink_entry(path: &Path) -> Result<([u8; 20], [u8; 32], String)> {
-        use std::os::unix::ffi::OsStrExt;
-
-        let target = fs::read_link(path)?;
-        let target_bytes = target.as_os_str().as_bytes();
-        let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(target_bytes);
-        let target_str = target.to_string_lossy().to_string();
+    fn hash_symlink_entry(store: &dyn Store, path: &Path) -> Result<SymlinkHashes> {
+        // `FsStore::read_link` serves the raw target bytes on unix and
+        // reproduces this fn's non-unix rejection on other platforms.
+        let target_bytes = store.read_link(path)?;
+        let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&target_bytes);
+        let target_str = String::from_utf8_lossy(&target_bytes).to_string();
         Ok((sha1, sha256, target_str))
-    }
-
-    #[cfg(not(unix))]
-    fn hash_symlink_entry(path: &Path) -> Result<([u8; 20], [u8; 32], String)> {
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "Symlinks not supported on this platform: {}",
-                path.display()
-            ),
-        )))
     }
 }
 
-fn hash_file_streaming(path: &Path) -> Result<([u8; 20], [u8; 32])> {
+fn hash_file_streaming(store: &dyn Store, path: &Path) -> Result<([u8; 20], [u8; 32])> {
     use sha1::{Digest, Sha1};
     use sha2::Sha256;
     use std::io::Read;
 
-    let mut file = fs::File::open(path)?;
+    let mut file = store.open(path)?;
     let mut sha1_hasher = Sha1::new();
     let mut sha256_hasher = Sha256::new();
     let mut buf = [0u8; 65536];

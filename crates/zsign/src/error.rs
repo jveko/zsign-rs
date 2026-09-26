@@ -53,6 +53,10 @@ pub enum Error {
     /// Core library error (forwarded from zsign-core).
     #[error(transparent)]
     Core(zsign_core::Error),
+
+    /// An input exceeds a documented size limit.
+    #[error("Input too large: {0}")]
+    InputTooLarge(String),
 }
 
 impl From<zsign_core::Error> for Error {

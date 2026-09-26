@@ -24,6 +24,7 @@
 //! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
+use crate::store::Store;
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -40,7 +41,8 @@ struct ExtractEntry {
     outpath: PathBuf,
     is_dir: bool,
     is_symlink: bool,
-    #[cfg(unix)]
+    /// Recorded on every target: the mem materializer re-derives symlink-ness
+    /// from it, while the native pass only reads it under `cfg(unix)`.
     unix_mode: Option<u32>,
 }
 
@@ -104,8 +106,8 @@ fn is_safe_symlink_target(target: &str) -> bool {
 ///
 /// Matches Linux `PATH_MAX`: longer targets can never be created by
 /// `symlink(2)`, and bounding the read keeps a hostile entry from buffering
-/// gigabytes before validation. Unix-only, like the symlink pass that uses it.
-#[cfg(unix)]
+/// gigabytes before validation. Shared by the native symlink pass and the
+/// store-backed materializer.
 const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 
 /// The entry name as UTF-8 when the raw bytes are valid UTF-8, otherwise the
@@ -356,148 +358,10 @@ pub fn extract_ipa_with_limits(
         )));
     }
 
-    // First pass: collect entry metadata and create directories
-    let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
+    // First pass: collect entry metadata and register directories
     let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
     let mut file_paths: HashSet<PathBuf> = HashSet::new();
-
-    for i in 0..archive.len() {
-        let file = archive.by_index(i).map_err(Error::Zip)?;
-
-        let name = canonical_entry_name(&file);
-        if is_unsafe_entry_name(name) {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Unsafe entry name in IPA: {}", name),
-            )));
-        }
-
-        let outpath = if name == file.name() {
-            // Fast path: both readings agree (all flag-set and all-ASCII
-            // names) — today's containment chain runs unchanged.
-            match file.enclosed_name() {
-                Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
-                _ => {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Unsafe entry name in IPA: {}", name),
-                    )))
-                }
-            }
-        } else {
-            // Divergence: flag-clear valid-UTF-8 non-ASCII name. Mirror
-            // enclosed_name's acceptance set on the canonical name: the
-            // NUL gate first (the one check is_unsafe_entry_name lacks),
-            // then drop empty/"." segments, reject any segment that is not
-            // a plain path component — a Windows drive prefix anywhere
-            // would make PathBuf::push replace the whole path, an escape
-            // enclosed_name never produces (it pushes only Normal
-            // components) — and join the survivors under dest_dir.
-            // Traversal, leading separators, and whole-name drive prefixes
-            // are already rejected by is_unsafe_entry_name above; PathBuf
-            // equality is component-based, so duplicate/type-conflict
-            // detection keys canonically on either branch.
-            if name.contains('\0') {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Unsafe entry name in IPA: {}", name),
-                )));
-            }
-            let mut rel = PathBuf::new();
-            for segment in name.split(['/', '\\']) {
-                if segment.is_empty() || segment == "." {
-                    continue;
-                }
-                let bytes = segment.as_bytes();
-                if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Unsafe entry name in IPA: {}", name),
-                    )));
-                }
-                rel.push(segment);
-            }
-            dest_dir.join(rel)
-        };
-
-        #[cfg(unix)]
-        let unix_mode = file.unix_mode();
-
-        #[cfg(unix)]
-        let is_symlink = unix_mode
-            .map(|mode| (mode & 0o170000) == 0o120000)
-            .unwrap_or(false);
-
-        #[cfg(not(unix))]
-        let is_symlink = false;
-
-        if file.is_dir() {
-            if file_paths.contains(&outpath) {
-                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Conflicting entry path in IPA: {}", relative.display()),
-                )));
-            }
-            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
-                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Conflicting entry path in IPA: {}", relative.display()),
-                )));
-            }
-            dirs_to_create.insert(outpath.clone());
-            // Claim every implied ancestor as a must-be-directory so a
-            // later file at the same path is rejected in the collect pass,
-            // whichever order the archive lists them. A dir entry that
-            // contains registered files stays legal — claims add no new
-            // rejection here.
-            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
-            entries.push(ExtractEntry {
-                index: i,
-                outpath,
-                is_dir: true,
-                is_symlink: false,
-                #[cfg(unix)]
-                unix_mode,
-            });
-        } else {
-            if file_paths.contains(&outpath) {
-                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Duplicate entry path in IPA: {}", relative.display()),
-                )));
-            }
-            if dirs_to_create.contains(&outpath) {
-                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Conflicting entry path in IPA: {}", relative.display()),
-                )));
-            }
-            if let Some(hit) = file_ancestor(&outpath, dest_dir, &file_paths) {
-                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Conflicting entry path in IPA: {}", relative.display()),
-                )));
-            }
-            // Claim this entry's ancestor chain as must-be-directories; the
-            // walk above already rejected file ancestors, and a later file
-            // at any claimed path conflicts below.
-            register_ancestor_dirs(&outpath, dest_dir, &mut dirs_to_create);
-            file_paths.insert(outpath.clone());
-            entries.push(ExtractEntry {
-                index: i,
-                outpath,
-                is_dir: false,
-                is_symlink,
-                #[cfg(unix)]
-                unix_mode,
-            });
-        }
-    }
+    let entries = collect_entries(&mut archive, dest_dir, &mut file_paths, &mut dirs_to_create)?;
 
     // Create all directories first (sequential, fast)
     for dir in &dirs_to_create {
@@ -640,6 +504,349 @@ pub fn extract_ipa_with_limits(
 
     // Find .app bundle in Payload/
     find_app_bundle(dest_dir)
+}
+
+/// Collects every archive entry's metadata, registering directory and file
+/// paths in the two conflict-detection sets as a side effect.
+///
+/// Pure zip-read plus judgement: no entry is materialized here, so the same
+/// pass serves the native filesystem extraction and the store-backed one.
+/// `file_paths` and `dirs_to_create` are threaded through so the native
+/// caller keeps its must-be-directory claims, and `dirs_to_create` is what
+/// the store materializer creates before writing any bytes.
+fn collect_entries<R: io::Read + io::Seek>(
+    archive: &mut ZipArchive<R>,
+    dest_dir: &Path,
+    file_paths: &mut HashSet<PathBuf>,
+    dirs_to_create: &mut HashSet<PathBuf>,
+) -> Result<Vec<ExtractEntry>> {
+    // Collect entry metadata; directory and file paths are registered in
+    // the caller's two conflict-detection sets as a side effect.
+    let mut entries: Vec<ExtractEntry> = Vec::with_capacity(archive.len());
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).map_err(Error::Zip)?;
+
+        let name = canonical_entry_name(&file);
+        if is_unsafe_entry_name(name) {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unsafe entry name in IPA: {}", name),
+            )));
+        }
+
+        let outpath = if name == file.name() {
+            // Fast path: both readings agree (all flag-set and all-ASCII
+            // names) — today's containment chain runs unchanged.
+            match file.enclosed_name() {
+                Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
+                _ => {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unsafe entry name in IPA: {}", name),
+                    )))
+                }
+            }
+        } else {
+            // Divergence: flag-clear valid-UTF-8 non-ASCII name. Mirror
+            // enclosed_name's acceptance set on the canonical name: the
+            // NUL gate first (the one check is_unsafe_entry_name lacks),
+            // then drop empty/"." segments, reject any segment that is not
+            // a plain path component — a Windows drive prefix anywhere
+            // would make PathBuf::push replace the whole path, an escape
+            // enclosed_name never produces (it pushes only Normal
+            // components) — and join the survivors under dest_dir.
+            // Traversal, leading separators, and whole-name drive prefixes
+            // are already rejected by is_unsafe_entry_name above; PathBuf
+            // equality is component-based, so duplicate/type-conflict
+            // detection keys canonically on either branch.
+            if name.contains('\0') {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unsafe entry name in IPA: {}", name),
+                )));
+            }
+            let mut rel = PathBuf::new();
+            for segment in name.split(['/', '\\']) {
+                if segment.is_empty() || segment == "." {
+                    continue;
+                }
+                let bytes = segment.as_bytes();
+                if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unsafe entry name in IPA: {}", name),
+                    )));
+                }
+                rel.push(segment);
+            }
+            dest_dir.join(rel)
+        };
+
+        // Recorded on every target: only the native pass below reads it
+        // under `cfg(unix)`, but the store materializer re-derives
+        // symlink-ness from the mode, and the mem path compiles there too.
+        let unix_mode = file.unix_mode();
+
+        #[cfg(unix)]
+        let is_symlink = unix_mode
+            .map(|mode| (mode & 0o170000) == 0o120000)
+            .unwrap_or(false);
+
+        #[cfg(not(unix))]
+        let is_symlink = false;
+
+        if file.is_dir() {
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            dirs_to_create.insert(outpath.clone());
+            // Claim every implied ancestor as a must-be-directory so a
+            // later file at the same path is rejected in the collect pass,
+            // whichever order the archive lists them. A dir entry that
+            // contains registered files stays legal — claims add no new
+            // rejection here.
+            register_ancestor_dirs(&outpath, dest_dir, dirs_to_create);
+            entries.push(ExtractEntry {
+                index: i,
+                outpath,
+                is_dir: true,
+                is_symlink: false,
+                unix_mode,
+            });
+        } else {
+            if file_paths.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Duplicate entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if dirs_to_create.contains(&outpath) {
+                let relative = outpath.strip_prefix(dest_dir).unwrap_or(&outpath);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            if let Some(hit) = file_ancestor(&outpath, dest_dir, file_paths) {
+                let relative = hit.strip_prefix(dest_dir).unwrap_or(hit);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Conflicting entry path in IPA: {}", relative.display()),
+                )));
+            }
+            // Claim this entry's ancestor chain as must-be-directories; the
+            // walk above already rejected file ancestors, and a later file
+            // at any claimed path conflicts below.
+            register_ancestor_dirs(&outpath, dest_dir, dirs_to_create);
+            file_paths.insert(outpath.clone());
+            entries.push(ExtractEntry {
+                index: i,
+                outpath,
+                is_dir: false,
+                is_symlink,
+                unix_mode,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Extracts a zip read from `input` into `store` under `dest_root`,
+/// enforcing `limits` before and while materializing entries.
+///
+/// The store-backed twin of [`extract_ipa_with_limits`]: the same collect
+/// pass decides names and conflicts, then entries are written through
+/// [`Store`] primitives instead of `std::fs`, so the bytes-to-bytes path
+/// never touches a filesystem. Declared sizes are checked up front, so an
+/// oversized archive is rejected before anything is materialized.
+pub(crate) fn extract_ipa_into_store<S: Store, R: io::Read + io::Seek>(
+    input: R,
+    store: &S,
+    dest_root: &Path,
+    limits: ExtractionLimits,
+) -> Result<PathBuf> {
+    let mut archive = ZipArchive::new(input).map_err(Error::Zip)?;
+
+    // Pre-check declared sizes: a hostile header must not be able to make
+    // the store buffer bytes it has already declared as over budget.
+    let mut declared_total: u64 = 0;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).map_err(Error::Zip)?;
+        let name = canonical_entry_name(&file);
+        let size = file.size();
+        if size > limits.max_entry_bytes {
+            return Err(Error::InputTooLarge(format!(
+                "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                name, limits.max_entry_bytes
+            )));
+        }
+        declared_total = declared_total.saturating_add(size);
+        if declared_total > limits.max_total_bytes {
+            return Err(Error::InputTooLarge(format!(
+                "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                limits.max_total_bytes
+            )));
+        }
+    }
+
+    let mut file_paths: HashSet<PathBuf> = HashSet::new();
+    let mut dirs_to_create: HashSet<PathBuf> = HashSet::new();
+    let entries = collect_entries(
+        &mut archive,
+        dest_root,
+        &mut file_paths,
+        &mut dirs_to_create,
+    )?;
+
+    // Directories first (sequential, cheap): ancestors implied by file
+    // entries are already claimed, so every parent exists by the time a
+    // child is written.
+    for dir in &dirs_to_create {
+        let relative = dir.strip_prefix(dest_root).unwrap_or(dir);
+        store.create_dir_all(relative)?;
+    }
+    for entry in entries.iter().filter(|e| e.is_dir) {
+        let relative = entry
+            .outpath
+            .strip_prefix(dest_root)
+            .unwrap_or(&entry.outpath);
+        if let Some(mode) = entry.unix_mode {
+            store.set_permissions(relative, mode & 0o777)?;
+        }
+    }
+
+    let total_written = AtomicU64::new(0);
+    for entry in entries.iter().filter(|e| !e.is_dir) {
+        let mut file = archive.by_index(entry.index).map_err(Error::Zip)?;
+        let relative = entry
+            .outpath
+            .strip_prefix(dest_root)
+            .unwrap_or(&entry.outpath);
+
+        // Symlinks are re-derived from the recorded mode on every target,
+        // not from the native pass's `cfg(unix)` classification.
+        let is_symlink = entry
+            .unix_mode
+            .map(|mode| (mode & 0o170000) == 0o120000)
+            .unwrap_or(false);
+
+        if is_symlink {
+            // Bound the read before validation: a hostile symlink entry
+            // must never buffer more than the limit into memory.
+            let mut target = String::new();
+            file.take(MAX_SYMLINK_TARGET_BYTES as u64 + 1)
+                .read_to_string(&mut target)?;
+            if target.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Symlink target too long in IPA: {} ({} bytes, limit {})",
+                        relative.display(),
+                        target.len(),
+                        MAX_SYMLINK_TARGET_BYTES
+                    ),
+                )));
+            }
+
+            // Symlink targets count toward both budgets, reserved before
+            // the link is created.
+            if target.len() as u64 > limits.max_entry_bytes {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: entry '{}' exceeds {} bytes",
+                        relative.display(),
+                        limits.max_entry_bytes
+                    ),
+                )));
+            }
+            let target_bytes = target.len() as u64;
+            let total = total_written.fetch_add(target_bytes, Ordering::Relaxed) + target_bytes;
+            if total > limits.max_total_bytes {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Archive exceeds extraction limit: total extracted size exceeds {} bytes",
+                        limits.max_total_bytes
+                    ),
+                )));
+            }
+
+            if !is_safe_symlink_target(&target) {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unsafe symlink target in IPA: {} -> {}",
+                        relative.display(),
+                        target
+                    ),
+                )));
+            }
+            store.symlink(target.as_bytes(), relative)?;
+        } else {
+            // BudgetedWriter stays the backstop against lying headers: the
+            // declared-size pre-check above trusts the central directory,
+            // this does not.
+            let mut budgeted = BudgetedWriter {
+                inner: Vec::new(),
+                relative,
+                entry_written: 0,
+                max_entry_bytes: limits.max_entry_bytes,
+                total: &total_written,
+                max_total_bytes: limits.max_total_bytes,
+            };
+            io::copy(&mut file, &mut budgeted)?;
+            let data = budgeted.inner;
+            store.write(relative, &data)?;
+        }
+
+        if let Some(mode) = entry.unix_mode {
+            store.set_permissions(relative, mode & 0o777)?;
+        }
+    }
+
+    find_app_bundle_in_store(store, dest_root)
+}
+
+/// [`find_app_bundle`]'s store-backed twin: the same first-`.app` scan, read
+/// through [`Store::list`] so it works on any medium. Ambiguity is not
+/// decided here — the sign flow's `ensure_single_app_bundle` names every
+/// candidate when more than one is present.
+fn find_app_bundle_in_store<S: Store>(store: &S, dest_root: &Path) -> Result<PathBuf> {
+    let payload_dir = dest_root.join("Payload");
+
+    if !store.exists(&payload_dir) {
+        return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
+            Cow::Borrowed("No Payload directory found in IPA"),
+        )));
+    }
+
+    for (name, kind) in store.list(&payload_dir)? {
+        if kind != crate::store::StoreKind::Dir {
+            continue;
+        }
+        if Path::new(&name).extension().is_some_and(|ext| ext == "app") {
+            return Ok(payload_dir.join(name));
+        }
+    }
+
+    Err(Error::Zip(zip::result::ZipError::InvalidArchive(
+        Cow::Borrowed("No .app bundle found in Payload/"),
+    )))
 }
 
 /// Finds the `.app` bundle inside a `Payload/` directory.

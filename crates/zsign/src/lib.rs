@@ -42,6 +42,7 @@ pub mod bundle;
 pub mod error;
 pub mod ipa;
 pub mod macho;
+mod store;
 pub mod verify;
 
 // Re-export core modules that don't need native wrapping

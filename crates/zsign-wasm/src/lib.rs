@@ -6,6 +6,7 @@
 //! - Mach-O binary signing (SHA-256-only default for thin input; dual SHA-1+SHA-256 via `sign_macho_fat`, incl. FAT/Universal)
 //! - CodeResources hash computation (including streaming for large files)
 //! - Mach-O binary parsing and metadata inspection
+//! - Whole-IPA bytes-to-bytes signing (`sign_ipa`)
 //!
 //! All cryptographic operations use pure-Rust RustCrypto implementations,
 //! making this crate fully compatible with `wasm32-unknown-unknown`.
@@ -36,6 +37,7 @@
 //! | `ZSIGN_PATH_IN_PROGRESS` | A streamed resource path is hashed directly. |
 //! | `ZSIGN_FAT_UNSUPPORTED` | FAT input is passed to thin signing. |
 //! | `ZSIGN_INTERNAL` | An internal JavaScript object operation fails. |
+//! | `ZSIGN_SIGNING_FAILED` / `ZSIGN_INPUT_TOO_LARGE` | `sign_ipa` adds no new codes: a malformed archive maps to `ZSIGN_SIGNING_FAILED`, and the IPA, per-entry, and total-uncompressed caps map to `ZSIGN_INPUT_TOO_LARGE`. |
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -56,6 +58,10 @@ const MAX_PLIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum size of a PKCS#12 file.
 const MAX_P12_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum size of a whole IPA input to `sign_ipa` (compressed bytes).
+/// Matches `MAX_MACHO_BYTES`; the uncompressed entry budget is enforced
+/// inside the pipeline (512 MiB per entry, 2 GiB total).
+const MAX_IPA_BYTES: usize = 512 * 1024 * 1024;
 
 /// Stable, machine-readable error categories exposed as `Error.code`.
 /// This is a public contract and changes only across major versions; message
@@ -123,6 +129,21 @@ fn code_for_core_error(e: &zsign_core::Error) -> WasmErrorCode {
         zsign_core::Error::Plist(_) => WasmErrorCode::InvalidPlist,
         zsign_core::Error::DerEncoding(_) => WasmErrorCode::DerEncoding,
         zsign_core::Error::Verification(_) => WasmErrorCode::Verification,
+    }
+}
+
+/// Maps the native crate's error enum onto the stable public codes.
+/// Exhaustive by construction: a new `zsign_rs::Error` variant must fail to
+/// compile until it is assigned a code.
+fn code_for_zsign_error(e: &zsign_rs::Error) -> WasmErrorCode {
+    match e {
+        zsign_rs::Error::Core(inner) => code_for_core_error(inner),
+        zsign_rs::Error::Plist(_) => WasmErrorCode::InvalidPlist,
+        zsign_rs::Error::MissingCredentials(_) => WasmErrorCode::MissingCredentials,
+        zsign_rs::Error::InputTooLarge(_) => WasmErrorCode::InputTooLarge,
+        zsign_rs::Error::Zip(_) => WasmErrorCode::SigningFailed,
+        zsign_rs::Error::Io(_) => WasmErrorCode::SigningFailed,
+        zsign_rs::Error::SymlinkNotSupported => WasmErrorCode::SigningFailed,
     }
 }
 
@@ -202,6 +223,7 @@ impl MachOInfo {
 pub struct WasmSigner {
     credentials: SigningCredentials,
     profile_entitlements: Option<Vec<u8>>,
+    profile_bytes: Option<Vec<u8>>,
     entitlements_override: Option<Vec<u8>>,
     resource_builder: CodeResourcesBuilder,
     streaming_hashes: HashMap<String, StreamingHashState>,
@@ -242,6 +264,7 @@ impl WasmSigner {
 
         Ok(WasmSigner {
             credentials,
+            profile_bytes,
             profile_entitlements: entitlements,
             entitlements_override: None,
             main_executable: None,
@@ -261,7 +284,7 @@ impl WasmSigner {
     ///
     /// `Some(bytes)` must be an XML or binary plist dictionary whose values
     /// the signer can encode to DER (strings, booleans, integers, arrays,
-    /// dictionaries — Data/Date/Real are rejected here rather than at sign
+    /// dictionaries, data, dates — Real is rejected here rather than at sign
     /// time) — it replaces the profile-derived entitlements until cleared.
     /// `None` clears the override, falling back to the profile-derived
     /// entitlements. To sign with no entitlements while holding a profile,
@@ -622,6 +645,61 @@ impl WasmSigner {
 
         Ok(js_obj.into())
     }
+
+    /// Signs a complete IPA in memory and returns the signed IPA bytes —
+    /// no JS-side zip handling needed.
+    ///
+    /// Options: `bundle_id`/`bundle_name`/`bundle_version` rewrite the root
+    /// bundle's Info.plist keys before signing; `compression_level` (0-9,
+    /// default 6) selects the output zip compression.
+    ///
+    /// Limits: input ≤ 512 MiB; declared uncompressed total ≤ 2 GiB
+    /// (`ZSIGN_INPUT_TOO_LARGE`). Peak memory ≈ input + uncompressed tree +
+    /// output plus per-file signing working set, with one ABI copy of the
+    /// input and one of the output; linear memory never shrinks, so large
+    /// signs leave a per-tab watermark. Desktop-class browsers are
+    /// recommended above ~100 MiB inputs.
+    ///
+    /// Errors: stable codes per the module table; malformed archives map to
+    /// `ZSIGN_SIGNING_FAILED`.
+    pub fn sign_ipa(
+        &self,
+        input: &[u8],
+        bundle_id: Option<String>,
+        bundle_name: Option<String>,
+        bundle_version: Option<String>,
+        compression_level: Option<u8>,
+    ) -> Result<Vec<u8>, JsValue> {
+        ensure_size(
+            input.len(),
+            MAX_IPA_BYTES,
+            "IPA input",
+            "split or reduce the archive before signing",
+        )?;
+
+        let mut signer = zsign_rs::ipa::IpaSigner::new(&self.credentials);
+        if let Some(data) = &self.profile_bytes {
+            signer = signer.provisioning_profile_bytes(data.clone());
+        }
+        if let Some(data) = &self.entitlements_override {
+            signer = signer.entitlements_bytes(data.clone());
+        }
+        if let Some(id) = bundle_id {
+            signer = signer.bundle_id(id);
+        }
+        if let Some(name) = bundle_name {
+            signer = signer.bundle_name(name);
+        }
+        if let Some(version) = bundle_version {
+            signer = signer.bundle_version(version);
+        }
+        if let Some(level) = compression_level {
+            signer = signer.compression_level(zsign_rs::CompressionLevel::new(level.into()));
+        }
+        signer
+            .sign_ipa_bytes(input)
+            .map_err(|e| js_err(code_for_zsign_error(&e), format!("sign_ipa failed: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +829,108 @@ pub mod tests {
     fn err_message(err: impl Into<JsValue>) -> String {
         let value: JsValue = err.into();
         value.unchecked_into::<js_sys::Error>().message().into()
+    }
+
+    /// XML for a minimal signable Info.plist: the sign flow only reads
+    /// CFBundleIdentifier and CFBundleExecutable.
+    fn info_plist_xml(cf_bundle_executable: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.zsign.test</string>
+    <key>CFBundleExecutable</key>
+    {cf_bundle_executable}
+</dict>
+</plist>"#
+        )
+    }
+
+    /// Builds a minimal IPA in-test, signs it through the bytes-to-bytes
+    /// surface, and verifies the output structurally: archive shape,
+    /// CodeResources presence, a verifying main-executable signature,
+    /// root-entry pass-through, and re-sign determinism.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn sign_ipa_round_trip_signs_and_verifies_structurally() {
+        use std::io::Read as _;
+
+        let input = build_test_ipa_bytes();
+        let signer = new_signer();
+
+        let output = signer
+            .sign_ipa(&input, None, None, None, None)
+            .expect("bytes-to-bytes IPA signing must succeed");
+
+        // The output is a zip with Payload/ and a signed CodeResources.
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(&output)).expect("output must be a zip");
+        let mut code_resources = Vec::new();
+        {
+            let mut entry = archive
+                .by_name("Payload/Test.app/_CodeSignature/CodeResources")
+                .expect("CodeResources must be present");
+            entry.read_to_end(&mut code_resources).unwrap();
+        }
+        archive
+            .by_name("SwiftSupport/keep.txt")
+            .expect("non-Payload root entries must pass through");
+
+        // ... and it actually seals content: parse the plist and require a
+        // known non-excluded path in the legacy `files` dict (Info.plist is
+        // rule-omitted from `files2`, so `files` is the honest map here).
+        let cr: plist::Value =
+            plist::from_bytes(&code_resources).expect("CodeResources must be a plist");
+        let files = cr
+            .as_dictionary()
+            .and_then(|d| d.get("files"))
+            .and_then(|v| v.as_dictionary())
+            .expect("CodeResources must have a files dict");
+        assert!(
+            files.contains_key("Info.plist"),
+            "CodeResources must seal Info.plist; keys: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+
+        // The main executable carries a signature that verifies against the
+        // fixture credential's certificate.
+        let main = {
+            let mut entry = archive
+                .by_name("Payload/Test.app/Test")
+                .expect("main executable must be present");
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            buf
+        };
+        let report = anchored_verify_slice(&main, 0, &signer.credentials);
+        assert!(report.valid, "main executable must verify: {:?}", report);
+
+        // Re-signing the output is byte-identical (determinism).
+        let resigned = signer
+            .sign_ipa(&output, None, None, None, None)
+            .expect("re-sign must succeed");
+        assert_eq!(output, resigned, "re-sign must be byte-identical");
+    }
+
+    /// Minimal signable IPA: Payload/Test.app with Info.plist, the
+    /// minimal mach-o executable, plus a root-level pass-through entry.
+    fn build_test_ipa_bytes() -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Payload/Test.app/Info.plist", opts).unwrap();
+        zip.write_all(info_plist_xml("<string>Test</string>").as_bytes())
+            .unwrap();
+        zip.start_file("Payload/Test.app/Test", opts).unwrap();
+        zip.write_all(MINIMAL_MACHO).unwrap();
+        zip.start_file("SwiftSupport/keep.txt", opts).unwrap();
+        zip.write_all(b"pass-through").unwrap();
+        zip.finish().unwrap();
+        cursor.into_inner()
     }
 
     fn cd_layout(signed: &[u8]) -> (bool, bool) {
@@ -1087,15 +1267,29 @@ pub mod tests {
             .expect_err("non-dictionary rejected");
         assert!(err_message(e2).contains("dictionary"));
 
-        // values the signer's DER encoder refuses (Data/Date/Real, der.rs:176-188)
-        // must fail at set time, not at sign time
+        // Data and Date are encodable (OCTET STRING / GeneralizedTime), so
+        // they pass eagerly and round-trip; only Real is still refused by the
+        // DER encoder, and it must fail at set time rather than at sign time.
         let with_data = br#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>k</key><data>AA==</data></dict></plist>"#;
-        let e3 = signer
+        signer
             .set_entitlements(Some(with_data.to_vec()))
-            .expect_err("DER-unsupported value rejected");
+            .expect("data values are DER-encodable and accepted");
+        assert_eq!(
+            parse_dict(&signer.entitlements().expect("data override is effective")),
+            parse_dict(with_data),
+            "an accepted data entitlements value must round-trip unchanged"
+        );
+
+        let with_real = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>k</key><real>1.5</real></dict></plist>"#;
+        let e3 = signer
+            .set_entitlements(Some(with_real.to_vec()))
+            .expect_err("Real rejected");
+        assert_eq!(error_code(&e3), Some("ZSIGN_INVALID_ENTITLEMENTS".into()));
         let m3 = err_message(e3);
         assert!(m3.contains("cannot encode"), "got: {m3}");
+        assert!(m3.contains("Real"), "got: {m3}");
     }
 
     // ensure_size boundaries: `len` is a plain parameter, so every constant
@@ -1187,6 +1381,47 @@ pub mod tests {
         let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1])
             .expect_err("profile guard");
         assert!(err_message(e).contains("too large"));
+    }
+
+    // Plain #[wasm_bindgen_test] (NOT `unsupported = test`): ensure_size's
+    // error path constructs the JsValue through js_err → js_sys::Error,
+    // whose import shim panics on non-wasm targets. Mirrors the existing
+    // error-path test ensure_size_rejects_one_byte_over_every_limit
+    // (lib.rs:1222), which is also plain; the Ok-path test at lib.rs:1206
+    // is the one that carries `unsupported = test`.
+    #[wasm_bindgen_test]
+    fn sign_ipa_size_guard_rejects_one_byte_over() {
+        // Mirrors ensure_size_rejects_one_byte_over_every_limit (lib.rs:1222):
+        // the guard is exercised directly rather than allocating a 513 MiB
+        // input; sign_ipa applies it to input.len() as its first statement.
+        ensure_size(
+            MAX_IPA_BYTES,
+            MAX_IPA_BYTES,
+            "IPA input",
+            "reduce the archive",
+        )
+        .expect("exactly-at-limit must pass");
+        let e = ensure_size(
+            MAX_IPA_BYTES + 1,
+            MAX_IPA_BYTES,
+            "IPA input",
+            "reduce the archive",
+        )
+        .expect_err("one byte over the IPA limit must be rejected");
+        assert_eq!(error_code(&e), Some("ZSIGN_INPUT_TOO_LARGE".into()));
+    }
+
+    // Plain #[wasm_bindgen_test] (NOT `unsupported = test`): the assertion
+    // goes through js_err → js_sys::Error + Reflect, whose import shims
+    // panic on non-wasm targets. This matches the crate's existing
+    // js_err-touching tests and runs only under `wasm-pack test --node`.
+    #[wasm_bindgen_test]
+    fn sign_ipa_maps_malformed_archive_to_stable_code() {
+        let signer = new_signer();
+        let e = signer
+            .sign_ipa(b"not a zip", None, None, None, None)
+            .expect_err("malformed input must be rejected");
+        assert_eq!(error_code(&e), Some("ZSIGN_SIGNING_FAILED".into()));
     }
     /// Reads the stored digests for `rel` from built CodeResources:
     /// legacy `files` maps ordinary paths to raw SHA-1 Data; `files2` maps

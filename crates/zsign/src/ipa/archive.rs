@@ -21,11 +21,11 @@
 //! # Ok::<(), zsign_rs::Error>(())
 //! ```
 
+use crate::store::{FsStore, Store};
 use crate::{Error, Result};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -144,8 +144,12 @@ const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 /// Validates a symlink target against the extractor's target policy before
 /// it is written, so every archive the writer accepts re-extracts through
 /// `extract_ipa` with its targets byte-identical. Returns the target.
-fn checked_symlink_target(entry_name: &str, target: &std::ffi::OsStr) -> Result<String> {
-    let target = target.to_str().ok_or_else(|| {
+///
+/// Takes the target as raw bytes because that is what [`Store::read_link`]
+/// hands back; on unix a non-UTF-8 target is still rejected rather than
+/// lossily rewritten.
+fn checked_symlink_target(entry_name: &str, target: &[u8]) -> Result<String> {
+    let target = std::str::from_utf8(target).map_err(|_| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Non-UTF-8 symlink target for archive entry: {entry_name}"),
@@ -257,13 +261,19 @@ pub fn create_ipa(
 
     // Walk the app bundle and add all files - don't follow symlinks
     let name_prefix = format!("Payload/{}", app_name);
-    write_tree(&mut zip, app_bundle_path, options, &|relative_path| {
-        if relative_path.as_os_str().is_empty() {
-            Some(name_prefix.clone())
-        } else {
-            Some(format!("{}/{}", name_prefix, zip_entry_name(relative_path)))
-        }
-    })?;
+    write_tree(
+        &mut zip,
+        &FsStore,
+        app_bundle_path,
+        options,
+        &|relative_path| {
+            if relative_path.as_os_str().is_empty() {
+                Some(name_prefix.clone())
+            } else {
+                Some(format!("{}/{}", name_prefix, zip_entry_name(relative_path)))
+            }
+        },
+    )?;
 
     // Finalize the archive
     zip.finish().map_err(Error::Zip)?;
@@ -302,17 +312,56 @@ pub(crate) fn create_ipa_from_root(
     let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
     let options = archive_options(compression_level);
 
-    write_tree(&mut zip, extraction_root, options, &|relative_path| {
+    write_tree(
+        &mut zip,
+        &FsStore,
+        extraction_root,
+        options,
+        &|relative_path| {
+            if relative_path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(zip_entry_name(relative_path))
+            }
+        },
+    )?;
+
+    zip.finish().map_err(Error::Zip)?;
+
+    Ok(())
+}
+
+/// [`create_ipa_from_root`]'s store-backed twin: the same archive, built
+/// from any [`Store`] medium into memory instead of onto a file, so the
+/// bytes-to-bytes sign flow never touches a filesystem.
+///
+/// No `Payload/` directory entry is synthesized: `create_ipa_from_root` does
+/// not make one either, and the `Payload/` entry in the output comes from
+/// the actual `Payload` directory node in the tree. Adding one here would
+/// duplicate it and break byte identity with the native twin.
+pub(crate) fn create_ipa_from_store<S: Store>(
+    store: &S,
+    root: &Path,
+    level: CompressionLevel,
+) -> Result<Vec<u8>> {
+    let mut cursor = io::Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut cursor);
+    let options = archive_options(level);
+    // The `name_of` closure is `create_ipa_from_root`'s, verbatim: the
+    // extraction root's empty relative path maps to `None`, which is what
+    // skips the root itself.
+    write_tree(&mut zip, store, root, options, &|relative_path| {
         if relative_path.as_os_str().is_empty() {
             None
         } else {
             Some(zip_entry_name(relative_path))
         }
     })?;
-
-    zip.finish().map_err(Error::Zip)?;
-
-    Ok(())
+    // `finish` flushes the central directory into the cursor; its error is
+    // a write failure and must not be dropped, so it propagates here and
+    // only the `Ok` payload is discarded.
+    let _ = zip.finish().map_err(Error::Zip)?;
+    Ok(cursor.into_inner())
 }
 
 /// Configures compression options. A fixed timestamp keeps the archive
@@ -339,19 +388,23 @@ fn archive_options(compression_level: CompressionLevel) -> SimpleFileOptions {
 /// Entries are written in bytewise archive-name order so archive output
 /// never depends on filesystem readdir order: identical inputs produce
 /// byte-identical archives.
-fn write_tree(
-    zip: &mut ZipWriter<std::io::BufWriter<File>>,
+fn write_tree<S: Store, W: io::Write + io::Seek>(
+    zip: &mut ZipWriter<W>,
+    store: &S,
     walk_root: &Path,
     options: SimpleFileOptions,
     name_of: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<()> {
     // Collect: map every walked entry to its archive name (None skips it).
+    // `store.walk` is root-inclusive, exactly as `WalkDir` is, so the root
+    // still reaches `name_of` (which is what skips it for
+    // `create_ipa_from_root` and renames it for `create_ipa`).
     let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    for entry in WalkDir::new(walk_root).follow_links(false) {
-        let entry = entry
-            .map_err(|e| Error::Io(io::Error::other(format!("Failed to walk directory: {}", e))))?;
+    for e in store.walk(walk_root)? {
+        // Per-entry results keep the walk's own error, which already
+        // carries the "Failed to walk directory" message.
+        let (path, _kind) = e?;
 
-        let path = entry.path();
         let relative_path = path.strip_prefix(walk_root).map_err(|_| {
             Error::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -360,7 +413,7 @@ fn write_tree(
         })?;
 
         if let Some(archive_path) = name_of(relative_path) {
-            entries.push((archive_path, path.to_path_buf()));
+            entries.push((archive_path, path));
         }
     }
 
@@ -369,18 +422,20 @@ fn write_tree(
     // (a child's name carries its directory's name as a byte prefix).
     entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
-    // Write: the per-entry body is unchanged from the previous walk loop.
+    // Write: the per-entry body is unchanged from the previous walk loop,
+    // with the store primitives swapped in for the `std::fs` ones.
     for (mut archive_path, path) in entries {
-        // Use symlink_metadata to check the entry type without following links
-        let metadata = fs::symlink_metadata(&path)?;
+        // lstat through the store: the entry type is read without following
+        // links, and on unix the mode rides along on the same call.
+        let metadata = store.metadata(&path)?;
 
         if metadata.is_dir() {
             archive_path.push('/');
             zip.add_directory(&archive_path, options)
                 .map_err(Error::Zip)?;
-        } else if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&path)?;
-            let target = checked_symlink_target(&archive_path, target.as_os_str())?;
+        } else if metadata.is_symlink() {
+            let target = store.read_link(&path)?;
+            let target = checked_symlink_target(&archive_path, &target)?;
             zip.add_symlink(&archive_path, &target, options)
                 .map_err(Error::Zip)?;
         } else {
@@ -393,14 +448,13 @@ fn write_tree(
                 options
             };
 
-            #[cfg(unix)]
-            let file_options = {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = metadata.permissions().mode();
+            let file_options = if let Some(mode) = metadata.unix_mode {
                 file_options.unix_permissions(mode)
+            } else {
+                file_options
             };
 
-            let file_options = if needs_zip64(metadata.len()) {
+            let file_options = if needs_zip64(metadata.len) {
                 file_options.large_file(true)
             } else {
                 file_options
@@ -409,8 +463,8 @@ fn write_tree(
             zip.start_file(&archive_path, file_options)
                 .map_err(Error::Zip)?;
 
-            // Stream file directly without loading into memory
-            let mut file = File::open(&path)?;
+            // Stream the entry through without loading it into memory
+            let mut file = store.open(&path)?;
             io::copy(&mut file, &mut *zip)?;
         }
     }
@@ -749,25 +803,22 @@ mod tests {
     #[test]
     fn test_checked_symlink_target_boundaries() {
         assert_eq!(
-            checked_symlink_target("e", std::ffi::OsStr::new("Versions/Current/x")).unwrap(),
+            checked_symlink_target("e", b"Versions/Current/x").unwrap(),
             "Versions/Current/x",
             "framework-style relative targets pass verbatim"
         );
         let max = "a".repeat(MAX_SYMLINK_TARGET_BYTES);
         assert!(
-            checked_symlink_target("e", std::ffi::OsStr::new(&max)).is_ok(),
+            checked_symlink_target("e", max.as_bytes()).is_ok(),
             "a target of exactly the extractor's limit is accepted"
         );
         let too_long = "a".repeat(MAX_SYMLINK_TARGET_BYTES + 1);
-        let err = checked_symlink_target("e", std::ffi::OsStr::new(&too_long))
+        let err = checked_symlink_target("e", too_long.as_bytes())
             .expect_err("targets above the extractor's limit are rejected");
         assert!(err.to_string().contains("too long"), "{err}");
-        #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStrExt;
-            let non_utf8 = std::ffi::OsStr::from_bytes(b"bad\xfftarget");
             assert!(
-                checked_symlink_target("e", non_utf8).is_err(),
+                checked_symlink_target("e", b"bad\xfftarget").is_err(),
                 "non-UTF-8 targets are rejected rather than lossily rewritten"
             );
         }
@@ -919,6 +970,114 @@ mod tests {
             fs::read(&out_rev).unwrap(),
             "identical content must produce byte-identical archives regardless \
              of filesystem creation order"
+        );
+    }
+
+    /// The store-backed repack must be byte-identical to the native one: the
+    /// bytes-to-bytes sign flow's output is compared against the native
+    /// output, so any divergence in entry order, names, modes or compression
+    /// would show up as a different IPA rather than a same-app resign.
+    ///
+    /// Covers a 0o755 executable (a mode that only survives if the store
+    /// carries it), a pass-through root sibling, and framework-style
+    /// symlinks (which the mem path classifies from the recorded mode rather
+    /// than from the native pass's `cfg(unix)` branch).
+    #[test]
+    #[cfg(unix)]
+    fn test_store_repack_is_byte_identical_to_native_repack() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        let app = create_test_app_bundle(&src);
+        fs::set_permissions(app.join("Test"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(src.join("SwiftSupport").join("iphoneos")).unwrap();
+        fs::write(
+            src.join("SwiftSupport")
+                .join("iphoneos")
+                .join("libswiftCore.dylib"),
+            b"swift",
+        )
+        .unwrap();
+        let versions = app
+            .join("Frameworks")
+            .join("Extra.framework")
+            .join("Versions");
+        fs::create_dir_all(versions.join("A")).unwrap();
+        fs::write(versions.join("A").join("resource.txt"), b"payload").unwrap();
+        symlink("A", versions.join("Current")).unwrap();
+        symlink(
+            "Versions/Current/resource.txt",
+            app.join("Frameworks").join("Extra.framework").join("Extra"),
+        )
+        .unwrap();
+
+        // (a) native: create -> extract -> repack from root.
+        let native_in = temp.path().join("native.ipa");
+        create_ipa(&app, &native_in, CompressionLevel::DEFAULT).unwrap();
+        let extracted = temp.path().join("extracted");
+        extract_ipa(&native_in, &extracted).unwrap();
+        let native_out = temp.path().join("native-repacked.ipa");
+        create_ipa_from_root(&extracted, &native_out, CompressionLevel::DEFAULT).unwrap();
+        let native_bytes = fs::read(&native_out).unwrap();
+
+        // (b) bytes: the same archive straight into a MemStore and back out.
+        let store = crate::ipa::mem_store::MemStore::new();
+        let bundle = crate::ipa::extract::extract_ipa_into_store(
+            io::Cursor::new(fs::read(&native_in).unwrap()),
+            &store,
+            Path::new(""),
+            crate::ipa::extract::ExtractionLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(bundle, Path::new("Payload/Test.app"), "bundle lookup");
+        let mem_bytes =
+            create_ipa_from_store(&store, Path::new(""), CompressionLevel::DEFAULT).unwrap();
+
+        assert_eq!(
+            native_bytes, mem_bytes,
+            "the store-backed repack must be byte-identical to the native one"
+        );
+
+        // And the mem archive is a real IPA: it re-extracts to the same tree,
+        // symlinks and modes included.
+        let mem_out = temp.path().join("mem.ipa");
+        fs::write(&mem_out, &mem_bytes).unwrap();
+        let re_extracted = temp.path().join("re_extracted");
+        extract_ipa(&mem_out, &re_extracted).unwrap();
+        for (rel, want) in [
+            (
+                "Payload/Test.app/Info.plist",
+                &b"<?xml version=\"1.0\"?><plist><dict></dict></plist>"[..],
+            ),
+            ("Payload/Test.app/Test", &b"MACHO_PLACEHOLDER"[..]),
+            (
+                "Payload/Test.app/Frameworks/Extra.framework/Versions/A/resource.txt",
+                &b"payload"[..],
+            ),
+        ] {
+            assert_eq!(
+                fs::read(re_extracted.join(rel)).unwrap(),
+                want,
+                "{rel} survives the bytes round trip"
+            );
+        }
+        assert_eq!(
+            fs::read_link(
+                re_extracted.join("Payload/Test.app/Frameworks/Extra.framework/Versions/Current")
+            )
+            .unwrap(),
+            Path::new("A"),
+            "symlinks survive the bytes round trip"
+        );
+        assert_eq!(
+            fs::symlink_metadata(re_extracted.join("Payload/Test.app/Test"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the executable's mode survives the bytes round trip"
         );
     }
 }

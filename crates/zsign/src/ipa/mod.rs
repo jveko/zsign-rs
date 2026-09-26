@@ -56,20 +56,25 @@
 pub mod archive;
 pub mod extract;
 
+mod mem_store;
 use archive::create_ipa_from_root;
+use archive::create_ipa_from_store;
 pub use archive::{create_ipa, CompressionLevel};
 pub use extract::{extract_ipa, validate_ipa};
+use extract::{extract_ipa_into_store, ExtractionLimits};
+use mem_store::MemStore;
 
 use crate::bundle::CodeResourcesBuilder;
 use crate::crypto::SigningCredentials;
 use crate::macho::{sign_any_macho, sign_macho, MachOFile};
+use crate::store::{FsStore, Store, StoreKind};
 use crate::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
-use walkdir::WalkDir;
 
 /// Provisioning profile bytes and their extracted entitlements.
 type ProfilePayload = (Option<Vec<u8>>, Option<Vec<u8>>);
@@ -237,6 +242,36 @@ fn profile_is_distribution(profile_data: Option<&[u8]>) -> bool {
     }
 }
 
+/// Where a blob input comes from: a native path (resolved at the same flow
+/// point as today) or caller-provided bytes (wasm surface, no IO).
+enum BlobSource {
+    Path(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+/// Label naming the bytes form in a validation rejection: there is no file to
+/// name, but the message must still say where the offending bytes came from.
+const IN_MEMORY_ENTS: &str = "<in-memory entitlements>";
+
+/// Reads and validates a blob input. `Ok(None)` when no source is set.
+///
+/// The `Path` arm keeps the native flow exactly as it is — the read, its
+/// wrapped I/O error, and the shared validation — so plan-build error timing
+/// and text are unchanged. The `Bytes` arm performs no IO and runs the same
+/// three checks over the supplied bytes.
+fn read_entitlements(source: Option<&BlobSource>) -> Result<Option<Vec<u8>>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match source {
+        BlobSource::Path(path) => crate::builder::read_entitlements_file(Some(path)),
+        BlobSource::Bytes(data) => {
+            crate::builder::validate_entitlements_blob(data, Path::new(IN_MEMORY_ENTS))?;
+            Ok(Some(data.clone()))
+        }
+    }
+}
+
 /// High-level IPA signing workflow.
 ///
 /// Provides a builder-style interface for signing IPA files, handling
@@ -283,8 +318,8 @@ pub struct IpaSigner<'a> {
     credentials: Option<&'a SigningCredentials>,
     /// Compression level for output IPA
     compression_level: CompressionLevel,
-    /// Path to provisioning profile to embed as embedded.mobileprovision
-    provisioning_profile_path: Option<PathBuf>,
+    /// Provisioning profile to embed as embedded.mobileprovision
+    provisioning_profile: Option<BlobSource>,
     /// Override bundle identifier for the main app bundle
     bundle_id: Option<String>,
     /// Override display name for the main app bundle
@@ -299,14 +334,46 @@ pub struct IpaSigner<'a> {
     weak_dylibs: bool,
     /// Override the FairPlay-encryption refusal (sign an encrypted binary anyway).
     allow_encrypted: bool,
-    /// Custom entitlements file replacing the profile-derived entitlements
-    entitlements_override: Option<PathBuf>,
+    /// Custom entitlements replacing the profile-derived entitlements
+    entitlements_override: Option<BlobSource>,
     /// Directory of per-bundle-id entitlements files, applied per bundle
     entitlements_dir: Option<PathBuf>,
     /// Per-nested-bundle provisioning profiles keyed by bundle id
     bundle_profiles: Vec<(String, PathBuf)>,
     /// Strip `embedded.mobileprovision` from every bundle before sealing
     remove_embedded_profile: bool,
+}
+
+/// Two-byte `PK` check over an IPA held in memory, the bytes analogue of
+/// [`validate_ipa`]: the path-existence branch has no bytes form, so only
+/// the magic check is reproduced.
+fn validate_ipa_bytes(input: &[u8]) -> Result<()> {
+    let mut magic = [0u8; 4];
+    let mut reader = input;
+    std::io::Read::read_exact(&mut reader, &mut magic)?;
+
+    // ZIP magic: PK\x03\x04 or PK\x05\x06 (empty) or PK\x07\x08 (spanned)
+    if &magic[0..2] != b"PK" {
+        return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
+            std::borrow::Cow::Borrowed("Not a valid ZIP/IPA file"),
+        )));
+    }
+
+    Ok(())
+}
+
+impl ExtractionLimits {
+    /// Browser-oriented caps for the in-memory bytes pipeline: 512 MiB per
+    /// entry, 2 GiB total — matching the whole-IPA input cap the wasm
+    /// surface enforces before the call. The native [`ExtractionLimits::
+    /// Default`] is deliberately wider and stays unchanged; these are
+    /// tighter for a wasm32 heap.
+    fn wasm_default() -> Self {
+        ExtractionLimits {
+            max_entry_bytes: 512 * 1024 * 1024,
+            max_total_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
 }
 
 impl<'a> IpaSigner<'a> {
@@ -319,7 +386,7 @@ impl<'a> IpaSigner<'a> {
         Self {
             credentials: Some(credentials),
             compression_level: CompressionLevel::DEFAULT,
-            provisioning_profile_path: None,
+            provisioning_profile: None,
             bundle_id: None,
             bundle_name: None,
             bundle_version: None,
@@ -339,7 +406,7 @@ impl<'a> IpaSigner<'a> {
         Self {
             credentials: None,
             compression_level: CompressionLevel::DEFAULT,
-            provisioning_profile_path: None,
+            provisioning_profile: None,
             bundle_id: None,
             bundle_name: None,
             bundle_version: None,
@@ -383,7 +450,14 @@ impl<'a> IpaSigner<'a> {
     /// The profile is read and entitlements are extracted during [`Self::sign`],
     /// where errors can be properly propagated.
     pub fn provisioning_profile(mut self, path: impl AsRef<Path>) -> Self {
-        self.provisioning_profile_path = Some(path.as_ref().to_path_buf());
+        self.provisioning_profile = Some(BlobSource::Path(path.as_ref().to_path_buf()));
+        self
+    }
+
+    /// Uses the given provisioning profile bytes instead of reading a path.
+    /// The bytes are validated during plan build, mirroring the path form.
+    pub fn provisioning_profile_bytes(mut self, data: Vec<u8>) -> Self {
+        self.provisioning_profile = Some(BlobSource::Bytes(data));
         self
     }
 
@@ -394,7 +468,16 @@ impl<'a> IpaSigner<'a> {
     /// entitlements extracted from the provisioning profile and applies only
     /// to the root app bundle. A rejected file fails the sign.
     pub fn entitlements(mut self, path: impl AsRef<Path>) -> Self {
-        self.entitlements_override = Some(path.as_ref().to_path_buf());
+        self.entitlements_override = Some(BlobSource::Path(path.as_ref().to_path_buf()));
+        self
+    }
+
+    /// Uses the given entitlements bytes instead of reading a file. They are
+    /// validated exactly like the path form — XML-or-binary plist,
+    /// dictionary root, DER-encodable values — during plan build, so a
+    /// rejected blob fails the sign.
+    pub fn entitlements_bytes(mut self, data: Vec<u8>) -> Self {
+        self.entitlements_override = Some(BlobSource::Bytes(data));
         self
     }
 
@@ -520,24 +603,52 @@ impl<'a> IpaSigner<'a> {
         })?;
 
         let app_bundle = extract_ipa(input_ipa, temp_dir.path())?;
+        let store = FsStore;
         // Components between the extraction root and the bundle root come
         // from the archive: none of them may be a symlink.
-        Self::resolve_within(temp_dir.path(), &app_bundle)?;
-        Self::ensure_single_app_bundle(&temp_dir.path().join("Payload"))?;
-        self.sign_bundle_from_options(&app_bundle)?;
+        Self::resolve_within(&store, temp_dir.path(), &app_bundle)?;
+        Self::ensure_single_app_bundle(&store, &temp_dir.path().join("Payload"))?;
+        self.sign_bundle_from_options(&store, &app_bundle)?;
 
         create_ipa_from_root(temp_dir.path(), output_ipa, self.compression_level)?;
 
         Ok(())
     }
 
+    /// Signs a complete IPA held in memory and returns the signed IPA
+    /// bytes. Same stages as [`Self::sign`], running over an in-memory
+    /// store: no filesystem access, deterministic output.
+    ///
+    /// Limits: input ≤ 512 MiB (enforced by the wasm surface), declared
+    /// per-entry uncompressed ≤ 512 MiB and total ≤ 2 GiB (enforced here).
+    pub fn sign_ipa_bytes(&self, input: &[u8]) -> Result<Vec<u8>> {
+        validate_ipa_bytes(input)?;
+
+        let store = MemStore::new();
+        let app_bundle = extract_ipa_into_store(
+            std::io::Cursor::new(input),
+            &store,
+            Path::new(""),
+            ExtractionLimits::wasm_default(),
+        )?;
+        Self::resolve_within(&store, Path::new(""), &app_bundle)?;
+        Self::ensure_single_app_bundle(&store, Path::new("Payload"))?;
+        self.sign_bundle_from_options(&store, &app_bundle)?;
+
+        create_ipa_from_store(&store, Path::new(""), self.compression_level)
+    }
+
     /// Loads the provisioning profile and its entitlements.
     fn load_profile(&self) -> Result<ProfilePayload> {
-        match &self.provisioning_profile_path {
-            Some(path) => {
+        match &self.provisioning_profile {
+            Some(BlobSource::Path(path)) => {
                 let data = fs::read(path)?;
                 let ent = zsign_core::extract_entitlements_from_profile(&data)?;
                 Ok((Some(data), ent))
+            }
+            Some(BlobSource::Bytes(data)) => {
+                let ent = zsign_core::extract_entitlements_from_profile(data)?;
+                Ok((Some(data.clone()), ent))
             }
             None => Ok((None, None)),
         }
@@ -593,9 +704,9 @@ impl<'a> IpaSigner<'a> {
         Ok(map)
     }
 
-    /// Reads and validates the custom entitlements file, if one is set.
+    /// Reads and validates the custom entitlements, if one is set.
     fn load_entitlements_override(&self) -> Result<Option<Vec<u8>>> {
-        crate::builder::read_entitlements_file(self.entitlements_override.as_deref())
+        read_entitlements(self.entitlements_override.as_ref())
     }
 
     /// Exact-key entitlements directory hit: `<dir>/<bundle-id>.plist`.
@@ -672,7 +783,7 @@ impl<'a> IpaSigner<'a> {
                 bundle_path.display()
             ))));
         }
-        self.sign_bundle_from_options(bundle_path)
+        self.sign_bundle_from_options(&FsStore, bundle_path)
     }
 
     /// Signs an app bundle and repacks it as an IPA.
@@ -692,18 +803,18 @@ impl<'a> IpaSigner<'a> {
     /// Rejects a symlinked bundle root, then delegates to [`Self::sign_bundle`]
     /// which applies the plist rewrites, resolves the root entitlements, and
     /// signs the bundle tree.
-    fn sign_bundle_from_options(&self, bundle_path: &Path) -> Result<()> {
+    fn sign_bundle_from_options<S: Store>(&self, store: &S, bundle_path: &Path) -> Result<()> {
         // A trailing separator makes lstat follow a final symlink, so check
         // the component-rebuilt path; ancestors of the root stay trusted.
         let plain_root: PathBuf = bundle_path.components().collect();
-        let root_metadata = fs::symlink_metadata(&plain_root)?;
-        if root_metadata.file_type().is_symlink() {
+        let root_metadata = store.metadata(&plain_root)?;
+        if root_metadata.is_symlink() {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Bundle root must not be a symlink: {}",
                 bundle_path.display()
             ))));
         }
-        self.sign_bundle(bundle_path)
+        self.sign_bundle(store, bundle_path)
     }
 
     /// Sign an app bundle in place.
@@ -728,9 +839,9 @@ impl<'a> IpaSigner<'a> {
     /// 2. Embed the resolved provisioning profile as
     ///    `embedded.mobileprovision` (whichever bundles resolved one)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
-    fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
+    fn sign_bundle<S: Store>(&self, store: &S, bundle_path: &Path) -> Result<()> {
         // --- read-only resolution: nothing below this line has written yet ---
-        let old_root_id = self.get_bundle_identifier(bundle_path)?;
+        let old_root_id = self.get_bundle_identifier(store, bundle_path)?;
         // The root's FINAL id is knowable without writing the plist, so the
         // plan build can key on the post-rewrite id (design §3.5 stage 3).
         let root_id_final = self
@@ -740,7 +851,7 @@ impl<'a> IpaSigner<'a> {
 
         // `collect_nested_bundles` is a pure read, so it runs before the dylib
         // pass: plan build must precede the first sign write.
-        let mut bundles = self.collect_nested_bundles(bundle_path)?;
+        let mut bundles = self.collect_nested_bundles(store, bundle_path)?;
         bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // Stage 1 (design §3.5): compute each nested bundle's FINAL id in
@@ -753,7 +864,7 @@ impl<'a> IpaSigner<'a> {
                 if path == bundle_path {
                     continue; // root rewritten by the existing requested rewrite
                 }
-                let old = match self.read_bundle_identifier(path) {
+                let old = match self.read_bundle_identifier(store, path) {
                     Some(id) => id,
                     None => continue, // plist-less extension arm: nothing to cascade
                 };
@@ -790,7 +901,7 @@ impl<'a> IpaSigner<'a> {
                 // to the file stem.
                 let final_id = match id_pairs.get(path) {
                     Some((_, new)) => new.clone(),
-                    None => self.get_bundle_identifier(path)?,
+                    None => self.get_bundle_identifier(store, path)?,
                 };
                 nested_ids.push(final_id.clone());
                 let mapped = profile_map.get(&final_id);
@@ -838,27 +949,35 @@ impl<'a> IpaSigner<'a> {
         // first, then nested, so a failure can at worst leave the root
         // rewritten -- the same exposure HEAD has for a broken root. ---
         if let Some(ref new_id) = self.bundle_id {
-            self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
+            self.rewrite_plist_string(store, bundle_path, "CFBundleIdentifier", new_id)?;
         }
         if let Some(ref name) = self.bundle_name {
-            self.rewrite_plist_string(bundle_path, "CFBundleDisplayName", name)?;
+            self.rewrite_plist_string(store, bundle_path, "CFBundleDisplayName", name)?;
         }
         if let Some(ref version) = self.bundle_version {
-            self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
+            self.rewrite_plist_string(store, bundle_path, "CFBundleShortVersionString", version)?;
         }
         if let Some(ref new_root) = self.bundle_id {
-            self.rewrite_nested_identifiers(&bundles, bundle_path, &old_root_id, new_root)?;
+            self.rewrite_nested_identifiers(store, &bundles, bundle_path, &old_root_id, new_root)?;
         }
 
-        let dylibs = self.find_standalone_dylibs(bundle_path)?;
+        let dylibs = self.find_standalone_dylibs(store, bundle_path)?;
         let already_signed: HashSet<PathBuf> = dylibs.iter().cloned().collect();
 
         // --- only now does anything mutate ---
-        dylibs
-            .par_iter()
-            .try_for_each(|dylib_path| self.sign_standalone_dylib(bundle_path, dylib_path))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        dylibs.par_iter().try_for_each(|dylib_path| {
+            self.sign_standalone_dylib(store, bundle_path, dylib_path)
+        })?;
+        // rayon's thread pool cannot run on wasm32; each dylib is signed
+        // independently, so sequential iteration yields the same tree.
+        #[cfg(target_arch = "wasm32")]
+        for dylib_path in &dylibs {
+            self.sign_standalone_dylib(store, bundle_path, dylib_path)?;
+        }
         for (path, entitlements, profile_data) in &plan {
             self.sign_single_bundle(
+                store,
                 path,
                 entitlements.as_deref(),
                 profile_data.as_deref(),
@@ -874,9 +993,9 @@ impl<'a> IpaSigner<'a> {
     /// `is_nested_bundle_dir` also matches plist-less `.framework`/`.appex`
     /// directories, so absence is a legitimate `None` here rather than an
     /// error: such a bundle simply has no id to cascade from.
-    fn read_bundle_identifier(&self, bundle_path: &Path) -> Option<String> {
-        let info_plist = Self::resolve_relative(bundle_path, "Info.plist").ok()?;
-        let data = fs::read(&info_plist).ok()?;
+    fn read_bundle_identifier<S: Store>(&self, store: &S, bundle_path: &Path) -> Option<String> {
+        let info_plist = Self::resolve_relative(store, bundle_path, "Info.plist").ok()?;
+        let data = store.read(&info_plist).ok()?;
         let value: plist::Value = plist::from_bytes(&data).ok()?;
         let dict = value.as_dictionary()?;
         dict.get("CFBundleIdentifier")
@@ -889,8 +1008,9 @@ impl<'a> IpaSigner<'a> {
     /// top-level and `NSExtension→NSExtensionAttributes`
     /// `WKAppBundleIdentifier`. Runs in the requested-rewrite phase, after
     /// every option rejection has already surfaced.
-    fn rewrite_nested_identifiers(
+    fn rewrite_nested_identifiers<S: Store>(
         &self,
+        store: &S,
         bundles: &[(PathBuf, usize)],
         root: &Path,
         old: &str,
@@ -900,9 +1020,9 @@ impl<'a> IpaSigner<'a> {
             if path == root {
                 continue; // root rewritten by the existing requested rewrite
             }
-            let info_plist = Self::resolve_relative(path, "Info.plist")?;
+            let info_plist = Self::resolve_relative(store, path, "Info.plist")?;
             // A plist-less extension-arm directory has no id to cascade from.
-            let Ok(data) = fs::read(&info_plist) else {
+            let Ok(data) = store.read(&info_plist) else {
                 continue;
             };
             let mut value: plist::Value = plist::from_bytes(&data).map_err(|e| {
@@ -947,7 +1067,7 @@ impl<'a> IpaSigner<'a> {
                         path.display()
                     )))
                 })?;
-                fs::write(&info_plist, &buf)?;
+                store.write(&info_plist, &buf)?;
             }
         }
         Ok(())
@@ -958,21 +1078,28 @@ impl<'a> IpaSigner<'a> {
     /// See [`crate::bundle::is_nested_bundle_dir`] for what qualifies.
     ///
     /// Returns a vector of (path, depth) tuples where depth is the nesting level.
-    fn collect_nested_bundles(&self, bundle_path: &Path) -> Result<Vec<(PathBuf, usize)>> {
+    fn collect_nested_bundles<S: Store>(
+        &self,
+        store: &S,
+        bundle_path: &Path,
+    ) -> Result<Vec<(PathBuf, usize)>> {
         let mut bundles = Vec::new();
 
         bundles.push((bundle_path.to_path_buf(), 0));
 
-        for entry in WalkDir::new(bundle_path)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
+        for entry in store.walk(bundle_path)? {
+            let Ok((path, kind)) = entry else {
+                continue;
+            };
+            // `walk` yields the root first; it is pushed above at depth 0, so
+            // the historical `min_depth(1)` guard stands in here.
+            if path == bundle_path {
+                continue;
+            }
 
-            if entry.file_type().is_dir() && crate::bundle::is_nested_bundle_dir(path) {
-                let depth = self.calculate_bundle_depth(path, bundle_path);
-                bundles.push((path.to_path_buf(), depth));
+            if kind == StoreKind::Dir && crate::bundle::is_nested_bundle_dir(&path) {
+                let depth = self.calculate_bundle_depth(&path, bundle_path);
+                bundles.push((path, depth));
             }
         }
 
@@ -987,7 +1114,7 @@ impl<'a> IpaSigner<'a> {
     /// spelling must be plain — no `..`, no absolute prefix, no `.`, no
     /// redundant separators — and no existing component may be a symlink.
     /// Returns `root.join(rel)`, the lexical shape WalkDir produces.
-    fn resolve_relative(root: &Path, rel: &str) -> Result<PathBuf> {
+    fn resolve_relative<S: Store>(store: &S, root: &Path, rel: &str) -> Result<PathBuf> {
         let rel_path = Path::new(rel);
         if rel_path.components().any(|c| {
             matches!(
@@ -1009,7 +1136,7 @@ impl<'a> IpaSigner<'a> {
                 root.display()
             ))));
         }
-        Self::check_no_symlink_components(root, rel_path)?;
+        Self::check_no_symlink_components(store, root, rel_path)?;
         Ok(root.join(rel))
     }
 
@@ -1019,7 +1146,7 @@ impl<'a> IpaSigner<'a> {
     /// `strip_prefix` must succeed; the remainder must be plain; no
     /// existing component may be a symlink. Returns `root.join(relative)`,
     /// the lexical shape WalkDir produces.
-    fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf> {
+    fn resolve_within<S: Store>(store: &S, root: &Path, path: &Path) -> Result<PathBuf> {
         let relative = path.strip_prefix(root).map_err(|_| {
             Error::Core(zsign_core::Error::Signing(format!(
                 "Path {} is not under root {}",
@@ -1055,7 +1182,7 @@ impl<'a> IpaSigner<'a> {
                 root.display()
             ))));
         }
-        Self::check_no_symlink_components(root, relative)?;
+        Self::check_no_symlink_components(store, root, relative)?;
         Ok(root.join(relative))
     }
 
@@ -1064,14 +1191,13 @@ impl<'a> IpaSigner<'a> {
     /// `extract_ipa` selects the first `Payload/*.app` it meets in `read_dir`
     /// order, so a multi-candidate archive would be signed and repacked from
     /// an arbitrary pick. Failing here names every candidate instead.
-    fn ensure_single_app_bundle(payload_dir: &Path) -> Result<()> {
+    fn ensure_single_app_bundle<S: Store>(store: &S, payload_dir: &Path) -> Result<()> {
         let mut candidates: Vec<String> = Vec::new();
-        for entry in fs::read_dir(payload_dir)? {
-            let path = entry?.path();
-            if path.is_dir() && path.extension().is_some_and(|ext| ext == "app") {
-                if let Some(name) = path.file_name() {
-                    candidates.push(name.to_string_lossy().into_owned());
-                }
+        for (name, kind) in store.list(payload_dir)? {
+            if kind == StoreKind::Dir
+                && Path::new(&name).extension().is_some_and(|ext| ext == "app")
+            {
+                candidates.push(name);
             }
         }
         candidates.sort();
@@ -1089,19 +1215,23 @@ impl<'a> IpaSigner<'a> {
     /// Walk `relative` below `root`: reject symlink components, stop at the
     /// first missing component (a fresh tail is safe), and turn any other
     /// metadata failure into a hard error instead of treating it as absence.
-    fn check_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+    fn check_no_symlink_components<S: Store>(
+        store: &S,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<()> {
         let mut current = root.to_path_buf();
         for component in relative.components() {
             current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+            match store.metadata(&current) {
+                Ok(metadata) if metadata.is_symlink() => {
                     return Err(Error::Core(zsign_core::Error::Signing(format!(
                         "Pre-existing symlink in signing path: {}",
                         current.display()
                     ))));
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => {
                     return Err(Error::Core(zsign_core::Error::Signing(format!(
                         "Failed to inspect signing path {}: {}",
@@ -1139,23 +1269,28 @@ impl<'a> IpaSigner<'a> {
     /// This matches C++ zsign behavior: find ALL .dylib files and sign them
     /// BEFORE processing bundle folders. These are signed with empty parameters
     /// (no bundleId, no InfoPlist hash, no CodeResources).
-    fn find_standalone_dylibs(&self, bundle_path: &Path) -> Result<Vec<PathBuf>> {
+    fn find_standalone_dylibs<S: Store>(
+        &self,
+        store: &S,
+        bundle_path: &Path,
+    ) -> Result<Vec<PathBuf>> {
         let mut dylibs = Vec::new();
 
-        for entry in WalkDir::new(bundle_path)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
+        for entry in store.walk(bundle_path)? {
+            let Ok((path, kind)) = entry else {
+                continue;
+            };
+            // `walk` yields the root first, and it is a directory, so the
+            // `!is_file` test below drops it — the historical `min_depth(1)`
+            // guard needs no separate check here.
 
-            if !entry.file_type().is_file() {
+            if !matches!(kind, StoreKind::File) {
                 continue;
             }
 
             if let Some(ext) = path.extension() {
                 if ext == "dylib" && !path.components().any(|c| c.as_os_str() == "_CodeSignature") {
-                    dylibs.push(path.to_path_buf());
+                    dylibs.push(path);
                 }
             }
         }
@@ -1167,10 +1302,15 @@ impl<'a> IpaSigner<'a> {
     ///
     /// C++ zsign signs dylibs with: macho.Sign(asset, force, "", "", "", "")
     /// This means: no bundleId, no InfoPlist hash, no CodeResources.
-    fn sign_standalone_dylib(&self, root: &Path, dylib_path: &Path) -> Result<()> {
-        let validated = Self::resolve_within(root, dylib_path)?;
+    fn sign_standalone_dylib<S: Store>(
+        &self,
+        store: &S,
+        root: &Path,
+        dylib_path: &Path,
+    ) -> Result<()> {
+        let validated = Self::resolve_within(store, root, dylib_path)?;
         let dylib_path = validated.as_path();
-        let macho = MachOFile::open(dylib_path)?;
+        let macho = MachOFile::parse(store.read(dylib_path)?)?;
 
         let identifier = dylib_path
             .file_stem()
@@ -1210,7 +1350,7 @@ impl<'a> IpaSigner<'a> {
             )?,
         };
 
-        fs::write(dylib_path, signed_binary)?;
+        store.write(dylib_path, &signed_binary)?;
 
         Ok(())
     }
@@ -1223,8 +1363,9 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all binaries EXCEPT the main executable (no CodeResources yet)
     /// 2. Generate CodeResources (which hashes the signed binaries)
     /// 3. Sign the main executable WITH the CodeResources hash
-    fn sign_single_bundle(
+    fn sign_single_bundle<S: Store>(
         &self,
+        store: &S,
         bundle_path: &Path,
         entitlements: Option<&[u8]>,
         profile_data: Option<&[u8]>,
@@ -1233,48 +1374,51 @@ impl<'a> IpaSigner<'a> {
         // Strip first: the removal must be visible to the CodeResources scan
         // below, or the seal would record a file that is no longer there.
         if self.remove_embedded_profile {
-            let embedded_path = Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
-            match fs::remove_file(&embedded_path) {
+            let embedded_path =
+                Self::resolve_relative(store, bundle_path, "embedded.mobileprovision")?;
+            match store.remove_file(&embedded_path) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
+                    let kind = match &e {
+                        Error::Io(e) => e.kind(),
+                        _ => std::io::ErrorKind::Other,
+                    };
                     return Err(Error::Io(std::io::Error::new(
-                        e.kind(),
+                        kind,
                         format!(
                             "failed to remove embedded provisioning profile '{}' (-R): {e}",
                             embedded_path.display()
                         ),
-                    )))
+                    )));
                 }
             }
         }
-        let identifier = self.get_bundle_identifier(bundle_path)?;
-        let main_executable = self.get_main_executable(bundle_path)?;
+        let identifier = self.get_bundle_identifier(store, bundle_path)?;
+        let main_executable = self.get_main_executable(store, bundle_path)?;
 
-        let binaries = self.find_immediate_macho_binaries(bundle_path, already_signed)?;
+        let binaries = self.find_immediate_macho_binaries(store, bundle_path, already_signed)?;
 
         let non_main_binaries: Vec<_> =
             binaries.iter().filter(|p| *p != &main_executable).collect();
 
+        #[cfg(not(target_arch = "wasm32"))]
         non_main_binaries.par_iter().try_for_each(|binary_path| {
-            let binary_identifier = binary_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&identifier);
-            self.sign_binary(
-                bundle_path,
-                binary_path,
-                binary_identifier,
-                None,
-                entitlements,
-            )
+            self.sign_one_binary(store, bundle_path, binary_path, &identifier, entitlements)
         })?;
+        // rayon's thread pool cannot run on wasm32; each binary is signed
+        // independently, so sequential iteration yields the same tree.
+        #[cfg(target_arch = "wasm32")]
+        for binary_path in &non_main_binaries {
+            self.sign_one_binary(store, bundle_path, binary_path, &identifier, entitlements)?;
+        }
 
         // The plan build hands this bundle the profile it resolved, so embedding
         // is decided by presence rather than by a separate main-app flag.
         if let Some(data) = profile_data.filter(|_| !self.remove_embedded_profile) {
-            let embedded_path = Self::resolve_relative(bundle_path, "embedded.mobileprovision")?;
-            fs::write(&embedded_path, data).map_err(|e| {
+            let embedded_path =
+                Self::resolve_relative(store, bundle_path, "embedded.mobileprovision")?;
+            store.write(&embedded_path, data).map_err(|e| {
                 Error::Core(zsign_core::Error::Signing(format!(
                     "Failed to write provisioning profile to {}: {}",
                     embedded_path.display(),
@@ -1283,17 +1427,18 @@ impl<'a> IpaSigner<'a> {
             })?;
         }
 
-        self.generate_code_resources(bundle_path)?;
+        self.generate_code_resources(store, bundle_path)?;
 
         let code_resources_path = bundle_path.join("_CodeSignature/CodeResources");
-        let code_resources_data = if code_resources_path.exists() {
-            Some(fs::read(&code_resources_path)?)
+        let code_resources_data = if store.exists(&code_resources_path) {
+            Some(store.read(&code_resources_path)?)
         } else {
             None
         };
 
-        if main_executable.exists() {
+        if store.exists(&main_executable) {
             self.sign_binary(
+                store,
                 bundle_path,
                 &main_executable,
                 &identifier,
@@ -1305,39 +1450,64 @@ impl<'a> IpaSigner<'a> {
         Ok(())
     }
 
+    /// Signs one non-main binary of the bundle; shared verbatim by the
+    /// parallel and sequential arms above so they cannot drift.
+    fn sign_one_binary<S: Store>(
+        &self,
+        store: &S,
+        bundle_path: &Path,
+        binary_path: &Path,
+        identifier: &str,
+        entitlements: Option<&[u8]>,
+    ) -> Result<()> {
+        let binary_identifier = binary_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(identifier);
+        self.sign_binary(
+            store,
+            bundle_path,
+            binary_path,
+            binary_identifier,
+            None,
+            entitlements,
+        )
+    }
+
     /// Find Mach-O binaries that belong directly to this bundle (not nested bundles).
     ///
     /// This excludes binaries inside nested-code bundle directories.
-    fn find_immediate_macho_binaries(
+    fn find_immediate_macho_binaries<S: Store>(
         &self,
+        store: &S,
         bundle_path: &Path,
         already_signed: &HashSet<PathBuf>,
     ) -> Result<Vec<PathBuf>> {
         let mut binaries = Vec::new();
 
-        let main_executable = self.get_main_executable(bundle_path)?;
-        if main_executable.exists() {
+        let main_executable = self.get_main_executable(store, bundle_path)?;
+        if store.exists(&main_executable) {
             binaries.push(main_executable.clone());
         }
 
-        for entry in WalkDir::new(bundle_path)
-            .min_depth(1)
-            .into_iter()
-            .filter_entry(|e| {
-                let path = e.path();
-                if path != bundle_path
-                    && e.file_type().is_dir()
-                    && crate::bundle::is_nested_bundle_dir(path)
-                {
-                    return false;
-                }
-                true
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
+        // `walk_pruned` reproduces the `filter_entry` chain exactly: a
+        // nested-bundle directory is never descended into, so nothing below
+        // it (nor an error inside it) is ever seen.
+        let prune = |path: &Path, kind: StoreKind| {
+            if path != bundle_path
+                && kind == StoreKind::Dir
+                && crate::bundle::is_nested_bundle_dir(path)
+            {
+                return false;
+            }
+            true
+        };
+        for entry in store.walk_pruned(bundle_path, &prune)? {
+            let Ok((path, kind)) = entry else {
+                continue;
+            };
 
-            if !entry.file_type().is_file() {
+            if !matches!(kind, StoreKind::File) {
                 continue;
             }
 
@@ -1346,10 +1516,10 @@ impl<'a> IpaSigner<'a> {
             }
 
             if path != main_executable
-                && !already_signed.contains(&path.to_path_buf())
-                && self.is_macho_binary(path)?
+                && !already_signed.contains(&path)
+                && self.is_macho_binary(store, &path)?
             {
-                binaries.push(path.to_path_buf());
+                binaries.push(path);
             }
         }
 
@@ -1357,17 +1527,23 @@ impl<'a> IpaSigner<'a> {
     }
 
     /// Rewrites a string key in the main app's `Info.plist`.
-    fn rewrite_plist_string(&self, bundle_path: &Path, key: &str, value: &str) -> Result<()> {
-        let info_plist_path = Self::resolve_relative(bundle_path, "Info.plist")?;
+    fn rewrite_plist_string<S: Store>(
+        &self,
+        store: &S,
+        bundle_path: &Path,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let info_plist_path = Self::resolve_relative(store, bundle_path, "Info.plist")?;
 
-        if !info_plist_path.exists() {
+        if !store.exists(&info_plist_path) {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Info.plist not found in bundle: {}",
                 bundle_path.display()
             ))));
         }
 
-        let plist_data = fs::read(&info_plist_path)?;
+        let plist_data = store.read(&info_plist_path)?;
         let mut plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
             Error::Core(zsign_core::Error::Signing(format!(
                 "Failed to parse Info.plist: {}",
@@ -1387,23 +1563,23 @@ impl<'a> IpaSigner<'a> {
             )))
         })?;
 
-        fs::write(&info_plist_path, &buf)?;
+        store.write(&info_plist_path, &buf)?;
 
         Ok(())
     }
 
     /// Get the bundle identifier from Info.plist.
-    fn get_bundle_identifier(&self, bundle_path: &Path) -> Result<String> {
+    fn get_bundle_identifier<S: Store>(&self, store: &S, bundle_path: &Path) -> Result<String> {
         let info_plist_path = bundle_path.join("Info.plist");
 
-        if !info_plist_path.exists() {
+        if !store.exists(&info_plist_path) {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Info.plist not found in bundle: {}",
                 bundle_path.display()
             ))));
         }
 
-        let plist_data = fs::read(&info_plist_path)?;
+        let plist_data = store.read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
             Error::Core(zsign_core::Error::Signing(format!(
                 "Failed to parse Info.plist: {}",
@@ -1434,17 +1610,17 @@ impl<'a> IpaSigner<'a> {
     /// values, absolute values, non-plain spellings, traversal, and
     /// symlinked components are rejected. The file-stem fallback applies
     /// only when the key is absent.
-    fn get_main_executable(&self, bundle_path: &Path) -> Result<PathBuf> {
+    fn get_main_executable<S: Store>(&self, store: &S, bundle_path: &Path) -> Result<PathBuf> {
         let info_plist_path = bundle_path.join("Info.plist");
 
-        if !info_plist_path.exists() {
+        if !store.exists(&info_plist_path) {
             return Err(Error::Core(zsign_core::Error::Signing(format!(
                 "Info.plist not found in bundle: {}",
                 bundle_path.display()
             ))));
         }
 
-        let plist_data = fs::read(&info_plist_path)?;
+        let plist_data = store.read(&info_plist_path)?;
         let plist: plist::Value = plist::from_bytes(&plist_data).map_err(|e| {
             Error::Core(zsign_core::Error::Signing(format!(
                 "Failed to parse Info.plist: {}",
@@ -1475,8 +1651,8 @@ impl<'a> IpaSigner<'a> {
                         bundle_path.display()
                     ))));
                 }
-                let executable = Self::resolve_relative(bundle_path, value)?;
-                match fs::symlink_metadata(&executable) {
+                let executable = Self::resolve_relative(store, bundle_path, value)?;
+                match store.metadata(&executable) {
                     Ok(metadata) if metadata.is_file() => return Ok(executable),
                     Ok(_) => {
                         return Err(Error::Core(zsign_core::Error::Signing(format!(
@@ -1497,14 +1673,14 @@ impl<'a> IpaSigner<'a> {
             }
         };
 
-        Self::resolve_relative(bundle_path, &executable_value)
+        Self::resolve_relative(store, bundle_path, &executable_value)
     }
 
     /// Check if a file is a Mach-O binary by reading its magic bytes.
-    fn is_macho_binary(&self, path: &Path) -> Result<bool> {
+    fn is_macho_binary<S: Store>(&self, store: &S, path: &Path) -> Result<bool> {
         use std::io::Read;
 
-        let mut file = match fs::File::open(path) {
+        let mut file = match store.open(path) {
             Ok(f) => f,
             Err(_) => return Ok(false),
         };
@@ -1538,17 +1714,18 @@ impl<'a> IpaSigner<'a> {
     /// (enforced in `zsign-core`'s signing context; the C++ upstream
     /// instead emits an empty-dict slot, which this port deliberately
     /// does not reproduce).
-    fn sign_binary(
+    fn sign_binary<S: Store>(
         &self,
+        store: &S,
         root: &Path,
         binary_path: &Path,
         identifier: &str,
         code_resources: Option<&[u8]>,
         entitlements: Option<&[u8]>,
     ) -> Result<()> {
-        let validated = Self::resolve_within(root, binary_path)?;
+        let validated = Self::resolve_within(store, root, binary_path)?;
         let binary_path = validated.as_path();
-        let binary_data = fs::read(binary_path)?;
+        let binary_data = store.read(binary_path)?;
         let executable_probe = MachOFile::parse(binary_data.clone())?;
         let is_executable = executable_probe
             .slices()
@@ -1581,7 +1758,7 @@ impl<'a> IpaSigner<'a> {
                     self.weak_dylibs,
                 )?;
             }
-            fs::write(binary_path, &binary_data)?;
+            store.write(binary_path, &binary_data)?;
         }
         let macho = MachOFile::parse(binary_data)?;
 
@@ -1595,8 +1772,8 @@ impl<'a> IpaSigner<'a> {
                 ))
             })?;
             let info_plist = bundle_path.join("Info.plist");
-            if info_plist.exists() {
-                Some(fs::read(&info_plist)?)
+            if store.exists(&info_plist) {
+                Some(store.read(&info_plist)?)
             } else {
                 None
             }
@@ -1638,7 +1815,7 @@ impl<'a> IpaSigner<'a> {
             )?,
         };
 
-        fs::write(binary_path, signed_binary)?;
+        store.write(binary_path, &signed_binary)?;
 
         Ok(())
     }
@@ -1661,14 +1838,17 @@ impl<'a> IpaSigner<'a> {
     }
 
     /// Generate CodeResources plist for the bundle.
-    fn generate_code_resources(&self, bundle_path: &Path) -> Result<()> {
-        let code_resources = CodeResourcesBuilder::new(bundle_path)?.scan()?.build()?;
+    fn generate_code_resources<S: Store>(&self, store: &S, bundle_path: &Path) -> Result<()> {
+        let code_resources = CodeResourcesBuilder::with_store(store, bundle_path)?
+            .scan()?
+            .build()?;
 
-        let codesig_dir = Self::resolve_relative(bundle_path, "_CodeSignature")?;
-        fs::create_dir_all(&codesig_dir)?;
+        let codesig_dir = Self::resolve_relative(store, bundle_path, "_CodeSignature")?;
+        store.create_dir_all(&codesig_dir)?;
 
-        let resources_path = Self::resolve_relative(bundle_path, "_CodeSignature/CodeResources")?;
-        fs::write(&resources_path, &code_resources)?;
+        let resources_path =
+            Self::resolve_relative(store, bundle_path, "_CodeSignature/CodeResources")?;
+        store.write(&resources_path, &code_resources)?;
 
         Ok(())
     }
@@ -1804,6 +1984,236 @@ mod tests {
         zip.finish().unwrap();
 
         ipa_path.to_path_buf()
+    }
+
+    /// The bytes form of [`write_test_ipa`]: the same fixture assembled in
+    /// memory over a `Cursor`, so the bytes pipeline never touches disk.
+    fn test_ipa_bytes(extras: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(&mut buf);
+
+        let options = SimpleFileOptions::default();
+
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/Test.app/", options).unwrap();
+
+        zip.start_file("Payload/Test.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleExecutable</key>
+    <string>Test</string>
+</dict>
+</plist>"#,
+        )
+        .unwrap();
+
+        zip.start_file("Payload/Test.app/Test", options).unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+
+        zip.start_file("Payload/Test.app/data.bin", options)
+            .unwrap();
+        zip.write_all(&[0xAB; 4096]).unwrap();
+
+        for (name, bytes) in extras {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+
+        zip.finish().unwrap();
+
+        buf.into_inner()
+    }
+
+    /// Entry names of the zip in `bytes`.
+    fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// The bytes of `name` inside the zip `bytes`.
+    fn zip_entry(bytes: &[u8], name: &str) -> Vec<u8> {
+        use std::io::Read;
+
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut file = archive.by_name(name).expect("entry must exist");
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_round_trip() {
+        let input = test_ipa_bytes(&[(
+            "SwiftSupport/iphoneos/libswiftCore.dylib",
+            b"swift-support-bytes".as_slice(),
+        )]);
+        let credentials = crate::test_util::test_credentials();
+
+        let signed = IpaSigner::new(&credentials)
+            .sign_ipa_bytes(&input)
+            .expect("bytes signing must succeed");
+
+        // The result must be a readable zip carrying the seal, the signed
+        // main executable, and the carried root entry.
+        let names = zip_entry_names(&signed);
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "Payload/Test.app/_CodeSignature/CodeResources"),
+            "the seal must be written; got {names:?}"
+        );
+
+        let cr = zip_entry(&signed, "Payload/Test.app/_CodeSignature/CodeResources");
+        let cr_plist: plist::Value = plist::from_bytes(&cr).unwrap();
+        let files = cr_plist
+            .as_dictionary()
+            .and_then(|d| d.get("files"))
+            .and_then(|v| v.as_dictionary())
+            .expect("CodeResources must have a files dict");
+        assert!(
+            files.get("data.bin").is_some(),
+            "CodeResources must hash the resource file"
+        );
+
+        let main_data = zip_entry(&signed, "Payload/Test.app/Test");
+        let macho =
+            zsign_core::macho::MachOFile::parse(main_data).expect("signed binary must parse");
+        let slice = &macho.slices()[0];
+        let sig_off = slice.code_sig_offset.expect("binary must be signed") as usize;
+        let sig_size = slice.code_sig_size.expect("binary must be signed") as usize;
+        let sig = &macho.data()[sig_off..sig_off + sig_size];
+        assert_eq!(
+            u32::from_be_bytes(sig.get(0..4).expect("superblob magic").try_into().unwrap()),
+            0xfade_0cc0,
+            "embedded signature must be a SuperBlob"
+        );
+        let sb = zsign_core::codesign::verify::parse_superblob(sig)
+            .expect("the embedded signature must parse as a SuperBlob");
+        let cms = sb
+            .entries
+            .iter()
+            .find(|e| e.slot == 0x10000)
+            .expect("SuperBlob must contain a CMS signature");
+        assert_eq!(
+            u32::from_be_bytes(cms.blob.get(0..4).expect("CMS magic").try_into().unwrap()),
+            0xfade_0b01,
+            "CMS slot must be a blob wrapper"
+        );
+
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "SwiftSupport/iphoneos/libswiftCore.dylib"),
+            "the carried root entry must survive; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_is_deterministic() {
+        let input = test_ipa_bytes(&[]);
+        let credentials = crate::test_util::test_credentials();
+
+        let a = IpaSigner::new(&credentials).sign_ipa_bytes(&input).unwrap();
+        let b = IpaSigner::new(&credentials).sign_ipa_bytes(&input).unwrap();
+        assert_eq!(a, b, "two signs of the same input must be byte-identical");
+
+        let again = IpaSigner::new(&credentials)
+            .sign_ipa_bytes(&a)
+            .expect("re-signing signed bytes must succeed");
+        assert_eq!(a, again, "re-signing signed bytes must be byte-identical");
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_rejects_oversize_declared_entries() {
+        // The fixture's data.bin declares 4096 uncompressed bytes; a 100-byte
+        // per-entry budget must reject it before anything is materialized.
+        let input = test_ipa_bytes(&[]);
+        let store = MemStore::new();
+        let err = extract_ipa_into_store(
+            std::io::Cursor::new(input),
+            &store,
+            Path::new(""),
+            ExtractionLimits {
+                max_entry_bytes: 100,
+                max_total_bytes: 100_000,
+            },
+        )
+        .expect_err("an entry over the budget must be rejected");
+        assert!(
+            matches!(err, Error::InputTooLarge(_)),
+            "the size breach must be reported as InputTooLarge; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_rejects_hostile_entry_names() {
+        for hostile in ["../evil", "Payload/../../evil", "/abs/evil", "C:/abs/evil"] {
+            let input = test_ipa_bytes(&[(hostile, b"evil content".as_slice())]);
+            let err = IpaSigner::new(&crate::test_util::test_credentials())
+                .sign_ipa_bytes(&input)
+                .expect_err("a hostile entry name must fail the sign");
+            // The shared collect pass rejects the name before any materializing
+            // — `Error::Io(InvalidInput)`, not `Error::Zip`.
+            assert!(
+                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "a hostile entry name must be an InvalidInput io error; got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Unsafe entry name in IPA") && msg.contains(hostile),
+                "the collect pass must reject {hostile} by name: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_entitlements_bytes_override() {
+        let input = test_ipa_bytes(&[]);
+        let signed = IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile_bytes(OVERRIDE_TEST_PROFILE.to_vec())
+            .entitlements_bytes(OVERRIDE_TEST_ENTITLEMENTS.as_bytes().to_vec())
+            .sign_ipa_bytes(&input)
+            .expect("signing with an entitlements override must succeed");
+
+        let main = zip_entry(&signed, "Payload/Test.app/Test");
+        let macho = zsign_core::macho::MachOFile::parse(main.clone()).unwrap();
+        let slice = &macho.slices()[0];
+        let off = slice.code_sig_offset.unwrap() as usize;
+        let len = slice.code_sig_size.unwrap() as usize;
+        let sb = zsign_core::codesign::verify::parse_superblob(&main[off..off + len]).unwrap();
+        let ents = sb
+            .entries
+            .iter()
+            .find(|e| e.slot == zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS)
+            .map(|e| String::from_utf8_lossy(e.blob).into_owned())
+            .expect("the main executable must carry an entitlements slot");
+        assert!(
+            ents.contains("com.zsign.bundle.override.ent"),
+            "the override must reach the signed slot: {ents}"
+        );
+        assert!(
+            !ents.contains("com.zsign.profile.entitlement"),
+            "the override must replace, not merge with, the profile's entitlements: {ents}"
+        );
+    }
+
+    #[test]
+    fn test_sign_ipa_bytes_rejects_malformed_input() {
+        let err = IpaSigner::new(&crate::test_util::test_credentials())
+            .sign_ipa_bytes(b"not a zip")
+            .expect_err("non-zip bytes must be rejected");
+        assert!(
+            matches!(err, Error::Zip(_)),
+            "a bad PK prefix must map to Error::Zip; got {err:?}"
+        );
     }
 
     /// XML for an Info.plist declaring `cf_bundle_executable_entry`
@@ -2252,7 +2662,7 @@ mod tests {
         let before = std::fs::read(&outside).unwrap();
 
         let signer = IpaSigner::new_adhoc();
-        let dylibs = signer.find_standalone_dylibs(&app).unwrap();
+        let dylibs = signer.find_standalone_dylibs(&FsStore, &app).unwrap();
         assert!(
             dylibs.contains(&app.join("real.dylib")),
             "a real dylib must still be discovered: {dylibs:?}"
@@ -2263,7 +2673,7 @@ mod tests {
         );
         let processed: std::collections::HashSet<_> = dylibs.iter().cloned().collect();
         let binaries = signer
-            .find_immediate_macho_binaries(&app, &processed)
+            .find_immediate_macho_binaries(&FsStore, &app, &processed)
             .unwrap();
         assert!(
             !binaries.contains(&link),
@@ -2435,7 +2845,9 @@ mod tests {
         symlink(&evil, app.join("Evil.framework")).unwrap();
         let before = std::fs::read(evil.join("Evil")).unwrap();
 
-        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        let bundles = IpaSigner::new_adhoc()
+            .collect_nested_bundles(&FsStore, &app)
+            .unwrap();
         assert!(
             bundles
                 .iter()
@@ -2632,7 +3044,9 @@ mod tests {
 
         // `.xpc` is not in the {app, framework, appex} whitelist: only the
         // Info.plist/location arms can discover this bundle.
-        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        let bundles = IpaSigner::new_adhoc()
+            .collect_nested_bundles(&FsStore, &app)
+            .unwrap();
         assert!(
             bundles.iter().any(|(p, d)| p == &xpc && *d == 1),
             "the XPC service must be collected as a depth-1 nested bundle: {bundles:?}"
@@ -2772,6 +3186,65 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
             "the override must replace, not merge with, the profile's entitlements"
+        );
+    }
+
+    #[test]
+    fn test_blob_source_bytes_setters_match_path_form() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+
+        // The bytes form must sign exactly as the path form does: the profile
+        // is embedded, and the supplied entitlements reach the root binary.
+        IpaSigner::new_adhoc()
+            .provisioning_profile_bytes(std::fs::read(&profile).unwrap())
+            .entitlements_bytes(OVERRIDE_TEST_ENTITLEMENTS.as_bytes().to_vec())
+            .sign_folder_in_place(&app)
+            .expect("signing from bytes must succeed");
+        assert!(
+            app.join("embedded.mobileprovision").exists(),
+            "profile bytes must be embedded, not skipped"
+        );
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root main binary must carry the supplied entitlements");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.bundle.override.ent"),
+            "entitlements bytes must reach the root binary's entitlements slot"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "the override must replace, not merge with, the profile's entitlements"
+        );
+
+        // The same three blob checks apply to supplied bytes: a non-dictionary
+        // root is a hard error, never a silent fallback to the profile.
+        let other = create_folder_bundle(temp.path(), "Other", true);
+        let err = IpaSigner::new_adhoc()
+            .entitlements_bytes(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <string>nope</string>
+</array>
+</plist>"#
+                .to_vec(),
+            )
+            .sign_folder_in_place(&other)
+            .expect_err("a non-dictionary override must fail the sign");
+        assert!(
+            err.to_string()
+                .contains("must contain a top-level dictionary"),
+            "the rejection must name the violated check: {err}"
+        );
+        assert!(
+            err.to_string().contains(IN_MEMORY_ENTS),
+            "a rejection from supplied bytes must name the bytes source: {err}"
         );
     }
 
@@ -3675,6 +4148,7 @@ mod tests {
 
         IpaSigner::new_adhoc()
             .rewrite_nested_identifiers(
+                &FsStore,
                 &[(app.clone(), 0), (appex.clone(), 1), (empty.clone(), 1)],
                 &app,
                 "com.test.app",
@@ -3831,7 +4305,9 @@ mod tests {
         let app = create_bundle_with_watch(temp.path());
         // The Watch companion must be discovered as a nested bundle, or the
         // cascade would legitimately never see it.
-        let bundles = IpaSigner::new_adhoc().collect_nested_bundles(&app).unwrap();
+        let bundles = IpaSigner::new_adhoc()
+            .collect_nested_bundles(&FsStore, &app)
+            .unwrap();
         assert!(
             bundles
                 .iter()
