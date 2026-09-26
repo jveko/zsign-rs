@@ -37,6 +37,9 @@ pbkdf2 = "0.12"
 hmac = "0.12"
 digest = "0.10"
 
+# OpenSSL traditional PEM key derivation (EVP_BytesToKey)
+md-5 = "0.10"
+
 # WASM entropy support — getrandom is pulled transitively by rsa.
 # On wasm32, it needs the "js" feature to use crypto.getRandomValues().
 [target.'cfg(target_arch = "wasm32")'.dependencies]

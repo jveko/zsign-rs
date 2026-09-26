@@ -15,6 +15,7 @@
 //!
 //! [RFC 7292]: https://www.rfc-editor.org/rfc/rfc7292
 
+use crate::Error;
 use aes::{Aes128, Aes192, Aes256};
 use const_oid::ObjectIdentifier;
 use des::{TdesEde2, TdesEde3};
@@ -156,13 +157,13 @@ const MAX_SAFE_CONTENTS_DEPTH: usize = 5;
 ///
 /// Handles definite-length encodings only, which is what PKCS#12 producers
 /// emit.
-struct DerReader<'a> {
+pub(crate) struct DerReader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> DerReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
@@ -180,12 +181,12 @@ impl<'a> DerReader<'a> {
     }
 
     /// Peeks the next tag byte without advancing.
-    fn peek_tag(&self) -> Option<u8> {
+    pub(crate) fn peek_tag(&self) -> Option<u8> {
         self.buf.get(self.pos).copied()
     }
 
     /// Reads a definite-length TLV and returns its tag and value slice.
-    fn read_tlv(&mut self) -> Result<(u8, &'a [u8])> {
+    pub(crate) fn read_tlv(&mut self) -> Result<(u8, &'a [u8])> {
         let tag = self.read_byte()?;
         let len = self.read_len()?;
         if self.remaining() < len {
@@ -225,11 +226,11 @@ impl<'a> DerReader<'a> {
         Ok(value)
     }
 
-    fn read_sequence(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn read_sequence(&mut self) -> Result<&'a [u8]> {
         self.expect_tag(0x30, "SEQUENCE")
     }
 
-    fn read_octet_string(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn read_octet_string(&mut self) -> Result<&'a [u8]> {
         self.expect_tag(0x04, "OCTET STRING")
     }
 
@@ -246,7 +247,7 @@ impl<'a> DerReader<'a> {
         }
     }
 
-    fn read_oid(&mut self) -> Result<ObjectIdentifier> {
+    pub(crate) fn read_oid(&mut self) -> Result<ObjectIdentifier> {
         let value = self.expect_tag(0x06, "OBJECT IDENTIFIER")?;
         ObjectIdentifier::from_bytes(value).map_err(|e| P12Error::Der(format!("bad OID: {e}")))
     }
@@ -607,7 +608,12 @@ fn aes_cbc_iv<'a>(scheme: &AlgorithmId<'a>) -> Result<&'a [u8]> {
     Ok(iv)
 }
 
-fn aes_decrypt<C>(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>>
+/// Block-cipher CBC decrypt with PKCS#7 removal, generic over the cipher so the traditional
+/// PEM decoder can reuse the same code path as PKCS#12. The name predates that reuse;
+/// `des::TdesEde3` satisfies the same `BlockDecrypt + KeyInit` bounds
+/// (`des-0.8.1/src/tdes.rs:21-31` for `BlockCipher`/`KeySizeUser`/`KeyInit`, and `des` re-exports
+/// `cipher` at `src/lib.rs:26` and `TdesEde3` at `:33`).
+pub(crate) fn aes_decrypt<C>(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>>
 where
     C: BlockDecrypt + KeyInit,
 {
@@ -790,13 +796,29 @@ fn collect_bags(
 }
 
 /// pkcs8ShroudedKeyBag ::= EncryptedPrivateKeyInfo
-fn decrypt_key_bag(value: &[u8], password: &str) -> Result<Vec<u8>> {
+pub(crate) fn decrypt_key_bag(value: &[u8], password: &str) -> Result<Vec<u8>> {
     let mut reader = DerReader::new(value);
     let epki = reader.read_sequence()?;
     let mut inner = DerReader::new(epki);
     let algorithm = AlgorithmId::parse(&mut inner)?;
     let encrypted = inner.read_octet_string()?;
     decrypt_with_algorithm(&algorithm, encrypted, password)
+}
+
+/// Translates a container failure into the credential error a caller reports. PBES2 inside
+/// PKCS#12 and inside an encrypted PKCS#8 PEM share this machinery: a decryption failure is a
+/// passphrase failure, an unknown algorithm is a policy refusal, anything else is a malformed
+/// container.
+pub(crate) fn pem_load_error(e: P12Error) -> Error {
+    match e {
+        P12Error::Mac | P12Error::Decrypt(_) => Error::InvalidPassword,
+        P12Error::Unsupported(msg) => {
+            Error::Certificate(format!("unsupported key encryption: {msg}"))
+        }
+        P12Error::Der(msg) => {
+            Error::Certificate(format!("failed to parse encrypted private key: {msg}"))
+        }
+    }
 }
 
 /// certBag ::= SEQUENCE { certId OBJECT IDENTIFIER,

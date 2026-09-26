@@ -5,7 +5,8 @@
 //!
 //! # Overview
 //!
-//! - [`SigningCredentials`] - Load certificates and private keys from PEM or PKCS#12 files
+//! - [`SigningCredentials`] - Load certificates and private keys from PEM (plaintext or
+//!   encrypted) or PKCS#12 files
 //! - [`SigningKeyType`] - RSA or ECDSA private key for signing operations
 //! - [`assets`] - Embedded Apple CA certificates for signature chain verification
 //! - [`cms`] - CMS/PKCS#7 signature generation with Apple CDHash attributes
@@ -30,6 +31,7 @@ pub mod assets;
 pub mod cert;
 pub mod cms;
 pub mod cms_verify;
+pub mod encrypted_pem;
 mod pkcs12;
 
 pub use cert::SigningCredentials;
