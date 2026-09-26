@@ -33,12 +33,22 @@ use const_oid::ObjectIdentifier;
 use der::{Decode, DecodePem};
 use p256::ecdsa::SigningKey as EcdsaSigningKey;
 use rsa::RsaPrivateKey;
+#[cfg(not(target_arch = "wasm32"))]
+use sha1::{Digest, Sha1};
 use x509_cert::Certificate;
 
 const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
 const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+
+/// Formats a SHA-1 digest as uppercase hex, as `security find-identity` prints it.
+// The keychain leaf selector is a native-only concern; the module exposing it
+// (`crypto::keychain`) is already gated off `wasm32`.
+#[cfg(not(target_arch = "wasm32"))]
+fn hex_upper(bytes: &[u8; 20]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
 
 /// Private key for code signing, supporting multiple key types.
 ///
@@ -614,6 +624,62 @@ impl SigningCredentials {
         }
 
         let (decoded, certificate, rest) = select_identity(&keys, &certs)?;
+        Self::finish_p12(decoded, certificate, rest)
+    }
+
+    /// Load from PKCS#12, selecting the identity whose leaf certificate's
+    /// SHA-1 matches `leaf_sha1` — the hash `security find-identity` prints
+    /// next to the identity's name.
+    ///
+    /// Every load-time check [`Self::from_p12`] performs runs on the selected
+    /// pair: key strength, code-signing policy, chain assembly and team ID
+    /// extraction are identical. The export-provided chain is preserved in
+    /// `rest`, so certificates belonging to other identities in the same
+    /// export still feed [`build_chain_from_leaf`]. An export that does not
+    /// contain the requested certificate is rejected with an actionable
+    /// message naming the missing hash.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn from_p12_with_leaf_sha1(
+        p12_data: &[u8],
+        password: &str,
+        leaf_sha1: &[u8; 20],
+    ) -> Result<Self> {
+        let contents = super::pkcs12::extract_p12(p12_data, password)
+            .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
+        let matches_leaf = |c: &[u8]| Sha1::digest(c).as_slice() == leaf_sha1;
+        let selected: Vec<Vec<u8>> = contents
+            .certs
+            .iter()
+            .filter(|c| matches_leaf(c))
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return Err(Error::Certificate(format!(
+                "no certificate in PKCS#12 has SHA-1 {} (the selected keychain identity was not exported)",
+                hex_upper(leaf_sha1)
+            )));
+        }
+        // Pair the key against the selected leaf only: the full container
+        // would trip select_identity's multi-identity rejection. Its `rest`
+        // then covers only that matched slice, so rebuild `rest` from every
+        // non-leaf certificate — the chain material `finish_p12` needs.
+        let (decoded, certificate, _matched_rest) = select_identity(&contents.keys, &selected)?;
+        let rest: Vec<Certificate> = contents
+            .certs
+            .iter()
+            .filter(|c| !matches_leaf(c))
+            .filter_map(|d| Certificate::from_der(d).ok())
+            .collect();
+        Self::finish_p12(decoded, certificate, rest)
+    }
+
+    /// Runs the checks every PKCS#12 entry point shares on a selected
+    /// key/certificate pair and assembles the credentials.
+    fn finish_p12(
+        decoded: DecodedKey,
+        certificate: Certificate,
+        rest: Vec<Certificate>,
+    ) -> Result<Self> {
         let signing_key = decoded.into_signing_key()?;
 
         if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
@@ -731,9 +797,10 @@ pub(crate) fn extract_subject_cn(cert: &Certificate) -> Option<String> {
 mod tests {
     use super::*;
 
+    use crate::crypto::pkcs12::extract_p12;
     use base64::Engine as _;
     use const_oid::ObjectIdentifier;
-    use der::Decode;
+    use der::Encode;
     use rsa::pkcs1::EncodeRsaPrivateKey;
     use spki::SubjectPublicKeyInfoOwned;
     use x509_cert::ext::pkix::ExtendedKeyUsage;
@@ -984,6 +1051,64 @@ mod tests {
             matches!(&res, Err(Error::Certificate(m))
                 if m.contains("2 identities") && m.contains("CN=zsign-test-fixture")),
             "expected ambiguous-identity rejection, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    fn sha1_of(der: &[u8]) -> [u8; 20] {
+        use sha1::{Digest, Sha1};
+        Sha1::digest(der).into()
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_selects_the_matching_pair() {
+        let contents = extract_p12(IDENTITY_DUP, "testpassword").expect("fixture parses");
+        assert!(
+            contents.certs.len() >= 2,
+            "duplicate fixture must carry both identities"
+        );
+        let target = sha1_of(&contents.certs[0]);
+        let creds =
+            SigningCredentials::from_p12_with_leaf_sha1(IDENTITY_DUP, "testpassword", &target)
+                .expect("selected identity must load through every load-time check");
+        let leaf_der = creds.certificate.to_der().expect("leaf DER");
+        assert_eq!(sha1_of(&leaf_der), target, "leaf must be the selected one");
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_unknown_hash_errors() {
+        let res =
+            SigningCredentials::from_p12_with_leaf_sha1(IDENTITY_DUP, "testpassword", &[0u8; 20]);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("SHA-1") && m.contains("0000000000000000000000000000000000000000")),
+            "actionable mismatch message required, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_enforces_weak_key_gate() {
+        let contents = extract_p12(WEAK_RSA1024, "testpassword").expect("fixture parses");
+        let leaf_sha1 = sha1_of(&contents.certs[0]);
+        let res =
+            SigningCredentials::from_p12_with_leaf_sha1(WEAK_RSA1024, "testpassword", &leaf_sha1);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("1024") && m.contains("2048")),
+            "keychain selector must not bypass the RSA minimum, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_enforces_code_signing_policy() {
+        let p12: &[u8] = include_bytes!("fixtures/modern_pbes2_aes256.p12");
+        let contents = extract_p12(p12, "testpassword").expect("fixture parses");
+        let leaf_sha1 = sha1_of(&contents.certs[0]);
+        let res = SigningCredentials::from_p12_with_leaf_sha1(p12, "testpassword", &leaf_sha1);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("codeSigning")),
+            "keychain selector must not bypass the code-signing policy, got {:?}",
             res.as_ref().err()
         );
     }

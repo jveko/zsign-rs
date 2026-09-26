@@ -32,6 +32,8 @@ pub mod cert;
 pub mod cms;
 pub mod cms_verify;
 pub mod encrypted_pem;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod keychain;
 mod pkcs12;
 pub mod revocation;
 

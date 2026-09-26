@@ -1,0 +1,3 @@
+     1) AABBCCDDEEFF00112233445566778899AABBCCDD "Apple Development: carol@example.com (TEAM999999)" [REVOKED]
+not a security output line
+     1 valid identities found

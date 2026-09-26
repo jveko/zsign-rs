@@ -1,0 +1,3 @@
+  1) 50034388646913B117AF1D6E51D9E045B77EA916 "Apple Development: alice@example.com (LVGBSLUQB4)"
+  2) 0123456789ABCDEF0123456789ABCDEF01234567 "iPhone Distribution: Example Corp (ABCDE12345)"
+     2 valid identities found

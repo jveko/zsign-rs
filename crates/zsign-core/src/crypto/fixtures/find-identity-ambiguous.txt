@@ -1,0 +1,3 @@
+  1) 1111111111111111111111111111111111111111 "Apple Development: bob@example.com (TEAM000001)"
+  2) 2222222222222222222222222222222222222222 "Apple Development: bob@example.com (TEAM000001)"
+     2 valid identities found
