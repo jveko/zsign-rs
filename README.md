@@ -12,14 +12,18 @@ zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS
 
 - **IPA Signing** — Re-sign existing IPA files with new certificates and provisioning profiles
 - **Bundle Signing** — Sign `.app` folders and nested bundles (frameworks, extensions)
-- **Mach-O Support** — Handle single-architecture and FAT/Universal binaries
-- **Cross-Platform** — Works on macOS, Linux, Windows, and WebAssembly
-- **Multiple Certificate Formats** — PKCS#12 (`.p12`) and PEM support
-- **SHA-256 Primary Code Directory** — modern default accepted by current
-  macOS verification and iOS 15+; legacy SHA-1 + SHA-256 dual directories
-  opt-in via `-L` for iOS <= 10 targets only
-- **Bundle ID Rewriting** — Change `CFBundleIdentifier` during signing
-- **WASM Support** — Pure-Rust crypto stack enables browser-based signing
+- **Mach-O Support** — Single-architecture and FAT/Universal binaries; little-endian 32-bit (armv7/i386) and 64-bit sign, big-endian 32-bit is rejected with a typed error
+- **Verification (`-V`)** — `codesign --verify --deep --strict`-style checks on any platform, with the exit-status contract below
+- **Cross-Platform** — macOS, Linux, Windows (`cargo check`-gated in CI), and WebAssembly
+- **Certificate Formats** — PKCS#12, PEM, and DER key material detected by content; encrypted PEM keys load with a password
+- **SHA-256 Primary Code Directory** — the native default; legacy SHA-1 + SHA-256 dual directories opt-in via `-L` for iOS <= 10 targets only
+- **Bundle Editing** — rewrite bundle id/name/version (`-b`/`-n`/`-r`), custom entitlements (`-e`, `--entitlements-dir`), profiles (`-m`, `--profile-map`, `-R`)
+- **Ad-hoc Signing & Dylib Injection** — `-a` signs without an identity; `-l`/`-w` inject dylib load commands
+- **Machine-Readable Output** — `--json` schema v1 (documented below)
+- **OCSP Revocation Warning** — `-C` warns on authenticated revocation, never gates; 3s budget, silent offline
+- **macOS Keychain Identities** — `--keychain-identity` signs with identities from the macOS keychain
+- **Deterministic Output** — sorted zip entries, pinned timestamps, RFC 6979 ECDSA (documented below)
+- **WASM Support** — browser-based signing, including whole-IPA `sign_ipa` bytes-to-bytes
 - **Apple Interop Verified** — CI signs bundles and verifies them with Apple's
   own `codesign --verify --deep --strict` on macOS (`scripts/verify-apple-interop.sh`)
 
@@ -28,31 +32,58 @@ zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS
 ```
 zsign-rs/
 ├── crates/
-│   ├── zsign-core/       # WASM-compatible core (no filesystem, no threads)
-│   │   ├── codesign      # Code signature structures (CodeDirectory, SuperBlob)
-│   │   ├── crypto        # Certificate parsing, CMS signature generation
-│   │   ├── macho         # Mach-O parsing, signing, and binary writing
+│   ├── zsign-core/       # pure signing + verification engine, wasm32-safe
+│   │   ├── macho         # parse/sign/write Mach-O (LE 32-bit, 64-bit, FAT)
+│   │   ├── codesign      # CodeDirectory, SuperBlob, DER, verification
+│   │   ├── crypto        # certificates, CMS sign + verify, OCSP, keychain
 │   │   ├── bundle        # CodeResources hash computation
-│   │   └── provisioning  # Entitlements extraction from profiles
-│   ├── zsign/            # Native library (filesystem, threading, IPA handling)
-│   │   ├── builder       # High-level signing API (ZSign)
-│   │   ├── bundle        # App bundle traversal with filesystem access
+│   │   └── provisioning  # entitlements extraction from profiles
+│   ├── zsign/            # native facade (filesystem, threading, IPA handling)
+│   │   ├── builder       # high-level signing API (ZSign)
 │   │   ├── ipa           # IPA archive extraction and creation
-│   │   └── macho         # Re-exports from zsign-core
+│   │   ├── macho         # filesystem wrapper over zsign-core
+│   │   ├── store         # Store trait seam (FsStore/MemStore, crate-private)
+│   │   └── verify        # the -V verification engine
 │   ├── zsign-wasm/       # WebAssembly bindings (wasm-bindgen)
-│   └── zsign-cli/        # Command-line interface
+│   └── zsign-cli/        # command-line interface (single main.rs)
+├── fuzz/                 # cargo-fuzz targets (zsign-fuzz, not published)
 └── examples/
-    └── web/              # Browser-based signing demo (Vite)
+    └── web/              # browser-based signing demo (Vite)
 ```
 
 ### Crate Overview
 
 | Crate | Description |
 |-------|-------------|
-| `zsign-core` | Pure-Rust signing engine — Mach-O parsing, CodeDirectory/SuperBlob generation, CMS signatures. No filesystem or threading; compiles to `wasm32-unknown-unknown`. |
-| `zsign` | Native library wrapping `zsign-core` with filesystem access, parallel bundle traversal, and IPA archive handling. |
-| `zsign-wasm` | `wasm-bindgen` bindings exposing `zsign-core` to JavaScript — credential loading, Mach-O signing, CodeResources building with streaming hash support. |
-| `zsign-cli` | CLI tool using `clap` for signing IPAs, app bundles, and Mach-O binaries. |
+| `zsign-core` | Pure-Rust signing **and** verification engine — Mach-O, CodeDirectory/SuperBlob, CMS signatures, trust anchoring. Compiles to `wasm32-unknown-unknown`: keychain, OCSP, and filesystem access are `cfg`-gated off that target; rayon executes sequentially there via its runtime wasm shim. |
+| `zsign-rs` | Native library wrapping `zsign-core` with filesystem access, parallel bundle traversal, IPA archive handling, an internal `Store` trait (`FsStore`/`MemStore`, crate-private), and the `-V` verifier. |
+| `zsign-wasm` | `wasm-bindgen` bindings over `zsign-rs`/`zsign-core` — credential loading, Mach-O signing, CodeResources with streaming hashes, and whole-IPA `sign_ipa` bytes-to-bytes signing. |
+| `zsign-cli` | CLI tool using `clap` for signing IPAs, app bundles, and Mach-O binaries, verifying signatures, and emitting `--json`. |
+| `fuzz` | `cargo-fuzz` harness (`zsign-fuzz`, six targets, `publish = false`); smoke-fuzzed weekly by CI. |
+
+## Trust and crypto boundary
+
+All signing **and** verification cryptography is pure Rust in `zsign-core::crypto`; no
+Apple frameworks and no OpenSSL are involved.
+
+- **CMS verification** is hand-parsed over the same `der`/`rsa`/`p256` stack used for
+  signing (the `cms` crate is signer-only) and validates in Apple's order: message
+  digest, `contentType`, Apple CDHash attributes, signature over the signed attributes,
+  signer certificate binding, chain structure, X.509 purpose (codeSigning EKU), trust
+  anchoring, SKI SignerInfo resolution, and SHA-1 certificate signatures — accepted
+  only as non-fatal warnings naming the affected subject
+  (`crates/zsign-core/src/crypto/cms_verify.rs`).
+- **Trust anchors** are an explicit set whose default is the embedded **Apple Root CA
+  only**; WWDR certificates are intermediates, never anchors. `chain_ok` without
+  anchoring fails verification, so self-signed test bundles report "not anchored"
+  rather than success
+  (`docs/superpowers/specs/2026-09-24-cms-trust-anchor-design.md`).
+- **Load-time credential policy** checks key type and strength (RSA ≥ 2048),
+  codeSigning EKU + digitalSignature KU, `CA:FALSE` leaf rules, and validity windows —
+  it never grants chain trust, which happens only at verify time.
+- **Revocation is a warning, never a gate** (`-C`, documented below), and CRL,
+  `https:` OCSP responders, stapling, and hard-fail modes are explicitly out of scope
+  (`docs/superpowers/specs/2026-09-26-crypto-repro-credentials-design.md`).
 
 ## How iOS Code Signing Works
 
@@ -87,6 +118,10 @@ For each executable:
 3. **CodeDirectory** — Build the directory structure containing all hashes
 4. **CMS Signature** — Generate cryptographic signature of the CodeDirectory
 5. **SuperBlob Assembly** — Combine all components into a single blob
+
+Little-endian 32-bit slices (armv7/i386) sign alongside 64-bit ones — thin and as FAT
+slices, through the same writer path; big-endian 32-bit (`MH_CIGAM`) is rejected with a
+typed error naming the supported alternatives.
 
 ```
 SuperBlob (0xfade0cc0)
