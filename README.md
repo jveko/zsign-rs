@@ -142,7 +142,7 @@ The SuperBlob is written to the `__LINKEDIT` segment, and the `LC_CODE_SIGNATURE
 ### Library
 
 ```rust
-use zsign::{ZSign, SigningCredentials};
+use zsign_rs::{ZSign, SigningCredentials};
 
 // Load credentials from PKCS#12
 let p12_data = std::fs::read("certificate.p12")?;
@@ -156,17 +156,64 @@ ZSign::new()
     .sign_ipa("input.ipa", "output.ipa")?;
 ```
 
-### CLI
+### CLI quick start
 
 ```bash
-zsign-cli \
-    --pkcs12 certificate.p12 \
-    --password "password" \
-    --profile app.mobileprovision \
-    --bundle-id com.example.myapp \
-    --output signed.ipa \
-    input.ipa
+# Sign an IPA with a PKCS#12 certificate and provisioning profile
+zsign-cli --pkcs12 cert.p12 --password secret \
+    --profile app.mobileprovision --output signed.ipa input.ipa
+
+# Same via -k (content-detected PKCS#12) and the ZSIGN_PASSWORD env var
+ZSIGN_PASSWORD=secret zsign-cli -k cert.p12 -m app.mobileprovision -o signed.ipa input.ipa
+
+# PEM certificate + PEM/DER key pair
+zsign-cli -k key.pem -c cert.pem -m app.mobileprovision -o signed.ipa input.ipa
+
+# Ad-hoc sign an app bundle in place
+zsign-cli -a MyApp.app
+
+# Verify a signed IPA, bundle, or Mach-O
+zsign-cli -V signed.ipa
 ```
+
+Signing requires a credential source — `--pkcs12`, `-k` (with `-c` for PEM/DER key
+material), or `--keychain-identity` — or one of `-a`/`-V`, which need none.
+
+### CLI reference
+
+Complete surface of `zsign-cli` (from `zsign-cli --help`, captured 2026-09-27):
+
+|Flag|Value|Description|
+|---|---|---|
+|`<INPUT>`|path|Input file (IPA, Mach-O, or app bundle); required|
+|`-o, --output`|path|Output file|
+|`-c, --certificate`|path|Certificate file (PEM format); requires `-k`|
+|`-k, --private-key`|path|Private key **or** PKCS#12 file — format detected by content (PEM `-----BEGIN` key, DER key, or PKCS#12; use `-k` alone for PKCS#12)|
+|`--pkcs12`|path|PKCS#12 file (`.p12`); long-only, conflicts `-c`/`-k`|
+|`--keychain-identity`|name/hash|macOS keychain codesigning identity (name or SHA-1 hash from `security find-identity -v -p codesigning`); conflicts `--pkcs12`/`-c`/`-k`/`-V`; macOS-only — other platforms fail with exit 1|
+|`-m, --profile`|path|Provisioning profile; conflicts `-a`|
+|`--profile-map`|`BUNDLE_ID=PATH`|Per-bundle provisioning profile (repeatable); app bundles only, ignored for a bare Mach-O|
+|`-R, --remove-profile`|—|Remove `embedded.mobileprovision` from every bundle before signing; bundles/IPAs only, ignored for bare Mach-O|
+|`-e, --entitlements`|path|Custom entitlements file (replaces the profile's entitlements)|
+|`--entitlements-dir`|path|Directory of per-bundle-id entitlements (`<dir>/<bundle-id>.plist`); falls back to the profile when no file matches|
+|`-p, --password`|string|Password for PKCS#12 or key material (empty password is valid); beats `ZSIGN_PASSWORD`; prefer the env var — argv values are visible in process listings. Env: `ZSIGN_PASSWORD` (value hidden from help/errors)|
+|`-z, --zip-level`|0–9|ZIP compression level, default `6` (`0` = no compression, matches C++ zsign; `9` = slowest/smallest); out-of-range is a usage error, never clamped|
+|`-b, --bundle-id`|id|New bundle identifier (`CFBundleIdentifier`)|
+|`-n, --bundle-name`|name|New display name (`CFBundleDisplayName`)|
+|`-r, --bundle-version`|version|New short version (`CFBundleShortVersionString`)|
+|`-2, --sha256-only`|—|Emit only the SHA-256 code directory (the modern default)|
+|`-L, --legacy-sha1`|—|Legacy SHA-1 + SHA-256 dual code directories (iOS <= 10 only); conflicts `-2`|
+|`-f, --force`|—|Override the FairPlay-encryption refusal and sign encrypted binaries anyway (already-decrypted input only)|
+|`-a, --adhoc`|—|Sign without an identity (ad-hoc); conflicts `-m`, `-C`, `-V`|
+|`-l, --dylibs`|path|Dylib load path to inject (repeatable)|
+|`-w, --weak`|—|Inject dylibs as `LC_LOAD_WEAK_DYLIB`|
+|`-C, --check-revocation`|—|OCSP revocation **warning** (semantics below); conflicts `-V`, `-a`|
+|`-V, --verify`|—|Verify like `codesign --verify --deep --strict`; conflicts with every signing option (clap rejects each pairing at parse time)|
+|`--json`|—|Machine-readable JSON output (documented below); works in both signing and verify modes|
+|`-h, --help`|—|Print help (there is no `--version` flag)|
+
+`zsign-cli` prints an `upstream users: -p/-k now match upstream; --pkcs12 is long-only`
+epilog after the option list — see the migration section below.
 
 #### Verify a signed binary, bundle, or IPA
 
