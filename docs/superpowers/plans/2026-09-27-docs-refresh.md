@@ -23,10 +23,14 @@ The `#### Verify a signed binary, bundle, or IPA` subsection stays where it is
 - `target/debug/zsign-cli --help` verbatim (exit 0) — 25 options + positional INPUT.
 - Live binary invocations: conflict errors (all exit 2), `-V` error paths (exit 2),
   `ZSIGN_PASSWORD` hidden in help, no-args usage error (exit 2).
-- `cargo test --workspace --no-fail-fast -- --skip …` (research only, for counts):
-  **739 passed, 0 failed, 13 ignored, 1 filtered** = 678 unit (cli 46 / core 433 /
-  rs 188 / wasm 11) + 61 doctests. **Caveat:** measured on this branch base while lane
-  zsn45 runs concurrently; README presents the number with its measurement date.
+- `cargo test --workspace --no-fail-fast` (unskipped, 2026-09-27, cargo exit 0):
+  **740 passed, 0 failed, 13 ignored** = 679 unit (cli 46 / core 433 / rs 189 passed
+  + 1 ignored / wasm 11) + 61 doctests (26 zsign-core + 35 zsign-rs; 12 key-material
+  doctests ignored). Round-1 review finding 1 was resolved by this measurement — the
+  static "45 on Linux" count misread `#[cfg(not(target_os = "macos"))]`, which
+  *includes* Linux (measured: `running 46 tests … 46 passed`). Caveat: measured on
+  this branch base while lane zsn45 runs concurrently; README pins the numbers with
+  their measurement date.
 - Exit mapping: `main.rs:197` (clap 2), `:199-205` (sign fail 1), `:303` (sign ok 0),
   `:320-325` (verify constructor Err 2), `:345-352` (verify 0/1/2).
 - Conflicts: `main.rs:42,49,121,130,145` and `-V`'s 21-name list `:155-177`.
@@ -67,9 +71,9 @@ The README must not present the release-CI skip as a contributor instruction.
 - Zero-warning gate: `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`
 
 ## Architecture
-Workspace members (`Cargo.toml:3`): `crates/zsign-core`, `crates/zsign` (package **`zsign-rs`**), `crates/zsign-wasm`, `crates/zsign-cli`, `fuzz` (`zsign-fuzz`, `publish = false`).
+Workspace members (root `Cargo.toml` `members` array; package names in each `crates/*/Cargo.toml`): `crates/zsign-core`, `crates/zsign` (package **`zsign-rs`**), `crates/zsign-wasm`, `crates/zsign-cli`, `fuzz` (`zsign-fuzz`, `publish = false`).
 
-- **`zsign-core`** (`crates/zsign-core/`) — pure engine: `macho` (parse/sign/write; little-endian 32-bit + 64-bit + FAT; big-endian 32-bit rejected with a typed error), `codesign` (CodeDirectory, SuperBlob, DER, verification), `crypto` (certificates, CMS signing **and** verification, OCSP revocation, macOS keychain, encrypted PEM), `bundle` (CodeResources), `provisioning`. Compiles to `wasm32-unknown-unknown`: nothing on the wasm path reaches `std::fs`/`std::net`/`std::thread` (keychain exec, OCSP transport + budget thread are `cfg`-gated off wasm32; rayon degrades to sequential there).
+- **`zsign-core`** (`crates/zsign-core/`) — pure engine: `macho` (parse/sign/write; little-endian 32-bit + 64-bit + FAT; big-endian 32-bit rejected with a typed error), `codesign` (CodeDirectory, SuperBlob, DER, verification), `crypto` (certificates, CMS signing **and** verification, OCSP revocation, macOS keychain, encrypted PEM), `bundle` (CodeResources), `provisioning`. Compiles to `wasm32-unknown-unknown`: keychain exec, the OCSP transport, and its budget thread are `cfg`-gated off wasm32; rayon is an unconditional dependency and executes sequentially there via its runtime wasm shim (the explicit cfg-gated rayon arms live in the facade's `bundle`/`ipa`).
 - **`zsign-rs`** (`crates/zsign/`) — native facade over `zsign-core`: `builder` (high-level `ZSign` API), `bundle`, `ipa` (zip extract/create), `macho` (filesystem wrapper over the core parser), `store` (`Store` trait — stateless `FsStore` ZST + `MemStore`, all-`&self` + `Sync` so rayon closures capture `&S` unchanged), `verify` (the `-V` engine), `error`. Re-exports `codesign`, `crypto`, `SigningCredentials` from core.
 - **`zsign-wasm`** (`crates/zsign-wasm/`) — `wasm-bindgen` bindings: `WasmSigner` per-entry CodeResources API plus whole-IPA `sign_ipa` bytes-to-bytes; stable `ZSIGN_*` error codes surface as `error.code` (match via `Reflect`, never string-match messages).
 - **`zsign-cli`** (`crates/zsign-cli/`) — single `main.rs`, clap derive; exit contract 0/1/2 and `--json` schema v1 live here.
@@ -80,7 +84,7 @@ Workspace members (`Cargo.toml:3`): `crates/zsign-core`, `crates/zsign` (package
 - Tests: inline `#[cfg(test)] mod tests` per file (exceptions: `fuzz/` binary targets; `#[wasm_bindgen_test]` cases run via `wasm-pack test --node`)
 - Error assertions: `assert!(matches!(&res, Err(Error::Variant(m)) if m.contains("…")), "…, got {:?}", res.as_ref().err());` — the `res.as_ref().err()` footer prints the actual failure (dominant pattern, 30+ sites)
 - Errors: `#[from]` for external crates, `#[error(transparent)]` wrappers, `Error::Variant(String)` payloads, unit variants for policy failures — all four shapes are in use
-- Imports: one alphabetically-sorted `use` block, no blank-line grouping, `crate::`/`super::` interleaved by name
+- Imports: one `use` block per module, mostly alphabetized; a few files split std/external/`crate::` with a blank line — match the file you are editing
 - Key deps: `goblin` (Mach-O), `zip` (IPA), `plist`, `sha1`/`sha2`, `rayon`, RustCrypto (`rsa`, `p256`, `pkcs8`, `der`, `x509-cert`, `cms`), `clap`/`serde`/`serde_json`/`rpassword` (CLI), `wasm-bindgen` (wasm)
 ````
 
@@ -137,7 +141,7 @@ Tree (replaces the fenced block under `## Architecture`):
 ````
 zsign-rs/
 ├── crates/
-│   ├── zsign-core/       # pure signing engine, wasm32-safe
+│   ├── zsign-core/       # pure signing + verification engine, wasm32-safe
 │   │   ├── macho         # parse/sign/write Mach-O (LE 32-bit, 64-bit, FAT)
 │   │   ├── codesign      # CodeDirectory, SuperBlob, DER, verification
 │   │   ├── crypto        # certificates, CMS sign + verify, OCSP, keychain
@@ -147,7 +151,7 @@ zsign-rs/
 │   │   ├── builder       # high-level signing API (ZSign)
 │   │   ├── ipa           # IPA archive extraction and creation
 │   │   ├── macho         # filesystem wrapper over zsign-core
-│   │   ├── store         # Store trait: FsStore / MemStore seam
+│   │   ├── store         # Store trait seam (FsStore/MemStore, crate-private)
 │   │   └── verify        # the -V verification engine
 │   ├── zsign-wasm/       # WebAssembly bindings (wasm-bindgen)
 │   └── zsign-cli/        # command-line interface (single main.rs)
@@ -160,8 +164,8 @@ Crate overview table (replace the `### Crate Overview` table):
 
 | Crate | Description |
 |-------|-------------|
-| `zsign-core` | Pure-Rust signing **and** verification engine — Mach-O, CodeDirectory/SuperBlob, CMS signatures, trust anchoring. Compiles to `wasm32-unknown-unknown`; keychain, OCSP, and filesystem access are `cfg`-gated off that target and rayon runs sequential there. |
-| `zsign-rs` | Native library wrapping `zsign-core` with filesystem access, parallel bundle traversal, IPA archive handling, the `Store` trait (`FsStore`/`MemStore`), and the `-V` verifier. |
+| `zsign-core` | Pure-Rust signing **and** verification engine — Mach-O, CodeDirectory/SuperBlob, CMS signatures, trust anchoring. Compiles to `wasm32-unknown-unknown`: keychain, OCSP, and filesystem access are `cfg`-gated off that target; rayon executes sequentially there via its runtime wasm shim. |
+| `zsign-rs` | Native library wrapping `zsign-core` with filesystem access, parallel bundle traversal, IPA archive handling, an internal `Store` trait (`FsStore`/`MemStore`, crate-private), and the `-V` verifier. |
 | `zsign-wasm` | `wasm-bindgen` bindings over `zsign-rs`/`zsign-core` — credential loading, Mach-O signing, CodeResources with streaming hashes, and whole-IPA `sign_ipa` bytes-to-bytes signing. |
 | `zsign-cli` | CLI tool using `clap` for signing IPAs, app bundles, and Mach-O binaries, verifying signatures, and emitting `--json`. |
 | `fuzz` | `cargo-fuzz` harness (`zsign-fuzz`, six targets, `publish = false`); smoke-fuzzed weekly by CI. |
@@ -477,7 +481,10 @@ There is no compatibility shim: old `zsign-cli -p cert.p12 …` invocations fail
 at parse time. `zsign-cli --help` ends with the same reminder:
 `upstream users: -p/-k now match upstream; --pkcs12 is long-only`.
 
-Upstream flags with **no** zsign-rs equivalent: `-d -q -i -t -D -x -I -S -M -E -W -U
+Upstream flags with **no** zsign-rs equivalent — transcribed from upstream
+`src/zsign.cpp` @ `614caa8` (2026-08-21) as recorded in
+`docs/superpowers/specs/2026-09-25-cli-surface-design.md` (upstream source is not
+vendored in this tree): `-d -q -i -t -D -x -I -S -M -E -W -U
 -P -v` (debug dumps, quiet, ideviceinstaller install, temp folder, dylib removal,
 metadata/icon extraction, Files-app toggles, MinimumOSVersion, extension/watch/
 UISupportedDevices cleanup, extension injection, version print), plus the
@@ -548,8 +555,10 @@ const signedIpa = signer.sign_ipa(
   `ZSIGN_VERIFICATION`, `ZSIGN_INPUT_TOO_LARGE`, `ZSIGN_INVALID_ENTITLEMENTS`,
   `ZSIGN_UNFINISHED_HASHES`, `ZSIGN_PATH_ALREADY_FINALIZED`,
   `ZSIGN_PATH_IN_PROGRESS`, `ZSIGN_FAT_UNSUPPORTED`, `ZSIGN_INTERNAL`.
-  `sign_ipa` adds no new codes: a malformed archive maps to `ZSIGN_SIGNING_FAILED`,
-  cap violations to `ZSIGN_INPUT_TOO_LARGE`.
+  `sign_ipa` adds no new codes: a malformed archive maps to `ZSIGN_SIGNING_FAILED`;
+  **declared-size** cap violations throw `ZSIGN_INPUT_TOO_LARGE`, while **actual-byte**
+  overruns caught mid-stream (a zip header that lies about its size) surface as
+  `ZSIGN_SIGNING_FAILED`.
 - **Memory:** peak ≈ input + uncompressed tree + output plus per-file working set;
   linear memory never shrinks, so a large sign leaves a per-tab watermark — use a
   desktop-class browser above ~100 MiB inputs.
@@ -605,10 +614,13 @@ hk fix         # auto-fix what the lint steps can
 Pre-commit runs file hygiene, `cargo fmt`, and `actionlint`; pre-push runs
 `cargo clippy --workspace --all-targets -- -D warnings`.
 
-**Tests:** 739 passing, 0 failing, 13 ignored as of 2026-09-27 — 678 unit tests
-(zsign-cli 46, zsign-core 433, zsign-rs 188, zsign-wasm 11) plus 61 doctests. The
-ignored doctests need real key material; one ignored test streams >4 GiB. Run the
-suite with `cargo test`; keep `TMPDIR` inside the worktree if `/tmp` is tight.
+**Tests:** 740 passing, 0 failing, 13 ignored as of 2026-09-27 (`cargo test
+--workspace`, measured on this branch) — 679 unit tests (zsign-cli 46, zsign-core
+433, zsign-rs 189, zsign-wasm 11) plus 61 doctests. The 12 ignored doctests need real
+key material and one ignored test streams >4 GiB; the wasm crate's
+`unsupported = test` cases run natively under `cargo test`, while wasm-target cases
+run via `wasm-pack test --node`. Run the suite with `cargo test`; keep `TMPDIR`
+inside the worktree if `/tmp` is tight.
 
 **CI** (`.github/workflows/`): `ci.yml` runs lint (`hk`), the debug test job
 (`cargo test --workspace`, full suite), a release-profile test job, Windows
@@ -701,3 +713,18 @@ git commit -m "docs: apply cross-check fixes to readme and agents"
 - **Placeholders:** none — every section carries its full target text.
 - **Gate integrity:** no skip flags, no thresholds moved; README never presents the
   release-CI skip as a contributor instruction.
+
+## Round-1 cold-review ledger (all findings applied before round 2)
+
+| # | Severity | Finding | Fix applied |
+|---|---|---|---|
+| 1 | material | Test-count breakdown disputed (static `#[test]` counts vs measured) | Re-measured unskipped: **740/0/13** (cli 46, core 433, rs 189+1 ignored, wasm 11); Evidence base + Task 6 text updated; wasm `unsupported = test` inversion footnoted. The reviewer's "45 on Linux" misread `#[cfg(not(target_os = "macos"))]`, which includes Linux — empirically `running 46 tests … 46 passed` in `target/tmp/full-test.log`. |
+| 2 | material | Import rule contradicted source (5 files blank-line-group, 12/23 not alphabetized) | Reworded to "one `use` block per module, mostly alphabetized; a few files split … — match the file you are editing" |
+| 3 | material | rayon not cfg-gated in core | Both AGENTS row and crate table now attribute sequential wasm execution to rayon's runtime shim; cfg-gated rayon arms attributed to the facade |
+| 4 | material | WASM cap errors: declared vs actual-byte overrun differ | Split into `ZSIGN_INPUT_TOO_LARGE` (declared) vs `ZSIGN_SIGNING_FAILED` (streaming backstop) |
+| 5 | nit | `Cargo.toml:3` single-line citation; license not in `fuzz/` | Members cited via root `members` array + `crates/*/Cargo.toml`; license text stays scoped to `crates/*` |
+| 6 | nit | Tree comment dropped "verification"; `store` reads public | Tree says "signing + verification"; `store` marked crate-private in tree and crate table |
+| 7 | nit | Upstream flag list second-hand | Provenance labeled (upstream `src/zsign.cpp` @ `614caa8` via the cli-surface design doc) |
+
+Round-2 reviewer: findings above are resolved — do not re-litigate; verify the fixes
+and look only for NEW material defects.
