@@ -929,7 +929,6 @@ fn check_code_resources(
 mod tests {
     use super::*;
     use crate::macho::{sign_macho_sha256_only, MachOFile};
-    use crate::test_util::minimal_macho;
     use crate::ZSign;
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
     use sha2::Sha256;
@@ -944,6 +943,7 @@ mod tests {
     use x509_cert::name::Name;
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::time::Validity;
+    use zsign_core::macho::fixtures;
 
     fn local_test_credentials() -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
         let mut rng = rand::thread_rng();
@@ -1027,10 +1027,10 @@ mod tests {
         let app = dir.join("Test.app");
         fs::create_dir_all(app.join("Frameworks").join("Sub.framework")).unwrap();
         fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
-        fs::write(app.join("Test"), minimal_macho()).unwrap();
+        fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         fs::write(
             app.join("Frameworks").join("Sub.framework").join("Sub"),
-            minimal_macho(),
+            fixtures::make_minimal_macho(),
         )
         .unwrap();
         fs::write(
@@ -1225,7 +1225,7 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let out = td.path().join("signed.bin");
         let (creds, _) = local_test_credentials();
-        let macho = MachOFile::parse(minimal_macho()).unwrap();
+        let macho = MachOFile::parse(fixtures::make_minimal_macho()).unwrap();
         let signed =
             sign_macho_sha256_only(&macho, "com.zsign.test", None, &creds, None, None, false)
                 .unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
     fn unsigned_binary_fails() {
         let td = tempfile::TempDir::new().unwrap();
         let f = td.path().join("u.bin");
-        fs::write(&f, minimal_macho()).unwrap();
+        fs::write(&f, fixtures::make_minimal_macho()).unwrap();
         let report = verify_macho_file(&f).unwrap();
         assert!(!report.valid());
     }
@@ -1253,7 +1253,7 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let app = td.path().join("Test.app");
         fs::create_dir_all(&app).unwrap();
-        fs::write(app.join("Test"), minimal_macho()).unwrap();
+        fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let report = verify_bundle(&app).unwrap();
         assert!(!report.valid());
     }

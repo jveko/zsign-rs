@@ -708,6 +708,7 @@ pub mod tests {
     use sha1::Sha1;
     use sha2::Sha256;
     use wasm_bindgen_test::*;
+    use zsign_core::macho::fixtures;
 
     // Self-issued code-signing leaf generated with openssl: RSA-2048, CA:FALSE,
     // digitalSignature, codeSigning EKU, validity 2026-09-25 to 2036-09-22,
@@ -765,8 +766,6 @@ pub mod tests {
         "DQYJYIZIAWUDBAIBBQAEINAqV8nM/KQFqB2FOMqJQo72ryE09t4IiDjnl4VfBWg4BBCrgwQLJGTJ",
         "UH6cwlIqKIM1AgIIAA==",
     );
-
-    const MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
 
     const PROFILE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -926,7 +925,7 @@ pub mod tests {
         zip.write_all(info_plist_xml("<string>Test</string>").as_bytes())
             .unwrap();
         zip.start_file("Payload/Test.app/Test", opts).unwrap();
-        zip.write_all(MINIMAL_MACHO).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.start_file("SwiftSupport/keep.txt", opts).unwrap();
         zip.write_all(b"pass-through").unwrap();
         zip.finish().unwrap();
@@ -1032,42 +1031,10 @@ pub mod tests {
         .expect("cms verify runs")
     }
 
-    fn build_fat_macho() -> Vec<u8> {
-        let mut fat = vec![0u8; 20_480];
-        fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
-        fat[4..8].copy_from_slice(&2u32.to_be_bytes());
-        for (index, (offset, size)) in [(4_096usize, 8_192usize), (12_288, 8_192)]
-            .into_iter()
-            .enumerate()
-        {
-            let start = 8 + index * 20;
-            fat[start..start + 4].copy_from_slice(&0x0100_000cu32.to_be_bytes());
-            fat[start + 4..start + 8].copy_from_slice(&0u32.to_be_bytes());
-            fat[start + 8..start + 12].copy_from_slice(&(offset as u32).to_be_bytes());
-            fat[start + 12..start + 16].copy_from_slice(&(size as u32).to_be_bytes());
-            fat[start + 16..start + 20].copy_from_slice(&12u32.to_be_bytes());
-            fat[offset..offset + MINIMAL_MACHO.len()].copy_from_slice(MINIMAL_MACHO);
-        }
-        fat
-    }
-
-    fn build_fat_macho_one_arch() -> Vec<u8> {
-        let mut fat = vec![0u8; 12_288];
-        fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
-        fat[4..8].copy_from_slice(&1u32.to_be_bytes());
-        fat[8..12].copy_from_slice(&0x0100_000cu32.to_be_bytes());
-        fat[12..16].copy_from_slice(&0u32.to_be_bytes());
-        fat[16..20].copy_from_slice(&4_096u32.to_be_bytes());
-        fat[20..24].copy_from_slice(&8_192u32.to_be_bytes());
-        fat[24..28].copy_from_slice(&12u32.to_be_bytes());
-        fat[4_096..4_096 + MINIMAL_MACHO.len()].copy_from_slice(MINIMAL_MACHO);
-        fat
-    }
-
     #[wasm_bindgen_test(unsupported = test)]
     fn sign_macho_default_emits_sha256_only_for_thin_input() {
         let signed = new_signer()
-            .sign_macho(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None)
+            .sign_macho(fixtures::make_minimal_macho(), "com.zsign.test", None, None)
             .expect("thin sign succeeds");
         assert_eq!(
             zsign_core::macho::MachOFile::parse(signed.clone())
@@ -1095,7 +1062,13 @@ pub mod tests {
 
     #[wasm_bindgen_test]
     fn sign_macho_rejects_fat_input() {
-        let fat = build_fat_macho();
+        let fat = fixtures::make_fat_macho(
+            &[
+                fixtures::make_minimal_macho(),
+                fixtures::make_minimal_macho(),
+            ],
+            &[12, 12],
+        );
         let err = new_signer()
             .sign_macho(fat, "com.zsign.test", None, None)
             .expect_err("FAT rejected by default");
@@ -1107,7 +1080,12 @@ pub mod tests {
         );
 
         let err2 = new_signer()
-            .sign_macho(build_fat_macho_one_arch(), "com.zsign.test", None, None)
+            .sign_macho(
+                fixtures::make_fat_macho(&[fixtures::make_minimal_macho()], &[12]),
+                "com.zsign.test",
+                None,
+                None,
+            )
             .expect_err("one-slice FAT rejected by default");
         assert_eq!(error_code(&err2), Some("ZSIGN_FAT_UNSUPPORTED".into()));
         assert!(err_message(err2).contains("sign_macho_fat"));
@@ -1142,7 +1120,7 @@ pub mod tests {
     fn sign_macho_fat_keeps_dual_behavior_for_thin_and_fat() {
         let signer = new_signer();
         let thin = signer
-            .sign_macho_fat(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None)
+            .sign_macho_fat(fixtures::make_minimal_macho(), "com.zsign.test", None, None)
             .expect("thin dual sign");
         let (has_sha1, has_sha256) = cd_layout(&thin);
         assert!(
@@ -1157,7 +1135,18 @@ pub mod tests {
         );
 
         let fat = signer
-            .sign_macho_fat(build_fat_macho(), "com.zsign.test", None, None)
+            .sign_macho_fat(
+                fixtures::make_fat_macho(
+                    &[
+                        fixtures::make_minimal_macho(),
+                        fixtures::make_minimal_macho(),
+                    ],
+                    &[12, 12],
+                ),
+                "com.zsign.test",
+                None,
+                None,
+            )
             .expect("FAT dual sign");
         assert_eq!(
             zsign_core::macho::MachOFile::parse(fat.clone())
@@ -1182,7 +1171,7 @@ pub mod tests {
     /// profile entitlements stop being applied.
     #[wasm_bindgen_test(unsupported = test)]
     fn non_executable_input_ignores_profile_entitlements() {
-        let mut dylib = MINIMAL_MACHO.to_vec();
+        let mut dylib = fixtures::make_minimal_macho();
         dylib[12..16].copy_from_slice(&6u32.to_le_bytes());
         let with = new_signer_with_profile();
         let without = new_signer();
@@ -1204,10 +1193,10 @@ pub mod tests {
         );
 
         let c = with
-            .sign_macho(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None)
+            .sign_macho(fixtures::make_minimal_macho(), "com.zsign.test", None, None)
             .expect("sign");
         let d = without
-            .sign_macho(MINIMAL_MACHO.to_vec(), "com.zsign.test", None, None)
+            .sign_macho(fixtures::make_minimal_macho(), "com.zsign.test", None, None)
             .expect("sign");
         assert_ne!(
             entitlements_slot(&c),
@@ -1611,7 +1600,18 @@ pub mod tests {
         assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PASSWORD".into()));
 
         let e = new_signer()
-            .sign_macho(build_fat_macho(), "com.zsign.test", None, None)
+            .sign_macho(
+                fixtures::make_fat_macho(
+                    &[
+                        fixtures::make_minimal_macho(),
+                        fixtures::make_minimal_macho(),
+                    ],
+                    &[12, 12],
+                ),
+                "com.zsign.test",
+                None,
+                None,
+            )
             .expect_err("fat input");
         assert_eq!(error_code(&e), Some("ZSIGN_FAT_UNSUPPORTED".into()));
 
@@ -1671,7 +1671,7 @@ pub mod tests {
     #[wasm_bindgen_test(unsupported = test)]
     fn adhoc_sign_round_trip_verifies_without_credentials() {
         let signed = zsign_core::macho::sign_macho_adhoc(
-            &zsign_core::macho::MachOFile::parse(MINIMAL_MACHO.to_vec()).unwrap(),
+            &zsign_core::macho::MachOFile::parse(fixtures::make_minimal_macho()).unwrap(),
             "com.zsign.test",
             None,
             None,

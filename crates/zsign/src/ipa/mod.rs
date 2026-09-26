@@ -1863,6 +1863,7 @@ mod tests {
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
+    use zsign_core::macho::fixtures;
 
     #[test]
     fn test_ipa_signing_is_deterministic() {
@@ -1969,8 +1970,7 @@ mod tests {
         .unwrap();
 
         zip.start_file("Payload/Test.app/Test", options).unwrap();
-        zip.write_all(include_bytes!("fixtures/minimal_macho.bin"))
-            .unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
 
         zip.start_file("Payload/Test.app/data.bin", options)
             .unwrap();
@@ -2014,7 +2014,7 @@ mod tests {
         .unwrap();
 
         zip.start_file("Payload/Test.app/Test", options).unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
 
         zip.start_file("Payload/Test.app/data.bin", options)
             .unwrap();
@@ -2086,7 +2086,7 @@ mod tests {
         let exec_options = SimpleFileOptions::default().unix_permissions(mode);
         zip.start_file("Payload/Test.app/Test", exec_options)
             .unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.start_file("Payload/Test.app/data.bin", dir_options)
             .unwrap();
         zip.write_all(&[0xAB; 4096]).unwrap();
@@ -2328,7 +2328,7 @@ mod tests {
         )
         .unwrap();
         if write_executable {
-            std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+            std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         }
         app
     }
@@ -2440,7 +2440,11 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(app.join("Enc"), crate::test_util::minimal_macho_encrypted()).unwrap();
+        std::fs::write(
+            app.join("Enc"),
+            fixtures::make_minimal_macho_encrypted(1, 0x1000),
+        )
+        .unwrap();
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
 
         let credentials = crate::test_util::test_credentials();
@@ -2479,7 +2483,11 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(app.join("Enc"), crate::test_util::minimal_macho_encrypted()).unwrap();
+        std::fs::write(
+            app.join("Enc"),
+            fixtures::make_minimal_macho_encrypted(1, 0x1000),
+        )
+        .unwrap();
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
 
         IpaSigner::new(&crate::test_util::test_credentials())
@@ -2493,7 +2501,7 @@ mod tests {
     fn test_sign_rejects_executable_path_outside_bundle() {
         let temp = TempDir::new().unwrap();
         let outside = temp.path().join("outside_macho");
-        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(&outside, fixtures::make_minimal_macho()).unwrap();
         let app = create_folder_bundle(temp.path(), "../outside_macho", true);
         let before = std::fs::read(&outside).unwrap();
 
@@ -2516,7 +2524,7 @@ mod tests {
     fn test_sign_rejects_absolute_executable_path() {
         let temp = TempDir::new().unwrap();
         let outside = temp.path().join("outside_macho");
-        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(&outside, fixtures::make_minimal_macho()).unwrap();
         let app = create_folder_bundle(temp.path(), outside.to_str().unwrap(), true);
         let before = std::fs::read(&outside).unwrap();
 
@@ -2561,7 +2569,7 @@ mod tests {
             info_plist_xml("<integer>42</integer>"),
         )
         .unwrap();
-        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
 
         let error = IpaSigner::new_adhoc()
             .sign_folder_in_place(&app)
@@ -2596,7 +2604,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let app = create_folder_bundle(temp.path(), "Test", false);
         let real = app.join("RealTest");
-        std::fs::write(&real, crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(&real, fixtures::make_minimal_macho()).unwrap();
         // Flattened versioned-framework layout: the declared executable
         // is the root link, RealTest the real binary.
         symlink(&real, app.join("Test")).unwrap();
@@ -2685,7 +2693,7 @@ mod tests {
             info_plist_xml("<string>./Test</string>"),
         )
         .unwrap();
-        std::fs::write(temp.path().join("Test"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(temp.path().join("Test"), fixtures::make_minimal_macho()).unwrap();
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp.path()).unwrap();
         let result = IpaSigner::new_adhoc().sign_folder_in_place(".");
@@ -2718,7 +2726,7 @@ mod tests {
         .unwrap();
         // Named after the bundle's file stem so the fallback target is the
         // file that actually gets signed.
-        std::fs::write(app.join("App"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(app.join("App"), fixtures::make_minimal_macho()).unwrap();
 
         IpaSigner::new(&crate::test_util::test_credentials())
             .sign_folder_in_place(&app)
@@ -2735,9 +2743,9 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let outside = temp.path().join("outside.dylib");
-        std::fs::write(&outside, crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(&outside, fixtures::make_minimal_macho()).unwrap();
         let app = create_folder_bundle(temp.path(), "Test", true);
-        std::fs::write(app.join("real.dylib"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(app.join("real.dylib"), fixtures::make_minimal_macho()).unwrap();
         let link = app.join("lib.dylib");
         symlink(&outside, &link).unwrap();
         let before = std::fs::read(&outside).unwrap();
@@ -2784,7 +2792,7 @@ mod tests {
         std::fs::create_dir_all(app.join("Frameworks")).unwrap();
         std::fs::write(
             app.join("Frameworks").join("libfoo.dylib"),
-            crate::test_util::minimal_dylib(),
+            fixtures::make_minimal_dylib(),
         )
         .unwrap();
 
@@ -2920,7 +2928,7 @@ mod tests {
 </plist>"#,
         )
         .unwrap();
-        std::fs::write(evil.join("Evil"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(evil.join("Evil"), fixtures::make_minimal_macho()).unwrap();
 
         let app = create_folder_bundle(temp.path(), "Test", true);
         symlink(&evil, app.join("Evil.framework")).unwrap();
@@ -3056,7 +3064,7 @@ mod tests {
         zip.write_all(info_plist_xml("<string>Test</string>").as_bytes())
             .unwrap();
         zip.start_file("Payload2/App.app/Test", options).unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.add_symlink("Payload", "Payload2", options).unwrap();
         zip.finish().unwrap();
 
@@ -3121,7 +3129,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(xpc.join("Foo"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(xpc.join("Foo"), fixtures::make_minimal_macho()).unwrap();
 
         // `.xpc` is not in the {app, framework, appex} whitelist: only the
         // Info.plist/location arms can discover this bundle.
@@ -3236,7 +3244,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(xpc.join("Foo"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(xpc.join("Foo"), fixtures::make_minimal_macho()).unwrap();
         app
     }
 
@@ -3734,7 +3742,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(appex.join("Ext"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(appex.join("Ext"), fixtures::make_minimal_macho()).unwrap();
         (app, appex)
     }
 
@@ -3836,7 +3844,7 @@ mod tests {
         let frameworks = app.join("Frameworks");
         std::fs::create_dir_all(&frameworks).unwrap();
         let dylib = frameworks.join("libHelper.dylib");
-        std::fs::write(&dylib, crate::test_util::minimal_dylib()).unwrap();
+        std::fs::write(&dylib, fixtures::make_minimal_dylib()).unwrap();
         let ext_profile = temp.path().join("ext.mobileprovision");
         std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
 
@@ -4020,7 +4028,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(watch.join("Companion"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(watch.join("Companion"), fixtures::make_minimal_macho()).unwrap();
         app
     }
 
@@ -4076,7 +4084,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(sibling.join("Guard"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(sibling.join("Guard"), fixtures::make_minimal_macho()).unwrap();
         sibling
     }
 
@@ -4254,12 +4262,10 @@ mod tests {
 
     #[test]
     fn test_entitlements_override_shields_invalid_dir_file() {
-        use crate::test_util::minimal_macho;
-
         let temp = TempDir::new().unwrap();
         let app = create_folder_bundle(temp.path(), "Test", true);
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST_FOR_OVERRIDE).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
 
         // The directory holds a GARBAGE entry for this very bundle id, so a
         // losing tier is able to fail the sign unless the winning override

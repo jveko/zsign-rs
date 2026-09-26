@@ -717,6 +717,7 @@ impl Default for ZSign {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zsign_core::macho::fixtures;
 
     #[test]
     fn test_zsign_builder_default() {
@@ -791,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_sign_bundle_folder_in_place() {
-        use crate::test_util::{minimal_macho, test_credentials};
+        use crate::test_util::test_credentials;
         use std::io::Write;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -807,7 +808,7 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let mut f = std::fs::File::create(app.join("data.bin")).unwrap();
         f.write_all(&[0xCD; 2048]).unwrap();
 
@@ -851,47 +852,15 @@ mod tests {
         assert!(ipa.exists());
     }
 
-    /// Assembles thin Mach-O slices into a big-endian FAT container using
-    /// lipo's alignment rule (each slice start aligned to 2^12).
-    fn make_fat_for_test(slices: &[Vec<u8>]) -> Vec<u8> {
-        assert!(!slices.is_empty());
-        let mut out = Vec::new();
-        out.extend_from_slice(&0xcafebabeu32.to_be_bytes());
-        out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
-        let header_size = 8 + slices.len() * 20;
-        let mut offsets = Vec::with_capacity(slices.len());
-        let mut cursor = header_size;
-        for slice in slices {
-            cursor = cursor.checked_add(4095).unwrap() & !4095;
-            offsets.push(cursor);
-            cursor += slice.len();
-        }
-        for (slice, offset) in slices.iter().zip(&offsets) {
-            let cpu = u32::from_le_bytes(slice[4..8].try_into().expect("cputype"));
-            let sub = u32::from_le_bytes(slice[8..12].try_into().expect("cpusubtype"));
-            out.extend_from_slice(&cpu.to_be_bytes());
-            out.extend_from_slice(&sub.to_be_bytes());
-            out.extend_from_slice(&(*offset as u32).to_be_bytes());
-            out.extend_from_slice(&(slice.len() as u32).to_be_bytes());
-            out.extend_from_slice(&12u32.to_be_bytes());
-        }
-        for (slice, offset) in slices.iter().zip(&offsets) {
-            out.resize(*offset, 0);
-            out.extend_from_slice(slice);
-        }
-        out
-    }
-
     /// Writes a two-architecture (arm64 + x86_64) universal binary into `dir`.
     fn write_two_arch_fat_fixture(dir: &std::path::Path) -> std::path::PathBuf {
-        let mut x86 = crate::test_util::minimal_macho();
+        let mut x86 = fixtures::make_minimal_macho();
         x86[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        let slices = [fixtures::make_minimal_macho(), x86];
+        // One align exponent per slice: both are padded to a 2^12 boundary.
+        let aligns = [12u32; 2];
         let input = dir.join("universal_bin");
-        std::fs::write(
-            &input,
-            make_fat_for_test(&[crate::test_util::minimal_macho(), x86]),
-        )
-        .expect("write fixture");
+        std::fs::write(&input, fixtures::make_fat_macho(&slices, &aligns)).expect("write fixture");
         input
     }
 
@@ -974,7 +943,7 @@ mod tests {
         zip.start_file("Payload/Test.app/Info.plist", opts).unwrap();
         zip.write_all(FIXTURE_PLIST).unwrap();
         zip.start_file("Payload/Test.app/Test", opts).unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.start_file("Payload/Test.app/data.bin", opts).unwrap();
         zip.write_all(&[0xCD; 4096]).unwrap();
         zip.finish().unwrap();
@@ -1084,14 +1053,14 @@ mod tests {
     }
     #[test]
     fn test_sign_bundle_forwards_compression_level() {
-        use crate::test_util::{minimal_macho, test_credentials};
+        use crate::test_util::test_credentials;
         use std::io::Write;
 
         let dir = tempfile::TempDir::new().unwrap();
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let mut f = std::fs::File::create(app.join("data.bin")).unwrap();
         f.write_all(&[0xCD; 2048]).unwrap();
 
@@ -1114,11 +1083,11 @@ mod tests {
 
     #[test]
     fn test_sign_macho_applies_dylibs_and_bundle_id() {
-        use crate::test_util::{minimal_macho, test_credentials};
+        use crate::test_util::test_credentials;
 
         let dir = tempfile::TempDir::new().unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("signed.bin");
 
         ZSign::new()
@@ -1166,13 +1135,12 @@ mod tests {
     #[test]
     fn test_sign_macho_adhoc_applies_profile_entitlements() {
         use crate::codesign::constants::CSSLOT_ENTITLEMENTS;
-        use crate::test_util::minimal_macho;
 
         let dir = tempfile::TempDir::new().unwrap();
         let profile = dir.path().join("test.mobileprovision");
         std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         // Control: adhoc without a profile must not carry an entitlements slot.
         let control = dir.path().join("control.bin");
@@ -1211,15 +1179,13 @@ mod tests {
     }
     #[test]
     fn validate_failure_leaves_input_tree_untouched() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
 
         // .app: abort before any bundle mutation
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let plist_before = std::fs::read(app.join("Info.plist")).unwrap();
         let result = ZSign::new().sign_bundle(&app, None);
         assert!(matches!(result, Err(Error::MissingCredentials(_))));
@@ -1238,7 +1204,7 @@ mod tests {
 
         // bare macho: output must never be created
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out_bin = dir.path().join("signed.bin");
         let result = ZSign::new().sign_macho(&input, &out_bin);
         assert!(matches!(result, Err(Error::MissingCredentials(_))));
@@ -1269,15 +1235,13 @@ mod tests {
 
     #[test]
     fn test_sign_macho_entitlements_override_replaces_profile() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let profile = dir.path().join("test.mobileprovision");
         std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
         let ents = dir.path().join("custom.entitlements");
         std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let out = dir.path().join("signed.bin");
         ZSign::new()
@@ -1301,15 +1265,13 @@ mod tests {
 
     #[test]
     fn test_sign_macho_entitlements_override_with_credentials() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let profile = dir.path().join("test.mobileprovision");
         std::fs::write(&profile, PROFILE_FIXTURE).unwrap();
         let ents = dir.path().join("custom.entitlements");
         std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let out = dir.path().join("signed.bin");
         ZSign::new()
@@ -1333,13 +1295,11 @@ mod tests {
 
     #[test]
     fn test_sign_macho_adhoc_entitlements_override_without_profile() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let ents = dir.path().join("custom.entitlements");
         std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let out = dir.path().join("signed.bin");
         ZSign::new()
@@ -1358,12 +1318,10 @@ mod tests {
 
     #[test]
     fn test_entitlements_override_missing_file_names_path() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("absent.entitlements");
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("signed.bin");
 
         let err = ZSign::new()
@@ -1388,8 +1346,6 @@ mod tests {
 
     #[test]
     fn test_entitlements_override_rejects_non_dictionary() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let ents = dir.path().join("array.entitlements");
         std::fs::write(
@@ -1404,7 +1360,7 @@ mod tests {
         )
         .unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let err = ZSign::new()
             .adhoc(true)
@@ -1420,8 +1376,6 @@ mod tests {
 
     #[test]
     fn test_entitlements_override_rejects_unencodable_values() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let ents = dir.path().join("real.entitlements");
         std::fs::write(
@@ -1437,7 +1391,7 @@ mod tests {
         )
         .unwrap();
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let err = ZSign::new()
             .adhoc(true)
@@ -1488,13 +1442,11 @@ mod tests {
 
     #[test]
     fn test_sign_bundle_forwards_entitlements_override() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let ents = dir.path().join("custom.entitlements");
         std::fs::write(&ents, OVERRIDE_ENTITLEMENTS).unwrap();
 
@@ -1559,13 +1511,11 @@ mod tests {
 
     #[test]
     fn test_sign_bundle_forwards_entitlements_dir() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let ents_dir = dir.path().join("ents");
         write_entitlements_dir(&ents_dir, "com.zsign.test", "com.zsign.dir.ent");
 
@@ -1585,13 +1535,11 @@ mod tests {
 
     #[test]
     fn test_entitlements_dir_uses_post_rewrite_bundle_id() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         // Only the REWRITTEN id has a file; the pre-rewrite one must not be used.
         let ents_dir = dir.path().join("ents");
         write_entitlements_dir(&ents_dir, "com.zsign.rewritten", "com.zsign.dir.ent");
@@ -1618,13 +1566,11 @@ mod tests {
 
     #[test]
     fn test_sign_macho_ignores_entitlements_dir() {
-        use crate::test_util::minimal_macho;
-
         let dir = tempfile::TempDir::new().unwrap();
         let ents_dir = dir.path().join("ents");
         write_entitlements_dir(&ents_dir, "app", "com.zsign.dir.ent");
         let input = dir.path().join("app.bin");
-        std::fs::write(&input, minimal_macho()).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("signed.bin");
 
         // A bare Mach-O has no bundle identity, so the directory must not apply.
@@ -1645,11 +1591,11 @@ mod tests {
         let app = dir.join("App.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         let appex = app.join("PlugIns").join("Ext.appex");
         std::fs::create_dir_all(&appex).unwrap();
         std::fs::write(appex.join("Info.plist"), EXT_APPLE_INFO_PLIST).unwrap();
-        std::fs::write(appex.join("Ext"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(appex.join("Ext"), fixtures::make_minimal_macho()).unwrap();
         (app, appex)
     }
 
@@ -1701,13 +1647,13 @@ mod tests {
         zip.start_file("Payload/App.app/Info.plist", opts).unwrap();
         zip.write_all(FIXTURE_PLIST).unwrap();
         zip.start_file("Payload/App.app/Test", opts).unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.start_file("Payload/App.app/PlugIns/Ext.appex/Info.plist", opts)
             .unwrap();
         zip.write_all(EXT_APPLE_INFO_PLIST).unwrap();
         zip.start_file("Payload/App.app/PlugIns/Ext.appex/Ext", opts)
             .unwrap();
-        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.write_all(&fixtures::make_minimal_macho()).unwrap();
         zip.finish().unwrap();
     }
 
@@ -1776,7 +1722,7 @@ mod tests {
         let app = dir.path().join("Test.app");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
-        std::fs::write(app.join("Test"), crate::test_util::minimal_macho()).unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         // Pre-seeded junk profile: it survives a sign that does NOT forward -R.
         std::fs::write(app.join("embedded.mobileprovision"), b"junk").unwrap();
 
@@ -1807,7 +1753,7 @@ mod tests {
             zip.start_file("Payload/Test.app/Info.plist", opts).unwrap();
             zip.write_all(FIXTURE_PLIST).unwrap();
             zip.start_file("Payload/Test.app/Test", opts).unwrap();
-            zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+            zip.write_all(&fixtures::make_minimal_macho()).unwrap();
             zip.start_file("Payload/Test.app/embedded.mobileprovision", opts)
                 .unwrap();
             zip.write_all(b"junk").unwrap();

@@ -974,87 +974,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
     use tempfile::TempDir;
-
-    /// Minimal arm64 MH_EXECUTE with an injected LC_ENCRYPTION_INFO_64 (cryptid=1, cryptsize=0x1000).
-    fn encrypted_macho() -> Vec<u8> {
-        let mut b = Vec::with_capacity(0x2000);
-        macro_rules! u32 {
-            ($v:expr) => {
-                b.extend_from_slice(&($v as u32).to_le_bytes())
-            };
-        }
-        macro_rules! u64 {
-            ($v:expr) => {
-                b.extend_from_slice(&($v as u64).to_le_bytes())
-            };
-        }
-        macro_rules! name {
-            ($s:expr) => {
-                let mut n = [0u8; 16];
-                n[..$s.len()].copy_from_slice($s.as_bytes());
-                b.extend_from_slice(&n);
-            };
-        }
-
-        u32!(0xfeedfacf); // MH_MAGIC_64
-        u32!(0x0100_000c); // CPU_TYPE_ARM64
-        u32!(0x0000_0000);
-        u32!(2); // MH_EXECUTE
-        u32!(4); // ncmds
-        u32!(152 + 72 + 24 + 24); // sizeofcmds
-        u32!(0x1); // MH_NOUNDEFS
-        u32!(0); // reserved
-        u32!(0x19);
-        u32!(152);
-        name!("__TEXT");
-        u64!(0x1_0000_0000);
-        u64!(0x1000);
-        u64!(0x1000);
-        u64!(0x1000);
-        u32!(7);
-        u32!(7);
-        u32!(1);
-        u32!(0);
-        name!("__text");
-        name!("__TEXT");
-        u64!(0x1_0000_0000);
-        u64!(4);
-        u32!(0x1000);
-        u32!(0);
-        u32!(0);
-        u32!(0);
-        u32!(0);
-        u32!(0);
-        u32!(0);
-        u32!(0);
-        u32!(0x19);
-        u32!(72);
-        name!("__LINKEDIT");
-        u64!(0x1_0000_1000);
-        u64!(0x1000);
-        u64!(0x2000);
-        u64!(0);
-        u32!(1);
-        u32!(1);
-        u32!(0);
-        u32!(0);
-        u32!(0x32);
-        u32!(24);
-        u32!(1);
-        u32!(0x000f_0000);
-        u32!(0x000f_0000);
-        u32!(0);
-        u32!(0x2c);
-        u32!(24);
-        u32!(0x1000);
-        u32!(0x1000);
-        u32!(1);
-        u32!(0);
-        b.resize(0x1000, 0);
-        b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
-        b.resize(0x2000, 0);
-        b
-    }
+    use zsign_core::macho::fixtures;
 
     /// Builds `dir/Enc.app` containing the encrypted executable.
     fn make_encrypted_app(dir: &Path) -> std::path::PathBuf {
@@ -1070,7 +990,11 @@ mod tests {
 </dict></plist>"#,
         )
         .unwrap();
-        std::fs::write(app.join("Enc"), encrypted_macho()).unwrap();
+        std::fs::write(
+            app.join("Enc"),
+            fixtures::make_minimal_macho_encrypted(1, 0x1000),
+        )
+        .unwrap();
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
         app
     }
@@ -1127,8 +1051,6 @@ mod tests {
         }
     }
 
-    const MINIMAL_MACHO: &[u8] = include_bytes!("../../zsign/src/ipa/fixtures/minimal_macho.bin");
-
     const IDENTITY_P12: &[u8] =
         include_bytes!("../../zsign-core/src/crypto/fixtures/identity_single.p12");
 
@@ -1157,7 +1079,7 @@ mod tests {
     fn verify_valid_input_exits_zero() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let signed = dir.path().join("signed.bin");
         let sign = run_cli(
             &[
@@ -1179,7 +1101,7 @@ mod tests {
         // unsigned minimal macho: slice error (no LC_CODE_SIGNATURE), top-level errors empty
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let v = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
         assert_eq!(v.code, 1, "expected 1, stderr: {}", v.stderr);
         assert!(v.stdout.contains("verified: no"), "stdout: {}", v.stdout);
@@ -1277,7 +1199,7 @@ mod tests {
     fn json_sign_reports_output() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let signed = dir.path().join("signed.bin");
         let r = run_cli(
             &[
@@ -1300,7 +1222,7 @@ mod tests {
     fn json_verify_valid_and_invalid_documents() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let signed = dir.path().join("signed.bin");
         assert_eq!(
             run_cli(
@@ -1367,7 +1289,7 @@ mod tests {
         // guard for the interop script's pinned stdout lines
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let r = run_cli(&[OsStr::new("-V"), input.as_os_str()], &[]);
         assert!(
             r.stdout.starts_with("verified: no\n"),
@@ -1413,7 +1335,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
         let r = run_cli(
             &[
@@ -1437,7 +1359,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         // the OID check runs before the certificate is read, so a nonexistent
         // -c path proves the misuse error fires first
         let r = run_cli(
@@ -1463,7 +1385,7 @@ mod tests {
         let key = dir.path().join("key.pem");
         std::fs::write(&key, concat!("-----BEGIN ", "PRIVATE KEY-----", "\n")).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("o.bin");
         let r = run_cli(
             &[
@@ -1505,7 +1427,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
         let r = run_cli(
             &[
@@ -1528,7 +1450,7 @@ mod tests {
         // reject the combinations where it would be silently ignored.
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         for extra in [OsStr::new("-V"), OsStr::new("-a")] {
             let r = run_cli(&[OsStr::new("-C"), extra, input.as_os_str()], &[]);
             assert_eq!(
@@ -1553,7 +1475,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
         let r = run_cli(
             &[
@@ -1578,7 +1500,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
 
         let env_only = run_cli(
             &[
@@ -1626,7 +1548,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let r = run_cli(
             &[
                 OsStr::new("-k"),
@@ -1657,7 +1579,7 @@ mod tests {
         let key = dir.path().join("empty.p12");
         std::fs::write(&key, EMPTY_PASSWORD_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let r = run_cli(
             &[
                 OsStr::new("-k"),
@@ -2028,7 +1950,7 @@ mod tests {
     fn encrypted_pem_routes_through_the_password_flow() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let key = dir.path().join("key.pem");
         let cert = dir.path().join("cert.pem");
         std::fs::write(&key, pem_fixture(ENC_TRAD_RSA)).unwrap();
@@ -2100,7 +2022,7 @@ mod tests {
     fn pbes2_pem_wrong_password_is_a_password_error_at_the_cli_too() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let key = dir.path().join("key.pem");
         let cert = dir.path().join("cert.pem");
         std::fs::write(&key, pem_fixture(ENC_PKCS8_RSA)).unwrap();
@@ -2135,7 +2057,7 @@ mod tests {
         // source line carries a private-key header.
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let key = dir.path().join("key.pem");
         let cert = dir.path().join("cert.pem");
         std::fs::write(
@@ -2181,7 +2103,7 @@ mod tests {
     fn credential_io_errors_name_the_file() {
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let missing_key = dir.path().join("absent.key");
         let r = run_cli(
             &[
@@ -2208,7 +2130,7 @@ mod tests {
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
         let input = dir.path().join("in.bin");
-        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
         let profile = dir.path().join("absent.mobileprovision");
         let r = run_cli(
