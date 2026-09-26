@@ -581,7 +581,10 @@ echo "fixtures verified"
     #[test]
     fn dek_info_aes256_yields_a_pkcs1_key() {
         let pem = pem_fixture(TRAD_RSA_AES256);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword"))
+            .unwrap()
+            .expect("a traditional encrypted PEM must be recognised")
+            .der;
         assert_eq!(der[0], 0x30, "plaintext must be a DER SEQUENCE");
         assert!(
             rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok(),
@@ -593,7 +596,10 @@ echo "fixtures verified"
     #[test]
     fn dek_info_aes128_yields_a_sec1_ec_key() {
         let pem = pem_fixture(TRAD_EC_AES128);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword"))
+            .unwrap()
+            .expect("a traditional encrypted PEM must be recognised")
+            .der;
         assert!(
             p256::SecretKey::from_sec1_der(&der).is_ok(),
             "traditional EC PEM must decrypt to SEC1, got {} bytes",
@@ -604,7 +610,10 @@ echo "fixtures verified"
     #[test]
     fn dek_info_3des_yields_a_pkcs1_key() {
         let pem = pem_fixture(TRAD_RSA_DES3);
-        let der = decrypt_traditional_pem(pem, Some("testpassword")).unwrap();
+        let der = decrypt_traditional_pem(pem, Some("testpassword"))
+            .unwrap()
+            .expect("a traditional encrypted PEM must be recognised")
+            .der;
         assert!(rsa::RsaPrivateKey::from_pkcs1_der(&der).is_ok());
     }
 
@@ -1077,7 +1086,7 @@ fn first_pem_block(pem: &str) -> Option<(&str, Vec<u8>)> {
 /// in the clear. A supplied password on an unencrypted container is ignored, which is what
 /// OpenSSL does.
 fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> {
-    if let Some(traditional) = crate::crypto::encrypted_pem::decrypt_pem_fixture(pem, password)? {
+    if let Some(traditional) = crate::crypto::encrypted_pem::decrypt_traditional_pem(pem, password)? {
         // The padding validated; a body that still fails to decode means the passphrase was wrong.
         return DecodedKey::from_der_by_content(&traditional.der).ok_or(Error::InvalidPassword);
     }
