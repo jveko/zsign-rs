@@ -55,7 +55,7 @@ cite, an RFC quote, or a **measured** probe result.
 | P10 | P7/P9 with a wrong password | CBC/PKCS#7 unpad failure = "padding invalid" — the traditional wrong-password signal |
 | P11 | RFC 6979 A.2.5 through `Signer::<DerSignature>::sign` (CMS's exact trait method) | DER equals `3046022100efd4…3716 022100f7cb…acda8` ("sample") and `3045022100f1ab…8367 0220 019f41…0083` ("test"); `openssl asn1parse` reads back the RFC's own INTEGERs |
 | P12 | RFC 6960 CertID hashes computed with `x509-cert` + `sha1` on the embedded Apple certs | `sha1(leaf.tbs.issuer.to_der()) = bb4d3042529e9ce71959c2225f8c845f90b43c2a` and `sha1(root SPKI value bits) = 2bd06947947609fef46b8d2e40a6f7474d7f085e`, both **equal to the hashes inside openssl's own generated request**; the natural wrong recipes (whole SPKI, subject DN) differ |
-| P13 | `openssl ocsp -url http://ocsp.apple.com/ocsp03-applerootca` (AIA URI of `APPLE_WWDR_CA_G3_CERT`) | `good`, thisUpdate = probe date → live Apple OCSP still answers over plain HTTP |
+| P13 | **one-time network observation, depended on by no test** — `openssl ocsp -url http://ocsp.apple.com/ocsp03-applerootca` (AIA URI of `APPLE_WWDR_CA_G3_CERT`) | `good`, thisUpdate = probe date → live Apple OCSP still answers over plain HTTP |
 | P14 | offline OCSP fixture generation: CA + leaf through `openssl ca` (AIA in the leaf), `openssl ocsp -reqout`, then `openssl ocsp -reqin -respout -index … -rsigner …` with the index row flipped `V`→`R` | real `req.der` (106 B), `revoked.der` (1293 B, `Cert Status: revoked`, `RevokedAt 2026-01-01`, `Responder Id` by name, **no nextUpdate**) — all fixtures producible with no network |
 
 

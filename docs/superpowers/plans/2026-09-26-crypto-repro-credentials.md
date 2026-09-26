@@ -1911,9 +1911,12 @@ fn accepted_delegate(candidate: &Certificate, issuer: &Certificate) -> bool {
   (`1.2.840.113549.1.1.5`), `sha256WithRSAEncryption` (`1.2.840.113549.1.1.11`), and
   `ecdsa-with-SHA256` (`1.2.840.10045.4.3.2`), each verifying the raw `tbsResponseData` bytes —
   the same three arms `cms_verify.rs:1237-1286` already uses, re-expressed here because that
-  function also handles CMS-specific `signedAttrs` re-framing. `verify_cert_signature` and the
-  `id-kp-OCSPSigning` EKU check are promoted from `cms_verify.rs`
-  (`:1518-1566`, `:1599-1613`) as `pub(crate)`, matching how ZSN-37 promoted `ext_value`.
+function also handles CMS-specific `signedAttrs` re-framing. `verify_cert_signature` is promoted
+from `cms_verify.rs:1518-1566` — the same issue-child-under-issuer-key check the chain builder
+already performs. The `id-kp-OCSPSigning` EKU test is **new** code here: read the EKU extension
+through this module's own `ext_value`, decode `ExtendedKeyUsage`, and look for
+`const_oid::db::rfc5280::ID_KP_OCSP_SIGNING`. Nothing in `cms_verify.rs` performs it today, and
+`:1599` there is `leaf_purpose_reason`, a codeSigning check — the two are not the same thing.
   `span_of_next_tlv` is one new method on `pkcs12::DerReader` returning the raw bytes of the next
   TLV (not just its value); it is the single reason the reader is widened, and it replaces the
   "re-encode and hope it is canonical" shortcut that would break on any length form the responder
