@@ -4,12 +4,15 @@ Lane **zsn42-crypto**, 2026-09-26. Tickets ZSN-14 / ZSN-18 / ZSN-21 (Kaneo), wor
 order; each lands as its own green commit series. Base `97e8460`.
 
 Inputs: three codebase scouts (PEM/password wiring, crypto invariants + fixtures, wasm/warning
-boundaries), one librarian pass (`.tmptmp/research/zsn42-crypto-research.md`), and probes run on
-this machine (OpenSSL 3.6.3, pinned crate versions). Every claim below is either a `file:line`
-cite, an RFC quote, or a **measured** probe result.
+boundaries), one librarian pass (its findings are folded into the probe table below), and probes
+run on this machine (OpenSSL 3.6.3, pinned crate versions). Every claim below is either a
+`file:line` cite, an RFC quote, or a **measured** probe result.
 
-## Premise corrections (re-derived against current source)
+## Premise corrections (re-derived against the pre-lane base tree)
 
+> The cites in this section are **base-tree coordinates at `97e8460`**, recorded before the lane
+> landed. They are the evidence for the premises, not pointers into the current tree; the
+> post-lane equivalents are cited in the decision sections that act on them.
 1. **ZSN-14's premise is already satisfied on the pinned stack.** The CMS builder is bounded on
    the *non-randomized* `signature::Signer` (`cms-0.2.3/src/builder.rs:386`), and for
    `p256::ecdsa::SigningKey` that path is `try_sign` (`ecdsa-0.16.9/src/signing.rs:280`) →
@@ -76,8 +79,8 @@ contract. Rejected alternatives:
   trait (`RandomizedSigner` impls exist side by side at `signing.rs:232`, `:295`, `:333`, `:391`,
   `:428`) and nothing in the repo would notice until users lost reproducibility. Rejected.
 
-**Tests to add** (all in `crypto/cms.rs`'s `mod tests`; the repo has zero ECDSA determinism coverage
-today — `macho/signer.rs:973` and `cert.rs:1219` are RSA-only):
+**Tests to add** (all in `crypto/cms.rs`'s `mod tests`, plus one in `macho::signer`'s `mod tests`;
+the repo has zero ECDSA determinism coverage today, so this lane adds the first):
 
 | Test | Level | What it pins |
 |---|---|---|
@@ -92,16 +95,31 @@ It builds `SigningCredentials` by literal (all four fields public, `cert.rs:89-1
 self-issued `Profile::Leaf` (codeSigning EKU + digitalSignature KU, `CA:FALSE`, `OU=TESTTEAM`),
 reusing the `cert.rs:718`/`cms_verify.rs:2118` conventions.
 
-**D14.3.** `crypto/cms.rs` module docs state the invariant: ECDSA nonces are RFC 6979 deterministic
-by contract; `signatureAlgorithm` is `ecdsa-with-SHA256 (1.2.840.10045.4.3.2)` with **parameters
-absent** (RFC 5758 §3.2; `cms_verify.rs:1235` already rejects a NULL-parameter form); and a
-**`signingTime` signed attribute must never be added** — `cms-0.2.3/src/builder.rs:1102-1125`
-provides `create_signing_time_attribute`, and using it would destroy byte reproducibility for RSA
-and ECDSA alike. No ticket IDs in code comments (repo rule); the upstream comparison lives here and
-in the final report: upstream `zhlynn/zsign` signs via OpenSSL `CMS_sign`/`CMS_final`
-(`src/openssl.cpp:440-506`), i.e. OpenSSL's default randomized nonce, so its output is not
-reproducible run to run. An RFC 6979 signature is an ordinary P-256 ECDSA signature, so `codesign`
-and Apple verifiers cannot tell the difference.
+**D14.3.** `crypto/cms.rs` module docs state the invariant (`cms.rs:14-23`): ECDSA nonces are
+RFC 6979 deterministic by contract; a **`signingTime` signed attribute must never be added** —
+`cms-0.2.3/src/builder.rs:1102-1125` provides `create_signing_time_attribute`, and using it would
+destroy byte reproducibility for RSA and ECDSA alike; and the ECDSA arm must stay on
+`signature::Signer` rather than `RandomizedSigner`.
+
+  The signing side does emit absent parameters, which is what RFC 5758 §3.2 asks for, but it is
+  *inherited*, not pinned here: `build_cms_signed_data` is bounded on
+  `spki::DynSignatureAlgorithmIdentifier` (`cms.rs:208`, `:367`), so the `SignerInfo`
+  `signatureAlgorithm` comes from the key, and for P-256 that is
+  `ecdsa-0.16.9/src/signing.rs:541-552` (`SignatureAlgorithmIdentifier for SigningKey<C>`) resolving
+  to `ecdsa-0.16.9/src/lib.rs:477-488`, which sets `parameters: None` (`:486`). The one
+  AlgorithmIdentifier our own file builds is the `SignerInfo` `digestAlgorithm`
+  (`cms.rs:315-318`, and the test-only `TestDigest::algorithm` at `:95-103`), also with
+  `parameters: None`.
+  The verifier does **not** enforce that: `cms_verify::verify_signer_signature` (`:1202`) dispatches
+  on the OID alone and never inspects `signature_algorithm.parameters`, so a trailing NULL is
+  accepted. That is the shipped behaviour and is recorded here as a known gap, not claimed as a
+  rejection.
+
+  No ticket IDs in code comments (repo rule); the upstream comparison lives here and in the final
+  report: upstream `zhlynn/zsign` signs via OpenSSL `CMS_sign`/`CMS_final`
+  (`src/openssl.cpp:440-506`), i.e. OpenSSL's default randomized nonce, so its output is not
+  reproducible run to run. An RFC 6979 signature is an ordinary P-256 ECDSA signature, so `codesign`
+  and Apple verifiers cannot tell the difference.
 
 **D14.4.** Verify path untouched. `cms_verify.rs:3064`
 (`ecdsa_code_signature_round_trips_with_der_signer_info`) and `:3087` already prove a
@@ -118,24 +136,28 @@ reported as red→green-by-mutation, honestly labelled.
 
 **Decision D18.1.** One entry point, one password source, no new `Error` variants, exactly one new
 crate (`md-5`), reached through the existing `SigningCredentials::from_pem(cert_pem, key_pem,
-Option<&str>)` signature (`cert.rs:465`), which does not change — so no caller migrates and no CLI
-flag appears.
+Option<&str>)` signature (`cert.rs:534`), which does not change — so no caller migrates and no CLI
+flag appears. (The `:465` this cites in the base tree moved to `:534` when the traditional-key
+branch landed inside `from_pem`.)
 
 ### Accepted formats and the code path that takes each
 
 | Format | Marker | Path | Evidence |
 |---|---|---|---|
-| Encrypted PKCS#8, PBES2 + PBKDF2 (PRF HMAC-SHA1/224/256/384/512, absent prf = SHA-1) + AES-128/192/256-CBC | ``ENCRYPTED PRIVATE KEY` label` | reuse the in-tree PBES2 stack: `pkcs12::decrypt_key_bag` (`pkcs12.rs:793`, already an `EncryptedPrivateKeyInfo` reader) → `pbes2_decrypt` (`:481`, PRF matrix `:525-545`, `keyLength` agreement check `:516-522`, `validate_iterations` `:382`) → plaintext PKCS#8 DER → existing `DecodedKey::from_pkcs8_der` (`cert.rs:118`) | P2, P5 |
+| Encrypted PKCS#8, PBES2 + PBKDF2 (PRF HMAC-SHA1/224/256/384/512, absent prf = SHA-1) + AES-128/192/256-CBC | ``ENCRYPTED PRIVATE KEY` label` | reuse the in-tree PBES2 stack: `pkcs12::decrypt_key_bag` (`pkcs12.rs:810`, already an `EncryptedPrivateKeyInfo` reader) → `pbes2_decrypt` (`:493`, PRF matrix `:537-557`, `keyLength` agreement check `:524-534`, `validate_iterations` `:394`) → plaintext PKCS#8 DER → existing `DecodedKey::from_pkcs8_der` (`cert.rs:121`) | P2, P5 |
 | Traditional OpenSSL encrypted PEM | `Proc-Type: 4,ENCRYPTED` + `DEK-Info: <cipher>,<hex IV>` on `PRIVATE KEY` / `RSA PRIVATE KEY` / `EC PRIVATE KEY` | new header-framing decoder (`crypto/encrypted_pem.rs`, production half ~200 lines including
-the cipher table): header framing, `EVP_BytesToKey(MD5, iter = 1, salt = first 8 IV bytes)` for the **key bytes only**, decrypt CBC with the **header IV**, PKCS#7 unpad, then decode PKCS#8 / PKCS#1 / SEC1 by label | P6-P10 |
+the cipher table): header framing, `EVP_BytesToKey(MD5, iter = 1, salt = first 8 IV bytes)` for the **key bytes only**, decrypt CBC with the **header IV**, PKCS#7 unpad, then decode PKCS#8 / PKCS#1 / SEC1 **by content**, not by label (`TraditionalKey` discards the label, `encrypted_pem.rs:13-16`) | P6-P10 |
 | Unencrypted, unchanged behaviour | `PRIVATE KEY` | content-driven `DecodedKey::from_der_by_content` (`cert.rs:131`), which replaced the label-locked
 `from_pkcs8_pem` that this ticket deleted | P2 |
 
 Reusing `pkcs12`'s PBES2 engine is what the brief asks for ("reuse ZSN-37's PBKDF2 PRF/keyLength
 dispatch if it exposed reusable primitives"): it is a *visibility* change —
-`decrypt_key_bag`, `cbc_decrypt`, `unpad_pkcs7`, `AlgorithmId` go from private `fn`/`struct` to
-`pub(crate)` inside the same private `mod pkcs12` (`crypto/mod.rs:33`) — so nothing new becomes
-public API.
+`decrypt_key_bag` (`:810`) and the generic CBC engine `aes_decrypt` (`:627`, the one
+`encrypted_pem.rs:82-91` calls for every AES/3DES variant) go from private `fn` to `pub(crate)`
+inside the same private `mod pkcs12` (`crypto/mod.rs:35`) — so nothing new becomes public API.
+`pbes2_decrypt` (`:493`), `cbc_decrypt` (`:637`), `unpad_pkcs7` (`:670`) and `AlgorithmId` (`:358`)
+stayed private: the PEM decoder reaches them through those two entries rather than by widening the
+module further.
 
 **D18.2. Rejected: the `pkcs8` vendor decrypt route.**
 `pkcs8::DecodePrivateKey::from_pkcs8_encrypted_pem` (`pkcs8-0.10.2/src/traits.rs:31-64`) is one
@@ -162,12 +184,14 @@ clear message. Rejected alternative: full legacy parity with `pkcs12.rs` — ext
 iOS signing workflow emits.
 
 **D18.5. Decoded key codings.** The traditional path decrypts to PKCS#1 (`RSA PRIVATE KEY`) or SEC1
-(`EC PRIVATE KEY`), which the repo cannot decode today at all (premise 2), so
-`DecodedKey` grows `from_pkcs1_der` (`rsa::pkcs1::DecodeRsaPrivateKey`) and
-`from_sec1_der` (`p256::SecretKey`, P9 confirms it links under our current `p256` features) next to
-the existing PKCS#8 attempts. Both are then *also* accepted unencrypted, which is the
-label-driven decoder being applied consistently rather than a special case; the previously
-reachable `PRIVATE KEY` behaviour is unchanged and stays covered by its existing tests.
+(`EC PRIVATE KEY`), which the repo cannot decode today at all (premise 2), so the content-driven
+decoder `DecodedKey::from_der_by_content` (`cert.rs:131-142`) tries the PKCS#1
+(`rsa::pkcs1::DecodeRsaPrivateKey`) and SEC1 (`p256::SecretKey`, P9 confirms it links under our
+current `p256` features) decodes inline, after the existing PKCS#8 attempt — no new public methods
+are added, the two vendor decodes are inlined in that one function. Both codings are then *also*
+accepted unencrypted, which is the same content-driven decoder being applied consistently rather
+than a special case; the previously reachable `PRIVATE KEY` behaviour is unchanged and stays
+covered by its existing tests.
 
 ### Error taxonomy (no new variants)
 
@@ -184,23 +208,27 @@ variant is a hard compile error in a wave-6 file plus a new stable JS code (its 
 
 Wrong-password and unsupported-encryption are therefore different `Error` variants *and* different
 JS codes, which is the explicitness the ticket asks for. A `keyLength` disagreement or an iteration
-count above the existing `validate_iterations` ceiling (`pkcs12.rs:382`) stays the
+count above the existing `validate_iterations` ceiling (`pkcs12.rs:394`) stays the
 malformed-container case, matching how the `.p12` route already treats them.
 
 ### CLI cutover (the one permitted `main.rs` edit)
 
-Delete `reject_encrypted_key` (`main.rs:776-793`) and its two call sites (`:810` PEM route, `:845`
-DER route); pass `cli.password.as_deref()` into `from_pem` at `:815` and `:848`. Migrate the five
-tests that pin the old text (`main.rs:1669-1716`) to real behaviour: encrypted PEM loads with the
-right password, wrong password produces the password error, and a password on an unencrypted key is
-accepted (the "any password is a reject" rule disappears with the function). The DER route keeps
-`pem_wrap_der` (`main.rs:896-908`): it already labels bodies `PRIVATE KEY`, and encrypted bodies now
-flow through the same content-sniffing decoder. No clap attribute, no flag, no help-text change.
+Delete `reject_encrypted_key` (`main.rs:776-793` in the base tree) and its two call sites (`:810`
+PEM route, `:845` DER route there; `:795` and `:827-831` after this lane's own cutover); pass
+`cli.password.as_deref()` into `from_pem` at the same two sites. Migrate the five tests that pinned
+the old text (`main.rs:1669-1716` at the base, now `main.rs:1670-1821`) to real behaviour:
+encrypted PEM loads with the right password, wrong password produces the password error, and a
+password on an unencrypted key is accepted — the loader now reaches the ordinary parse path and
+fails there, with the old reject string asserted *absent* (`main.rs:1810-1814`). The DER route
+keeps `pem_wrap_der` (`main.rs:879`): it already labels bodies `PRIVATE KEY`, and encrypted bodies
+now flow through the same content-sniffing decoder — which is why routing is by content and not by
+label. No clap attribute, no flag, no help-text change.
 
-**Seam (not done here).** The TTY prompt lives in `resolve_p12_password` (`main.rs:865-892`) and is
+**Seam (not done here).** The TTY prompt lives in `resolve_p12_password` (`main.rs:848`) and is
 PKCS#12-only, so an encrypted PEM without `-p`/`ZSIGN_PASSWORD` gets the explicit "requires a
 password" error instead of a prompt. Extending the prompt to the PEM route is a password-flow change
-in the lane that owns `main.rs`; it needs no new flag, only one `Option<&str>` threaded at `:815`.
+in the lane that owns `main.rs`; it needs no new flag, only one `Option<&str>` threaded at the PEM
+call site (`main.rs:795`; the DER route is `:827-831`).
 
 ## ZSN-21 — revocation warning
 
@@ -215,14 +243,14 @@ Why not default-on inside this wave:
   `macho/verify.rs:57`, `crates/zsign/src/verify.rs:129`), printed only in verify output
   (`main.rs:348-350`) and mirrored into verify DTOs (`main.rs:582`, `:678`). No report object
   exists on the sign path.
-- The once-per-invocation hooks that could carry one — `load_credentials` (`main.rs:795`) and
+- The once-per-invocation hooks that could carry one — `load_credentials` (`main.rs:776`) and
   `ZSign::get_credentials` (`builder.rs:264`) — are lane-forbidden, and `from_p12`/`from_pem`
   return only `Result<Self>`.
 - Library-level stderr writes have zero production precedent in `zsign-core` (every `eprintln!` in
   the workspace is in `main.rs` or a test), as do process-global latches (no
   `OnceLock`/`LazyLock`/`thread_local` in production code).
 - Today the crate says the opposite out loud: `crypto/cms_verify.rs:32-33` records "revocation
-  remains a device concern", and `pkcs12.rs:787` drops CRL bags.
+  remains a device concern", and `pkcs12.rs:804` drops CRL bags.
 
 So an automatic version this wave means inventing an unowned sink in a file zsn40 owns — precisely
 the case the brief sends to a seam report. The seam note names the one-line patch
@@ -266,16 +294,23 @@ pub fn check(leaf: &Certificate, issuer: Option<&Certificate>, transport: &dyn O
 pub fn warn_revocation(leaf: &Certificate, chain: &[Certificate]);      // the CLI-callable sink
 ```
 
+`TransportError` (`:140`), `warning_of` (`:844`, network-free and callable from the caller's own
+transport) and `HttpTransport` (`:884`, native-only) are public too, as is the `OcspTransport`
+trait (`:150`) they implement. The rest of the module is private to the file —
+`cert_id`, `stored_issuer_name_der`, `tlv`/`oid_tlv`/`concat`, `ext_value`,
+`has_ocsp_signing_eku`, `verify_signature` — except `transport_reason` (`:829`), which is
+`pub(crate)` so the mapping table can be named from a test.
+
 `check` takes the certificate pair rather than `SigningCredentials` so the whole module is testable
 with fixture certificates and needs no private key; `check` returns `NotChecked(_)` for every failure
 mode and never an `Err`, so a caller cannot turn a warning into a gate by accident, and only an
 authenticated `Revoked` produces text. `issuer_of` reads `SigningCredentials::cert_chain`
 (populated from the `.p12` bag, or completed from the embedded Apple assets for the PEM route,
-`crypto/cert.rs:271-322`) and matches on subject/issuer name. `warning_of` is
+`crypto/cert.rs:355-386`) and matches on subject/issuer name. `warning_of` is
 network-free and compiles for every target, which is what keeps the wasm surface honest: the only
 function that opens a socket is `warn_revocation`, and that exists on native targets only. `now`
 follows the crate's standing rule for new time-aware APIs — take `Option<OffsetDateTime>` and resolve
-through `cms_verify::resolve_now` (`crypto/cms_verify.rs:1681-1703`), leaving the wasm fixed-clock
+through `cms_verify::resolve_now` (`crypto/cms_verify.rs:1681-1699`), leaving the wasm fixed-clock
 convention (`1_800_000_000`) untouched.
 
 Request/response DER is built and parsed with the pinned `der`/`x509-cert`/`const-oid` stack:
@@ -283,26 +318,53 @@ Request/response DER is built and parsed with the pinned `der`/`x509-cert`/`cons
 (`src/ext/pkix/access.rs:19-60`, re-exported at `ext/pkix.rs:17`), and `const-oid 0.9.6` carries
 `ID_AD_OCSP`, `ID_PKIX_OCSP_BASIC`, `ID_KP_OCSP_SIGNING` — so AIA extraction and the response
 envelope need no new dependency and no hand-rolled ASN.1 writer beyond the `CertID` framing.
-`x509-cert` has **no** OCSP types, so `OCSPRequest`/`OCSPResponse` are local `#[derive(Sequence)]`
-structs in this module (the same pattern `cms_verify.rs` uses for its hand-parsed envelopes).
+`x509-cert` has **no** OCSP types, so the `OCSPRequest` is hand-framed with three local helpers
+(`oid_tlv` `:233`, `tlv` `:248`, `concat` `:238`; `build_request` `:297-303` is three `tlv` calls
+around the `CertID`) and the `OCSPResponse` is *walked* with the shared `pkcs12::DerReader` rather
+than decoded into types — `basic_response` (`:413-458`) unwraps the envelope, and
+`parse_and_verify` (`:310`) delegates to `walk_response` (`:462-578`), which reads the
+`SingleResponse` fields one TLV at a time and uses `span_of_next_tlv` to capture `tbsResponseData`
+as the exact bytes the responder signed.
 
 ### Verification posture
 
 Trusted answer, per RFC 6960 §3.2 — stricter than upstream, which verifies nothing:
 
-1. `CertID` recomputed and matched: `sha1(leaf.tbs_certificate.issuer.to_der())` and
-   `sha1(issuer subjectPublicKey value bits)` plus the serial, SHA-1 as the hash algorithm. P12
-   proves these exact recipes reproduce openssl's own request bytes for the embedded Apple pair
-   (`bb4d3042…`/`2bd06947…`), and that the tempting wrong recipes (whole SPKI DER, subject DN) do
-   not.
+1. `CertID` recomputed and matched, SHA-1 as the hash algorithm: `sha1(stored_issuer_name_der(leaf))`
+   — the issuer `Name` **sliced out of the leaf's own DER** (`:180-187`) — plus
+   `sha1(issuer subjectPublicKey value bits)` and the serial. The stored-bytes recipe is the point:
+   a `Name` stored in a non-minimal form re-encodes to bytes no responder ever hashed, so
+   `Name::to_der()` is the wrong input even though it looks equivalent. P12 proves these recipes
+   reproduce openssl's own request bytes for the embedded Apple pair (`bb4d3042…`/`2bd06947…`),
+   and that the tempting wrong recipes (whole SPKI DER, subject DN) do not.
 2. `responseStatus == successful(0)`; `responseType == id-pkix-ocsp-basic (1.3.6.1.5.5.7.48.1.1)`.
 3. **Signature over `tbsResponseData`'s DER bytes verifies** against the issuer's key, or against a
    responder certificate embedded in the response that is (a) issued by that CA and (b) carries
-   `id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9)`. Reuses the existing RSA-PKCS#1v1.5/P-256 verify
-   primitives (`cms_verify.rs:1237-1286`, `:1518-1566`). Anything else is `UnverifiedResponse`.
+   `id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9)`. Two primitives are shared with the rest of the crate:
+   `cms_verify::verify_cert_signature` (promoted to `pub(crate)` at `cms_verify.rs:1518`, used for the
+   delegate's own certificate path) and `cms_verify::resolve_now` (`revocation.rs:44`). The
+   response-signature check itself is deliberately local — `verify_signature` (`:697`) re-expresses
+   the same three RSA-PKCS#1v1.5/P-256 arms over an *arbitrary message*, which is what a raw
+   `tbsResponseData` is, because `cms_verify`'s routine also re-frames CMS `signedAttrs`; and
+   `has_ocsp_signing_eku` (`:675`) is this module's own EKU lookup, since nothing in `cms_verify`
+   performs that check. Anything else is `NotCheckedReason::Unverified`.
 4. `thisUpdate <= now` and `nextUpdate` absent or `> now`; otherwise `OutsideValidityWindow`.
 
-Anything but an authenticated `Revoked` is silent, and no branch can fail a signature. Note what
+Anything but an authenticated `Revoked` is silent, and no branch can fail a signature.
+
+**Delegate-certificate algorithm policy (changed during review).** One review pass found a second
+certificate verifier living inside `revocation.rs` beside `cms_verify`'s; the duplicate was deleted in
+favour of promoting `cms_verify::verify_cert_signature` (`:1518`) to `pub(crate)`, because the
+delegate check *is* a one-link certificate-chain verification and should follow the chain builder's
+policy rather than a bespoke copy. That also widened which signature algorithms a delegate certificate
+may carry, from `sha1WithRSA`/`sha256WithRSA` plus `ecdsa-with-SHA256` only, to the shared
+verifier's set: RSA with SHA-1/256/384/512 (SHA-256 standing in for an unrecognised RSA signature
+OID) and P-256 ECDSA without an OID gate. Nothing else about the trust decision moved: a delegated
+responder is still accepted only when its certificate is issued by this CA, carries
+`id-kp-OCSPSigning`, **and** verifies under this CA's key — and a stronger digest is not a weaker
+check. The OCSP *response* signature keeps its own strict OID allowlist in this module's
+`verify_signature`, which is a different question (an arbitrary message under a key) and was never
+merged into the certificate verifier. Note what
 the posture does *not* claim: OCSP over plaintext HTTP proves the responder's key, not the channel,
 so an on-path attacker can still *suppress* a warning by forging a `good` answer — the same
 limitation upstream has. That is recorded here rather than papered over; it is also why this stays a
@@ -326,9 +388,9 @@ already accounts for the rest (`code_directory.rs:66-68` documents its wasm degr
 
 **Rejected:** `ureq` (3.3.0 pulls `base64`, `url`, `percent-encoding`, `log`; 2.13.2 pulls
 `base64ct`, `url`, `percent-encoding`; neither builds for `wasm32-unknown-unknown`, so the dep buys
-nothing for the wasm half of the workspace and every added crate is a permanent
-`cargo deny check`/`cargo hack --feature-powerset` surface — `ci.yml:131`). **Rejected:**
-`curl`/`openssl ocsp` subprocess (breaks the Windows CI job `ci.yml:75`). **Rejected:**
+nothing for the wasm half of the workspace and every added crate is a permanent `cargo deny`
+license and advisory surface — the `cargo-deny` job, `ci.yml:117-126`). **Rejected:**
+`curl`/`openssl ocsp` subprocess (breaks the Windows CI job `ci.yml:65`). **Rejected:**
 `rustls`/full TLS (no `https:` responder needed today).
 
 ### Deferred, with reasons
@@ -372,17 +434,22 @@ assumed: `cargo-deny` is not installed in this environment, so the posture is ar
 `cargo check -p zsign-wasm --target wasm32-unknown-unknown` (`ci.yml:88`), release wasm build
 (`ci.yml:90`), `wasm-pack test --node` (`ci.yml:96`).
 
-**Public API.** Two new public paths only: the `crypto::revocation` module and the widened
-`from_pem` password semantics (signature unchanged). `SigningCredentials` keeps its exact four-field
-public shape — the credential-hardening spec froze it for structural reasons
-(`specs/2026-09-25-credential-hardening-design.md:48-51`), and it still holds: 14 struct-literal
-sites exist in tests/benches, zero in production.
+**Public API.** Two new public modules — `crypto::revocation` and `crypto::encrypted_pem`
+(`crypto/mod.rs:34`, `:36`) — plus the widened `from_pem` password semantics (signature
+unchanged). Every item in `encrypted_pem` is `pub(crate)`, so that second module is a public path
+with no public items. `SigningCredentials` keeps its exact four-field public shape — the
+credential-hardening spec froze it for structural reasons
+(`specs/2026-09-25-credential-hardening-design.md:48-51`), and it still holds: 17
+struct-literal sites exist in tests/benches, zero in production.
 
 **Revocation coverage is hermetic in two layers.** Layer 1, every target: canned DER — the
-`build_request` output is compared byte-for-byte with openssl's own 106-byte request (P12, the
-`CertID` as a byte-substring), and
-`parse_and_verify` is driven by the `good`/`revoked`/`stale`/`mis-signed` DER fixtures (P14) with an
-injected `now`. Layer 2, native only: a `TcpListener` bound to `127.0.0.1:0` inside the test serves
+`build_request` output is compared byte-for-byte with openssl's own 106-byte `req.der` (P12, the
+`CertID` as a byte-substring). The leaf/issuer pair is `issued_leaf.pem` + `ca.pem`, and
+`parse_and_verify` is driven by the five committed response DERs — `good.der`,
+`good_nextupdate.der`, `revoked.der`, `good_delegate.der` and `good_delegate_nocert.der` — with an
+injected `now`. The "stale" and "mis-signed" behaviours are not fixture files but injected clocks
+and in-memory DER mutation, so no committed answer is stale by the time it is read.
+Layer 2, native only: a `TcpListener` bound to `127.0.0.1:0` inside the test serves
 the canned bytes through the real `HttpTransport`, so the header set, the size cap, the read timeout
 and `warn_revocation` itself are exercised with no DNS and no internet — the leaf's AIA URI is
 written at runtime with the accepted port, using the same extension-replacement idiom the verify

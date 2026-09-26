@@ -56,7 +56,7 @@ new `revocation.rs` whose network edge is a trait with a native `std::net` imple
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms.rs` (test module; `build_test_ecdsa_credentials`
-  lives at `:1048`)
+  lives at `:1059`)
 - Test: same file, inline `#[cfg(test)] mod tests`
 
 - [ ] **Step 1: Write the failing test** — add to `cms.rs`'s `mod tests`, after
@@ -94,7 +94,7 @@ new `revocation.rs` whose network edge is a trait with a native `std::net` imple
 
         let key = SigningKey::from_slice(&RFC6979_P256_SCALAR).expect("RFC 6979 scalar");
         // The annotation is what pins the trait arm: `DerSignature` is the exact type
-        // `sign_code_directory` hands to the CMS builder (`cms.rs:334`), so these are the
+        // `sign_code_directory` hands to the CMS builder (`cms.rs:345`), so these are the
         // bytes that land in the SignerInfo signature BIT STRING.
         // UFCS because `SigningKey` implements `Signer<Signature<C>>` (signing.rs:171) and
         // `Signer<der::Signature<C>>` (signing.rs:272) for the same key type.
@@ -169,8 +169,8 @@ the test, never as a reason to weaken the assertion.
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cms.rs` (test module only)
 
-- [ ] **Step 1: Add the fixed-key credential helper.** `build_test_ecdsa_credentials` (`cms.rs:1048`)
-  draws `SigningKey::random(&mut OsRng)` at `:1061`, so it cannot pin bytes. Add a sibling that
+- [ ] **Step 1: Add the fixed-key credential helper.** `build_test_ecdsa_credentials` (`cms.rs:1059`)
+  draws `SigningKey::random(&mut OsRng)` at `:1072`, so it cannot pin bytes. Add a sibling that
   reuses the same certificate-construction shape with the RFC 6979 scalar, plus a pinned validity so
   the certificate DER is identical in every process (`Validity::from_now` would move the bytes):
 
@@ -288,13 +288,13 @@ git commit -m "test(crypto): prove p-256 cms output is byte-identical across rep
 ## Task 3: Blob-level determinism and the documented contract
 
 **Files:**
-- Modify: `crates/zsign-core/src/macho/signer.rs` (test module; RSA precedent at `:973`
-  `cms_signature_is_deterministic_for_identical_inputs`)
+- Modify: `crates/zsign-core/src/macho/signer.rs` (test module; the tree has no RSA determinism
+  test, so the credential builder here is the RSA test fixture at `test_credentials` `:960`)
 - Modify: `crates/zsign-core/src/crypto/cms.rs` (module docs)
 
-- [ ] **Step 1: Write the failing test** in `macho/signer.rs`'s `mod tests`, mirroring the RSA
-  precedent's use of `crate::macho::fixtures::make_minimal_macho` and the `SigningCredentials`
-  literal pattern at `macho/fixtures.rs:404-409`, but with the ECDSA arm. Because
+- [ ] **Step 1: Write the failing test** in `macho/signer.rs`'s `mod tests`, following the existing
+  RSA tests' use of `crate::macho::fixtures::make_minimal_macho` and the `SigningCredentials`
+  literal pattern at `macho/fixtures.rs:401-405`, but with the ECDSA arm. Because
   `build_fixed_ecdsa_credentials` lives in `cms.rs`'s private test module, the blob-level test builds
   its own credential with the same fixed scalar and pinned validity:
 
@@ -365,7 +365,8 @@ git commit -m "test(macho): pin byte-identical p-256 macho signing and document 
 ## Task 4: Make the PKCS#12 PBES2 engine reusable
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:793` (one visibility change)
+- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:810` (`decrypt_key_bag`) and `:627` (`aes_decrypt`)
+  (two visibility changes; the shipped line numbers)
 
 - [ ] **Step 1: Widen the PBES2 engine and add the shared helpers.** This is the only task that
   changes `pkcs12.rs` visibility; Tasks 5, 6 and 9 consume it and widen nothing themselves.
@@ -427,15 +428,12 @@ appended to that `impl` block:
 ```
 
   Nothing else in the module changes: `pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`,
-  `unpad_pkcs7`, `mod oid`, `read_explicit`, `read_any`, `read_integer_u32`, `read_len` and
-  `remaining` stay module-private, and the PBES2 machinery is reached only through
-  `decrypt_key_bag`.
-
-
-  Nothing else in the module changes: `pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`,
-  `unpad_pkcs7`, `mod oid`, `read_explicit`, `read_any`, `read_integer_u32`, `read_len` and
-  `remaining` stay module-private, and the PBES2 machinery is reached only through
-  `decrypt_key_bag`.
+  `unpad_pkcs7`, `AlgorithmId`, `mod oid`, `read_explicit`, `read_any`, `read_integer_u32`,
+  `read_len` and `remaining` stay module-private. The PBES2 machinery is reached through two
+  widened entries and no others: `decrypt_key_bag` (`:810`), which Task 6's PKCS#8 path calls, and
+  the generic `aes_decrypt` (`:627`), which `encrypted_pem.rs:81-91` calls directly for
+  AES-128/192/256 and DES-EDE3-CBC. The per-field structs the traditional path could plausibly
+  have wanted were not widened, because it never parses an `EncryptedPrivateKeyInfo`.
 
 - [ ] **Step 2: Verify the module still compiles, and do not commit yet.**
 
@@ -455,9 +453,11 @@ Expected: all pass, behaviour unchanged.
 
 **Files:**
 - Create: `crates/zsign-core/src/crypto/encrypted_pem.rs`
-- Modify: `crates/zsign-core/src/crypto/mod.rs` (`pub mod encrypted_pem;` next to `pub mod cms;` at `:31`)
+- Modify: `crates/zsign-core/src/crypto/mod.rs` (`pub mod encrypted_pem;` after `pub mod cms_verify;` at `:33`)
 - Modify: `crates/zsign-core/Cargo.toml` (one dependency)
-- Create: 12 PEM fixtures under `crates/zsign-core/src/crypto/fixtures/`
+- Create: 8 PEM fixtures under `crates/zsign-core/src/crypto/fixtures/` (six encrypted key
+  containers as `*.pem.b64`, two readable certificates; no plaintext key fixture is committed —
+  the unencrypted cases generate their key in-test)
 
 - [ ] **Step 1: Add the single new dependency** (`md-5` is MIT OR Apache-2.0, already allowlisted at
   `deny.toml:14-27`; pinned to 0.10 because 0.11 needs `digest` 0.11 and the tree is on 0.10):
@@ -810,7 +810,7 @@ fn unsupported(detail: String) -> Error {
 
 /// Decrypts a traditional encrypted PEM. `Ok(None)` means "this is not a traditional encrypted
 /// PEM" — the caller then falls through to the PKCS#8 and PBES2 paths.
-pub(crate) fn decrypt_pem_fixture(pem: &str, password: Option<&str>) -> Result<Option<TraditionalKey>> {
+pub(crate) fn decrypt_traditional_pem(pem: &str, password: Option<&str>) -> Result<Option<TraditionalKey>> {
     let mut lines = pem.lines().map(str::trim_end);
     let begin = loop {
         match lines.next() {
@@ -843,9 +843,9 @@ pub(crate) fn decrypt_pem_fixture(pem: &str, password: Option<&str>) -> Result<O
     let (cipher, iv_hex) = dek_info
         .split_once(',')
         .ok_or_else(|| malformed(format!("DEK-Info has no IV: {dek_info}")))?;
-    let cipher = cipher.trim();
-    let (key_len, iv_len) = cipher_shape(cipher)
-        .ok_or_else(|| unsupported(format!("DEK-Info cipher {cipher} (supported: AES-128/192/256-CBC, DES-EDE3-CBC)")))?;
+    let cipher_name = cipher.trim();
+    let (cipher, key_len, iv_len) = DekCipher::shape(cipher_name)
+        .ok_or_else(|| unsupported(format!("DEK-Info cipher {cipher_name} (supported: AES-128/192/256-CBC, DES-EDE3-CBC)")))?;
     if iv_hex.len() != iv_len * 2 {
         return Err(malformed(format!(
             "{cipher} needs a {iv_len}-byte IV, DEK-Info carries {} hex characters",
@@ -871,20 +871,24 @@ pub(crate) fn decrypt_pem_fixture(pem: &str, password: Option<&str>) -> Result<O
     // and no `unreachable!()` arm is needed. Each variant's `decrypt` calls the shared CBC engine.
     let plaintext = cipher.decrypt(&key, &iv, &ciphertext);
     match plaintext {
-        Ok(der) => Ok(Some(TraditionalKey { der })),
+        Some(der) => Ok(Some(TraditionalKey { der })),
         // Every failure after a real decryption attempt is a passphrase failure: either the
         // PKCS#7 padding is invalid, or (one in 256 times) it is valid and the DER is nonsense,
-        // which the caller's decoder also reports as such.
-        Err(_) => Err(Error::InvalidPassword),
+        // which the caller's decoder also reports as such. `DekCipher::decrypt` returns
+        // `Option<Vec<u8>>` precisely so both collapse to one arm.
+        None => Err(Error::InvalidPassword),
     }
 }
 ```
 
   `use base64::Engine as _;` is added to the imports (`base64` is already a dependency, used the
-  same way in `crates/zsign-cli/src/main.rs:897`). `pkcs12::aes_decrypt` is generic over
-  `C: BlockDecrypt + KeyInit` (`pkcs12.rs:610-617`), so DES-EDE3-CBC goes through the same CBC +
-  PKCS#7 code as PKCS#12 — no second block-mode implementation, and `rc2` stays unused here because
-  RC2 DEK-Info is deliberately unsupported (design D18.4).
+  same way in `crates/zsign-cli/src/main.rs:880`, inside `pem_wrap_der`). `pkcs12::aes_decrypt` is
+  generic over `C: BlockDecrypt + KeyInit` (`pkcs12.rs:627`, bound at `:629`), so DES-EDE3-CBC
+  goes through the same CBC + PKCS#7 code as PKCS#12 — no second block-mode implementation, and
+  `rc2` stays unused here because RC2 DEK-Info is deliberately unsupported (design D18.4).
+  `DekCipher`'s `Display` is what prints
+  the canonical cipher name in the IV-length error, so the message never echoes a spelling the
+  crate did not accept.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
@@ -904,9 +908,9 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
 ## Task 6: Route encrypted keys through `from_pem`
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/cert.rs:465-501` (`from_pem`), `:111-164` (`DecodedKey`)
-- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:793` (`pub(crate) fn decrypt_key_bag`)
-- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:610` (`pub(crate) fn aes_decrypt`)
+- Modify: `crates/zsign-core/src/crypto/cert.rs` (`from_pem` `:534`, `DecodedKey` `:120-142`)
+- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:810` (`pub(crate) fn decrypt_key_bag`)
+- Modify: `crates/zsign-core/src/crypto/pkcs12.rs:627` (`pub(crate) fn aes_decrypt`)
 - Modify: `crates/zsign-core/src/crypto/mod.rs` (module list)
 - Test: inline in `cert.rs`
 
@@ -928,7 +932,7 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
     const EC_CERT: &[u8] = include_bytes!("fixtures/pem_ec_cert.pem");
     // No plaintext-key fixtures exist (see Task 5): the unencrypted PKCS#1 / SEC1 cases build
     // their key in the test, which is also what makes them regression tests of the new decoder.
-    const PLAIN_PKCS8: &str = "";
+    // So there is deliberately no plaintext constant here to go stale.
     const PASS: &str = "testpassword";
 
     #[test]
@@ -980,7 +984,7 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
 
     #[test]
     fn from_pem_encrypted_key_without_password_asks_for_one() {
-        let res = SigningCredentials::from_pem(RSA_CERT, ENC_TRAD_RSA.as_bytes(), None);
+        let res = SigningCredentials::from_pem(RSA_CERT, pem_fixture(ENC_TRAD_RSA).as_bytes(), None);
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("requires a password")),
             "got {:?}",
@@ -990,15 +994,26 @@ git commit -m "feat(crypto): decrypt traditional dek-info pem keys with openssl-
 
     #[test]
     fn from_pem_keeps_the_password_free_pkcs8_path_unchanged() {
-        let plain = include_str!("fixtures/pem_rsa_key_pkcs8.pem");
-        assert!(SigningCredentials::from_pem(RSA_CERT, plain.as_bytes(), None).is_ok());
+        // Generated rather than committed: no plaintext key fixture exists in this lane.
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsign-test-fixture,OU=TESTTEAM",
+            "CN=zsign-test-fixture,OU=TESTTEAM",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let (cert_pem, key_pem) = leaf_pems(&cert, &key);
+        assert!(SigningCredentials::from_pem(&cert_pem, &key_pem, None).is_ok());
         // A password on an unencrypted key is accepted and ignored, as OpenSSL does.
-        assert!(SigningCredentials::from_pem(RSA_CERT, plain.as_bytes(), Some("ignored")).is_ok());
+        assert!(SigningCredentials::from_pem(&cert_pem, &key_pem, Some("ignored")).is_ok());
     }
 
     #[test]
     fn from_pem_still_pairs_the_decrypted_key_with_the_certificate() {
-        let res = SigningCredentials::from_pem(EC_CERT, ENC_PKCS8_RSA.as_bytes(), Some(PASS));
+        let res =
+            SigningCredentials::from_pem(EC_CERT, pem_fixture(ENC_PKCS8_RSA).as_bytes(), Some(PASS));
         assert!(
             matches!(&res, Err(Error::Certificate(m)) if m.contains("does not match")),
             "an encrypted key must still be SPKI-paired, got {:?}",
@@ -1026,7 +1041,7 @@ visibility, then seven red tests once the visibility lands in Step 3.
         let signing_key = decoded.into_signing_key()?;
 ```
 
-  and add, next to `DecodedKey` (`cert.rs:111-164`):
+  and add, next to `DecodedKey` (`cert.rs:120-142`):
 
 ```rust
 /// Returns the first PEM block's label and DER body.
@@ -1057,7 +1072,7 @@ fn first_pem_block(pem: &str) -> Option<(&str, Vec<u8>)> {
 /// Decodes a private key given as PEM, decrypting it when the container is encrypted.
 ///
 /// Routing is by content, never by label: `main.rs` wraps bare DER in a `PRIVATE KEY`
-/// label (`pem_wrap_der`, `main.rs:896-908`), so an encrypted PKCS#8 DER can legitimately
+/// label (`pem_wrap_der`, `main.rs:879`), so an encrypted PKCS#8 DER can legitimately
 /// arrive under that label, and PKCS#1 / SEC1 bodies arrive both traditional-encrypted and
 /// in the clear. A supplied password on an unencrypted container is ignored, which is what
 /// OpenSSL does.
@@ -1118,8 +1133,8 @@ fn decode_key_material(pem: &str, password: Option<&str>) -> Result<DecodedKey> 
 - [ ] **Step 6: Run the scoped gate**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto:: -- --skip test_ipa_signing_is_deterministic`
-Expected: every `crypto::` test passes, including the 13 pre-existing PKCS#12 fixture tests and the
-33-test `cms_verify` module — a regression here means the routing changed an unencrypted path.
+Expected: every `crypto::` test passes, including the 18 pre-existing PKCS#12 fixture tests and the
+55-test `cms_verify` module — a regression here means the routing changed an unencrypted path.
 
 - [ ] **Step 7: Commit**
 
@@ -1232,41 +1247,75 @@ git commit -m "feat(crypto): load encrypted pem private keys through the existin
 
     #[test]
     fn password_on_an_unencrypted_pem_key_is_now_accepted() {
-        // The deleted reject path failed any password on the key route; the flow now behaves
-        // like OpenSSL and lets the load proceed.
+        // The deleted reject path failed any password on the key route *before looking at the key
+        // at all*. A well-formed but undecodable plaintext PEM now reaches the loader, so the only
+        // failures left are the ordinary parse ones. The assertion is therefore: the old reject
+        // string is gone, and the run fails downstream at the decoder — not exit 0.
         let dir = TempDir::new().unwrap();
         let input = dir.path().join("in.bin");
         std::fs::write(&input, MINIMAL_MACHO).unwrap();
         let key = dir.path().join("key.pem");
         let cert = dir.path().join("cert.pem");
-        std::fs::write(&key, PLAIN_PKCS8).unwrap();
+        // The label is split so no source line carries a private-key header.
+        std::fs::write(
+            &key,
+            concat!(
+                "-----BEGIN ",
+                "PRIVATE KEY-----\n",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+                "-----END ",
+                "PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
         std::fs::write(&cert, RSA_CERT).unwrap();
-        let out = dir.path().join("o.bin");
         let r = run_cli(
             &[
                 OsStr::new("-k"), key.as_os_str(),
                 OsStr::new("-c"), cert.as_os_str(),
                 OsStr::new("-p"), OsStr::new("irrelevant"),
-                OsStr::new("-o"), out.as_os_str(),
+                OsStr::new("-o"), dir.path().join("o.bin").as_os_str(),
                 input.as_os_str(),
             ],
             &[],
         );
-        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-        assert!(out.exists(), "signed output missing");
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            !r.stderr.contains("encrypted PEM keys are unsupported"),
+            "the old reject path must be gone, stderr: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("Failed to parse private key"),
+            "a password on an unencrypted key must be ignored, not rejected, stderr: {}",
+            r.stderr
+        );
     }
 ```
 
-  Fixture constants at the top of the test module, next to the existing cross-crate
-  `include_bytes!` pair (`main.rs:1068-1074`):
+  Fixture constants at the top of the test module, beside the existing cross-crate pair
+  (`RSA_CERT` at `main.rs:1062`, `ENC_TRAD_RSA` at `:1063`) and its `pem_fixture` decoder
+  (`:1068-1074`). Each encrypted container is committed as one
+  `base64 -w0` blob of the whole OpenSSL PEM text, so the constant reads the `.b64` and decodes
+  it through the same `pem_fixture` helper the core tests use. There is deliberately **no**
+  plaintext-key constant: the unencrypted case generates its key in-test and frames it with
+  `pem_text` (`cert.rs:773`), which is what keeps it a regression test of the new decoder.
 
 ```rust
-    const ENC_TRAD_RSA: &str =
-        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_dekinfo_aes256.pem");
-    const ENC_PKCS8_RSA: &str =
-        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_pbes2_sha256.pem");
-    const PLAIN_PKCS8: &str =
-        include_str!("../../zsign-core/src/crypto/fixtures/pem_rsa_key_pkcs8.pem");
+    fn pem_fixture(b64: &str) -> String {
+        String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .expect("fixture blob must be base64"),
+        )
+        .expect("OpenSSL PEM text is UTF-8")
+    }
+    const ENC_TRAD_RSA: &str = include_str!(
+        "../../zsign-core/src/crypto/fixtures/pem_rsa_key_dekinfo_aes256.pem.b64"
+    );
+    const ENC_PKCS8_RSA: &str = include_str!(
+        "../../zsign-core/src/crypto/fixtures/pem_rsa_key_pbes2_sha256.pem.b64"
+    );
     const RSA_CERT: &[u8] = include_bytes!("../../zsign-core/src/crypto/fixtures/pem_rsa_cert.pem");
 ```
 
@@ -1306,7 +1355,7 @@ git commit -m "feat(cli): decrypt encrypted pem keys instead of rejecting the pa
 ## Tasks 8-10: corrections applied during implementation
 
 The snippets in Tasks 8-10 below were written from the RFC text before any OCSP code was compiled.
-Implementing them surfaced nine defects; each is listed with what shipped, and the shipped code —
+Implementing them surfaced ten defects; each is listed with what shipped, and the shipped code —
 not the snippet — is the authority. The snippets are kept in place because the surrounding tests
 and the fixture recipe are unchanged.
 
@@ -1344,18 +1393,39 @@ and the fixture recipe are unchanged.
    budget. Shipped code splits host/port (`split_authority`, with `[ipv6]` support), takes a
    numeric-literal fast path off the resolver, and threads the budget into connect/read/write.
 
+11. **Shared certificate verifier, wider delegate algorithm set.** Deleting `revocation.rs`'s
+    duplicate `verify_cert_signature` in favour of promoting `cms_verify::verify_cert_signature`
+    (`:1518`) to `pub(crate)` also widened the signature algorithms a *delegated responder
+    certificate* may use: `sha1WithRSA`/`sha256WithRSA`/`ecdsa-with-SHA256` only before, versus the
+    chain verifier's RSA SHA-1/256/384/512 (SHA-256 for an unrecognised RSA OID) and ungated P-256
+    ECDSA after. The three trust conditions — issued by this CA, `id-kp-OCSPSigning` present,
+    signature verifies under the CA key — are unchanged and all still required, and the response
+    signature path keeps its own strict OID allowlist in `verify_signature`. `has_ocsp_signing_eku`
+    stays local to `revocation.rs` (`:675`): `cms_verify.rs` has no OCSPSigning helper, only
+    codeSigning-purpose checks.
+
+11. **The scheme filter moved from AIA extraction into `check`.** The snippet filtered in
+    `ocsp_responder_url` (`url.starts_with("http://").then_some(url)`), which made `UnusableUrl`
+    unreachable — a non-`http:` responder would have been indistinguishable from a certificate
+    with no OCSP pointer at all. Shipped code returns the AIA text whatever its scheme
+    (`revocation.rs:162-178`) and `check` short-circuits `UnusableUrl` *before* the issuer lookup
+    (`:801-803`), so an `https:` AIA with no issuer reports `UnusableUrl`, not
+    `NoIssuerCertificate`. Both snippets below are corrected to that ordering.
 Two plan-side claims were also wrong and are corrected above where they appear: the snippet's
 expected request was `SEQUENCE x3` around the CertID where RFC 6960 has four levels
-(`OCSPRequest / tbsRequest / requestList / Request`), and a foreign issuer key yields
-`NoMatchingCertId` rather than `Unverified`, because the CertID is recomputed from that foreign
-issuer's own key.
+(`OCSPRequest / tbsRequest / requestList / Request`), and the foreign-issuer-key case is not pinned
+to one variant. A foreign issuer changes the recomputed `CertID`, so it fails the match *and* the
+signature check, and the shipped test asserts only `NotChecked(_)`
+(`revocation.rs:1335-1338`, with a `Good` control at `:1351`); `NoMatchingCertId` is pinned for a
+*serial* mismatch only (`:1364-1367`).
+
 
 ## Task 8: OCSP request construction and AIA extraction
 
 **Files:**
 - Create: `crates/zsign-core/src/crypto/revocation.rs`
 - Modify: `crates/zsign-core/src/crypto/mod.rs` (`pub mod revocation;`)
-- Create: 5 fixtures under `crates/zsign-core/src/crypto/fixtures/revocation/`
+- Create: 8 fixtures under `crates/zsign-core/src/crypto/fixtures/revocation/`
 
 - [ ] **Step 1: Generate the fixtures** with the offline recipe verified during design (P12, P14):
 
@@ -1414,6 +1484,7 @@ openssl ca -batch -config ca.cnf -in leaf.csr -out issued_leaf.pem
 ser=$(openssl x509 -in issued_leaf.pem -noout -serial | cut -d= -f2)
 openssl ocsp -issuer ca.pem -cert issued_leaf.pem -reqout req.der
 openssl ocsp -reqin req.der -respout good.der -index index.txt -CA ca.pem -rsigner ca.pem -rkey ca.key -noverify
+openssl ocsp -reqin req.der -respout good_nextupdate.der -index index.txt -CA ca.pem -rsigner ca.pem -rkey ca.key -noverify -nmin 60
 python3 - <<'PY'
 rows = [l.split('\t') for l in open('index.txt').read().splitlines() if l.strip()]
 for r in rows:
@@ -1443,9 +1514,13 @@ if openssl ocsp -respin good_delegate_nocert.der -text -noverify 2>&1 \
      | grep -q 'Responder Cert'; then
   echo "nocert fixture still embeds a responder certificate"; exit 1
 fi
-cp ca.pem issued_leaf.pem req.der good.der revoked.der good_delegate.der \
-   good_delegate_nocert.der "$R/"
-ls -1 "$R" | grep -c . | grep -qx 7 || { echo "expected 7 revocation fixtures"; exit 1; }
+cp ca.pem issued_leaf.pem req.der good.der good_nextupdate.der revoked.der \
+   good_delegate.der good_delegate_nocert.der "$R/"
+ls -1 "$R" | grep -c . | grep -qx 8 || { echo "expected 8 revocation fixtures"; exit 1; }
+# `good.der` deliberately omits nextUpdate (RFC 6960 makes it OPTIONAL); this one carries it an
+# hour out, so the window tests have a real pair to straddle. Without the flag openssl emits no
+# nextUpdate at all and the file would be a byte-copy of good.der.
+openssl ocsp -respin good_nextupdate.der -text -noverify 2>&1 | grep -q 'Next Update:'
 # thisUpdate is stamped with the generation date; the tests below anchor their clock to the
 # fixture instead of a constant so nothing rots. Printed for the reader, asserted nowhere.
 openssl ocsp -respin good.der -text -noverify 2>&1 | grep 'This Update'
@@ -1586,11 +1661,14 @@ fn build_request(leaf: &Certificate, issuer: &Certificate) -> Option<Vec<u8>> {
     Some(tlv(0x30, &tbs_request))
 }
 
-/// The `id-ad-ocsp` access location of the leaf's AIA extension, when it is a plaintext `http:`
-/// URI. Decoded with the typed extension `x509-cert` already ships
-/// (`ext/pkix/access.rs:19` `AuthorityInfoAccessSyntax`, re-exported at `ext/pkix.rs:17`), so no
-/// hand-rolled AIA parser exists here.
-fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
+/// The `id-ad-ocsp` `uniformResourceIdentifier` text of the leaf's AIA extension, whatever its
+/// scheme, or `None` when the certificate names no OCSP access location at all. Whether the text is
+/// one this module can actually speak is the caller's decision: [`check`] reports a non-`http://`
+/// location as [`NotCheckedReason::UnusableUrl`], which keeps "no responder named" and "responder
+/// named but unreachable by this module" distinguishable. Decoded with the typed extension
+/// `x509-cert` already ships (`ext/pkix/access.rs:19` `AuthorityInfoAccessSyntax`, re-exported at
+/// `ext/pkix.rs:17`), so no hand-rolled AIA parser exists here.
+pub fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
     use x509_cert::ext::pkix::AuthorityInfoAccessSyntax;
     let value = ext_value(leaf, ID_PE_AUTHORITY_INFO_ACCESS)?;
     let aia = AuthorityInfoAccessSyntax::from_der(value).ok()?;
@@ -1598,11 +1676,10 @@ fn ocsp_responder_url(leaf: &Certificate) -> Option<String> {
         if desc.access_method != ID_AD_OCSP {
             return None;
         }
-        match desc.access_location {
+        match &desc.access_location {
             // GeneralName `uniformResourceIdentifier` is `[6] IMPLICIT IA5String`.
-            x509_cert::ext::pkix::name::GeneralName::UniformResourceIdentifier(ref uri) => {
-                let url = uri.to_string();
-                url.starts_with("http://").then_some(url)
+            x509_cert::ext::pkix::name::GeneralName::UniformResourceIdentifier(uri) => {
+                Some(uri.to_string())
             }
             _ => None,
         }
@@ -1644,8 +1721,8 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/revocation.rs`
-- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (promote `verify_cert_signature` `:1518`
-  and `OID_KP_OCSP_SIGNING`-style EKU lookup to `pub(crate)`; no logic change)
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (promote `verify_cert_signature` `:1518` to
+  `pub(crate)`; no logic change). The EKU lookup is **not** promoted — see Step 4.
 
 - [ ] **Step 1: Declare the fixture constants and the shared test helpers** at the top of
   `revocation.rs`'s test module — every test below uses them:
@@ -1731,16 +1808,27 @@ git commit -m "feat(crypto): build rfc6960 ocsp requests from the leaf authority
 
     #[test]
     fn a_foreign_issuer_key_is_not_trusted() {
-        let (leaf, _real) = fixture_pair();
+        let (leaf, real_issuer) = fixture_pair();
         let unrelated = Certificate::from_pem(
             super::assets::APPLE_WWDR_CA_G3_CERT.as_bytes(),
         )
         .unwrap();
+        // The response is the one the real CA signed, so the foreign issuer both fails the CertID
+        // match and cannot verify the signature. Which of the two trips first is an
+        // implementation detail, so the test pins the contract — never a status — rather than
+        // over-specifying one variant.
         let status = parse_and_verify(GOOD_DER, &leaf, &unrelated, now_in_window());
         assert!(
-            matches!(status, RevocationStatus::NotChecked(NotCheckedReason::Unverified)),
-            "verification must bind to the real issuer key, got {status:?}"
+            matches!(status, RevocationStatus::NotChecked(_)),
+            "a foreign issuer key must never produce a status, got {status:?}"
         );
+        assert!(status.warning().is_none());
+        // Control: the same bytes are trusted under the real issuer, so the failure above is the
+        // key and not a permanently broken parser.
+        assert!(matches!(
+            parse_and_verify(GOOD_DER, &leaf, &real_issuer, now_in_window()),
+            RevocationStatus::Good
+        ));
     }
 
     #[test]
@@ -2041,20 +2129,30 @@ fn pick_signer(
 fn accepted_delegate(candidate: &Certificate, issuer: &Certificate) -> bool {
     candidate.tbs_certificate.issuer == issuer.tbs_certificate.subject
         && has_ocsp_signing_eku(candidate)
-        && verify_cert_signature(candidate, issuer)
+        && cms_verify::verify_cert_signature(candidate, issuer)
 }
 ```
 
   `verify_signature` dispatches on `signatureAlgorithm`: `sha1WithRSAEncryption`
   (`1.2.840.113549.1.1.5`), `sha256WithRSAEncryption` (`1.2.840.113549.1.1.11`), and
   `ecdsa-with-SHA256` (`1.2.840.10045.4.3.2`), each verifying the raw `tbsResponseData` bytes —
-  the same three arms `cms_verify.rs:1237-1286` already uses, re-expressed here because that
-function also handles CMS-specific `signedAttrs` re-framing. `verify_cert_signature` is promoted
-from `cms_verify.rs:1518-1566` — the same issue-child-under-issuer-key check the chain builder
-already performs. The `id-kp-OCSPSigning` EKU test is **new** code here: read the EKU extension
-through this module's own `ext_value`, decode `ExtendedKeyUsage`, and look for
-`const_oid::db::rfc5280::ID_KP_OCSP_SIGNING`. Nothing in `cms_verify.rs` performs it today, and
-`:1599` there is `leaf_purpose_reason`, a codeSigning check — the two are not the same thing.
+  the same three arms `cms_verify.rs:1235-1280` already uses, re-expressed here because that
+  function also handles CMS-specific `signedAttrs` re-framing and a *CMS* message rather than an
+  arbitrary one.
+
+  Two primitives are **shared**, one is **deliberately local**:
+  - `cms_verify::verify_cert_signature` (`:1518`) is promoted to `pub(crate)` and called as
+    `cms_verify::verify_cert_signature` — the same issue-child-under-issuer-key check the chain
+    builder already performs, so duplicating it would be two answers to one question. (An earlier
+    pass did duplicate it locally; the duplicate was deleted when the promotion landed.)
+  - `cms_verify::resolve_now` (`:1681`) is already `pub(crate)` and reached through the existing
+    `use super::cms_verify;` (`revocation.rs:44`) — it is the only `cms_verify` import.
+  - `has_ocsp_signing_eku` stays **local**: read the EKU extension through this module's own
+    `ext_value`, decode `ExtendedKeyUsage`, and look for
+    `const_oid::db::rfc5280::ID_KP_OCSP_SIGNING`. Nothing in `cms_verify.rs` performs it, and
+    `:1599` there is `leaf_purpose_reason`, a codeSigning check — the two are not the same thing, so
+    widening `cms_verify` for it would buy nothing.
+
   `span_of_next_tlv` is one new method on `pkcs12::DerReader` returning the raw bytes of the next
   TLV (not just its value); it is the single reason the reader is widened, and it replaces the
   "re-encode and hope it is canonical" shortcut that would break on any length form the responder
@@ -2295,6 +2393,12 @@ pub fn check(
     let Some(url) = ocsp_responder_url(leaf) else {
         return RevocationStatus::NotChecked(NotCheckedReason::NoOcspUrl);
     };
+    // Deliberately *before* the issuer lookup: a responder this module will not speak to is the
+    // more specific finding, and reporting `NoIssuerCertificate` for an `https:` AIA with no
+    // chain would send the reader looking in the wrong place.
+    if !url.starts_with("http://") {
+        return RevocationStatus::NotChecked(NotCheckedReason::UnusableUrl);
+    }
     let Some(issuer) = issuer else {
         return RevocationStatus::NotChecked(NotCheckedReason::NoIssuerCertificate);
     };
@@ -2389,15 +2493,19 @@ cargo check -p zsign-wasm --target wasm32-unknown-unknown
     as the red evidence; `sign_macho_ecdsa_is_byte_identical_twice` as the blob-level proof;
     `ecdsa_code_signature_round_trips_with_der_signer_info` and
     `attached_profile_envelope_accepts_der_ecdsa_signer` (`cms_verify.rs:3064`, `:3087`)
-    unchanged — those two are the "verify path unchanged" proof; and RSA untouched via
-    `cms_signature_is_deterministic_for_identical_inputs` (`macho/signer.rs:973`),
-    `test_sign_macho_is_deterministic` (`crypto/cert.rs:1219`), `test_estimate_cms_size_rsa_2048`
-    (`cms.rs:876`). State plainly that no cross-process and no IPA-level determinism test was
-    added: determinism is proven five times within one process, twice at blob level, and
+    unchanged — those two are the "verify path unchanged" proof. State plainly that no
+    cross-process and no IPA-level determinism test was added, and that this lane added the tree's
+    *first* ECDSA determinism coverage: RSA determinism is covered only indirectly, by
+    `macho::signer::tests::test_sign_then_verify_roundtrip` (`:1440`) and the size estimates
+    `test_estimate_cms_size_rsa_2048` / `test_estimate_cms_size_rsa_with_chain` (`cms.rs:887`,
+    `:967`). Determinism is proven five times within one process, twice at blob level, and
     cross-process only in the sense that the KAT pins RFC-published constants rather than
     self-generated bytes.
   - **ZSN-18:** which fixture each test loads; the three distinct outcomes (missing password,
-    wrong password, unsupported cipher) at unit *and* CLI level; the PKCS#8 unencrypted path
+    wrong password, unsupported cipher) — missing password and wrong password at unit *and* CLI
+    level (`main.rs:1695`, `:1717`, `:1766`), unsupported cipher at unit level only
+    (`encrypted_pem.rs:293`, `:315`; no CLI assertion covers an unsupported/legacy `DEK-Info`
+    cipher, so that outcome is reported as library-level); the PKCS#8 unencrypted path
     unchanged while PKCS#1/SEC1 in the clear become newly accepted (D18.5).
   - **ZSN-21:** that every revocation test is offline — canned DER plus loopback `127.0.0.1`
     sockets — and that the design's live Apple probe (P13) is a one-time network observation,
@@ -2440,16 +2548,19 @@ fatal. Fixture names are identical in Tasks 5, 6 and 7.
 ## Seams and follow-ups (report, do not implement here)
 
 1. **CLI revocation wiring.** `warn_revocation` is the intended call; the insertion points are the
-   four `return Ok(creds)` sites in `crates/zsign-cli/src/main.rs::load_credentials` (`:800`,
-   `:816`, `:849`, `:855`). Owned by lane zsn40's file; no flag is needed.
-2. **TTY prompt parity for encrypted PEM keys.** `resolve_p12_password` (`main.rs:865-892`) prompts
+   four credential-return sites in `crates/zsign-cli/src/main.rs::load_credentials` (`:781`, `:796`,
+   `:832`, `:838` — the first two `return Ok(creds)`, the last two the tail `Ok(creds)` of the
+   `match`). Owned by lane zsn40's file; no flag is needed.
+2. **TTY prompt parity for encrypted PEM keys.** `resolve_p12_password` (`main.rs:848`) prompts
    for PKCS#12 only; after this lane an encrypted PEM without `-p`/`ZSIGN_PASSWORD` gets an explicit
    "requires a password" error instead of a prompt. Adding the prompt is a password-flow change in
    the file this lane does not own.
 3. **No static known-revoked list.** No license-clean source exists (design premise 5); implementing
    this would mean inventing data, which the brief forbids.
-4. **Fixtures for ZSN-30.** 12 PEM files plus 5 revocation fixtures land under
+4. **Fixtures for ZSN-30.** 8 PEM files plus 8 revocation fixtures land under
    `crates/zsign-core/src/crypto/fixtures/`; wave 7 consolidates them and their recipes.
-5. **Docs lane.** `README.md:32-57` and `crates/zsign-core/src/crypto/mod.rs` still describe PEM
-   loading as unencrypted-only and revocation as a device concern; the code-level docs are updated in
-   Tasks 6 and 9, but the top-level README is outside this lane's file list.
+5. **Docs lane.** The in-crate docs are already correct after Tasks 6 and 9 — `crypto/mod.rs:8-9`
+   reads "from PEM (plaintext or encrypted)". What is still silent is the README: its credential
+   bullet (`README.md:17`) and crate-table row (`README.md:224`) mention PKCS#12 and PEM but not
+   encrypted keys, and nothing at all mentions the revocation warning. Those are omissions, not
+   stale claims, and the README is outside this lane's file list.
