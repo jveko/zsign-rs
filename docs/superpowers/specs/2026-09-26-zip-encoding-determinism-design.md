@@ -102,8 +102,8 @@ ZSN-34. Every cited location was re-derived against current source:
    behavior. Only when they differ (the fix class) a divergence branch runs:
    reject `name.contains('\0')` — the one protection `enclosed_name` provided
    that `is_unsafe_entry_name` does not, pinned by `extract.rs:766-768` — then
-   mirror `enclosed_name`'s componentization (`zip-7.2.0 types.rs:583-608`)
-   over the canonical name split on both separators: drop empty/`.` segments,
+   mirror `enclosed_name`'s componentization (`zip-7.2.0 read.rs:1820`, impl
+   `types.rs:583-608`) over the canonical name split on both separators: drop empty/`.` segments,
    reject any segment carrying a Windows drive prefix (zip builds its result
    from an empty `PathBuf` by pushing only `Normal` components and rejects
    `Prefix`/`RootDir`; a raw `PathBuf::push` of an interior `C:x` segment
@@ -258,6 +258,7 @@ run with `TMPDIR=$PWD/.tmptmp`, and use the existing helpers/patterns
 | T2 | `test_create_ipa_writes_entries_in_sorted_order` (`archive.rs`) | Small tree created in non-sorted order; asserts the exact full `by_index` name sequence (sorted, dirs with trailing `/`, `Payload/` first) and that every entry's `last_modified()` equals `Some(zip::DateTime::default())` (1980-01-01 pin, matrix row f; `last_modified()` returns `Option<DateTime>`, zip-7.2.0 `read.rs:1967`) | **Yes** on this btrfs machine — walk yields creation/readdir order ≠ sorted (Tester confirms red before the fix) |
 | T3 | `test_create_ipa_from_root_is_byte_identical_across_creation_order` (`archive.rs`) | Two extraction roots with identical content but opposite file-creation order, including `SwiftSupport/iphoneos/…` and `iTunesMetadata.plist` pass-through siblings (ZSN-39 coverage) → `create_ipa_from_root` outputs compared as whole bytes | **Yes** on this btrfs machine — readdir order differs between the roots → entry order diverges (same divergence class as the confirmed 3/3 sign-test failure) |
 | T4 | `test_ipa_signing_is_deterministic` (`ipa/mod.rs:1126-1146`, pre-existing, unmodified) | End-to-end sign-the-same-input-twice byte identity | **Yes** today (3/3 confirmed); must be green **without skip**, proven 5× (brief's acceptance) |
+| T5 | `test_extract_rejects_flag_clear_{nul,interior_drive,backslash_traversal}_entry` (`extract.rs`) | Divergence-class unsafe-name arms: fixtures are flag-clear UTF-8 names (via `rewrite_entry_header`) so they reach the new branch — NUL gate, per-segment Windows-drive rejection (a raw `PathBuf::push` of `C:x` would replace the buffer), and `is_unsafe_entry_name` catching backslash traversal on the canonical name before either outpath branch; each asserts the error names the canonical (raw) name | Guards — green before and after; pin the new arms against regression |
 
 Scoped gates (mid-flight, never project-wide):
 `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs ipa::extract` after Task 1,

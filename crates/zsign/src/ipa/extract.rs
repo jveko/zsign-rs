@@ -1235,6 +1235,15 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_extract_rejects_flag_clear_backslash_traversal_entry() {
+        // Backslash traversal under a flag-clear UTF-8 name: the raw-name
+        // safety check must catch it on the canonical name before either
+        // outpath branch runs.
+        assert_divergence_entry_rejected("Payload/Test.app/资\\..\\evil");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_extract_ipa_strips_setuid_bit() {
         let temp_dir = TempDir::new().unwrap();
         let ipa_path = temp_dir.path().join("setuid.ipa");
