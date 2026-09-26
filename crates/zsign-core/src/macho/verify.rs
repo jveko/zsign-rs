@@ -516,57 +516,12 @@ mod tests {
         CSSLOT_ALTERNATE_CODEDIRECTORIES, CSSLOT_CODEDIRECTORY, CSSLOT_DER_ENTITLEMENTS,
         CSSLOT_REQUIREMENTS, CSSLOT_SIGNATURESLOT,
     };
-    use crate::crypto::cert::SigningKeyType;
     use crate::crypto::SigningCredentials;
     use crate::macho::fixtures::{make_fat_macho, make_minimal_macho};
     use crate::macho::{
         sign_any_macho, sign_macho, sign_macho_adhoc, sign_macho_sha256_only, MachOFile,
     };
-    use der::Decode;
     use sha2::{Digest, Sha256};
-    use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
-    use std::str::FromStr;
-    use std::time::Duration;
-    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-    use x509_cert::name::Name;
-    use x509_cert::serial_number::SerialNumber;
-    use x509_cert::time::Validity;
-
-    fn rsa_credentials() -> SigningCredentials {
-        let mut rng = rand::thread_rng();
-        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
-        let subject = Name::from_str("CN=zsign verify test").unwrap();
-        let serial = SerialNumber::from(7u32);
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
-        let pub_der = key.to_public_key().to_public_key_der().unwrap();
-        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_der.as_ref()).unwrap();
-        let mut builder = CertificateBuilder::new(
-            Profile::Leaf {
-                issuer: subject.clone(),
-                enable_key_agreement: false,
-                enable_key_encipherment: false,
-            },
-            serial,
-            validity,
-            subject,
-            pub_key,
-            &signing_key,
-        )
-        .unwrap();
-        builder
-            .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
-                const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
-            ]))
-            .unwrap();
-        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
-        SigningCredentials {
-            certificate: cert,
-            signing_key: SigningKeyType::Rsa(signing_key),
-            cert_chain: vec![],
-            team_id: Some("TESTTEAM".to_string()),
-        }
-    }
 
     fn sign_round_trip(creds: &SigningCredentials, ident: &str) -> Vec<u8> {
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
@@ -759,7 +714,7 @@ mod tests {
         let fat = make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
         assert_eq!(macho.slices().len(), 2);
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let mut signed =
             sign_any_macho(&macho, "com.example.fat", None, &creds, None, None, false).unwrap();
 
@@ -886,7 +841,7 @@ mod tests {
 
     #[test]
     fn verify_signed_binary_round_trip() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_round_trip(&creds, "com.example");
         let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
         // Production anchors to Apple's roots, so the self-signed fixture is
@@ -920,7 +875,7 @@ mod tests {
 
     #[test]
     fn verify_signed_32bit_armv7_round_trip() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho_32()).unwrap();
         assert!(!macho.slices()[0].is_64, "fixture must be 32-bit");
         let signed = sign_macho(&macho, "com.example", None, &creds, None, None, false).unwrap();
@@ -955,7 +910,7 @@ mod tests {
 
     #[test]
     fn verify_signed_fat_armv7_arm64_round_trip() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let fat = make_fat_macho(
             &[
                 crate::macho::fixtures::make_minimal_macho_32(),
@@ -1005,7 +960,7 @@ mod tests {
         let macho = MachOFile::parse(data).expect("big-endian 32-bit fixture parses");
         let slice = &macho.slices()[0];
         assert!(!slice.is_64, "fixture must be 32-bit");
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let res = sign_any_macho(&macho, "com.example.be32", None, &creds, None, None, false);
         assert!(
             matches!(&res, Err(crate::Error::MachO(m)) if m.contains("big-endian")),
@@ -1016,7 +971,7 @@ mod tests {
 
     #[test]
     fn tampered_code_bytes_fail_page_hash() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let mut signed = sign_round_trip(&creds, "com.example");
         // Flip a byte inside the __text code region (file offset 0x1000).
         signed[0x1000] ^= 0x01;
@@ -1027,7 +982,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_bytes_fail_cms() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let mut signed = sign_round_trip(&creds, "com.example");
         // Flip a bit inside the CMS signature slot (file offset = signature
         // region offset + superblob-relative blob offset).
@@ -1061,7 +1016,7 @@ mod tests {
 
     #[test]
     fn non_adhoc_truncated_cms_is_rejected() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let mut signed = sign_round_trip(&creds, "com.example.trunc");
         let m = MachOFile::parse(signed.clone()).unwrap();
         let sl = &m.slices()[0];
@@ -1091,7 +1046,7 @@ mod tests {
 
     #[test]
     fn special_slots_bind_info_and_resources() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let info = b"<?xml version=\"1.0\"?><plist><dict><key>CFBundleIdentifier</key><string>com.example</string></dict></plist>";
         let resources =
             b"<?xml version=\"1.0\"?><plist><dict><key>files2</key><dict/></dict></plist>";
@@ -1153,7 +1108,7 @@ mod tests {
 
     #[test]
     fn embedded_superblob_parses() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_round_trip(&creds, "com.example");
         let sb = signed_superblob(&signed);
         assert_eq!(&sb[0..4], &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
@@ -1163,7 +1118,7 @@ mod tests {
     }
     #[test]
     fn dual_signing_binds_cdhash_pair() {
-        let creds = rsa_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
         // sign_macho signs in DUAL mode (sha256_only=false): SHA-1 primary at slot 0,
         // SHA-256 alternate at 0x1000, CMS over the primary.

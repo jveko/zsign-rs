@@ -60,6 +60,7 @@ fn hex_upper(bytes: &[u8; 20]) -> String {
 /// * [`Rsa`](SigningKeyType::Rsa) - RSA private key (minimum 2048 bits)
 /// * [`Ecdsa`](SigningKeyType::Ecdsa) - ECDSA P-256 private key (secp256r1)
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum SigningKeyType {
     /// RSA PKCS#1 v1.5 signing key with SHA-256 digest, pre-built for signing.
     ///
@@ -99,6 +100,7 @@ pub enum SigningKeyType {
 ///
 /// The private key contained in this struct should be treated as sensitive data.
 /// Avoid logging or exposing [`SigningCredentials`] instances.
+#[derive(Clone)]
 pub struct SigningCredentials {
     /// X.509 signing certificate identifying the developer or organization.
     pub certificate: Certificate,

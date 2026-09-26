@@ -956,50 +956,6 @@ mod tests {
         assert_eq!(hash1, hash2);
     }
 
-    /// Self-signed RSA-2048 credentials with `team_id=Some("TESTTEAM")`.
-    fn test_credentials() -> crate::crypto::SigningCredentials {
-        use crate::crypto::cert::{SigningCredentials, SigningKeyType};
-        use der::Decode;
-        use rsa::RsaPrivateKey;
-        use sha2::Sha256;
-        use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
-        use std::str::FromStr;
-        use std::time::Duration;
-        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-        use x509_cert::name::Name;
-        use x509_cert::serial_number::SerialNumber;
-        use x509_cert::time::Validity;
-
-        let mut rng = rand::thread_rng();
-        let rsa_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(rsa_key.clone());
-
-        let subject = Name::from_str("CN=zsign roundtrip,OU=TESTTEAM").unwrap();
-        let serial = SerialNumber::from(7u32);
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
-        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
-        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-
-        let cert = CertificateBuilder::new(
-            Profile::Root,
-            serial,
-            validity,
-            subject,
-            pub_key,
-            &signing_key,
-        )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
-        .unwrap();
-
-        SigningCredentials {
-            certificate: cert,
-            signing_key: SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<Sha256>::new(rsa_key)),
-            cert_chain: vec![],
-            team_id: Some("TESTTEAM".to_string()),
-        }
-    }
-
     /// RFC 6979 A.2.5 P-256 scalar, quoted from
     /// <https://www.rfc-editor.org/rfc/rfc6979.txt#appendix-A.2.5>.
     const RFC6979_P256_SCALAR: [u8; 32] = [
@@ -1118,7 +1074,7 @@ mod tests {
         };
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
         let signed = sign_macho_sha256_only(
             &macho,
             "com.zsign.sha256only",
@@ -1178,7 +1134,7 @@ mod tests {
         assert!(macho.is_fat(), "fixture must parse as a FAT container");
         assert_eq!(macho.slices().len(), 2, "fixture must hold two slices");
 
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         // This is exactly the call the default IpaSigner (sha256_only=true) makes.
         let signed =
             sign_macho_sha256_only(&macho, "com.zsign.fatsha", None, &creds, None, None, false)
@@ -1256,7 +1212,7 @@ mod tests {
         let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
         let macho = MachOFile::parse(fat).unwrap();
         assert!(macho.is_fat() && macho.slices().len() == 1);
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         let signed = sign_any_macho(&macho, "com.zsign.onefat", None, &creds, None, None, false)
             .expect("one-arch FAT must sign through the FAT-capable path");
         assert_eq!(
@@ -1285,7 +1241,7 @@ mod tests {
         b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed
         let fat = make_fat_macho(&[a, b], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         let signed = sign_any_macho(&macho, "com.zsign.tail", None, &creds, None, None, false)
             .expect("FAT signing must succeed");
         let m = MachOFile::parse(signed.clone()).expect("signed output reparses");
@@ -1309,7 +1265,7 @@ mod tests {
     fn test_thin_only_signers_reject_fat_containers() {
         let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
         let macho = MachOFile::parse(fat).unwrap();
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         let err = sign_macho(&macho, "com.zsign.no", None, &creds, None, None, false)
             .expect_err("thin-only signer must reject a container, never strip it");
         assert!(
@@ -1411,7 +1367,7 @@ mod tests {
         );
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         let first = sign_macho(
             &macho,
             "com.zsign.bigents",
@@ -1443,7 +1399,7 @@ mod tests {
 
         let identifier = "com.zsign.roundtrip";
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
 
         let signed = sign_macho(
             &macho,
@@ -1527,7 +1483,7 @@ mod tests {
         // cryptsize=0x2000 (distinct from the fixture's hardcoded cryptoff=0x1000)
         // so the message assertion proves both fields are serialized.
         let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x2000)).unwrap();
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
         let err = sign_macho(
             &macho,
             "com.zsign.encrypted",
@@ -1574,7 +1530,7 @@ mod tests {
         // sign_any_macho single-arch path must enforce the guard and forward
         // allow_encrypted through to sign_macho.
         let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
         let err = sign_any_macho(
             &macho,
             "com.zsign.encrypted",
@@ -1612,7 +1568,7 @@ mod tests {
             "second slice must be encrypted"
         );
 
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
         let err = sign_any_macho(
             &macho,
             "com.zsign.fat",
@@ -1657,7 +1613,7 @@ mod tests {
     #[test]
     fn test_sign_allow_encrypted_override() {
         let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
-        let credentials = test_credentials();
+        let credentials = crate::macho::fixtures::test_root_credentials();
         let signed = sign_macho(
             &macho,
             "com.zsign.encrypted",
@@ -1796,7 +1752,7 @@ mod tests {
         b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
         let fat = make_fat_macho(&[make_minimal_macho(), b], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
-        let creds = test_credentials();
+        let creds = crate::macho::fixtures::test_root_credentials();
         let signed =
             sign_any_macho(&macho, "com.zsign.execseg", None, &creds, None, None, false).unwrap();
         let m = MachOFile::parse(signed.clone()).unwrap();

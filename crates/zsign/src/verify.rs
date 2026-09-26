@@ -931,56 +931,9 @@ mod tests {
     use crate::macho::{sign_macho_sha256_only, MachOFile};
     use crate::ZSign;
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
-    use sha2::Sha256;
-    use spki::der::Decode;
-    use spki::{EncodePublicKey, ObjectIdentifier, SubjectPublicKeyInfoOwned};
     use std::fs;
     use std::path::PathBuf;
-    use std::str::FromStr;
-    use std::time::Duration;
-    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-    use x509_cert::ext::pkix::ExtendedKeyUsage;
-    use x509_cert::name::Name;
-    use x509_cert::serial_number::SerialNumber;
-    use x509_cert::time::Validity;
     use zsign_core::macho::fixtures;
-
-    fn local_test_credentials() -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
-        let mut rng = rand::thread_rng();
-        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let signing_key = RsaSigningKey::<Sha256>::new(rsa_key.clone());
-        let subject = Name::from_str("CN=zsign test,OU=TESTTEAM").unwrap();
-        let serial = SerialNumber::from(7u32);
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
-        let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
-        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-        let mut builder = CertificateBuilder::new(
-            Profile::Leaf {
-                issuer: subject.clone(),
-                enable_key_agreement: false,
-                enable_key_encipherment: false,
-            },
-            serial,
-            validity,
-            subject,
-            pub_key,
-            &signing_key,
-        )
-        .unwrap();
-        builder
-            .add_extension(&ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap(
-                "1.3.6.1.5.5.7.3.3",
-            )]))
-            .unwrap();
-        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
-        let creds = crate::SigningCredentials {
-            certificate: cert,
-            signing_key: zsign_core::crypto::SigningKeyType::Rsa(signing_key),
-            cert_chain: vec![],
-            team_id: Some("TESTTEAM".to_string()),
-        };
-        (creds, rsa_key)
-    }
 
     fn cms_report_with_test_anchor(
         bin: &[u8],
@@ -1046,7 +999,7 @@ mod tests {
         )
         .unwrap();
         setup(&app);
-        let (creds, rsa_key) = local_test_credentials();
+        let (creds, rsa_key) = crate::test_util::test_credentials_with_key();
         let verify_creds = crate::SigningCredentials {
             certificate: creds.certificate.clone(),
             signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::new(rsa_key)),
@@ -1224,7 +1177,7 @@ mod tests {
     fn bare_macho_verifies() {
         let td = tempfile::TempDir::new().unwrap();
         let out = td.path().join("signed.bin");
-        let (creds, _) = local_test_credentials();
+        let (creds, _) = crate::test_util::test_credentials_with_key();
         let macho = MachOFile::parse(fixtures::make_minimal_macho()).unwrap();
         let signed =
             sign_macho_sha256_only(&macho, "com.zsign.test", None, &creds, None, None, false)

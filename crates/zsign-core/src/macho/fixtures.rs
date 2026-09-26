@@ -674,10 +674,74 @@ pub fn make_text_segment_macho(segment_fileoff: u64) -> Vec<u8> {
 }
 
 #[cfg(test)]
-/// Shared self-signed RSA-2048 code-signing credentials for macho tests:
-/// `Profile::Leaf` (issuer == subject), the code-signing EKU
-/// `1.3.6.1.5.5.7.3.3`, `CA=false`, `team_id = Some("TESTTEAM")`.
+use std::sync::LazyLock;
+
+#[cfg(test)]
+static CANON_CREDS: LazyLock<crate::crypto::SigningCredentials> =
+    LazyLock::new(build_test_signing_credentials);
+
+/// Shared self-signed RSA-2048 code-signing credentials (`Profile::Leaf`,
+/// codeSigning EKU, `team_id = Some("TESTTEAM")`), cached after first use.
+#[cfg(test)]
 pub(crate) fn test_signing_credentials() -> crate::crypto::SigningCredentials {
+    CANON_CREDS.clone()
+}
+
+#[cfg(test)]
+static ROOT_CREDS: LazyLock<crate::crypto::SigningCredentials> =
+    LazyLock::new(build_test_root_credentials);
+
+/// Shared self-signed RSA-2048 `Profile::Root` credentials for the macho
+/// signing tests (`team_id = Some("TESTTEAM")`), cached after first use.
+#[cfg(test)]
+pub(crate) fn test_root_credentials() -> crate::crypto::SigningCredentials {
+    ROOT_CREDS.clone()
+}
+
+#[cfg(test)]
+fn build_test_root_credentials() -> crate::crypto::SigningCredentials {
+    use crate::crypto::cert::SigningKeyType;
+    use der::Decode;
+    use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+    use std::str::FromStr;
+    use std::time::Duration;
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::Validity;
+
+    let mut rng = rand::thread_rng();
+    let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key.clone());
+
+    let subject = Name::from_str("CN=zsign roundtrip,OU=TESTTEAM").unwrap();
+    let serial = SerialNumber::from(7u32);
+    let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+    let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
+    let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
+
+    let certificate = CertificateBuilder::new(
+        Profile::Root,
+        serial,
+        validity,
+        subject,
+        pub_key,
+        &signing_key,
+    )
+    .unwrap()
+    .build::<rsa::pkcs1v15::Signature>()
+    .unwrap();
+
+    crate::crypto::SigningCredentials {
+        certificate,
+        signing_key: SigningKeyType::Rsa(signing_key),
+        cert_chain: vec![],
+        team_id: Some("TESTTEAM".to_string()),
+    }
+}
+
+#[cfg(test)]
+fn build_test_signing_credentials() -> crate::crypto::SigningCredentials {
     use crate::crypto::cert::SigningKeyType;
     use der::Decode;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};

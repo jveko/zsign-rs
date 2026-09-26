@@ -1734,6 +1734,7 @@ mod tests {
     use sha2::Sha256;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
+    use std::sync::LazyLock;
     use std::time::Duration;
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
     use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
@@ -1741,7 +1742,20 @@ mod tests {
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::time::Validity;
 
+    static CMS_CREDS: LazyLock<(SigningCredentials, rsa::RsaPrivateKey)> =
+        LazyLock::new(build_rsa_test_credentials);
+
+    /// The shared identity, built once and handed out as clones.
     fn rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey) {
+        CMS_CREDS.clone()
+    }
+
+    /// Build a fresh identity; callers must not share one across roles.
+    fn fresh_rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey) {
+        build_rsa_test_credentials()
+    }
+
+    fn build_rsa_test_credentials() -> (SigningCredentials, rsa::RsaPrivateKey) {
         let mut rng = rand::thread_rng();
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
@@ -2228,8 +2242,8 @@ mod tests {
 
     #[test]
     fn attacker_self_signed_resign_is_invalid() {
-        let (victim, _k1) = rsa_credentials();
-        let (attacker, _k2) = rsa_credentials();
+        let (victim, _k1) = fresh_rsa_credentials();
+        let (attacker, _k2) = fresh_rsa_credentials();
         let content: &[u8] = b"the code directory bytes";
         let cd_sha256: [u8; 32] = Sha256::digest(content).into();
         // The attacker re-signs the same CodeDirectory (same CDHash binding)
@@ -2256,7 +2270,7 @@ mod tests {
     fn chain_missing_issuer_is_invalid() {
         // leaf issued by `root`, but only the leaf gets embedded (cert_chain empty);
         // the anchors available at verification time are an UNRELATED root.
-        let (unrelated, _uk) = rsa_credentials();
+        let (unrelated, _uk) = fresh_rsa_credentials();
         let (_root_key, root, root_signer) = build_rsa_root("CN=zsign missing issuer root");
         let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
         let leaf_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(leaf_key.clone());

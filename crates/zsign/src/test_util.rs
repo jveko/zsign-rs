@@ -1,13 +1,26 @@
 //! Shared test utilities (test-only build).
 
+use std::sync::LazyLock;
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::Validity;
 
+static CREDS: LazyLock<(crate::SigningCredentials, rsa::RsaPrivateKey)> =
+    LazyLock::new(build_test_credentials);
+
 /// Self-issued RSA-2048 credentials (`Profile::Leaf`, codeSigning EKU) with
-/// `team_id=Some("TESTTEAM")`.
+/// `team_id=Some("TESTTEAM")`, cached after first use.
 pub(crate) fn test_credentials() -> crate::SigningCredentials {
+    CREDS.0.clone()
+}
+
+/// Same cached identity, with the raw key for rebuild-anchor patterns.
+pub(crate) fn test_credentials_with_key() -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
+    CREDS.clone()
+}
+
+fn build_test_credentials() -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
     use rsa::RsaPrivateKey;
     use sha2::Sha256;
@@ -46,10 +59,13 @@ pub(crate) fn test_credentials() -> crate::SigningCredentials {
         .unwrap();
     let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
-    crate::SigningCredentials {
+    let creds = crate::SigningCredentials {
         certificate: cert,
-        signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::<Sha256>::new(rsa_key)),
+        signing_key: zsign_core::crypto::SigningKeyType::Rsa(RsaSigningKey::<Sha256>::new(
+            rsa_key.clone(),
+        )),
         cert_chain: vec![],
         team_id: Some("TESTTEAM".to_string()),
-    }
+    };
+    (creds, rsa_key)
 }
