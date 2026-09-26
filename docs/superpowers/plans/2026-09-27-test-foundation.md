@@ -286,8 +286,10 @@ was materially incomplete):
 grep -rnE '\b(minimal_macho|minimal_dylib|minimal_macho_encrypted)\(\)' crates/zsign/src
 ```
 
-Expected **~54 sites** (builder.rs ~20, ipa/mod.rs ~29, verify.rs ~5;
-the `\b` boundary keeps `make_minimal_*` hits out). Every hit migrates:
+Expected **~57 call sites** — 60 raw grep hits, of which 3 are the
+`test_util.rs` definitions themselves (builder.rs 25, ipa/mod.rs 23,
+verify.rs 5, test_util.rs 4 internal uses; the `\b` boundary keeps
+`make_minimal_*` hits out). Every hit migrates:
 `minimal_macho()` → `zsign_core::macho::fixtures::make_minimal_macho()`,
 `minimal_macho_encrypted()` → `zsign_core::macho::fixtures::make_minimal_macho_encrypted(1, 0x1000)`,
 `minimal_dylib()` → `zsign_core::macho::fixtures::make_minimal_dylib()`.
@@ -511,10 +513,11 @@ pub(crate) fn test_credentials_with_key()
 }
 ```
 
-- `test_credentials()` keeps its exact signature ⇒ **~40 callers
+- `test_credentials()` keeps its exact signature ⇒ **29 callers
   untouched** (verify with
   `grep -rnE '\btest_credentials\(\)' crates/zsign/src | wc -l` before and
-  after — the count of call sites must not change).
+  after — 30 raw hits = 29 call sites + the definition; the call-site
+  count must not change).
 - **Delete** `zsign/src/verify.rs:948 local_test_credentials` (recipe is
   byte-equivalent to `test_util::test_credentials` — cold-review
   verified); its 2 callers (`:1049`, `:1227` — re-grep) switch to

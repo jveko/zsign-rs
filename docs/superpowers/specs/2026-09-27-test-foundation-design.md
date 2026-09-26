@@ -179,9 +179,9 @@ are chain builders, payload keys, or parametrized factories and stay
 | canon `fixtures.rs:603` `test_signing_credentials` — `CN=zsign verify test`, serial 7, Leaf+E KU, `team_id=Some("TESTTEAM")` | 8 (`signer.rs:1912`, `writer.rs` ×7) | **Wrap in `OnceLock`** inside the canon home (fn and static stay `#[cfg(test)]` per §3.1) |
 | `macho/verify.rs:573` `rsa_credentials` — byte-equivalent recipe (same CN/serial/Leaf/EKU/team) | 13 | **Delete** → canon (exact duplicate) |
 | `macho/signer.rs:960` `test_credentials` — `CN=zsign roundtrip,OU=TESTTEAM`, serial 7, **`Profile::Root`** (no EKU ext) | 12 | **Not a duplicate** — `Profile::Root` vs `Leaf` changes BasicConstraints and the subject; migrating would alter signed-bytes and chain-shape assertions. **Move into fixtures** as a second named recipe (`test_root_credentials`), wrapped in its own `OnceLock` (same `#[cfg(test)]` gate). One home for zsign-core's recipes, no recipe change. |
-| `zsign/src/test_util.rs:37` `test_credentials` — `CN=zsign test,OU=TESTTEAM`, serial 7, Leaf+E KU, team | ~40 | **OnceLock in place** in `zsign`'s own `test_util` — credential recipes cannot cross the crate boundary (§3.1), and the brief only mandates *OnceLock* for credentials. One cached `(creds, RsaPrivateKey)` pair backs two accessors: `test_credentials()` (signature unchanged ⇒ ~40 callers untouched) and a new `test_credentials_with_key()`. Same recipe as the next row, so one cache serves both. |
+| `zsign/src/test_util.rs:37` `test_credentials` — `CN=zsign test,OU=TESTTEAM`, serial 7, Leaf+E KU, team | 29 (grep-verified) | **OnceLock in place** in `zsign`'s own `test_util` — credential recipes cannot cross the crate boundary (§3.1), and the brief only mandates *OnceLock* for credentials. One cached `(creds, RsaPrivateKey)` pair backs two accessors: `test_credentials()` (signature unchanged ⇒ 29 callers untouched) and a new `test_credentials_with_key()`. Same recipe as the next row, so one cache serves both. |
 | `zsign/src/verify.rs:948` `local_test_credentials` — byte-equivalent to the row above, additionally returns `(creds, RsaPrivateKey)` | 2 (`:1049`, `:1227`) | **Delete** — callers switch to `test_util::test_credentials_with_key()` (the keyed accessor on the same cache); the raw key stays reachable for the anchored-verify rebuild. |
-| `crypto/cms_verify.rs:1744` `rsa_credentials` — `CN=zsign verify test`, serial **42**, `team_id=None`, returns key | 18 | **Stay local, gain `OnceLock`** *with one carve-out*: `attacker_self_signed_resign_is_invalid` (`:2231-2232`) calls it twice **expecting two independent identities**; `:2259` needs a third. Design: split into `OnceLock`-cached `rsa_credentials()` for the 16 single-identity callers and a `fresh_rsa_credentials()` for the three independence-dependent call sites (same recipe, uncached). Serial 42 / `team_id=None` differ from canon, so it does **not** merge into fixtures canon. |
+| `crypto/cms_verify.rs:1744` `rsa_credentials` — `CN=zsign verify test`, serial **42**, `team_id=None`, returns key | 18 call sites (+ the fn definition) | **Stay local, gain `OnceLock`** *with one carve-out*: `attacker_self_signed_resign_is_invalid` (`:2231,:2232`) calls it twice **expecting two independent identities**; `chain_missing_issuer_is_invalid` (`:2259`) needs a third. Design: split into `OnceLock`-cached `rsa_credentials()` for the 15 single-identity callers and a `fresh_rsa_credentials()` for the three independence-dependent call sites (same recipe, uncached). Serial 42 / `team_id=None` differ from canon, so it does **not** merge into fixtures canon. |
 | `crypto/cms.rs:926` `build_test_rsa_credentials(bits)` | 2 | **Keep** — parametrized by key size (1024-bit weak-key path exists) |
 | `crypto/cms.rs:1059` / `:1166`, `signer.rs:1026` ECDSA builders | 1 each | **Keep** — P-256, fixed-scalar determinism twins with pinned validity windows; deterministic-by-construction, `OnceLock` buys nothing |
 | `crypto/cert.rs:852` `fresh_2048()` | 25 | **Keep** — callers each *require a distinct key* (identity-selection, chain-walk ordering); caching would break the tests' premise |
@@ -206,10 +206,12 @@ pub fn test_signing_credentials() -> crate::crypto::SigningCredentials {
 ```
 
 - **Return type stays owned** — `.credentials(creds)` consumes by value at
-  ~40 call sites (`builder.rs:815,848,1042,1049,1100,1125` and many more);
-  an owned-clone return keeps *every* call site unchanged. The alternative
+  the 29 `test_credentials()` call sites in `zsign/src`
+  (`builder.rs:815,848,1042,1049,1100,1125` and the rest; grep-verified)
+  plus zsign-core's own users; an owned-clone return keeps *every* call
+  site unchanged. The alternative
   (`&'static` accessors) was evaluated and rejected: it forces churn across
-  all ~40 owned-consumption sites or a production API change to
+  all ~30 owned-consumption sites or a production API change to
   `ZSign::credentials`.
 - **Production change required:** `#[derive(Clone)]` on
   `SigningCredentials` (`crypto/cert.rs:102`) and `SigningKeyType`
@@ -444,7 +446,7 @@ formatting). Decision recorded here per brief; no `Cargo.toml` change.
 - **F7** `build_test_binary` moves as `make_text_segment_macho` with
   `write_u32`/`write_u64` rewritten as direct slice stores (private fns
   don't travel); segment is `__TEXT`, not linkedit (§3.2, plan Task 3).
-- **F8** caller sizing: ~54 zsign-side sites, exhaustive grep is the
+- **F8** caller sizing: ~57 zsign-side call sites (60 raw grep hits), exhaustive grep is the
   authority (plan Task 4 Step 1).
 - Notes folded in: `make_fat_macho` length assert (`fixtures.rs:568`),
   equality-direction identity check in the pre-flight, evidence greps
