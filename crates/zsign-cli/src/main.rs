@@ -87,7 +87,7 @@ struct Cli {
     /// Legacy SHA-1 + SHA-256 dual code directories (iOS <= 10 only).
     /// Emitting a SHA-1 primary directory makes output fail
     /// `codesign --verify` on modern macOS.
-    #[arg(short = 'L', long)]
+    #[arg(short = 'L', long, conflicts_with_all = ["sha256_only"])]
     legacy_sha1: bool,
 
     /// Force signing: override the FairPlay-encryption refusal and sign
@@ -96,7 +96,7 @@ struct Cli {
     force: bool,
 
     /// Sign without an identity (ad-hoc)
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, conflicts_with_all = ["profile"])]
     adhoc: bool,
 
     /// Dylib load path to inject (repeatable)
@@ -1588,6 +1588,47 @@ mod tests {
         }
         // verify itself stays valid, and ZSIGN_PASSWORD must NOT conflict (env presentness)
         assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn sha256_only_conflicts_with_legacy_sha1_at_parse() {
+        assert_eq!(
+            parse_err(&["zsign", "-2", "-L", "in.ipa"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_err(&["zsign", "-L", "-2", "in.ipa"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        // each flag alone stays valid (adhoc supplies the credentials exemption)
+        assert!(Cli::try_parse_from(["zsign", "-a", "-2", "in.ipa"]).is_ok());
+        assert!(Cli::try_parse_from(["zsign", "-a", "-L", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn adhoc_conflicts_with_profile_at_parse() {
+        assert_eq!(
+            parse_err(&["zsign", "-a", "-m", "p.mobileprovision", "in.ipa"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_err(&["zsign", "-m", "p.mobileprovision", "-a", "in.ipa"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        // profile stays valid with credentials and without adhoc
+        assert!(Cli::try_parse_from([
+            "zsign",
+            "--pkcs12",
+            "x.p12",
+            "-p",
+            "pw",
+            "-m",
+            "p.mobileprovision",
+            "in.ipa"
+        ])
+        .is_ok());
+        // adhoc without a profile stays valid
+        assert!(Cli::try_parse_from(["zsign", "-a", "in.ipa"]).is_ok());
     }
 
     #[test]
