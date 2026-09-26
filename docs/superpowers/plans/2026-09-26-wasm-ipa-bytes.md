@@ -302,6 +302,19 @@ pub(crate) trait Store: Sync {
 (`Result<(PathBuf, StoreKind)>` = `crate::Result` — the crate alias — so
 per-entry errors are `Error` values.)
 
+**Applied implementation note (compile-forced, landed in `store.rs`):**
+`Box<dyn Read + Seek>` is not valid Rust (E0225 — only auto traits may
+appear as additional trait-object bounds). The trait instead carries a
+blanket-implemented supertrait and `open` returns `Box<dyn ReadSeek>`:
+
+```rust
+/// Object-safe combination of `Read` and `Seek` for `open`'s reader.
+pub(crate) trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+```
+
+Every later task reading `open` (Tasks 2, 5) uses `Box<dyn ReadSeek>`.
+
 - [ ] **Step 1.2: Implement `FsStore`**
 
 Same file. Each method is a one-line delegation preserving today's errors
