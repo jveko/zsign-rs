@@ -965,8 +965,11 @@ impl<'a> IpaSigner<'a> {
     /// modifying the LC_CODE_SIGNATURE load command and appending the
     /// SuperBlob signature data.
     ///
-    /// For non-executable binaries (dylibs, frameworks), empty entitlements are used
-    /// instead of the full entitlements. This matches the behavior of the C++ zsign.
+    /// Entitlements are emitted only for executables: non-executables
+    /// (dylibs, frameworks) are signed with no entitlements slot at all
+    /// (enforced in `zsign-core`'s signing context; the C++ upstream
+    /// instead emits an empty-dict slot, which this port deliberately
+    /// does not reproduce).
     fn sign_binary(
         &self,
         root: &Path,
@@ -1015,8 +1018,8 @@ impl<'a> IpaSigner<'a> {
         let macho = MachOFile::parse(binary_data)?;
 
         // Only the main executable gets Info.plist in its CodeDirectory.
-        // Dylibs/frameworks must NOT include Info.plist or AMFI rejects them
-        // with "has entitlements but is not a main binary".
+        // The Info.plist hash arrives with the bundle's CodeResources,
+        // which only the main-executable path receives.
         let info_data = if is_executable && code_resources.is_some() {
             let bundle_path = binary_path.parent().ok_or_else(|| {
                 Error::Core(zsign_core::Error::Signing(

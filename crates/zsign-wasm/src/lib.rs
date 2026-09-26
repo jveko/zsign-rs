@@ -521,16 +521,7 @@ impl WasmSigner {
                 "FAT/Universal input is not supported by SHA-256-only signing; call sign_macho_fat() to opt into dual SHA-1+SHA-256 signing explicitly",
             ));
         }
-        let is_executable = macho
-            .slices()
-            .first()
-            .map(|s| s.is_executable)
-            .unwrap_or(false);
-        let entitlements: Option<&[u8]> = if is_executable {
-            self.effective_entitlements()
-        } else {
-            Some(zsign_core::macho::EMPTY_ENTITLEMENTS)
-        };
+        let entitlements: Option<&[u8]> = self.effective_entitlements();
         zsign_core::macho::sign_macho_sha256_only(
             &macho,
             identifier,
@@ -1003,10 +994,12 @@ pub mod tests {
         }
     }
 
-    /// Pins the executable/non-executable entitlements replication in sign_macho:
-    /// non-executable input must ignore profile entitlements (EMPTY_ENTITLEMENTS
-    /// both times), executable input must not. Passes on the pre-change
-    /// delegation; goes red if the replication is dropped.
+    /// Pins the executable/non-executable entitlements policy: non-executable
+    /// input must ignore profile entitlements entirely (no entitlements slot
+    /// either way), executable input must not. The non-executable assertion
+    /// goes red if any entitlements slot is ever emitted for non-executables
+    /// again (the pre-change state); the executable assertions go red if
+    /// profile entitlements stop being applied.
     #[wasm_bindgen_test(unsupported = test)]
     fn non_executable_input_ignores_profile_entitlements() {
         let mut dylib = MINIMAL_MACHO.to_vec();
@@ -1020,6 +1013,10 @@ pub mod tests {
         let b = without
             .sign_macho(dylib.clone(), "com.zsign.test", None, None)
             .expect("sign");
+        assert!(
+            entitlements_slot(&a).is_none(),
+            "non-executable input must emit no entitlements slot at all"
+        );
         assert_eq!(
             entitlements_slot(&a),
             entitlements_slot(&b),

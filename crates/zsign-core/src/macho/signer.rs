@@ -80,6 +80,11 @@ impl SigningContext {
         // verification for certificates that do not chain to Apple.
         let requirements = build_requirements_blob();
 
+        // Non-executables (dylibs, frameworks) carry no entitlements: an absent
+        // entitlements slot is the codesign baseline, and unallocated special
+        // slots are presumed absent rather than being an error.
+        let entitlements = if is_executable { entitlements } else { None };
+
         let entitlements_blob = entitlements.map(build_entitlements_blob);
 
         let der_entitlements_blob: Option<Vec<u8>> = if is_executable {
@@ -127,9 +132,6 @@ impl SigningContext {
     }
 }
 
-/// Empty entitlements plist for non-executable binaries (dylibs, frameworks).
-pub const EMPTY_ENTITLEMENTS: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
-
 /// Refuse to sign if any slice is FairPlay-encrypted (unless overridden).
 fn reject_encrypted(macho: &MachOFile, identifier: &str, allow_encrypted: bool) -> Result<()> {
     if allow_encrypted {
@@ -154,10 +156,9 @@ fn reject_encrypted(macho: &MachOFile, identifier: &str, allow_encrypted: bool) 
 ///
 /// Dispatch follows the container kind: a FAT/Universal container is signed
 /// slice-by-slice and reassembled (even when it holds a single architecture),
-/// while a thin binary is signed in place. Automatically selects entitlements
-/// based on executable type:
-/// - Executables use the provided entitlements
-/// - Non-executables (dylibs, frameworks) use empty entitlements
+/// while a thin binary is signed in place.
+/// * Entitlements are ignored for non-executables: no entitlements slot is
+///   emitted (an absent slot is the codesign baseline).
 pub fn sign_any_macho(
     macho: &MachOFile,
     identifier: &str,
@@ -167,23 +168,13 @@ pub fn sign_any_macho(
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
-    let is_executable = macho
-        .slices()
-        .first()
-        .map(|s| s.is_executable)
-        .unwrap_or(false);
-    let ent = if is_executable {
-        entitlements
-    } else {
-        Some(EMPTY_ENTITLEMENTS)
-    };
     reject_encrypted(macho, identifier, allow_encrypted)?;
 
     if !macho.is_fat() {
         sign_macho(
             macho,
             identifier,
-            ent,
+            entitlements,
             credentials,
             info_plist,
             code_resources,
@@ -193,7 +184,7 @@ pub fn sign_any_macho(
         let signed_slices = sign_macho_all_slices(
             macho,
             identifier,
-            ent,
+            entitlements,
             credentials,
             info_plist,
             code_resources,
@@ -1763,5 +1754,155 @@ mod tests {
             flags, 0,
             "non-executables must not claim CS_EXECSEG_MAIN_BINARY"
         ); // contract lock
+    }
+
+    #[test]
+    fn test_non_executable_signing_carries_no_entitlements() {
+        const ENT: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.example.ent</key><string>yes</string></dict></plist>"#;
+
+        fn assert_no_entitlements(signed: &[u8], via: &str) {
+            let m = MachOFile::parse(signed.to_vec()).unwrap();
+            let sl = &m.slices()[0];
+            let sig_off = sl.code_sig_offset.unwrap() as usize;
+            let sig_len = sl.code_sig_size.unwrap() as usize;
+            let sb = crate::codesign::verify::parse_superblob(&signed[sig_off..sig_off + sig_len])
+                .unwrap_or_else(|e| panic!("{via}: superblob must parse: {e}"));
+            assert!(
+                sb.entries.iter().all(|e| e.slot != 0x0005),
+                "{via}: entitlements blob (slot -5) must not be emitted for a dylib"
+            );
+            assert!(
+                sb.entries.iter().all(|e| e.slot != 0x0007),
+                "{via}: DER entitlements blob must not be emitted for a dylib"
+            );
+            let cd = sb
+                .code_directory
+                .as_ref()
+                .unwrap_or_else(|| panic!("{via}: primary CodeDirectory must be present"));
+            match cd.special_slot_hash(5) {
+                None => {}
+                Some(h) => assert!(
+                    h.iter().all(|&b| b == 0),
+                    "{via}: slot -5 must be unbound, got {h:02x?}"
+                ),
+            }
+        }
+
+        fn verify(signed: &[u8]) -> crate::macho::MachOVerifyReport {
+            crate::macho::verify_macho(signed, &crate::codesign::verify::SignatureInputs::none())
+                .unwrap_or_else(|e| panic!("verify must accept the signed dylib: {e}"))
+        }
+
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_dylib()).unwrap();
+        // Leaf + codeSigning EKU fixture (macho/fixtures.rs:360-399) — the
+        // shared macho-test credentials. EKU is required for the identity
+        // entries to reach the anchor gate the dual-pin pattern below pins.
+        let creds = crate::macho::fixtures::test_signing_credentials();
+
+        // Adhoc entry: strict verify leg — adhoc output carries no certificate,
+        // so "still verifies via the existing verify path" means report.is_valid()
+        // with zero errors (empirically confirmed for this fixture shape).
+        let signed =
+            sign_macho_adhoc(&macho, "com.zsign.dylib", Some(ENT), None, None, false).unwrap();
+        assert_no_entitlements(&signed, "sign_macho_adhoc");
+        let report = verify(&signed);
+        assert!(
+            report.is_valid(),
+            "sign_macho_adhoc: dylib must verify clean: {:?}",
+            report.slices[0].errors
+        );
+
+        // Identity-signed entries: copy verify_signed_binary_round_trip
+        // (macho/verify.rs:948-980) verbatim — signed + !adhoc + identifier +
+        // pages Matched + cms signature/message_digest/cdhash/chain each ok,
+        // with the ONLY allowed error being the anchor message.
+        let gated: [(&str, Vec<u8>); 3] = [
+            (
+                "sign_macho",
+                sign_macho(
+                    &macho,
+                    "com.zsign.dylib",
+                    Some(ENT),
+                    &creds,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
+            (
+                "sign_macho_sha256_only",
+                sign_macho_sha256_only(
+                    &macho,
+                    "com.zsign.dylib",
+                    Some(ENT),
+                    &creds,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
+            (
+                "sign_any_macho",
+                sign_any_macho(
+                    &macho,
+                    "com.zsign.dylib",
+                    Some(ENT),
+                    &creds,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
+        ];
+        for (via, signed) in gated {
+            assert_no_entitlements(&signed, via);
+            let report = verify(&signed);
+            assert!(!report.is_valid(), "{via}: fixture must stay anchor-gated");
+            let slice = &report.slices[0];
+            assert!(slice.signed, "{via}: output must carry a signature");
+            assert!(
+                !slice.adhoc,
+                "{via}: credential-signed output must not be ad-hoc"
+            );
+            assert_eq!(
+                slice.identifier.as_deref(),
+                Some("com.zsign.dylib"),
+                "{via}"
+            );
+            assert_eq!(
+                slice.pages,
+                crate::codesign::verify::PageCheck::Matched,
+                "{via}: page hashes must match"
+            );
+            assert_eq!(
+                slice.errors.len(),
+                1,
+                "{via}: only the anchor gate may fail, got {:?}",
+                slice.errors
+            );
+            assert!(
+                slice.errors[0].contains("not anchored to a trusted root"),
+                "{via}: unexpected gate: {}",
+                slice.errors[0]
+            );
+            let cms = slice.cms.as_ref().expect("CMS report");
+            assert!(
+                cms.signature_ok
+                    && cms.message_digest_ok
+                    && cms.cdhash_v1_ok
+                    && cms.cdhash_v2_ok
+                    && cms.chain_ok,
+                "{via}: cms: {cms:?}"
+            );
+            assert!(
+                !cms.anchored,
+                "{via}: not anchored without an injected root"
+            );
+        }
     }
 }

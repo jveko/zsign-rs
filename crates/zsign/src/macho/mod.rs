@@ -147,9 +147,8 @@ pub fn sign_macho_sha256_only(
 
 /// Signs any Mach-O binary (single-arch or FAT), returns signed bytes.
 ///
-/// Automatically selects entitlements based on executable type:
-/// - Executables use the provided entitlements
-/// - Non-executables (dylibs, frameworks) use empty entitlements
+/// * Entitlements are ignored for non-executables: no entitlements slot is
+///   emitted (an absent slot is the codesign baseline).
 pub fn sign_any_macho(
     macho: &MachOFile,
     identifier: &str,
