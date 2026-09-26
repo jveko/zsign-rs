@@ -170,7 +170,12 @@ Next to the existing limit tests (the `ensure_size_*` block at
         assert_eq!(error_code(&e), Some("ZSIGN_INPUT_TOO_LARGE".into()));
     }
 
-    #[wasm_bindgen_test(unsupported = test)]
+    // Plain #[wasm_bindgen_test] (NOT `unsupported = test`): the assertion
+    // goes through js_err → js_sys::Error + Reflect, whose import shims
+    // panic on non-wasm targets. This matches the crate's existing
+    // js_err-touching tests (lib.rs:1074, :1120, :1166, :1370-1371) and
+    // runs only under `wasm-pack test --node`.
+    #[wasm_bindgen_test]
     fn sign_ipa_maps_malformed_archive_to_stable_code() {
         let signer = new_signer();
         let e = signer
@@ -609,13 +614,16 @@ Required behavior (implement exactly; each is load-bearing):
 
 Add `#[cfg(test)] mod tests` inside `mem_store.rs` covering: normalize
 rejects `../`, absolute, and `.` paths; `write` refuses when an ancestor is a
-symlink; `walk` returns sorted pre-order `Ok` entries and excludes the root;
-`walk_pruned` never yields entries under a pruned subtree (and does not
-descend — assert a poisoned child is unreachable); `metadata` NotFound
-mirrors `exists() == false`; `read_link` round-trips target bytes and 4096+
-byte targets are rejected at the extract layer (not here); `open` reads back
-the written bytes. If `cargo check` flags a `MemStore` method these tests do
-not reach, attach the same narrowly-scoped `#[allow(dead_code)]` treatment as
+symlink; `walk` returns sorted pre-order `Ok` entries **yielding the root
+first** (assert entry 0 is the root key and the remainder is sorted DFS —
+matching the trait contract; `create_ipa` depends on receiving the root);
+`walk_pruned` never yields the root and never yields entries under a pruned
+subtree (and does not descend — assert a poisoned child is unreachable);
+`metadata` NotFound mirrors `exists() == false`; `read_link` round-trips
+target bytes and 4096+ byte targets are rejected at the extract layer (not
+here); `open` reads back the written bytes. If `cargo check` flags a
+`MemStore` method these tests do not reach, attach the same narrowly-scoped
+`#[allow(dead_code)]` treatment as
 Step 1.3 (removed in Task 3/6 once consumed; Task 8 greps for leftovers).
 
 - [ ] **Step 2.3: Scoped gate**
@@ -1110,6 +1118,12 @@ new fixture code):
    signed main executable's entitlements slot equals the custom plist, not
    the profile's (pattern `mod.rs:4067-4106`), pinning ZSN-10 precedence for
    the bytes form.
+6. `test_sign_ipa_bytes_rejects_malformed_input` — `sign_ipa_bytes(b"not a
+   zip")` returns `Err` and the error **is** `Error::Zip`
+   (`assert!(matches!(err, Error::Zip(_)))`), pinning the native layer of
+   the malformed-input mapping (the wasm layer's
+   `ZSIGN_SIGNING_FAILED` code is pinned by the wasm-only test in Task 0.3,
+   which cannot run natively because it goes through `js_err`).
 
 - [ ] **Step 6.3: Scoped gate**
 
