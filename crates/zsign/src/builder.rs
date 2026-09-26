@@ -394,13 +394,17 @@ impl ZSign {
         self.validate()?;
 
         let mut signer = if self.adhoc {
-            IpaSigner::new_adhoc().compression_level(self.compression_level)
+            IpaSigner::new_adhoc()
+                .compression_level(self.compression_level)
+                .sha256_only(self.sha256_only)
         } else {
             let credentials = self
                 .credentials
                 .as_ref()
                 .ok_or_else(|| Error::MissingCredentials("No credentials configured".into()))?;
-            IpaSigner::new(credentials).compression_level(self.compression_level)
+            IpaSigner::new(credentials)
+                .compression_level(self.compression_level)
+                .sha256_only(self.sha256_only)
         };
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
@@ -413,6 +417,13 @@ impl ZSign {
 
         if let Some(ref id) = self.bundle_id {
             signer = signer.bundle_id(id);
+        }
+
+        if let Some(ref name) = self.bundle_name {
+            signer = signer.bundle_name(name.as_str());
+        }
+        if let Some(ref version) = self.bundle_version {
+            signer = signer.bundle_version(version.as_str());
         }
 
         signer.sign(input, output)
@@ -737,5 +748,124 @@ mod tests {
             .sign_macho(&input, &output)
             .expect_err("adhoc direct-sign must fail closed on FAT (documented limitation)");
         assert!(err.to_string().contains("sign_any_macho"), "{err}");
+    }
+    /// Minimal `Info.plist` for the IPA fixture (has no name/version keys, so a
+    /// rewrite of either key is observable in the signed output).
+    const FIXTURE_PLIST: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>CFBundleExecutable</key><string>Test</string>
+      <key>CFBundleIdentifier</key><string>com.zsign.test</string>
+    </dict></plist>"#;
+
+    /// Writes a one-app IPA (Info.plist + thin Mach-O + a data blob) to `path`.
+    fn write_ipa_fixture(path: &std::path::Path) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Payload/Test.app/Info.plist", opts).unwrap();
+        zip.write_all(FIXTURE_PLIST).unwrap();
+        zip.start_file("Payload/Test.app/Test", opts).unwrap();
+        zip.write_all(&crate::test_util::minimal_macho()).unwrap();
+        zip.start_file("Payload/Test.app/data.bin", opts).unwrap();
+        zip.write_all(&[0xCD; 4096]).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// Read one entry's bytes back out of an IPA.
+    fn ipa_entry(path: &std::path::Path, name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let f = std::fs::File::open(path).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut buf = Vec::new();
+        zip.by_name(name).unwrap().read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    /// Locate the code signature of a thin Mach-O and parse its SuperBlob.
+    /// LC_CODE_SIGNATURE lookup follows the repo idiom at
+    /// zsign-core/src/macho/signer.rs:1364-1376 (goblin 0.10 MachO has no
+    /// `code_signature` field — only the `CommandVariant::CodeSignature` variant).
+    fn thin_code_signature(bytes: &[u8]) -> crate::codesign::verify::SuperBlob<'_> {
+        use goblin::mach::load_command::CommandVariant;
+        let mach = goblin::mach::Mach::parse(bytes).unwrap();
+        let macho = match mach {
+            goblin::mach::Mach::Binary(b) => b,
+            goblin::mach::Mach::Fat(_) => panic!("thin binary expected"),
+        };
+        let lc = macho
+            .load_commands
+            .iter()
+            .find_map(|cmd| match cmd.command {
+                CommandVariant::CodeSignature(cs) => Some(cs),
+                _ => None,
+            })
+            .expect("LC_CODE_SIGNATURE");
+        let start = lc.dataoff as usize;
+        let end = start + lc.datasize as usize;
+        crate::codesign::verify::parse_superblob(&bytes[start..end]).unwrap()
+    }
+
+    /// True when any emitted CodeDirectory (primary or alternate) is SHA-1.
+    fn has_sha1_directory(sb: &crate::codesign::verify::SuperBlob<'_>) -> bool {
+        sb.code_directory.as_ref().is_some_and(|cd| cd.is_sha1())
+            || sb.alternate_code_directories.iter().any(|cd| cd.is_sha1())
+    }
+
+    #[test]
+    fn test_sign_ipa_forwards_bundle_options() {
+        use crate::test_util::test_credentials;
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("in.ipa");
+        write_ipa_fixture(&input);
+
+        // Control: ZSign defaults — sha256_only=true, no name/version rewrites.
+        let control = dir.path().join("control.ipa");
+        ZSign::new()
+            .credentials(test_credentials())
+            .sign_ipa(&input, &control)
+            .expect("control sign");
+
+        // Treatment: forwarded options must reach the output.
+        let out = dir.path().join("out.ipa");
+        ZSign::new()
+            .credentials(test_credentials())
+            .bundle_name("Renamed")
+            .bundle_version("9.9")
+            .sha256_only(false)
+            .sign_ipa(&input, &out)
+            .expect("treatment sign");
+
+        let plist: plist::Value =
+            plist::from_bytes(&ipa_entry(&out, "Payload/Test.app/Info.plist")).unwrap();
+        let dict = plist.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("CFBundleDisplayName")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "Renamed"
+        );
+        assert_eq!(
+            dict.get("CFBundleShortVersionString")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "9.9"
+        );
+
+        let control_exe = ipa_entry(&control, "Payload/Test.app/Test");
+        let treatment_exe = ipa_entry(&out, "Payload/Test.app/Test");
+        assert!(
+            !has_sha1_directory(&thin_code_signature(&control_exe)),
+            "default sha256_only must emit no SHA-1 directory"
+        );
+        assert!(
+            has_sha1_directory(&thin_code_signature(&treatment_exe)),
+            "sha256_only(false) must be forwarded as a dual directory"
+        );
     }
 }
