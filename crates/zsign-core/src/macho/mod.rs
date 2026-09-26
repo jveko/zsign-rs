@@ -11,8 +11,8 @@ pub mod signer;
 pub mod verify;
 pub mod writer;
 
-#[cfg(test)]
-pub(crate) mod fixtures;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
 
 pub use parser::{ArchSlice, EncryptionInfo, MachOFile, MachOMetadata};
 pub use signer::{

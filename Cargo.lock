@@ -1829,6 +1829,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zsign-core",
  "zsign-rs",
 ]
 

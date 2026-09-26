@@ -1,9 +1,11 @@
-//! Shared in-memory Mach-O fixtures for zsign-core tests (test builds only).
+//! Shared in-memory Mach-O byte builders for zsign-core's own tests and for
+//! sibling crates' tests, compiled when `cfg(test)` or the `test-fixtures`
+//! feature is on (see `macho/mod.rs` and the feature comment in Cargo.toml).
 
 /// Minimal thin-arm64 Mach-O bytes: `__TEXT` with a tiny `__text` section and
 /// a `__LINKEDIT` segment sized for signature insertion. No `LC_CODE_SIGNATURE`
 /// — an unsigned input for signing/verification tests.
-pub(crate) fn make_minimal_macho() -> Vec<u8> {
+pub fn make_minimal_macho() -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32 {
         ($v:expr) => {
@@ -90,7 +92,7 @@ pub(crate) fn make_minimal_macho() -> Vec<u8> {
 
 /// `make_minimal_macho` with zero-fill in `__TEXT`: `vmsize` 0x2000 over a
 /// file-backed `filesize` of 0x1000 (file length unchanged at 0x2000).
-pub(crate) fn make_minimal_macho_text_vmsize_pad() -> Vec<u8> {
+pub fn make_minimal_macho_text_vmsize_pad() -> Vec<u8> {
     let mut b = make_minimal_macho();
     // LC_SEGMENT_64 __TEXT starts at 32: vmsize at +32 (fileoff 0x1000, filesize 0x1000).
     b[64..72].copy_from_slice(&0x2000u64.to_le_bytes());
@@ -108,7 +110,7 @@ pub fn make_minimal_dylib() -> Vec<u8> {
 /// Minimal thin-armv7 (little-endian 32-bit) Mach-O bytes: `mach_header`
 /// (28 B), `LC_SEGMENT` (56 B + one 68 B section), 32-bit `__LINKEDIT`.
 /// No `LC_CODE_SIGNATURE` — an unsigned input for 32-bit signing tests.
-pub(crate) fn make_minimal_macho_32() -> Vec<u8> {
+pub fn make_minimal_macho_32() -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32le {
         ($v:expr) => {
@@ -188,7 +190,7 @@ pub(crate) fn make_minimal_macho_32() -> Vec<u8> {
 /// [`make_minimal_macho_32`] whose `__LINKEDIT` load command is an
 /// `LC_SEGMENT_64` (72 B, `u64` sizes) inside a 32-bit header — a
 /// mixed-width image that must be rejected rather than signed.
-pub(crate) fn make_minimal_macho_32_mixed_linkedit() -> Vec<u8> {
+pub fn make_minimal_macho_32_mixed_linkedit() -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32le {
         ($v:expr) => {
@@ -270,7 +272,7 @@ pub(crate) fn make_minimal_macho_32_mixed_linkedit() -> Vec<u8> {
 
 /// Byte-for-byte layout of [`make_minimal_macho_32`], with every integer
 /// encoded big-endian (`MH_CIGAM`) — the typed-rejection input.
-pub(crate) fn make_minimal_macho_32_be() -> Vec<u8> {
+pub fn make_minimal_macho_32_be() -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32be {
         ($v:expr) => {
@@ -348,13 +350,13 @@ pub(crate) fn make_minimal_macho_32_be() -> Vec<u8> {
 /// `make_minimal_macho` extended with an existing LC_CODE_SIGNATURE whose
 /// `slot_len`-byte slot begins at 0x2000 (inside `__LINKEDIT`, whose filesize
 /// covers the slot), filled with 0xAA. Builds a parseable already-signed image.
-pub(crate) fn make_signed_minimal_macho(slot_len: u32) -> Vec<u8> {
+pub fn make_signed_minimal_macho(slot_len: u32) -> Vec<u8> {
     make_signed_minimal_macho_at(0x2000, slot_len)
 }
 
 /// As `make_signed_minimal_macho`, but the signature starts at an arbitrary
 /// (possibly unaligned) `dataoff`.
-pub(crate) fn make_signed_minimal_macho_at(dataoff: u32, slot_len: u32) -> Vec<u8> {
+pub fn make_signed_minimal_macho_at(dataoff: u32, slot_len: u32) -> Vec<u8> {
     let mut b = make_minimal_macho();
     let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
     let sizeofcmds = u32::from_le_bytes(b[20..24].try_into().unwrap());
@@ -377,7 +379,7 @@ pub(crate) fn make_signed_minimal_macho_at(dataoff: u32, slot_len: u32) -> Vec<u
 
 /// Byte-for-byte layout of [`make_minimal_macho`], with every integer encoded
 /// big-endian.
-pub(crate) fn make_minimal_macho_be() -> Vec<u8> {
+pub fn make_minimal_macho_be() -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32 {
         ($v:expr) => {
@@ -463,7 +465,7 @@ pub(crate) fn make_minimal_macho_be() -> Vec<u8> {
 
 /// [`make_minimal_macho`] with an appended `LC_ENCRYPTION_INFO_64` load
 /// command (FairPlay-encrypted binary shape), for refusal/verify tests.
-pub(crate) fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<u8> {
+pub fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<u8> {
     let mut data = make_minimal_macho();
     // ncmds (offset 16) and sizeofcmds (offset 20) live in mach_header_64.
     let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap());
@@ -483,7 +485,7 @@ pub(crate) fn make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32) -> Vec<
 /// produced by the linker) and a `__text` section inside `__TEXT`.
 /// With `tight_gap`, the section starts only 8 bytes after the last load
 /// command, i.e. there is no room to append a 16-byte load command.
-pub(crate) fn make_text_fileoff0_macho(tight_gap: bool) -> Vec<u8> {
+pub fn make_text_fileoff0_macho(tight_gap: bool) -> Vec<u8> {
     let mut b = Vec::new();
     macro_rules! u32w {
         ($v:expr) => {
@@ -597,6 +599,7 @@ pub fn make_fat_macho(slices: &[Vec<u8>], aligns: &[u32]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 /// Shared self-signed RSA-2048 code-signing credentials for macho tests:
 /// `Profile::Leaf` (issuer == subject), the code-signing EKU
 /// `1.3.6.1.5.5.7.3.3`, `CA=false`, `team_id = Some("TESTTEAM")`.
