@@ -108,6 +108,17 @@ fn is_safe_symlink_target(target: &str) -> bool {
 #[cfg(unix)]
 const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 
+/// The entry name as UTF-8 when the raw bytes are valid UTF-8, otherwise the
+/// zip crate's own decode: cp437 for flag-clear legacy names, lossy UTF-8
+/// when a flag-set name is not valid UTF-8.
+///
+/// Reading the raw bytes first fixes entries whose writer stored UTF-8
+/// without setting general-purpose bit 11 — the zip crate cp437-decodes
+/// those into mojibake, which the repack would then persist.
+fn canonical_entry_name<'f, R: io::Read + ?Sized>(file: &'f zip::read::ZipFile<'_, R>) -> &'f str {
+    std::str::from_utf8(file.name_raw()).unwrap_or_else(|_| file.name())
+}
+
 /// Returns true if an archive entry name is absolute, uses `..` traversal,
 /// or has no substantive component.
 ///
@@ -353,7 +364,7 @@ pub fn extract_ipa_with_limits(
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(Error::Zip)?;
 
-        let name = file.name();
+        let name = canonical_entry_name(&file);
         if is_unsafe_entry_name(name) {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -361,14 +372,52 @@ pub fn extract_ipa_with_limits(
             )));
         }
 
-        let outpath = match file.enclosed_name() {
-            Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
-            _ => {
+        let outpath = if name == file.name() {
+            // Fast path: both readings agree (all flag-set and all-ASCII
+            // names) — today's containment chain runs unchanged.
+            match file.enclosed_name() {
+                Some(path) if !path.as_os_str().is_empty() => dest_dir.join(path),
+                _ => {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unsafe entry name in IPA: {}", name),
+                    )))
+                }
+            }
+        } else {
+            // Divergence: flag-clear valid-UTF-8 non-ASCII name. Mirror
+            // enclosed_name's acceptance set on the canonical name: the
+            // NUL gate first (the one check is_unsafe_entry_name lacks),
+            // then drop empty/"." segments, reject any segment that is not
+            // a plain path component — a Windows drive prefix anywhere
+            // would make PathBuf::push replace the whole path, an escape
+            // enclosed_name never produces (it pushes only Normal
+            // components) — and join the survivors under dest_dir.
+            // Traversal, leading separators, and whole-name drive prefixes
+            // are already rejected by is_unsafe_entry_name above; PathBuf
+            // equality is component-based, so duplicate/type-conflict
+            // detection keys canonically on either branch.
+            if name.contains('\0') {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Unsafe entry name in IPA: {}", name),
-                )))
+                )));
             }
+            let mut rel = PathBuf::new();
+            for segment in name.split(['/', '\\']) {
+                if segment.is_empty() || segment == "." {
+                    continue;
+                }
+                let bytes = segment.as_bytes();
+                if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unsafe entry name in IPA: {}", name),
+                    )));
+                }
+                rel.push(segment);
+            }
+            dest_dir.join(rel)
         };
 
         #[cfg(unix)]
@@ -948,6 +997,240 @@ mod tests {
             pos += 46 + name_len + extra_len + comment_len;
         }
         panic!("entry {entry_name} not found in central directory");
+    }
+
+    /// Rewrite one entry's raw name bytes and clear general-purpose bit 11 in
+    /// both headers — the flag-clear input class real-world zippers emit
+    /// (zip 7.2.0 always sets the bit for non-ASCII `&str` names, so fixtures
+    /// must patch it off to exercise the cp437 decode path).
+    ///
+    /// `new_name` must have the same byte length as the stored name; header
+    /// name-length fields are not rewritten. Finding is by the ORIGINAL name
+    /// as written by `ZipWriter`, so patch each entry exactly once.
+    #[cfg(unix)]
+    fn rewrite_entry_header(archive_path: &Path, find_name: &str, new_name: &[u8]) {
+        let mut bytes = fs::read(archive_path).unwrap();
+
+        let eocd = bytes
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .expect("end-of-central-directory record not found");
+        let entry_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut pos = u32::from_le_bytes([
+            bytes[eocd + 16],
+            bytes[eocd + 17],
+            bytes[eocd + 18],
+            bytes[eocd + 19],
+        ]) as usize;
+
+        for _ in 0..entry_count {
+            assert_eq!(
+                &bytes[pos..pos + 4],
+                b"PK\x01\x02",
+                "bad central directory entry"
+            );
+            let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[pos + 30], bytes[pos + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[pos + 32], bytes[pos + 33]]) as usize;
+            let name = std::str::from_utf8(&bytes[pos + 46..pos + 46 + name_len]).unwrap();
+            if name == find_name {
+                assert_eq!(
+                    name_len,
+                    new_name.len(),
+                    "rewrites must keep the stored name length"
+                );
+                // Central header: general-purpose flags at +8, name bytes at
+                // +46, local header offset at +42.
+                let flags = u16::from_le_bytes([bytes[pos + 8], bytes[pos + 9]]);
+                let cleared = flags & !(1 << 11);
+                bytes[pos + 8..pos + 10].copy_from_slice(&cleared.to_le_bytes());
+                bytes[pos + 46..pos + 46 + name_len].copy_from_slice(new_name);
+                let local = u32::from_le_bytes([
+                    bytes[pos + 42],
+                    bytes[pos + 43],
+                    bytes[pos + 44],
+                    bytes[pos + 45],
+                ]) as usize;
+                assert_eq!(&bytes[local..local + 4], b"PK\x03\x04", "bad local header");
+                // Local header: general-purpose flags at +6, name bytes at +30.
+                let lflags = u16::from_le_bytes([bytes[local + 6], bytes[local + 7]]);
+                let lcleared = lflags & !(1 << 11);
+                bytes[local + 6..local + 8].copy_from_slice(&lcleared.to_le_bytes());
+                bytes[local + 30..local + 30 + name_len].copy_from_slice(new_name);
+                fs::write(archive_path, &bytes).unwrap();
+                return;
+            }
+            pos += 46 + name_len + extra_len + comment_len;
+        }
+        panic!("entry {find_name} not found in central directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_repack_roundtrip_preserves_non_ascii_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = temp_dir.path().join("nonascii.ipa");
+        let file = File::create(&ipa_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.add_directory("Payload/", options).unwrap();
+        zip.add_directory("Payload/App.app/", options).unwrap();
+        // Non-ASCII directory and file: patched to flag-clear below.
+        zip.add_directory("Payload/App.app/资源/", options).unwrap();
+        zip.start_file("Payload/App.app/资源/测试文件.txt", options)
+            .unwrap();
+        zip.write_all(b"chinese content").unwrap();
+        // Flag-set control entry: written by zip with bit 11 already set.
+        zip.start_file("Payload/App.app/资料/说明.txt", options)
+            .unwrap();
+        zip.write_all(b"flag-set content").unwrap();
+        // Non-ASCII symlink name; the target rides in the entry content.
+        zip.add_symlink("Payload/App.app/资源链接", "资源/测试文件.txt", options)
+            .unwrap();
+        // Placeholder for the adversarial cp437 entry, rewritten below.
+        zip.start_file("Payload/App.app/zz", options).unwrap();
+        zip.write_all(b"cp437 content").unwrap();
+        zip.finish().unwrap();
+
+        // The bug-class input: UTF-8 name bytes with bit 11 clear.
+        rewrite_entry_header(
+            &ipa_path,
+            "Payload/App.app/资源/",
+            "Payload/App.app/资源/".as_bytes(),
+        );
+        rewrite_entry_header(
+            &ipa_path,
+            "Payload/App.app/资源/测试文件.txt",
+            "Payload/App.app/资源/测试文件.txt".as_bytes(),
+        );
+        rewrite_entry_header(
+            &ipa_path,
+            "Payload/App.app/资源链接",
+            "Payload/App.app/资源链接".as_bytes(),
+        );
+        // Adversarial: same-length rewrite to cp437 é bytes (0x82), which
+        // are NOT valid UTF-8 — the cp437 reading must survive every hop
+        // without double-mangling. Must stay the last patch: later helper
+        // calls would scan over the now-invalid UTF-8 name bytes.
+        rewrite_entry_header(&ipa_path, "Payload/App.app/zz", b"Payload/App.app/\x82\x82");
+
+        // Hop 1: extract.
+        let hop1 = temp_dir.path().join("hop1");
+        let app1 = extract_ipa(&ipa_path, &hop1).unwrap();
+        assert_eq!(
+            fs::read(app1.join("资源").join("测试文件.txt")).unwrap(),
+            b"chinese content",
+            "flag-clear UTF-8 file name must extract unmangled"
+        );
+        assert!(
+            app1.join("资料").join("说明.txt").exists(),
+            "flag-set control entry must extract"
+        );
+        assert_eq!(
+            fs::read_link(app1.join("资源链接")).unwrap().to_str(),
+            Some("资源/测试文件.txt"),
+            "non-ASCII symlink name and target must survive"
+        );
+        assert_eq!(
+            fs::read(app1.join("\u{e9}\u{e9}")).unwrap(),
+            b"cp437 content",
+            "non-UTF-8 cp437 name must decode via cp437"
+        );
+
+        // Repack the whole extraction root (the signing repack path).
+        let out = temp_dir.path().join("repacked.ipa");
+        super::super::archive::create_ipa_from_root(
+            &hop1,
+            &out,
+            crate::ipa::CompressionLevel::DEFAULT,
+        )
+        .unwrap();
+
+        // The produced archive must flag every non-ASCII name as UTF-8 and
+        // carry the literal names.
+        use zip::HasZipMetadata;
+        let mut reader = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+        let mut seen: Vec<(String, u16)> = Vec::new();
+        for i in 0..reader.len() {
+            let entry = reader.by_index(i).unwrap();
+            seen.push((entry.name().to_string(), entry.get_metadata().flags));
+        }
+        for (name, flags) in &seen {
+            if !name.is_ascii() {
+                assert!(
+                    flags & (1 << 11) != 0,
+                    "UTF-8 general-purpose bit must be set on {name}"
+                );
+            }
+        }
+        for expected in [
+            "Payload/App.app/资源/",
+            "Payload/App.app/资源/测试文件.txt",
+            "Payload/App.app/资料/说明.txt",
+            "Payload/App.app/资源链接",
+            "Payload/App.app/\u{e9}\u{e9}",
+        ] {
+            assert!(
+                seen.iter().any(|(n, _)| n == expected),
+                "missing {expected} in {seen:?}"
+            );
+        }
+
+        // Hop 2: extract the repack — every hop keeps the same names.
+        let hop2 = temp_dir.path().join("hop2");
+        let app2 = extract_ipa(&out, &hop2).unwrap();
+        assert_eq!(
+            fs::read(app2.join("资源").join("测试文件.txt")).unwrap(),
+            b"chinese content"
+        );
+        assert!(app2.join("资料").join("说明.txt").exists());
+        assert_eq!(
+            fs::read_link(app2.join("资源链接")).unwrap().to_str(),
+            Some("资源/测试文件.txt")
+        );
+        assert_eq!(
+            fs::read(app2.join("\u{e9}\u{e9}")).unwrap(),
+            b"cp437 content"
+        );
+    }
+
+    /// Builds the hostile fixture, clears general-purpose bit 11 so the name
+    /// takes the divergence branch, and asserts extraction rejects it while
+    /// naming the canonical (raw) entry name — a cp437-decoded fallback would
+    /// print mojibake and fail the second assertion.
+    #[cfg(unix)]
+    fn assert_divergence_entry_rejected(hostile_name: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let ipa_path = create_ipa_with_hostile_entry(temp_dir.path(), hostile_name);
+        rewrite_entry_header(&ipa_path, hostile_name, hostile_name.as_bytes());
+        let extract_dir = temp_dir.path().join("extracted");
+        let err = extract_ipa(&ipa_path, &extract_dir)
+            .expect_err("flag-clear unsafe entry name must fail extraction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsafe entry name in IPA"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains(hostile_name),
+            "error must name the canonical entry: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_rejects_flag_clear_nul_entry() {
+        // NUL survives is_unsafe_entry_name and is valid UTF-8, so only the
+        // divergence branch's own NUL gate can reject it.
+        assert_divergence_entry_rejected("Payload/Test.app/资\0x");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_rejects_flag_clear_interior_drive_entry() {
+        // The drive prefix sits past the root, so is_unsafe_entry_name's
+        // whole-name check misses it; only the per-segment gate rejects it.
+        assert_divergence_entry_rejected("Payload/Test.app/资/C:x");
     }
 
     #[test]
