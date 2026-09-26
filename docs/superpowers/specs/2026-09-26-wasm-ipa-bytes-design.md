@@ -58,7 +58,9 @@ Result<Vec<u8>>`, exported from `zsign-wasm` as `WasmSigner::sign_ipa`.
   clock is pinned (`zsign-core/src/crypto/cert.rs:402-409`), zip timestamps
   are pinned to `zip::DateTime::default()` (`archive.rs:320-333`), archive
   order is bytewise-sorted (`archive.rs:370`), and CodeResources is
-  BTreeMap-ordered (`zsign-core/src/bundle/code_resources.rs:67`).
+  BTreeMap-ordered (`crates/zsign-core/src/bundle/code_resources.rs:67`,
+  field `files: BTreeMap<String, FileEntry>` — the filesystem-free core
+  builder, not the FS wrapper).
 
 ## Candidate architectures (brainstorm)
 
@@ -117,23 +119,59 @@ Primitive set derived from the exhaustive IO inventory of the native flow
 /// Kind of a directory entry, lstat-style (symlink reported as symlink).
 pub(crate) enum StoreKind { File, Dir, Symlink }
 
+/// lstat-style metadata for one path.
 pub(crate) struct StoreStat { kind: StoreKind, len: u64, unix_mode: Option<u32> }
 
-pub(crate) trait Store {
+/// All methods take `&self` so the rayon sites' closures can capture a
+/// shared `&S` unchanged (`Sync` supertrait below). Mutation is an
+/// implementation detail: `FsStore` is a stateless unit struct delegating
+/// straight to `std::fs` (no locks, zero overhead vs today), `MemStore`
+/// hides a `Mutex<BTreeMap<..>>` whose guard never leaves a single method.
+pub(crate) trait Store: Sync {
     fn read(&self, path: &Path) -> Result<Vec<u8>>;
-    /// Streaming reader (native: File, preserving io::copy; mem: borrowed cursor).
-    fn open(&self, path: &Path) -> Result<Box<dyn Read + Seek + '_>>;
-    fn write(&mut self, path: &Path, data: &[u8]) -> Result<()>;
-    fn create_dir_all(&mut self, path: &Path) -> Result<()>;
+    /// Owned streaming reader (native: `File`, so `io::copy` callers never
+    /// buffer the file; mem: an owned `Cursor` over a per-call clone — the
+    /// one transient copy is bounded by a single file).
+    fn open(&self, path: &Path) -> Result<Box<dyn Read + Seek>>;
+    fn write(&self, path: &Path, data: &[u8]) -> Result<()>;
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn list(&self, path: &Path) -> Result<Vec<(String, StoreKind)>>;
     fn metadata(&self, path: &Path) -> Result<StoreStat>;   // lstat; NotFound as io error
-    fn walk(&self, root: &Path) -> Result<Vec<(PathBuf, StoreKind)>>; // pre-order, parent-first
-    fn read_link(&self, path: &Path) -> Result<Vec<u8>>;    // raw target bytes
-    fn symlink(&mut self, target: &[u8], path: &Path) -> Result<()>;
-    fn remove_file(&mut self, path: &Path) -> Result<()>;
-    fn set_permissions(&mut self, path: &Path, mode: u32) -> Result<()>;
+    /// Pre-order walk (parent before children) under `root`, root excluded.
+    /// Per-entry results preserve each call site's current WalkDir error
+    /// handling: sites that propagate errors write `entry?`, sites that
+    /// skip write `let Ok(..) = entry else { continue }`. `FsStore` maps
+    /// `WalkDir` 1:1 (entries in readdir order, entry errors as inner
+    /// `Err`s); `MemStore` yields sorted entries, always `Ok`.
+    fn walk(&self, root: &Path) -> Result<Vec<Result<(PathBuf, StoreKind), Error>>>;
+    /// Pruned walk mirroring `WalkDir::filter_entry`: returning `false`
+    /// skips the subtree entirely (never visited, never yielded, any error
+    /// inside it never surfaces) — exact parity for
+    /// `find_immediate_macho_binaries`'s nested-bundle pruning.
+    fn walk_pruned(&self, root: &Path, prune: &dyn Fn(&Path, StoreKind) -> bool)
+        -> Result<Vec<Result<(PathBuf, StoreKind), Error>>>;
+    /// Raw target bytes of a symlink, without following it.
+    fn read_link(&self, path: &Path) -> Result<Vec<u8>>;
+    fn symlink(&self, target: &[u8], path: &Path) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn set_permissions(&self, path: &Path, mode: u32) -> Result<()>;
+
+    /// `path.exists()` semantics: any failure answers `false`.
+    fn exists(&self, path: &Path) -> bool {
+        self.metadata(path).is_ok()
+    }
 }
 ```
+
+Mutability split (cold-review round-1 blocker, resolved this way): the three
+rayon sites (`ipa/mod.rs:857-859`, `:1259`, `bundle/code_resources.rs:162-163`)
+stay structurally untouched — their closures capture `&S` exactly as they
+capture `&self` today, writes go through `Store::write(&self, ..)`, and the
+`Sync` supertrait discharges rayon's `Send + Sync` bounds (`FsStore` is a
+ZST; `MemStore` is `Sync` because `Mutex<T: Send>` is `Sync`). The wasm32
+build compiles only the sequential cfg arm at those sites, so rayon never
+runs on wasm. A borrow error during implementation is a design-regression
+signal, not something to patch around.
 
 Semantics pinned to native behavior:
 
@@ -143,27 +181,44 @@ Semantics pinned to native behavior:
 - `read_link` returns **raw bytes** so native symlink hashing stays
   byte-identical: `FsStore` (cfg unix) returns
   `read_link(..).as_os_str().as_bytes()`, matching `code_resources.rs:270-279`
-  today; `FsStore` (cfg not unix) returns `Error::SymlinkNotSupported`,
-  matching `code_resources.rs:281-288` today. `MemStore` returns the zip
-  entry's target bytes — which makes symlinked frameworks (symlink entries in
-  the input zip) signable in the browser instead of erroring.
-- `walk` lives in the trait so `FsStore` keeps using `WalkDir` exactly as each
-  call site does today (`follow_links(false)`, error-entry handling preserved
-  per site); `MemStore` yields a deterministic pre-order traversal with
-  children in sorted order. Walk order never determines output bytes
-  (CodeResources is BTreeMap-ordered, per-file signs are independent, error
-  lists are explicitly sorted at `mod.rs:835-845`, `mod.rs:1076`).
+  today; `FsStore` (cfg not unix) returns
+  `Error::Io(ErrorKind::Unsupported, "Symlinks not supported on this
+  platform: {path}")`, exactly what `hash_symlink_entry`'s non-unix arm
+  builds today (`code_resources.rs:281-290` — the
+  `Error::SymlinkNotSupported` variant exists at `error.rs:51` but is
+  constructed nowhere, so the genericized call site must keep producing the
+  `Io` variant). `MemStore` returns the zip entry's target bytes — which
+  makes symlinked frameworks (symlink entries in the input zip) signable in
+  the browser instead of erroring.
+- `walk`/`walk_pruned` live in the trait so `FsStore` keeps using `WalkDir`
+  exactly as each call site does today (`follow_links(false)`; per-entry
+  error handling preserved site-by-site via the inner `Result`s; the
+  `filter_entry` pruning at `mod.rs:1323-1334` maps to `walk_pruned` so
+  pruned subtrees are never visited — a flat list plus post-filter would
+  surface errors inside pruned subtrees that the native site never sees);
+  `write_tree` keeps propagating walk errors (it does so today) rather than
+  adopting the skip pattern. `MemStore` yields a deterministic pre-order
+  traversal with children in sorted order. Walk order never determines
+  output bytes (CodeResources is BTreeMap-ordered at
+  `zsign-core/src/bundle/code_resources.rs:67`, per-file signs are
+  independent, error lists are explicitly sorted at `mod.rs:825-835` and
+  `mod.rs:1077`).
 - All paths are root-relative keys; `MemStore` rejects absolute/`..`/
   symlink-ancestor writes (equivalent of `validate_output_path` +
   `resolve_within`), so no containment guard is weakened.
 
 `FsStore` is a zero-logic delegator to `std::fs`/`WalkDir`. `MemStore` is a
-`BTreeMap<PathBuf, Node>` with `Node = Dir | File { bytes, unix_mode } |
-Symlink { target, unix_mode }`, rooted at `/`-relative keys.
+`Mutex<BTreeMap<PathBuf, Node>>` with `Node = Dir { unix_mode } | File {
+bytes, unix_mode } | Symlink { target, unix_mode }`, rooted at
+`/`-relative keys (dir modes replay zip directory modes on output; the
+default is `0o40755`); the lock guard
+is acquired and released inside each method (no async, no nesting, so no
+deadlock surface), making `MemStore: Sync` for the native-target tests that
+run the pipeline under rayon's parallel arm.
 
 ### 2. Genericized sign stage (`ipa/mod.rs`, `bundle/code_resources.rs`)
 
-Every sign-stage method that touches the tree gains a `store: &mut S`
+Every sign-stage method that touches the tree gains a `store: &S`
 (`S: Store`) parameter — struct fields and the public builder API of
 `IpaSigner` do not change. Mechanical swaps at the inventoried sites:
 
@@ -171,17 +226,25 @@ Every sign-stage method that touches the tree gains a `store: &mut S`
   `fs::create_dir_all` → `store.create_dir_all`;
   `fs::remove_file` → `store.remove_file`;
   `exists`/`is_dir`/`symlink_metadata` → `store.metadata`;
-  WalkDir sites (`mod.rs:966,1145,1323`, `code_resources.rs:150`) →
-  `store.walk` with the site's existing filter/prune logic preserved;
+  WalkDir sites (`mod.rs:966,1145` via `walk`, `mod.rs:1323` via
+  `walk_pruned` — its `filter_entry` subtree pruning is load-bearing, and a
+  flat list + post-filter would surface errors inside pruned subtrees that
+  the native site never sees — `code_resources.rs:150` via `walk`) with each
+  site's existing error handling preserved over the per-entry results;
   `MachOFile::open(p)` → `MachOFile::parse(store.read(p)?)` (open is exactly
   `fs::read` + `parse`, `macho/parser.rs:30-37` — byte-identical);
-  `CodeResourcesBuilder` scan reads (`code_resources.rs:253,274,296-317`) →
-  store reads via a `&S` passed into `scan`.
+  `CodeResourcesBuilder` scan reads (`code_resources.rs:253,274`, streaming
+  fn at `:293-317`) → store reads. The builder is publicly re-exported
+  (`lib.rs:57`), so it is NOT genericized: it holds a `&'a dyn Store`
+  (the trait is object-safe) set by a crate-private `with_store`, while the
+  public `new(path)` keeps its exact signature backed by `FsStore` — no
+  public API change, no `pub(crate)` trait leaking into a public bound.
 - The path-based entry points (`IpaSigner::sign`,
   `sign_folder_in_place`, `sign_folder_to_ipa`) construct an `FsStore`
   internally and call the same generic stage — native behavior and signatures
   unchanged. `TempDir` stays native-only, inside `IpaSigner::sign`.
-- rayon sites (`mod.rs:857,1264`, `code_resources.rs:163`) are gated:
+- rayon sites (`mod.rs:857-859`, `mod.rs:1259`, `code_resources.rs:162-163`)
+  are gated:
   `#[cfg(not(target_arch = "wasm32"))] par_iter` (unchanged native) vs
   sequential iteration on wasm32. Output bytes are order-independent (see
   research facts), so the gate cannot change results.
@@ -201,16 +264,27 @@ Every sign-stage method that touches the tree gains a `store: &mut S`
 `is_unsafe_entry_name`, `file_ancestor`, `register_ancestor_dirs`,
 `ExtractionLimits`, `ExtractEntry` — is already pure and is reused as-is; the
 collect pass's reader becomes generic over `R: Read + Seek` so the native
-`ZipArchive<BufReader<File>>` call sites keep their types. A new
+`ZipArchive<BufReader<File>>` call sites keep their types. One data-plumbing
+change (cold-review round-1 finding): `ExtractEntry.unix_mode` and the
+`MAX_SYMLINK_TARGET_BYTES` const lose their `#[cfg(unix)]` so the bytes are
+available on every target — `file.unix_mode()` is not cfg-gated in zip
+7.2.0. The **classification** stays target-identical for the native FS path:
+the collect pass computes `is_symlink` exactly as today (real mode test on
+cfg-unix, `false` on cfg-not-unix, `extract.rs:419-427`), while the new mem
+materializer re-derives symlink-ness from `entry.unix_mode`'s `0o120000` bit
+unconditionally — so wasm32 (cfg-not-unix) still extracts symlinks as
+symlinks without changing native non-unix behavior. A new
 `extract_ipa_into_store<S: Store>(input: R, store, limits)` materializes the
-collected `ExtractEntry` list sequentially through the store (mkdir entries,
-`store.write` for files through `BudgetedWriter`, `store.symlink` for
-symlinks) with the same validation order as the native passes. The native
+collected `ExtractEntry` list sequentially through the store (mkdir entries
++ `set_permissions` for modes, `store.write` for files through
+`BudgetedWriter`, `store.symlink` for symlinks classified from the
+unconditional `unix_mode`) with the same validation order as the native
+passes. The native
 FS materialization (rayon, TOCTOU re-stat, `set_permissions`) is untouched.
 
 - `find_app_bundle` gets a store-based sibling driven by `store.list` with
   the same first-`.app`-then-`ensure_single_app_bundle` ambiguity rejection
-  (`mod.rs:1067`, candidates sorted at `:1076`).
+  (`mod.rs:1067`, candidates sorted at `:1077`).
 
 **Repack** (`ipa/archive.rs`): `write_tree` becomes
 `write_tree<S: Store, W: Write + Seek>(zip: &mut ZipWriter<W>, store: &S,
@@ -320,9 +394,17 @@ uncompressed mirrors the demo's `MAX_UNCOMPRESSED_BYTES`.
 - Wasm linear heap during the call ≈ `N` (input copy) + `U` (uncompressed
   `MemStore` tree) + `M` (output `Vec`) + per-file signing working set
   (roughly 2–3× the largest single binary, per the crate's existing sizing
-  note). With `N ≤ 512 MiB`, `U ≤ 2 GiB`, `M ≈ N` the theoretical worst case
-  sits just under the 4 GiB wasm32 ceiling; realistic IPAs (300–600 MiB)
-  peak around 2–3× input.
+  note). The caps are **per-stage guards, not a jointly-saturable envelope**:
+  saturating every cap simultaneously (0.5 + 2.0 + 0.5 GiB + up to 1.5 GiB
+  working set for a legal 512 MiB binary) reaches ~4.5 GiB and exceeds the
+  4 GiB wasm32 ceiling. The binding constraint is therefore
+  `N + U + M + working < 4 GiB`; the supported operational envelope is
+  stated as: input ≤ 512 MiB **and** declared uncompressed total ≤ 2 GiB,
+  with expected peaks ≈ 2–3× input for realistic archives (300–600 MiB
+  inputs ≈ 1–1.8 GiB peak). Inputs whose combined footprint approaches the
+  ceiling can abort on allocation — documented as a known OOM residual,
+  alongside ZSN-40's boundary-copy residual, rather than hidden behind the
+  per-stage numbers.
 - JS heap simultaneously holds the original `Uint8Array` (`N`) and the result
   (`M`).
 - Linear memory never shrinks: a large sign leaves a permanent per-tab
