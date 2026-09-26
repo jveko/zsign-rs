@@ -17,7 +17,7 @@ use zsign_rs::{SigningCredentials, ZSign};
 // mandatory: non-multiple groups auto-conflict their members in clap 4.6.7
 // (validator.rs:509-515), which would reject the legitimate -c + -k pairing
 #[command(group = clap::ArgGroup::new("credentials")
-    .args(["pkcs12", "certificate", "private_key"])
+    .args(["pkcs12", "certificate", "private_key", "keychain_identity"])
     .multiple(true))]
 struct Cli {
     /// Input file (IPA, Mach-O, or app bundle)
@@ -43,6 +43,11 @@ struct Cli {
         required_unless_present_any = ["adhoc", "verify", "credentials"]
     )]
     pkcs12: Option<PathBuf>,
+
+    /// macOS keychain codesigning identity (name or SHA-1 hash from
+    /// `security find-identity -v -p codesigning`)
+    #[arg(long, conflicts_with_all = ["pkcs12", "certificate", "private_key"])]
+    keychain_identity: Option<String>,
 
     /// Provisioning profile
     #[arg(short = 'm', long)]
@@ -152,6 +157,7 @@ struct Cli {
             "certificate",
             "private_key",
             "pkcs12",
+            "keychain_identity",
             "profile",
             "profile_map",
             "remove_profile",
@@ -844,6 +850,9 @@ fn read_credential_file(
 }
 
 fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
+    if let Some(identity) = &cli.keychain_identity {
+        return Ok(zsign_rs::crypto::keychain::load(identity)?);
+    }
     if let Some(p12_path) = &cli.pkcs12 {
         let p12_data = read_credential_file(p12_path, "pkcs12")?;
         let password = resolve_p12_password(cli, &p12_data)?;
@@ -1928,6 +1937,81 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::ArgumentConflict
         );
+    }
+
+    #[test]
+    fn keychain_identity_conflicts_with_credential_flags_at_parse() {
+        for extra in [
+            vec![
+                "--keychain-identity",
+                "Apple Development: a (T)",
+                "-k",
+                "k.p12",
+            ],
+            vec![
+                "--pkcs12",
+                "a.p12",
+                "--keychain-identity",
+                "Apple Development: a (T)",
+            ],
+            vec![
+                "-c",
+                "c.pem",
+                "-k",
+                "k.pem",
+                "--keychain-identity",
+                "Apple Development: a (T)",
+            ],
+        ] {
+            let mut args = vec!["zsign"];
+            args.extend(extra);
+            args.push("in.ipa");
+            let err = parse_err(&args);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{err}"
+            );
+        }
+        let err = parse_err(&["zsign", "-V", "--keychain-identity", "x", "in.ipa"]);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keychain_identity_satisfies_credential_requirement() {
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "--keychain-identity",
+            "Apple Development: a (T)",
+            "in.ipa",
+        ])
+        .expect("keychain identity alone must satisfy the credential requirement");
+        assert_eq!(
+            cli.keychain_identity.as_deref(),
+            Some("Apple Development: a (T)")
+        );
+        assert!(cli.private_key.is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keychain_identity_refuses_on_non_macos() {
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "--keychain-identity",
+            "Apple Development: a (T)",
+            "in.ipa",
+        ])
+        .expect("parse must succeed so the platform gate is what refuses");
+        let err = match load_credentials(&cli) {
+            Ok(_) => panic!("non-macOS must refuse keychain identities"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("macOS"), "{err}");
     }
 
     #[test]
