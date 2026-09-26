@@ -301,13 +301,21 @@ impl ZSign {
     /// ```
     pub fn sign_macho(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
         self.validate()?;
-        let macho = MachOFile::open(input.as_ref())?;
+        let mut bytes = std::fs::read(input.as_ref())?;
+        for dylib in &self.dylibs {
+            bytes =
+                zsign_core::macho::writer::inject_dylib_command(&bytes, dylib, self.weak_dylibs)?;
+        }
+        let macho = MachOFile::parse(bytes)?;
 
-        let identifier = input
-            .as_ref()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        let identifier = match &self.bundle_id {
+            Some(id) => id.as_str(),
+            None => input
+                .as_ref()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown"),
+        };
 
         let signed_binary = if self.adhoc {
             crate::macho::sign_macho_adhoc(
@@ -899,6 +907,46 @@ mod tests {
             entry.compression(),
             zip::CompressionMethod::Stored,
             "compression_level(0) must reach the repack as Stored"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_applies_dylibs_and_bundle_id() {
+        use crate::test_util::{minimal_macho, test_credentials};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+        let out = dir.path().join("signed.bin");
+
+        ZSign::new()
+            .credentials(test_credentials())
+            .dylib_injection(vec!["/usr/lib/libzsn.dylib".to_string()], false)
+            .bundle_id("com.zsign.forwarded")
+            .sign_macho(&input, &out)
+            .expect("sign");
+
+        let signed = std::fs::read(&out).unwrap();
+
+        // the injected dylib appears as a load command in the SIGNED output
+        let mach = goblin::mach::Mach::parse(&signed).unwrap();
+        let macho = match mach {
+            goblin::mach::Mach::Binary(b) => b,
+            goblin::mach::Mach::Fat(_) => panic!("thin binary expected"),
+        };
+        assert!(
+            macho.libs.contains(&"/usr/lib/libzsn.dylib"),
+            "injected dylib missing from signed load commands: {:?}",
+            macho.libs
+        );
+
+        // bundle_id becomes the code-signing identifier
+        let sb = thin_code_signature(&signed);
+        let cd = sb.code_directory.as_ref().expect("code directory");
+        assert_eq!(
+            cd.identifier(),
+            Some("com.zsign.forwarded"),
+            "configured bundle_id must replace the file-stem identifier"
         );
     }
 }
