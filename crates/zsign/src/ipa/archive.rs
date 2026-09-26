@@ -24,7 +24,7 @@
 use crate::{Error, Result};
 use std::fs::{self, File};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -335,12 +335,18 @@ fn archive_options(compression_level: CompressionLevel) -> SimpleFileOptions {
 /// Walks `walk_root` and writes every entry into `zip`, mapping each
 /// strip-prefix-relative path to an archive name through `name_of`
 /// (`None` skips the entry). Directories get their trailing separator here.
+///
+/// Entries are written in bytewise archive-name order so archive output
+/// never depends on filesystem readdir order: identical inputs produce
+/// byte-identical archives.
 fn write_tree(
     zip: &mut ZipWriter<std::io::BufWriter<File>>,
     walk_root: &Path,
     options: SimpleFileOptions,
     name_of: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<()> {
+    // Collect: map every walked entry to its archive name (None skips it).
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
     for entry in WalkDir::new(walk_root).follow_links(false) {
         let entry = entry
             .map_err(|e| Error::Io(io::Error::other(format!("Failed to walk directory: {}", e))))?;
@@ -353,25 +359,33 @@ fn write_tree(
             ))
         })?;
 
-        let Some(mut archive_path) = name_of(relative_path) else {
-            continue;
-        };
+        if let Some(archive_path) = name_of(relative_path) {
+            entries.push((archive_path, path.to_path_buf()));
+        }
+    }
 
+    // Sort: bytewise order of the archive name ('/'-joined relative path),
+    // which is platform-stable and keeps every directory before its children
+    // (a child's name carries its directory's name as a byte prefix).
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    // Write: the per-entry body is unchanged from the previous walk loop.
+    for (mut archive_path, path) in entries {
         // Use symlink_metadata to check the entry type without following links
-        let metadata = fs::symlink_metadata(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
 
         if metadata.is_dir() {
             archive_path.push('/');
             zip.add_directory(&archive_path, options)
                 .map_err(Error::Zip)?;
         } else if metadata.file_type().is_symlink() {
-            let target = fs::read_link(path)?;
+            let target = fs::read_link(&path)?;
             let target = checked_symlink_target(&archive_path, target.as_os_str())?;
             zip.add_symlink(&archive_path, &target, options)
                 .map_err(Error::Zip)?;
         } else {
             // Regular file — use Stored for pre-compressed formats
-            let file_options = if is_precompressed(path) {
+            let file_options = if is_precompressed(&path) {
                 options
                     .compression_method(CompressionMethod::Stored)
                     .compression_level(None)
@@ -396,7 +410,7 @@ fn write_tree(
                 .map_err(Error::Zip)?;
 
             // Stream file directly without loading into memory
-            let mut file = File::open(path)?;
+            let mut file = File::open(&path)?;
             io::copy(&mut file, &mut *zip)?;
         }
     }
@@ -815,6 +829,96 @@ mod tests {
             std::fs::read_link(root.join("Extra")).unwrap(),
             std::path::Path::new("Versions/Current/resource.txt"),
             "targets round-trip verbatim"
+        );
+    }
+    #[test]
+    fn test_create_ipa_writes_entries_in_sorted_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("Demo.app");
+        // Created in an order that differs from bytewise sorted order.
+        fs::create_dir_all(src.join("zdir")).unwrap();
+        fs::create_dir_all(src.join("adir")).unwrap();
+        fs::write(src.join("zdir/b.txt"), b"b").unwrap();
+        fs::write(src.join("adir/a.txt"), b"a").unwrap();
+        fs::write(src.join("Info.plist"), b"info").unwrap();
+        fs::write(src.join("zz.txt"), b"zz").unwrap();
+
+        let out = temp_dir.path().join("out.ipa");
+        create_ipa(&src, &out, CompressionLevel::NONE).unwrap();
+
+        let mut reader = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+        let mut names = Vec::with_capacity(reader.len());
+        for i in 0..reader.len() {
+            let entry = reader.by_index(i).unwrap();
+            assert_eq!(
+                entry.last_modified(),
+                Some(zip::DateTime::default()),
+                "entry {} must carry the pinned 1980-01-01 timestamp",
+                entry.name()
+            );
+            names.push(entry.name().to_string());
+        }
+        assert_eq!(
+            names,
+            [
+                "Payload/",
+                "Payload/Demo.app/",
+                "Payload/Demo.app/Info.plist",
+                "Payload/Demo.app/adir/",
+                "Payload/Demo.app/adir/a.txt",
+                "Payload/Demo.app/zdir/",
+                "Payload/Demo.app/zdir/b.txt",
+                "Payload/Demo.app/zz.txt",
+            ],
+            "entries must be in bytewise archive-name order with directories \
+             before their children"
+        );
+    }
+
+    #[test]
+    fn test_create_ipa_from_root_is_byte_identical_across_creation_order() {
+        // Same content, two extraction roots, opposite file-creation order —
+        // including pass-through siblings such as SwiftSupport/.
+        fn build_root(root: &Path, forward: bool) {
+            let app = root.join("Payload").join("Demo.app");
+            let mut files: Vec<(PathBuf, Vec<u8>)> = vec![
+                (app.join("Info.plist"), b"info".to_vec()),
+                (root.join("iTunesMetadata.plist"), b"meta".to_vec()),
+                (
+                    root.join("SwiftSupport")
+                        .join("iphoneos")
+                        .join("libswiftCore.dylib"),
+                    b"swift".to_vec(),
+                ),
+            ];
+            for i in 0..24u8 {
+                files.push((app.join("res").join(format!("f{i:02}.bin")), vec![i; 8]));
+            }
+            if !forward {
+                files.reverse();
+            }
+            for (path, bytes) in files {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let root_fwd = temp_dir.path().join("fwd");
+        let root_rev = temp_dir.path().join("rev");
+        build_root(&root_fwd, true);
+        build_root(&root_rev, false);
+
+        let out_fwd = temp_dir.path().join("fwd.ipa");
+        let out_rev = temp_dir.path().join("rev.ipa");
+        create_ipa_from_root(&root_fwd, &out_fwd, CompressionLevel::DEFAULT).unwrap();
+        create_ipa_from_root(&root_rev, &out_rev, CompressionLevel::DEFAULT).unwrap();
+
+        assert_eq!(
+            fs::read(&out_fwd).unwrap(),
+            fs::read(&out_rev).unwrap(),
+            "identical content must produce byte-identical archives regardless \
+             of filesystem creation order"
         );
     }
 }
