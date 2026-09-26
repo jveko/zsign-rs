@@ -40,7 +40,7 @@ ZSN-34. Every cited location was re-derived against current source:
 | c | WalkDir walk at `archive.rs:344` is unsorted | **STILL OPEN (line number coincidentally current)** | `archive.rs:344` = `for entry in WalkDir::new(walk_root).follow_links(false) {` — no sort option; walkdir 2.5.0 (`Cargo.lock:1588-1591`) yields OS readdir order; this machine is btrfs (`stat -f` = `btrfs`, creation-order readdir) |
 | d | Repack entry point may be in `ipa/mod.rs` | **NOT THERE — no cross-lane seam needed** | `ipa/mod.rs:283` `extract_ipa`, `:290` `create_ipa_from_root`, `:329` `create_ipa`; zero ordering logic in `mod.rs` (only signing-order sort `:395` and error-text sort `:532`). All zip writing funnels through `write_tree` (`archive.rs:338-405`) — both `create_ipa` (`:260-266`) and `create_ipa_from_root` (`:305-311`) |
 | e | CodeResources ordering | **ALREADY SATISFIED (BTreeMap)** | `bundle/code_resources.rs` — not touched, per brief |
-| f | Pinned 1980-01-01 timestamps | **ALREADY SATISFIED — load-bearing, will be test-verified** | `archive_options` pins `zip::DateTime::default()` at `archive.rs:325` and `:331`; zip 7.2.0 `DateTime::default()` = 1980-01-01 (`types.rs:254-257`). The pin matters because `SimpleFileOptions::default()` would stamp *now* with the enabled `time` feature (`write.rs:576`, `types.rs:139-145`) |
+| f | Pinned 1980-01-01 timestamps | **ALREADY SATISFIED — load-bearing, will be test-verified** | `archive_options` pins `zip::DateTime::default()` at `archive.rs:325` and `:331`; zip 7.2.0 `DateTime::default()` = 1980-01-01 (`types.rs:254-257`). The pin matters because `SimpleFileOptions::default()` stamps the current time via `default_for_write()` (`write.rs:576`, `types.rs:137-141`), and both header builders substitute it whenever a time is missing (`types.rs:915-916` local, `:936-937` central: `last_modified_time.unwrap_or_else(DateTime::default_for_write)`) — only the explicit `last_modified_time` pin makes output time-invariant |
 | g | Fleet-wide `--skip test_ipa_signing_is_deterministic` | **Located; NOT edited (orchestrator's call)** | `.github/workflows/ci.yml:62` (release job, rationale comment `:59-60`); debug test job `:49` and `hk.pkl:32` run unskipped already |
 | h | Upstream issue #337 | **Context: effectively unfixed upstream** | Issue closed COMPLETED 2025-05-13 with zero comments and no linked commit; master 614caa8 still writes with vendored minizip `flagBase=0` (`src/third-party/minizip/zip.c:1271-1276`) → upstream-produced IPAs carry flag-clear UTF-8 names, precisely the input class our extraction garbles |
 
@@ -84,7 +84,7 @@ ZSN-34. Every cited location was re-derived against current source:
    | flag set, invalid UTF-8 | `name()` = `from_utf8_lossy` | identical |
    | flag clear, ASCII | raw bytes (== cp437 decode) | identical |
    | flag clear, valid UTF-8, non-ASCII | **raw bytes = the fix** | was cp437 mojibake |
-   | flag clear, non-UTF-8 (genuine legacy cp437, e.g. `0xE9`) | `name()` = cp437 decode | identical |
+   | flag clear, non-UTF-8 (genuine legacy cp437, e.g. `0x82` → `é`) | `name()` = cp437 decode | identical |
 
    Divergence from `name()` happens **iff** flag clear ∧ valid UTF-8 ∧
    non-ASCII — the exact bug class.
@@ -102,11 +102,24 @@ ZSN-34. Every cited location was re-derived against current source:
    behavior. Only when they differ (the fix class) a divergence branch runs:
    reject `name.contains('\0')` — the one protection `enclosed_name` provided
    that `is_unsafe_entry_name` does not, pinned by `extract.rs:766-768` — then
-   `dest_dir.join(Path::new(name))`. Containment holds because
+   mirror `enclosed_name`'s componentization (`zip-7.2.0 types.rs:583-608`)
+   over the canonical name split on both separators: drop empty/`.` segments,
+   reject any segment carrying a Windows drive prefix (zip builds its result
+   from an empty `PathBuf` by pushing only `Normal` components and rejects
+   `Prefix`/`RootDir`; a raw `PathBuf::push` of an interior `C:x` segment
+   would instead *replace* the buffer — an escape the fast path never has),
+   and join the surviving segments under `dest_dir`. Containment holds because
    `is_unsafe_entry_name` (`extract.rs:120-137`) already rejects leading
-   `/`/`\`, drive prefixes (`:125`), `..` segments under both separators, and
-   empty/dot-only names. The canonical name is used in the error messages too
-   (better diagnostics than the cp437 mojibake).
+   `/`/`\`, whole-name drive prefixes (`:125`), `..` segments under both
+   separators, and empty/dot-only names. Duplicate/type-conflict detection
+   holds on both branches regardless of segment spelling: `PathBuf` `Eq`/`Hash`
+   are component-based (probe-verified on this toolchain:
+   `dest.join("./x") == dest.join(x)` and a `HashSet` of the two keeps one
+   entry), so the `file_paths`/`dirs_to_create` keys at `extract.rs:416`/`:441`
+   canonicalize `.` and empty segments on their own; the branch-level
+   collapsing keeps the *stored* `outpath` text canonical and mirrors the fast
+   path's Windows component semantics. The canonical name is used in the error
+   messages too (better diagnostics than the cp437 mojibake).
 
 3. **Creation: no production change.** Matrix row b: zip 7.2.0 sets bit 11 on
    every non-ASCII name automatically and exposes no setter; `zip_entry_name`
@@ -241,7 +254,7 @@ run with `TMPDIR=$PWD/.tmptmp`, and use the existing helpers/patterns
 
 | # | Test (file) | What it pins | Red before fix? |
 |---|---|---|---|
-| T1 | `test_extract_repack_roundtrip_preserves_non_ascii_names` (`extract.rs`) | Fixture: `Payload/App.app/资源/` (dir), `资源/测试文件.txt` (file), `资料/说明.txt` (flag-set control), `资源链接` → target `资源/测试文件.txt` (symlink), plus an adversarial entry patched to raw `[0xE9,0xE9]` with bit 11 clear. Fixture builder patches: bit 11 cleared in **local** (+6) and **central** (+8) headers (local offset at central +42), mirroring `patch_central_dir_unix_mode` (`extract.rs:913-951`). Assertions: extract→`create_ipa_from_root`→extract yields the exact literal names at both hops (files, non-ASCII directory, `read_link` target), file contents route correctly, the adversarial name decodes to `éé` at every hop (cp437 fallback, no double-mangle), and every non-ASCII entry of the produced zip has bit 11 set (`get_metadata().flags`, read via the zip crate reader) | **Yes** — flag-clear UTF-8 entries extract to cp437 mojibake today, so the literal-path assertions fail. The adversarial and flag-set assertions are guards (green before and after) |
+| T1 | `test_extract_repack_roundtrip_preserves_non_ascii_names` (`extract.rs`) | Fixture: `Payload/App.app/资源/` (dir), `资源/测试文件.txt` (file), `资料/说明.txt` (flag-set control), `资源链接` → target `资源/测试文件.txt` (symlink), plus an adversarial entry rewritten to the same-length raw bytes `Payload/App.app/\x82\x82` (cp437 `éé`, invalid UTF-8) with bit 11 clear. Fixture builder patches: bit 11 cleared in **local** (+6) and **central** (+8) headers (local offset at central +42), mirroring `patch_central_dir_unix_mode` (`extract.rs:913-951`). Assertions: extract→`create_ipa_from_root`→extract yields the exact literal names at both hops (files, non-ASCII directory, `read_link` target), file contents route correctly, the adversarial name decodes to `éé` at every hop (cp437 fallback, no double-mangle), and every non-ASCII entry of the produced zip has bit 11 set (`get_metadata().flags`, read via the zip crate reader) | **Yes** — flag-clear UTF-8 entries extract to cp437 mojibake today, so the literal-path assertions fail. The adversarial and flag-set assertions are guards (green before and after) |
 | T2 | `test_create_ipa_writes_entries_in_sorted_order` (`archive.rs`) | Small tree created in non-sorted order; asserts the exact full `by_index` name sequence (sorted, dirs with trailing `/`, `Payload/` first) and that every entry's `last_modified()` equals `Some(zip::DateTime::default())` (1980-01-01 pin, matrix row f; `last_modified()` returns `Option<DateTime>`, zip-7.2.0 `read.rs:1967`) | **Yes** on this btrfs machine — walk yields creation/readdir order ≠ sorted (Tester confirms red before the fix) |
 | T3 | `test_create_ipa_from_root_is_byte_identical_across_creation_order` (`archive.rs`) | Two extraction roots with identical content but opposite file-creation order, including `SwiftSupport/iphoneos/…` and `iTunesMetadata.plist` pass-through siblings (ZSN-39 coverage) → `create_ipa_from_root` outputs compared as whole bytes | **Yes** on this btrfs machine — readdir order differs between the roots → entry order diverges (same divergence class as the confirmed 3/3 sign-test failure) |
 | T4 | `test_ipa_signing_is_deterministic` (`ipa/mod.rs:1126-1146`, pre-existing, unmodified) | End-to-end sign-the-same-input-twice byte identity | **Yes** today (3/3 confirmed); must be green **without skip**, proven 5× (brief's acceptance) |

@@ -169,9 +169,11 @@ with the shared `rewrite_entry_header` helper above:
             "Payload/App.app/资源链接",
             "Payload/App.app/资源链接".as_bytes(),
         );
-        // Adversarial: bytes that are NOT valid UTF-8, flag clear — the
-        // cp437 reading must survive every hop without double-mangling.
-        rewrite_entry_header(&ipa_path, "Payload/App.app/zz", &[0xE9, 0xE9]);
+        // Adversarial: same-length rewrite to cp437 é bytes (0x82), which
+        // are NOT valid UTF-8 — the cp437 reading must survive every hop
+        // without double-mangling. Must stay the last patch: later helper
+        // calls would scan over the now-invalid UTF-8 name bytes.
+        rewrite_entry_header(&ipa_path, "Payload/App.app/zz", b"Payload/App.app/\x82\x82");
 
         // Hop 1: extract.
         let hop1 = temp_dir.path().join("hop1");
@@ -302,18 +304,39 @@ replace the `outpath` match with:
                 }
             }
         } else {
-            // Divergence: flag-clear valid-UTF-8 non-ASCII name. The
-            // is_unsafe_entry_name gate above already rejects absolute,
-            // drive-prefixed, traversal, and dot-only names; the NUL check
-            // below is the one protection enclosed_name() provided that the
-            // raw check does not.
+            // Divergence: flag-clear valid-UTF-8 non-ASCII name. Mirror
+            // enclosed_name's acceptance set on the canonical name: the
+            // NUL gate first (the one check is_unsafe_entry_name lacks),
+            // then drop empty/"." segments, reject any segment that is not
+            // a plain path component — a Windows drive prefix anywhere
+            // would make PathBuf::push replace the whole path, an escape
+            // enclosed_name never produces (it pushes only Normal
+            // components) — and join the survivors under dest_dir.
+            // Traversal, leading separators, and whole-name drive prefixes
+            // are already rejected by is_unsafe_entry_name above; PathBuf
+            // equality is component-based, so duplicate/type-conflict
+            // detection keys canonically on either branch.
             if name.contains('\0') {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Unsafe entry name in IPA: {}", name),
                 )));
             }
-            dest_dir.join(Path::new(name))
+            let mut rel = PathBuf::new();
+            for segment in name.split(['/', '\\']) {
+                if segment.is_empty() || segment == "." {
+                    continue;
+                }
+                let bytes = segment.as_bytes();
+                if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unsafe entry name in IPA: {}", name),
+                    )));
+                }
+                rel.push(segment);
+            }
+            dest_dir.join(rel)
         };
 ```
 
