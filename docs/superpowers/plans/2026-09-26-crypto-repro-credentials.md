@@ -407,40 +407,35 @@ pub(crate) fn pem_load_error(e: P12Error) -> Error {
 
   `pkcs12.rs` currently imports nothing from `crate` except through its own `Result<T, E =
   P12Error>` alias (`:94`), so `pem_load_error` needs `use crate::Error;` added to the import
-  block at `:18-29`. `P12Error` is already `pub(crate)` (`:71`). Promote the reader as well,
-  because Tasks 8 and 9 walk DER with it:
+  block at `:18-29`. `P12Error` is already `pub(crate)` (`:71`).
+
+Widen the reader itself, because Tasks 8 and 9 walk DER with it. Six existing methods get
+`pub(crate)` on the `fn` keyword and nothing else: `new` (`:165`), `peek_tag` (`:183`),
+`read_tlv` (`:188`), `read_sequence` (`:228`), `read_octet_string` (`:232`), `read_oid` (`:249`).
+The struct declaration becomes `pub(crate) struct DerReader<'a>` (`:159`) and one method is
+appended to that `impl` block:
 
 ```rust
-pub(crate) struct DerReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> DerReader<'a> {
-    pub(crate) fn new(buf: &'a [u8]) -> Self { … }              // was private
-    pub(crate) fn peek_tag(&self) -> Option<u8> { … }           // exists at :183, widen only
-    pub(crate) fn read_tlv(&mut self) -> Result<(u8, &'a [u8])> { … }   // was private
-    pub(crate) fn read_sequence(&mut self) -> Result<&'a [u8]> { … }    // was private
-    pub(crate) fn read_oid(&mut self) -> Result<ObjectIdentifier> { … }  // was private
-    pub(crate) fn read_octet_string(&mut self) -> Result<&'a [u8]> { … } // was private
-
     /// Reads the next TLV and returns its **full encoded bytes** (tag, length, value), not just
-    /// the value. Signature verification must cover the bytes as the responder wrote them, so
-    /// the value-only `read_tlv` cannot be used for that.
+    /// the value. Signature verification must cover exactly the bytes the responder wrote, so the
+    /// value-only `read_tlv` cannot be used for that.
     pub(crate) fn span_of_next_tlv(&mut self) -> Option<&'a [u8]> {
         let start = self.pos;
         self.read_tlv().ok()?;
         self.buf.get(start..self.pos)
     }
-}
 ```
 
-  Each `…` above is "keep the existing body, change only the visibility" — `peek_tag`, `read_tlv`,
-  `read_sequence`, `read_oid` and `read_octet_string` already exist at `:183`, `:188`, `:228`,
-  `:249` and `:232`; only `span_of_next_tlv` is new code. Everything else in the module
-  (`pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`, `unpad_pkcs7`, `mod oid`, `read_explicit`,
-  `read_any`, `read_integer_u32`, `read_len`, `expect_tag`, `remaining`) stays module-private, and
-  the PBES2 machinery is reached through `decrypt_key_bag`.
+  Nothing else in the module changes: `pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`,
+  `unpad_pkcs7`, `mod oid`, `read_explicit`, `read_any`, `read_integer_u32`, `read_len` and
+  `remaining` stay module-private, and the PBES2 machinery is reached only through
+  `decrypt_key_bag`.
+
+
+  Nothing else in the module changes: `pbes2_decrypt`, `Pbkdf2Parameter`, `cbc_decrypt`,
+  `unpad_pkcs7`, `mod oid`, `read_explicit`, `read_any`, `read_integer_u32`, `read_len` and
+  `remaining` stay module-private, and the PBES2 machinery is reached only through
+  `decrypt_key_bag`.
 
 - [ ] **Step 2: Verify the module still compiles, and do not commit yet.**
 
@@ -1325,7 +1320,7 @@ if openssl ocsp -respin good_delegate_nocert.der -text -noverify 2>&1 \
 fi
 cp ca.pem issued_leaf.pem req.der good.der revoked.der good_delegate.der \
    good_delegate_nocert.der "$R/"
-ls -1 "$R" | grep -c . | grep -qx 8 || { echo "expected 8 revocation fixtures"; exit 1; }
+ls -1 "$R" | grep -c . | grep -qx 7 || { echo "expected 7 revocation fixtures"; exit 1; }
 # thisUpdate is stamped with the generation date; the tests below anchor their clock to the
 # fixture instead of a constant so nothing rots. Printed for the reader, asserted nowhere.
 openssl ocsp -respin good.der -text -noverify 2>&1 | grep 'This Update'
