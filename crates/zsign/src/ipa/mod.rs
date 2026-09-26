@@ -136,6 +136,8 @@ pub struct IpaSigner<'a> {
     allow_encrypted: bool,
     /// Custom entitlements file replacing the profile-derived entitlements
     entitlements_override: Option<PathBuf>,
+    /// Directory of per-bundle-id entitlements files for the root bundle
+    entitlements_dir: Option<PathBuf>,
 }
 
 impl<'a> IpaSigner<'a> {
@@ -157,6 +159,7 @@ impl<'a> IpaSigner<'a> {
             weak_dylibs: false,
             allow_encrypted: false,
             entitlements_override: None,
+            entitlements_dir: None,
         }
     }
 
@@ -174,6 +177,7 @@ impl<'a> IpaSigner<'a> {
             weak_dylibs: false,
             allow_encrypted: false,
             entitlements_override: None,
+            entitlements_dir: None,
         }
     }
 
@@ -203,6 +207,21 @@ impl<'a> IpaSigner<'a> {
     /// to the root app bundle. A rejected file fails the sign.
     pub fn entitlements(mut self, path: impl AsRef<Path>) -> Self {
         self.entitlements_override = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets a directory of per-bundle-id entitlements files.
+    ///
+    /// For the ROOT app bundle the file `<dir>/<bundle-id>.plist` — looked up
+    /// by the bundle id *after* any [`Self::bundle_id`] rewrite — replaces the
+    /// profile's entitlements. A missing *entry* falls back to the profile, but
+    /// a symlinked entry is refused and a configured directory that does not
+    /// exist is a hard error, so a typo cannot silently sign with the
+    /// profile's entitlements. An entry that exists but is invalid also fails
+    /// the sign. Precedence is [`Self::entitlements`] > this directory >
+    /// profile-derived entitlements.
+    pub fn entitlements_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.entitlements_dir = Some(dir.as_ref().to_path_buf());
         self
     }
 
@@ -321,17 +340,69 @@ impl<'a> IpaSigner<'a> {
 
     /// Reads and validates the custom entitlements file, if one is set.
     fn load_entitlements_override(&self) -> Result<Option<Vec<u8>>> {
-        let Some(path) = &self.entitlements_override else {
+        crate::builder::read_entitlements_file(self.entitlements_override.as_deref())
+    }
+
+    /// Exact-key entitlements directory hit: `<dir>/<bundle-id>.plist`.
+    ///
+    /// `Ok(None)` means "no hit, fall back to the profile": no directory
+    /// configured, a bundle id whose file name carries a prefix / root / parent
+    /// component (a malformed identity must never read a file through the
+    /// directory — this is the escape, and on Windows `join` would clear the
+    /// base for a drive-prefixed id), or a non-regular entry. A symlinked entry
+    /// is refused outright — the resolved path must stay inside the directory
+    /// (design D4 §3.3), so a planted link cannot get outside bytes signed.
+    /// A configured directory that is missing or is not a directory is a hard
+    /// error, not a silent fallback.
+    fn dir_hit(&self, bundle_id: &str) -> Result<Option<Vec<u8>>> {
+        let Some(dir) = &self.entitlements_dir else {
             return Ok(None);
         };
-        let data = fs::read(path).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to read entitlements file '{}': {e}", path.display()),
-            )
-        })?;
-        crate::builder::validate_entitlements_blob(&data, path)?;
-        Ok(Some(data))
+        if !dir.exists() {
+            return Err(Error::Core(zsign_core::Error::Config(format!(
+                "entitlements directory does not exist: {}",
+                dir.display()
+            ))));
+        }
+        if !dir.is_dir() {
+            return Err(Error::Core(zsign_core::Error::Config(format!(
+                "entitlements directory is not a directory: {}",
+                dir.display()
+            ))));
+        }
+        let name = format!("{bundle_id}.plist");
+        // Component-based guard, matching this file's own `resolve_relative`:
+        // reject any prefix, root or parent component rather than a character
+        // blacklist, so no platform's `join` can redirect the lookup.
+        if bundle_id.is_empty()
+            || Path::new(&name).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let path = dir.join(&name);
+        // symlink_metadata does NOT follow links, so a planted link is
+        // classified here instead of resolving to an outside file.
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(crate::builder::entitlements_read_error(&path, e)),
+            Ok(m) if m.file_type().is_symlink() => Err(Error::Core(zsign_core::Error::Signing(
+                format!("Refusing symlinked entitlements file: {}", path.display()),
+            ))),
+            Ok(m) if !m.is_file() => Ok(None),
+            Ok(_) => match crate::builder::read_entitlements_file(Some(&path)) {
+                // The entry can vanish between the probe and the read; a miss
+                // stays a miss. `Error::Io` preserves the `ErrorKind`.
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                result => result,
+            },
+        }
     }
 
     /// Signs an app bundle in place (`.app` folder signing).
@@ -363,7 +434,9 @@ impl<'a> IpaSigner<'a> {
         )
     }
 
-    /// Loads profile options and applies bundle rewrites before signing.
+    /// Rejects a symlinked bundle root, then delegates to [`Self::sign_bundle`]
+    /// which applies the plist rewrites, resolves the root entitlements, and
+    /// signs the bundle tree.
     fn sign_bundle_from_options(&self, bundle_path: &Path) -> Result<()> {
         // A trailing separator makes lstat follow a final symlink, so check
         // the component-rebuilt path; ancestors of the root stay trusted.
@@ -375,13 +448,7 @@ impl<'a> IpaSigner<'a> {
                 bundle_path.display()
             ))));
         }
-        let (profile_data, profile_entitlements) = self.load_profile()?;
-        let entitlements = self.load_entitlements_override()?.or(profile_entitlements);
-        self.sign_bundle(
-            bundle_path,
-            entitlements.as_deref(),
-            profile_data.as_deref(),
-        )
+        self.sign_bundle(bundle_path)
     }
 
     /// Sign an app bundle in place.
@@ -399,12 +466,7 @@ impl<'a> IpaSigner<'a> {
     /// 1. Sign all Mach-O binaries in-place (modifies binary content)
     /// 2. Copy provisioning profile to bundle (main app only)
     /// 3. Generate CodeResources (hashes all files including signed binaries)
-    fn sign_bundle(
-        &self,
-        bundle_path: &Path,
-        entitlements: Option<&[u8]>,
-        profile_data: Option<&[u8]>,
-    ) -> Result<()> {
+    fn sign_bundle(&self, bundle_path: &Path) -> Result<()> {
         if let Some(ref new_id) = self.bundle_id {
             self.rewrite_plist_string(bundle_path, "CFBundleIdentifier", new_id)?;
         }
@@ -414,6 +476,18 @@ impl<'a> IpaSigner<'a> {
         if let Some(ref version) = self.bundle_version {
             self.rewrite_plist_string(bundle_path, "CFBundleShortVersionString", version)?;
         }
+
+        // The directory is keyed by the POST-rewrite bundle id, so resolve it
+        // only after the rewrites — and before the dylib pass, which is the
+        // first step that mutates binaries.
+        let (profile_data, profile_entitlements) = self.load_profile()?;
+        let root_id = self.get_bundle_identifier(bundle_path)?;
+        let entitlements = self
+            .load_entitlements_override()?
+            .or(self.dir_hit(&root_id)?)
+            .or(profile_entitlements);
+        let entitlements = entitlements.as_deref();
+        let profile_data = profile_data.as_deref();
 
         let dylibs = self.find_standalone_dylibs(bundle_path)?;
         dylibs
@@ -2271,6 +2345,346 @@ mod tests {
             )
             .is_none(),
             "a nested bundle must not inherit the root's entitlements override"
+        );
+    }
+
+    /// An entitlements plist carrying a single marker key.
+    fn dir_entitlements(marker: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>{marker}</key>
+    <true/>
+</dict>
+</plist>"#
+        )
+    }
+
+    /// Root bundle whose Info.plist declares `bundle_id` as CFBundleIdentifier.
+    fn create_bundle_with_id(dir: &Path, bundle_id: &str) -> PathBuf {
+        let app = create_folder_bundle(dir, "Test", true);
+        std::fs::write(
+            app.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>Test</string>
+    <key>CFBundleIdentifier</key><string>{bundle_id}</string>
+</dict>
+</plist>"#
+            ),
+        )
+        .unwrap();
+        app
+    }
+
+    #[test]
+    fn test_entitlements_dir_hit_replaces_profile() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("com.test.app.plist"),
+            dir_entitlements("com.zsign.dir.ent"),
+        )
+        .unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("a directory hit must sign");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root main binary must carry the directory entitlements");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.dir.ent"),
+            "the directory hit must reach the root slot: {blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "a directory hit must replace the profile's entitlements, not merge"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_miss_falls_back_to_profile() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+        // The directory exists but holds no file for this bundle id.
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("com.other.app.plist"),
+            dir_entitlements("com.zsign.dir.ent"),
+        )
+        .unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("a directory miss must fall back and still sign");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the profile entitlements must still be signed");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "a directory miss must fall back to the profile: {blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.dir.ent"),
+            "another app's entitlements must never be used"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_traversal_id_never_reads_outside() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_id(temp.path(), "../evil");
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        // One level ABOVE the directory: reachable only by escaping it.
+        std::fs::write(
+            temp.path().join("evil.plist"),
+            dir_entitlements("com.zsign.evil"),
+        )
+        .unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("a traversal-shaped id must fall back, not fail");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the profile entitlements must be signed");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "a traversal id must fall back to the profile: {blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.evil"),
+            "a bundle id must never escape the entitlements directory"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_invalid_file_names_path() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("com.test.app.plist");
+        std::fs::write(&bad, b"not a plist at all").unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect_err("an unparsable directory entry must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.plist"),
+            "the error must name the offending file: {message}"
+        );
+        assert!(
+            !app.join("_CodeSignature").exists(),
+            "a rejected directory entry must not seal the bundle"
+        );
+        assert!(
+            signature_slot_blob(
+                &app.join("Test"),
+                zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS
+            )
+            .is_none(),
+            "a rejected directory entry must leave the main binary unsigned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_entitlements_dir_symlink_key_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let outside = temp.path().join("outside.plist");
+        std::fs::write(&outside, dir_entitlements("com.zsign.outside")).unwrap();
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        symlink(&outside, dir.join("com.test.app.plist")).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect_err("a symlinked directory entry must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.plist") && message.contains("symlink"),
+            "the error must name the symlinked entry: {message}"
+        );
+        assert!(
+            !app.join("_CodeSignature").exists(),
+            "a refused symlinked entry must not seal the bundle"
+        );
+        assert!(
+            signature_slot_blob(
+                &app.join("Test"),
+                zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS
+            )
+            .is_none(),
+            "a refused symlinked entry must leave the main binary unsigned"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_missing_directory_names_path() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let dir = temp.path().join("absent-ents");
+
+        let err = IpaSigner::new_adhoc()
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect_err("a configured but absent directory must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("absent-ents"),
+            "the error must name the configured directory: {message}"
+        );
+        assert!(
+            !app.join("_CodeSignature").exists(),
+            "a rejected directory must not seal the bundle"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_file_beats_entitlements_dir() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("com.test.app.plist"),
+            dir_entitlements("com.zsign.dir.ent"),
+        )
+        .unwrap();
+        let file = temp.path().join("custom.entitlements");
+        std::fs::write(&file, OVERRIDE_TEST_ENTITLEMENTS).unwrap();
+
+        IpaSigner::new_adhoc()
+            .entitlements(&file)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("both sources set must sign");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the root binary must carry entitlements");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.bundle.override.ent"),
+            "the -e file must win over a directory hit: {blob:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("com.zsign.dir.ent"),
+            "the directory tier must not be consulted once -e is set: {blob:?}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_regular_file_reports_not_a_directory() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        // A regular file where the directory was configured.
+        let dir = temp.path().join("ents");
+        std::fs::write(&dir, b"not a directory").unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect_err("a file used as the entitlements directory must fail the sign");
+        let message = err.to_string();
+        assert!(
+            message.contains("not a directory"),
+            "a regular file must be reported as such, not as missing: {message}"
+        );
+        assert!(
+            !message.contains("does not exist"),
+            "an existing path must not be reported as missing: {message}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_rejects_drive_prefixed_id() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("ents");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Planted one level ABOVE the directory: reachable only by escaping it.
+        std::fs::write(
+            temp.path().join("evil.plist"),
+            dir_entitlements("com.zsign.evil"),
+        )
+        .unwrap();
+        // A Windows drive-prefixed id would make `dir.join(name)` clear the base
+        // on Windows; the component guard must reject it on every platform.
+        for id in ["C:foo", "C:\\foo", "..", "../evil", "", "a/b", "a\\b"] {
+            assert!(
+                IpaSigner::new_adhoc()
+                    .entitlements_dir(&dir)
+                    .dir_hit(id)
+                    .expect("a malformed id must be a miss, not an error")
+                    .is_none(),
+                "id {id:?} must not resolve to a file through the directory"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entitlements_dir_non_regular_entry_falls_back() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let profile = temp.path().join("test.mobileprovision");
+        std::fs::write(&profile, OVERRIDE_TEST_PROFILE).unwrap();
+        let dir = temp.path().join("ents");
+        // A directory planted where the bundle's entry file is expected.
+        std::fs::create_dir_all(dir.join("com.test.app.plist")).unwrap();
+
+        IpaSigner::new_adhoc()
+            .provisioning_profile(&profile)
+            .entitlements_dir(&dir)
+            .sign_folder_in_place(&app)
+            .expect("a non-regular entry must fall back, not fail");
+
+        let blob = signature_slot_blob(
+            &app.join("Test"),
+            zsign_core::codesign::constants::CSSLOT_ENTITLEMENTS,
+        )
+        .expect("the profile entitlements must be signed");
+        assert!(
+            String::from_utf8_lossy(&blob).contains("com.zsign.profile.entitlement"),
+            "a non-regular entry must fall back to the profile: {blob:?}"
         );
     }
 }

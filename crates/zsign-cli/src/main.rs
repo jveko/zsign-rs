@@ -52,6 +52,11 @@ struct Cli {
     #[arg(short = 'e', long)]
     entitlements: Option<PathBuf>,
 
+    /// Directory of per-bundle-id entitlements files (`<dir>/<bundle-id>.plist`).
+    /// Applies to the app bundle; falls back to the profile when no file matches.
+    #[arg(long)]
+    entitlements_dir: Option<PathBuf>,
+
     /// Password for the PKCS#12 or key material (empty password is valid).
     /// Precedence: this flag beats the ZSIGN_PASSWORD environment variable.
     /// Values passed on the command line are visible to other users in
@@ -125,6 +130,7 @@ struct Cli {
             "pkcs12",
             "profile",
             "entitlements",
+            "entitlements_dir",
             "zip_level",
             "bundle_id",
             "bundle_name",
@@ -178,6 +184,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if let Some(entitlements) = cli.entitlements {
         signer = signer.entitlements(entitlements);
+    }
+
+    if let Some(entitlements_dir) = cli.entitlements_dir {
+        signer = signer.entitlements_dir(entitlements_dir);
     }
 
     if let Some(bundle_id) = cli.bundle_id {
@@ -1625,6 +1635,31 @@ mod tests {
         // entitlements alone (and alongside adhoc) stays valid
         assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
         assert!(Cli::try_parse_from(["zsign", "-a", "-e", "x.plist", "in.bin"]).is_ok());
+    }
+
+    #[test]
+    fn entitlements_dir_flag_parses() {
+        let cli = Cli::try_parse_from(["zsign", "-a", "--entitlements-dir", "ents", "in.ipa"])
+            .expect("must parse");
+        assert_eq!(cli.entitlements_dir, Some(PathBuf::from("ents")));
+    }
+
+    #[test]
+    fn verify_conflicts_with_entitlements_dir() {
+        for extra in [
+            vec!["zsign", "-V", "--entitlements-dir", "ents", "in.ipa"],
+            vec!["zsign", "--entitlements-dir", "ents", "-V", "in.ipa"],
+        ] {
+            assert_eq!(
+                parse_err(&extra).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        // alone-valid controls
+        assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["zsign", "-a", "--entitlements-dir", "ents", "in.ipa"]).is_ok()
+        );
     }
 
     #[test]

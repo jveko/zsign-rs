@@ -88,6 +88,8 @@ pub struct ZSign {
     allow_encrypted: bool,
     /// Custom entitlements file: replaces profile-derived entitlements
     entitlements: Option<PathBuf>,
+    /// Entitlements directory keyed by bundle id (`<dir>/<bundle-id>.plist`)
+    entitlements_dir: Option<PathBuf>,
 }
 
 impl ZSign {
@@ -114,6 +116,7 @@ impl ZSign {
             weak_dylibs: false,
             allow_encrypted: false,
             entitlements: None,
+            entitlements_dir: None,
         }
     }
 
@@ -175,6 +178,28 @@ impl ZSign {
     /// ```
     pub fn entitlements(mut self, path: impl AsRef<Path>) -> Self {
         self.entitlements = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets a directory of per-bundle-id entitlements files.
+    ///
+    /// For the ROOT app bundle the file `<dir>/<bundle-id>.plist` — looked up
+    /// by the bundle id *after* any configured [`Self::bundle_id`] rewrite —
+    /// is used in place of the profile's entitlements. A missing *entry*
+    /// falls back to the profile, while a symlinked entry or a configured
+    /// directory that does not exist is a hard error. Precedence is
+    /// [`Self::entitlements`] > this directory > profile-derived entitlements.
+    /// Not consulted by [`Self::sign_macho`], which has no bundle identity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zsign_rs::ZSign;
+    ///
+    /// let zsign = ZSign::new().entitlements_dir("entitlements");
+    /// ```
+    pub fn entitlements_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.entitlements_dir = Some(dir.as_ref().to_path_buf());
         self
     }
 
@@ -451,6 +476,10 @@ impl ZSign {
             signer = signer.entitlements(entitlements);
         }
 
+        if let Some(entitlements_dir) = &self.entitlements_dir {
+            signer = signer.entitlements_dir(entitlements_dir);
+        }
+
         if let Some(ref id) = self.bundle_id {
             signer = signer.bundle_id(id);
         }
@@ -506,6 +535,9 @@ impl ZSign {
         if let Some(entitlements) = &self.entitlements {
             signer = signer.entitlements(entitlements);
         }
+        if let Some(entitlements_dir) = &self.entitlements_dir {
+            signer = signer.entitlements_dir(entitlements_dir);
+        }
         if let Some(ref bundle_id) = self.bundle_id {
             signer = signer.bundle_id(bundle_id.as_str());
         }
@@ -560,18 +592,31 @@ impl ZSign {
     /// hard error naming the path — silently falling back to the profile is
     /// the upstream failure mode this port deliberately does not reproduce.
     fn load_entitlements_override(&self) -> Result<Option<Vec<u8>>> {
-        let Some(path) = &self.entitlements else {
-            return Ok(None);
-        };
-        let data = std::fs::read(path).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to read entitlements file '{}': {e}", path.display()),
-            )
-        })?;
-        validate_entitlements_blob(&data, path)?;
-        Ok(Some(data))
+        read_entitlements_file(self.entitlements.as_deref())
     }
+}
+
+/// Reads and validates an entitlements file. `Ok(None)` when no path is given.
+///
+/// Every rejection is a hard error naming the path — silently falling back to
+/// the profile is the upstream failure mode this port deliberately does not
+/// reproduce.
+pub(crate) fn read_entitlements_file(path: Option<&Path>) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let data = std::fs::read(path).map_err(|e| entitlements_read_error(path, e))?;
+    validate_entitlements_blob(&data, path)?;
+    Ok(Some(data))
+}
+
+/// Single owner of the "failed to read entitlements file" text, shared by the
+/// builder override loader and the signer's entitlements-directory lookup.
+pub(crate) fn entitlements_read_error(path: &Path, e: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        e.kind(),
+        format!("failed to read entitlements file '{}': {e}", path.display()),
+    ))
 }
 
 /// Validates entitlements bytes against the blob contract: XML-or-binary
@@ -1389,6 +1434,134 @@ mod tests {
         assert!(
             blob.contains("com.zsign.override.ent"),
             "sign_bundle must forward the override to IpaSigner: {blob}"
+        );
+    }
+
+    /// An entitlements directory holding a single `<key>.plist` with `marker`.
+    fn write_entitlements_dir(dir: &Path, key: &str, marker: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{key}.plist"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>{marker}</key>
+    <true/>
+</dict>
+</plist>"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_sign_ipa_forwards_entitlements_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("in.ipa");
+        write_ipa_fixture(&input);
+        // FIXTURE_PLIST declares com.zsign.test as CFBundleIdentifier.
+        let ents_dir = dir.path().join("ents");
+        write_entitlements_dir(&ents_dir, "com.zsign.test", "com.zsign.dir.ent");
+        let out = dir.path().join("out.ipa");
+
+        ZSign::new()
+            .adhoc(true)
+            .entitlements_dir(&ents_dir)
+            .sign_ipa(&input, &out)
+            .expect("sign_ipa must forward the entitlements directory");
+
+        let blob = entitlements_slot_blob(&ipa_entry(&out, "Payload/Test.app/Test"))
+            .expect("the root binary must carry the directory entitlements");
+        assert!(
+            blob.contains("com.zsign.dir.ent"),
+            "sign_ipa must forward entitlements_dir to IpaSigner: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_sign_bundle_forwards_entitlements_dir() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        let ents_dir = dir.path().join("ents");
+        write_entitlements_dir(&ents_dir, "com.zsign.test", "com.zsign.dir.ent");
+
+        ZSign::new()
+            .adhoc(true)
+            .entitlements_dir(&ents_dir)
+            .sign_bundle(&app, None)
+            .expect("sign_bundle must forward the entitlements directory");
+
+        let blob = entitlements_slot_blob(&std::fs::read(app.join("Test")).unwrap())
+            .expect("the root binary must carry the directory entitlements");
+        assert!(
+            blob.contains("com.zsign.dir.ent"),
+            "sign_bundle must forward entitlements_dir to IpaSigner: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_entitlements_dir_uses_post_rewrite_bundle_id() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = dir.path().join("Test.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Info.plist"), FIXTURE_PLIST).unwrap();
+        std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+        // Only the REWRITTEN id has a file; the pre-rewrite one must not be used.
+        let ents_dir = dir.path().join("ents");
+        write_entitlements_dir(&ents_dir, "com.zsign.rewritten", "com.zsign.dir.ent");
+        write_entitlements_dir(&ents_dir, "com.zsign.test", "com.zsign.stale.ent");
+
+        ZSign::new()
+            .adhoc(true)
+            .bundle_id("com.zsign.rewritten")
+            .entitlements_dir(&ents_dir)
+            .sign_bundle(&app, None)
+            .expect("signing with a rewrite must succeed");
+
+        let blob = entitlements_slot_blob(&std::fs::read(app.join("Test")).unwrap())
+            .expect("the root binary must carry the directory entitlements");
+        assert!(
+            blob.contains("com.zsign.dir.ent"),
+            "the directory must be keyed by the post-rewrite id: {blob}"
+        );
+        assert!(
+            !blob.contains("com.zsign.stale.ent"),
+            "the pre-rewrite id must not be used as a directory key: {blob}"
+        );
+    }
+
+    #[test]
+    fn test_sign_macho_ignores_entitlements_dir() {
+        use crate::test_util::minimal_macho;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ents_dir = dir.path().join("ents");
+        write_entitlements_dir(&ents_dir, "app", "com.zsign.dir.ent");
+        let input = dir.path().join("app.bin");
+        std::fs::write(&input, minimal_macho()).unwrap();
+        let out = dir.path().join("signed.bin");
+
+        // A bare Mach-O has no bundle identity, so the directory must not apply.
+        ZSign::new()
+            .adhoc(true)
+            .entitlements_dir(&ents_dir)
+            .sign_macho(&input, &out)
+            .expect("sign_macho must not consult the directory");
+
+        assert!(
+            entitlements_slot_blob(&std::fs::read(&out).unwrap()).is_none(),
+            "sign_macho has no bundle identity and must not sign with directory entitlements"
         );
     }
 }
