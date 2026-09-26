@@ -10,12 +10,15 @@ last plumbing scratch test, consolidate Mach-O fixture builders and shared
 test credentials behind `zsign_core::macho::fixtures` + `OnceLock`, fill
 four coverage gaps red-first, and remove the one stale CI skip.
 
-**Architecture:** expose the canon fixtures module to workspace test builds
-via a dev-dependency-only `test-fixtures` feature (resolver 2 keeps it out
-of release/wasm artifacts); migrate stragglers crate-by-crate with a
-full-suite green after each batch; cache duplicate leaf-credential recipes
-behind `OnceLock` returning owned clones (`Clone` derives added to
-`SigningCredentials`/`SigningKeyType`).
+**Architecture:** expose the canon fixtures module's **byte builders** to
+workspace test builds via a dev-dependency-only `test-fixtures` feature
+(resolver 2 keeps it out of release/wasm artifacts; credential recipes stay
+`#[cfg(test)]` because they need dev-only `rand`/`x509-cert/builder` —
+design §3.1); migrate stragglers crate-by-crate with a full-suite green
+after each batch; cache duplicate leaf-credential recipes behind `OnceLock`
+returning owned clones (`Clone` derives added to
+`SigningCredentials`/`SigningKeyType`) — zsign-core's in `fixtures`,
+zsign's in its own `test_util` (design §4.1).
 
 **Tech stack:** Rust workspace (4 crates + fuzz), cargo, hk 1.55.0. No new
 external dependencies.
@@ -110,18 +113,28 @@ with:
 pub mod fixtures;
 ```
 
-- [ ] **Step 3: Make fixture fns `pub`**
+- [ ] **Step 3: Make byte-builder fns `pub`; gate credential fns `#[cfg(test)]`**
 
-In `crates/zsign-core/src/macho/fixtures.rs`, change every `pub(crate) fn`
-to `pub fn` (`make_minimal_macho`, `make_minimal_macho_text_vmsize_pad`,
-`make_minimal_macho_32`, `make_minimal_macho_32_mixed_linkedit`,
-`make_minimal_macho_32_be`, `make_signed_minimal_macho`,
-`make_signed_minimal_macho_at`, `make_minimal_macho_be`,
-`make_minimal_macho_encrypted`, `make_text_fileoff0_macho`,
-`test_signing_credentials`). `make_minimal_dylib` and `make_fat_macho` are
-already `pub`. All already carry `///` docs (no `missing_docs` deny exists
-— verified `lib.rs` has no `#![deny]` attrs). Module-level gating keeps
-them out of normal builds; no doc changes needed beyond the existing ones.
+In `crates/zsign-core/src/macho/fixtures.rs`:
+
+1. Change every `pub(crate) fn` **byte builder** to `pub fn`
+   (`make_minimal_macho`, `make_minimal_macho_text_vmsize_pad`,
+   `make_minimal_macho_32`, `make_minimal_macho_32_mixed_linkedit`,
+   `make_minimal_macho_32_be`, `make_signed_minimal_macho`,
+   `make_signed_minimal_macho_at`, `make_minimal_macho_be`,
+   `make_minimal_macho_encrypted`, `make_text_fileoff0_macho`).
+   `make_minimal_dylib` and `make_fat_macho` are already `pub`.
+2. `test_signing_credentials` stays `pub(crate)` and gains an explicit
+   `#[cfg(test)]` — it (and anything moved next to it in Task 5) names
+   dev-only deps (`rand::thread_rng`, `x509_cert::builder`), which are not
+   linked when the feature compiles the lib for a sibling crate; without
+   the gate, `cargo check --features test-fixtures` fails with `E0433`.
+   The same `#[cfg(test)]` applies to Task 5's credential statics and
+   `build_*` fns (they are only read by `cfg(test)` callers — without the
+   gate the unused statics would trip `dead_code` under `-D warnings`).
+3. All builders already carry `///` docs (no `missing_docs` deny exists —
+   `lib.rs` has no `#![deny]` attrs). Module-level gating keeps builders
+   out of normal builds.
 
 - [ ] **Step 4: Add dev-dependency edges**
 
@@ -149,10 +162,14 @@ zsign-core = { path = "../zsign-core", version = "0.1.0", features = ["test-fixt
 
 Run:
 ```
+TMPDIR=$PWD/.tmptmp cargo check -p zsign-core --features test-fixtures
 TMPDIR=$PWD/.tmptmp cargo check --workspace --all-targets
 TMPDIR=$PWD/.tmptmp cargo check --release -p zsign-wasm
 ```
-Expected: both `Finished` with no warnings. The second command proves the
+Expected: all three `Finished` with no warnings. Command 1 is the
+dep-class guard: it builds zsign-core with the feature but **without**
+`cfg(test)` — if any feature-exposed fn names a dev-only crate, it fails
+here. Command 2 proves the test builds compile; command 3 proves the
 feature stays OFF for release/wasm builds (fixtures module absent — if it
 were present the gate is wrong).
 
@@ -227,10 +244,16 @@ delete `make_fat_with_encrypted_second_slice` (`signer.rs:1596`).
   The existing test at `verify.rs:795+` that constructed *overlapping*
   slices deliberately is a different, inline hostile fixture — leave it.
 - Cut `writer.rs:1814` `build_test_binary(segment_fileoff)` into
-  `fixtures.rs` as `pub fn make_linkedit_only_macho(segment_fileoff: u64) -> Vec<u8>`
-  (body unchanged, doc comment added); update the three writer.rs callers
-  (`:1845,:1915,:1926`) to `crate::macho::fixtures::make_linkedit_only_macho(...)`;
-  delete the local fn.
+  `fixtures.rs` as `pub fn make_text_segment_macho(segment_fileoff: u64) -> Vec<u8>`
+  (body preserved except the writer-private helpers: `write_u32`/`write_u64`
+  at `writer.rs:1648`/`:1669` are private `fn`s of the writer module and do
+  **not** move with it — rewrite each call as a direct little-endian slice
+  store, e.g. `data[off..off + 4].copy_from_slice(&v.to_le_bytes());`
+  (the buffer is pre-sized to 104 bytes and every offset is a constant ⇒
+  infallible); the `copy_from_slice(b"__TEXT\0")` line moves unchanged.
+  Update the three writer.rs callers (`:1845,:1915,:1926`) to
+  `crate::macho::fixtures::make_text_segment_macho(...)`; delete the local
+  fn.
 
 - [ ] **Step 5: Scoped gate + byte-identity spot check**
 
@@ -256,24 +279,32 @@ Subject: `test: consolidate zsign-core macho fixture builders into fixtures (ZSN
 
 - [ ] **Step 1: zsign crate — replace the three test_util macho wrappers**
 
-In every zsign test module that calls them (grep first):
+Exhaustive grep first (this is the authority — the earlier cluster list
+was materially incomplete):
+
+```
+grep -rnE '\b(minimal_macho|minimal_dylib|minimal_macho_encrypted)\(\)' crates/zsign/src
+```
+
+Expected **~54 sites** (builder.rs ~20, ipa/mod.rs ~29, verify.rs ~5;
+the `\b` boundary keeps `make_minimal_*` hits out). Every hit migrates:
 `minimal_macho()` → `zsign_core::macho::fixtures::make_minimal_macho()`,
 `minimal_macho_encrypted()` → `zsign_core::macho::fixtures::make_minimal_macho_encrypted(1, 0x1000)`,
 `minimal_dylib()` → `zsign_core::macho::fixtures::make_minimal_dylib()`.
 Add `use zsign_core::macho::fixtures;` where a module has several call
 sites (then `fixtures::make_minimal_macho()`); keep full paths where a
-site is singular. Known caller clusters from the re-audit: `builder.rs`
-(:794,887,888,892,1087,1117,1169), `ipa/mod.rs` (:1972,2443,2482,2496,2787,3839),
-`verify.rs` (:1228), `test_util.rs` internals. Re-grep to catch all.
+site is singular. Re-run the grep after migration: zero hits.
 
 - [ ] **Step 2: zsign — delete `make_fat_for_test`, rewire
 `write_two_arch_fat_fixture`**
 
-`builder.rs:892` caller → `fixtures::make_fat_macho(slices, &[12, 12])`
-(matching the slice count: pass `&[12u32][..slices.len()]` or a
-`vec![12; slices.len()]`). Inside `write_two_arch_fat_fixture` (`:886`)
-replace its hand-rolled header with the same canon call. Delete
-`make_fat_for_test` (`:856`).
+`builder.rs:892` caller → `fixtures::make_fat_macho(slices, aligns)` with
+`aligns.len() == slices.len()` (e.g. `&[12u32][..slices.len()]` or
+`vec![12; slices.len()]`) — canon **asserts** `slices.len() == aligns.len()`
+(`fixtures.rs:568`), so a mismatched length panics by design rather than
+erroring. Inside `write_two_arch_fat_fixture` (`:886`) replace its
+hand-rolled header with the same canon call. Delete `make_fat_for_test`
+(`:856`).
 
 - [ ] **Step 3: zsign — replace the `include_bytes!` zip write**
 
@@ -309,7 +340,7 @@ After Steps 1-3, `minimal_macho`, `minimal_macho_encrypted`,
 - Delete `encrypted_macho()` (`:979`, caller `:1073`) →
   `zsign_core::macho::fixtures::make_minimal_macho_encrypted(1, 0x1000)`
   (verify the old fn's cryptid/cryptsize words match before swapping).
-- Delete `MINIMAL_MACHO` const (`:1130`) and route its ~15 uses to
+- Delete `MINIMAL_MACHO` const (`:1130`) and route its **19** uses to
   `fixtures::make_minimal_macho()` (same bind-then-slice pattern).
 
 - [ ] **Step 7: Delete the committed `.bin`**
@@ -353,14 +384,24 @@ Subject: `test: route cross-crate macho fixtures through zsign-core (ZSN-30)`
 For each helper being cached (`fixtures::test_signing_credentials`,
 `verify.rs:573 rsa_credentials`, `signer.rs:960 test_credentials`,
 `zsign test_util::test_credentials`, `zsign verify.rs:948
-local_test_credentials`, `cms_verify.rs:1744 rsa_credentials`): grep every
-caller function body for a **second** call to the same helper within one
-`#[test]`. Expected findings from re-audit: only `cms_verify`
-`attacker_self_signed_resign_is_invalid` (`:2231,:2232`) and
-`missing_issuer` (`:2259`) require *distinct* identities from the same
-helper. Any additional hit ⇒ stop, keep that helper uncached, and record
+local_test_credentials`, `cms_verify.rs:1744 rsa_credentials`), grep every
+caller function body for **both** identity directions (design §4.2):
+
+1. **needs-distinct:** a **second** call to the same helper within one
+   `#[test]` that expects a different identity. Expected findings from
+   re-audit: only `cms_verify`
+   `attacker_self_signed_resign_is_invalid` (`:2231,:2232`) and
+   `chain_missing_issuer_is_invalid` (`:2259`) require distinct identities
+   from the same helper.
+2. **expects-differ:** any assertion that two signings with the same
+   helper produce *different* bytes (`assert_ne`, `!=`, "differs"
+   comments) — a cached identity makes them byte-identical. The
+   determinism tests go the *safe* direction (they assert *equality*:
+   `ipa/mod.rs:2203-2206`); confirm no inverse-direction assertion exists.
+
+Any hit in either direction ⇒ stop, keep that helper uncached, and record
 the deviation in design §9. This step is the guard against silently
-sharing an identity a test depends on being unique.
+changing a test's identity semantics.
 
 - [ ] **Step 1: Add Clone derives**
 
@@ -400,16 +441,23 @@ pub fn test_signing_credentials() -> crate::crypto::SigningCredentials {
 ```
 
 with `use std::sync::OnceLock;`. Signature unchanged ⇒ zero caller churn.
+Both the static and the `build_*` fn carry `#[cfg(test)]` (module-level
+rule from Task 2 Step 3: without it, the feature build compiles an unused
+static and `dead_code` fires under `-D warnings`; `rand`/`x509-cert/builder`
+would also be missing).
 
 - [ ] **Step 3: Delete the exact duplicate in macho/verify.rs**
 
 `verify.rs:573 rsa_credentials` is byte-equivalent (same CN/serial/Leaf/
-E KU/team — design §4.1). Replace its 13 callers
-(`:514,820,947,981,1016,1066,1077,1088,1122,1152,1214,1224,3415,3437`
-— re-grep for `rsa_credentials()` in that file) with
+E KU/team — design §4.1). Replace its callers with
 `crate::macho::fixtures::test_signing_credentials()`, then delete the
-local fn. (If a caller destructures a tuple it doesn't — this one returns
-`SigningCredentials` only — signature matches canon exactly.)
+local fn. Authoritative caller list: re-grep
+`grep -n "rsa_credentials()" crates/zsign-core/src/macho/verify.rs` —
+expected `:514, :820, :947, :981, :1016, :1066, :1077, :1088, :1122,
+:1152, :1214, :1224` (13 with the fn definition at `:573`; the earlier
+plan draft listed `:3415/:3437`, which are `cms_verify.rs` lines — that
+file is only 1557 lines). The fn returns `SigningCredentials` only, so
+the signature matches canon exactly (no tuple destructures to fix).
 
 - [ ] **Step 4: Move the Root recipe into canon**
 
@@ -427,31 +475,52 @@ pub fn test_root_credentials() -> crate::crypto::SigningCredentials {
 ```
 
 (body of the moved fn becomes `build_test_root_credentials`, unchanged
-recipe). Delete the signer.rs local; its 12 callers
-(`:1121,1181,1259,1288,1312,1414,1446,1530,1577,1640,1685,1824` — re-grep)
-become `crate::macho::fixtures::test_root_credentials()`.
+recipe; static + both fns carry `#[cfg(test)]` per Task 2 Step 3).
+Delete the signer.rs local; its 12 callers
+(`:1121,1181,1259,1288,1312,1414,1446,1530,1577,1640,1685,1824` — re-grep
+to confirm) become `crate::macho::fixtures::test_root_credentials()`.
 
-- [ ] **Step 5: zsign-side recipe moves**
+- [ ] **Step 5: zsign-side credentials — OnceLock in place (design §4.1)**
 
+These recipes **cannot** cross into zsign-core's fixtures (credential fns
+are `#[cfg(test)]` there — design §3.1), so they are cached where they
+live; the brief mandates `OnceLock` for credentials, not a single home.
 In `crates/zsign/src/test_util.rs`:
-- Rename-and-move `test_credentials` body into `fixtures.rs` as
-  `build_team_ou_test_credentials` + `static TEAM_OU_CREDS: OnceLock<…>`
-  + public `pub fn team_ou_test_credentials() -> SigningCredentials`
-  (cached clone; recipe `CN=zsign test,OU=TESTTEAM` preserved byte-for-byte).
-  Also store a `static TEAM_OU_WITH_KEY: OnceLock<(SigningCredentials, RsaPrivateKey)>`
-  built from the *same* recipe so `local_test_credentials` callers keep a
-  matching key: add `pub fn team_ou_test_credentials_with_key() -> (SigningCredentials, RsaPrivateKey)`
-  returning clones of the tuple. Build both from one init fn to avoid two
-  keygens (the tuple's `.0` and the creds-only accessor share one static —
-  implement as one `OnceLock<(creds, key)>` and derive both accessors from
-  it, constructing `creds` once inside).
-- Replace `zsign/src/verify.rs:948 local_test_credentials` — delete it;
-  its callers (`:1049,:1227` — re-grep) use
-  `zsign_core::macho::fixtures::team_ou_test_credentials_with_key()`.
-- Replace all `test_util::test_credentials()` callers (~40 sites:
-  `builder.rs:777,787,815,848,905,930,1042,1049,1100,1125,1316`,
-  `ipa/mod.rs:1871,1907,2103,2174,2189,2203,2241,2261,2291,2364,2446,2485,2723,2768,2791,2943,3034,3087` — re-grep)
-  with `zsign_core::macho::fixtures::team_ou_test_credentials()`.
+- Rename the current `test_credentials` body to
+  `fn build_test_credentials() -> (crate::SigningCredentials, rsa::RsaPrivateKey)`
+  — clone `rsa_key` **before** it is moved into `SigningKeyType::Rsa(...)`
+  so the pair retains the raw key.
+- Add one shared cache and two accessors:
+
+```rust
+use std::sync::OnceLock;
+
+static CREDS: OnceLock<(crate::SigningCredentials, rsa::RsaPrivateKey)> =
+    OnceLock::new();
+
+/// Cached self-signed RSA-2048 test credentials (`CN=zsign test,OU=TESTTEAM`).
+pub(crate) fn test_credentials() -> crate::SigningCredentials {
+    CREDS.get_or_init(build_test_credentials).0.clone()
+}
+
+/// Same cached identity, with the raw key for rebuild-anchor patterns.
+pub(crate) fn test_credentials_with_key()
+    -> (crate::SigningCredentials, rsa::RsaPrivateKey) {
+    let (creds, key) = CREDS.get_or_init(build_test_credentials);
+    (creds.clone(), key.clone())
+}
+```
+
+- `test_credentials()` keeps its exact signature ⇒ **~40 callers
+  untouched** (verify with
+  `grep -rnE '\btest_credentials\(\)' crates/zsign/src | wc -l` before and
+  after — the count of call sites must not change).
+- **Delete** `zsign/src/verify.rs:948 local_test_credentials` (recipe is
+  byte-equivalent to `test_util::test_credentials` — cold-review
+  verified); its 2 callers (`:1049`, `:1227` — re-grep) switch to
+  `crate::test_util::test_credentials_with_key()`. The `verify_creds`
+  rebuild block in `build_signed_bundle_with` keeps working unchanged
+  (it already clones the cert and re-wraps the same key).
 
 - [ ] **Step 6: cms_verify cache + fresh split**
 
@@ -478,13 +547,17 @@ Expected: all green; zsign-cli baseline 46 passed.
 
 - [ ] **Step 8: Residue grep (acceptance evidence)**
 
-Run: `grep -rn "fn rsa_credentials\|fn test_credentials\|fn local_test_credentials" crates/`
-Expected: only the three private `build_*`/`fresh_*` helpers named above
-remain (no stray local duplicates). Record output.
+Run: `grep -rn "fn local_test_credentials\|fn build_test_credentials\|fn build_test_root_credentials\|fn build_rsa_test_credentials\|fn build_canon" crates/`
+Expected: exactly the `build_*` init fns named above and **zero**
+`local_test_credentials` (deleted). Second run:
+`grep -rn "fn rsa_credentials\|fn test_credentials" crates/` — every hit
+must be a *cached wrapper* (`get_or_init` in its body) or the documented
+`fresh_rsa_credentials`; no uncached duplicate recipe remains. Record
+both outputs.
 
 - [ ] **Step 9: Commit**
 
-Subject: `test: share test credentials through oncelock fixtures (ZSN-30)`
+Subject: `test: share test credentials through oncelock caches (ZSN-30)`
 
 ---
 
@@ -501,124 +574,216 @@ green. Probe edits are never committed.
 
 File: `crates/zsign/src/builder.rs`, test
 `test_sign_macho_fat_default_sha256_only_routes_through_fat_path`
-(`:899`). After the existing "both slices signed" assertions, read the
-written output back and verify it end-to-end:
+(`:899`). After the existing "both slices signed" assertions, verify the
+written file through the crate's own public verifier (design §5 e1b):
 
 ```rust
-let written = std::fs::read(&output).unwrap();
-let report = zsign_core::macho::verify_macho(
-    &written,
-    &zsign_core::macho::verify::SignatureInputs::none(),
-)
-.unwrap();
-assert!(report.fat);
-assert_eq!(report.slices.len(), 2);
-for (i, slice) in report.slices.iter().enumerate() {
+let report = crate::verify::verify_macho_file(&output).unwrap();
+let macho = report.macho.as_ref().expect("Mach-O report");
+assert!(macho.fat);
+assert_eq!(macho.slices.len(), 2);
+for (i, slice) in macho.slices.iter().enumerate() {
     assert!(slice.signed, "slice {i} must verify as signed");
-    assert_eq!(slice.pages, zsign_core::codesign::verify::PageCheck::Matched, "slice {i}: {:?}", slice.errors);
+    assert_eq!(
+        slice.pages,
+        zsign_core::codesign::verify::PageCheck::Matched,
+        "slice {i}: {:?}",
+        slice.errors
+    );
+    // Dual-pin: the only allowed problem is the anchoring gate
+    // (self-signed test creds are never Apple-anchored).
+    assert!(
+        slice
+            .errors
+            .iter()
+            .all(|e| e.contains("not anchored to a trusted root")),
+        "slice {i}: {:?}",
+        slice.errors
+    );
 }
 ```
 
-Confirm the exact import paths against `verify.rs:1014-1058` (which uses
-`SignatureInputs::none()` and `PageCheck::Matched` in-module); adjust
-paths to what `zsign` can name publicly. Run scoped:
+`verify_macho_file` is `pub` (`verify.rs:333`, re-export `lib.rs:61`) and
+wraps `zsign_core::macho::verify_macho` + `SignatureInputs::none()`; the
+`PageCheck` path is `zsign_core::codesign::verify::PageCheck`
+(`codesign/mod.rs:50 pub mod verify`). Run scoped:
 `TMPDIR=$PWD/.tmptmp cargo test -p zsign-rs test_sign_macho_fat_default`
 → red/green per rules above. Mutation probe: temporarily break slice
 offset emission in the write path → test must go red → restore.
 
 - [ ] **Step 2 (e2): sign-IPA → `verify_ipa` end-to-end**
 
-File: `crates/zsign/src/verify.rs` tests mod (has `local_test_credentials`
-replaced in Task 5 — use `fixtures::team_ou_test_credentials()`).
+File: `crates/zsign/src/verify.rs` tests mod.
+
+**Read first:** `build_signed_bundle_with` (`verify.rs:1039-1063`) for the
+exact folder/plist writes, and the dual-pin contract at
+`verify.rs:1160-1175`. **Do NOT assert `report.valid()`** — it is
+structurally `false` for self-signed test creds (never Apple-anchored;
+design §5 e2). `zip` and `walkdir` are normal deps of `zsign`.
 
 ```rust
+/// Zip `app` into `out` as `Payload/Test.app/<rel>` entries. `options`
+/// construction mirrors the ipa tests (ipa/mod.rs:1954-1980).
+fn zip_app_as_ipa(app: &std::path::Path, out: &std::path::Path) {
+    use std::io::Write as _;
+    let file = std::fs::File::create(out).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for entry in walkdir::WalkDir::new(app) {
+        let entry = entry.unwrap();
+        let rel = entry.path().strip_prefix(app).unwrap();
+        if entry.file_type().is_dir() {
+            archive.add_directory(format!("Payload/Test.app/{}", rel.display()), options).unwrap();
+        } else {
+            archive.start_file(format!("Payload/Test.app/{}", rel.display()), options).unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            archive.write_all(&bytes).unwrap();
+        }
+    }
+    archive.finish().unwrap();
+}
+
 #[test]
 fn signed_ipa_verifies_end_to_end() {
     let td = tempfile::TempDir::new().unwrap();
-    let app = td.path().join("Payload").join("Test.app");
-    std::fs::create_dir_all(app.join("SCInfo")).unwrap();
+    // Same folder construction as build_signed_bundle_with (read it first;
+    // mirror its Info.plist + executable writes), signed in place:
+    let app = td.path().join("Test.app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("Info.plist"), /* mirror helper's plist */ …).unwrap();
     std::fs::write(
-        app.join("Info.plist"),
-        br#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleIdentifier</key><string>com.test.e2e</string>
-  <key>CFBundleExecutable</key><string>Test</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-</dict></plist>"#,
+        app.join("Test"),
+        zsign_core::macho::fixtures::make_minimal_macho(),
     )
     .unwrap();
-    std::fs::write(app.join("Test"), minimal_macho()).unwrap();
+    let creds = crate::test_util::test_credentials();
+    crate::ZSign::new()
+        .credentials(creds.clone())
+        .sign_bundle(&app, None)
+        .unwrap();
     let ipa = td.path().join("signed.ipa");
-    let zsign = crate::ZSign::new()
-        .credentials(zsign_core::macho::fixtures::team_ou_test_credentials());
-    zsign.sign_bundle(&app, Some(&ipa)).unwrap();
+    zip_app_as_ipa(&app, &ipa);
 
     let report = crate::verify::verify_ipa(&ipa).expect("verify_ipa must run");
-    assert!(report.valid(), "errors: {:?}", report);
+    // Dual-pin contract (verify.rs:1160-1175): without injected anchors
+    // report.valid() is false, so "clean end-to-end" = every problem is
+    // the anchoring gate and the CMS verifies anchored against the test root.
+    let bundle = report.bundle.as_ref().expect("bundle section");
+    assert!(bundle.errors.is_empty(), "errors: {:?}", bundle.errors);
+    assert!(!bundle.binaries.is_empty());
+    for binary in &bundle.binaries {
+        let slice = &binary.report.as_ref().expect("Mach-O report").slices[0];
+        assert_eq!(slice.errors.len(), 1, "binaries: {:?}", binary.errors);
+        assert!(slice.errors[0].contains("not anchored to a trusted root"));
+    }
+    let cr = bundle.code_resources.as_ref().expect("CodeResources check");
+    assert!(
+        cr.valid(),
+        "mismatched={:?} missing={:?} unsealed={:?}",
+        cr.mismatched, cr.missing, cr.unsealed
+    );
+    // Anchored half: the signed executable (same in-place-signed folder the
+    // zip was made from) verifies against the injected test root.
+    let exe = std::fs::read(app.join("Test")).unwrap();
+    let injected = cms_report_with_test_anchor(&exe, &creds);
+    assert!(injected.valid, "cms errors: {:?}", injected.errors);
+    assert!(injected.anchored);
 }
 
 #[test]
 fn verify_ipa_rejects_unsigned_bundle() {
-    // build the same minimal .ipa WITHOUT signing → verify_ipa must not report valid
+    let td = tempfile::TempDir::new().unwrap();
+    // Same folder layout as above, WITHOUT the sign step (mirror the
+    // helper's writes; do not refactor the existing helper).
+    let app = td.path().join("Test.app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("Info.plist"), /* same plist */ …).unwrap();
+    std::fs::write(
+        app.join("Test"),
+        zsign_core::macho::fixtures::make_minimal_macho(),
+    )
+    .unwrap();
+    let ipa = td.path().join("unsigned.ipa");
+    zip_app_as_ipa(&app, &ipa);
+
+    let report = crate::verify::verify_ipa(&ipa).expect("well-formed unsigned ipa must yield a report");
+    // Gated: verification must never report an unsigned bundle as clean.
+    assert!(!report.valid());
+    let bundle = report.bundle.as_ref().expect("bundle section");
+    assert!(!bundle.binaries.is_empty(), "extraction must still find the executable");
+    let slice = &bundle.binaries[0].report.as_ref().expect("Mach-O report").slices[0];
+    assert!(!slice.signed, "unsigned binary must not report signed");
 }
 ```
 
-Build the unsigned case by zipping the same layout with the `zip` crate
-(mirroring `ipa/mod.rs:1954-1980`) or by reusing an existing unsigned-ipa
-helper — check first; do not duplicate if one exists. If `sign_bundle`
-needs a directory outside `Payload/` layout, mirror the exact folder
-construction used by `builder.rs:794-850` tests (copy that block's shape).
-Negative variant: tamper → `!report.valid()`. First run recorded; mutation
-probe: make `verify_ipa` extraction skip the executable → positive test
-red → restore.
+Notes: `test_credentials()` is the cached accessor from Task 5 (clone
+taken for `ZSign::credentials`, original reused for the anchor check —
+same identity by construction). If `verify_ipa` returns `Err` for the
+unsigned bundle instead of an invalid report, record which form occurred
+and assert *that* form (still never `valid()`); the CLI's exit-1 mapping
+for unsigned inputs (`main.rs:1178`) suggests the report form. First run
+recorded per the red-first rules; mutation probe: make `verify_ipa`'s
+extraction skip the executable → the positive dual-pin goes red
+(`bundle.errors` non-empty or `binaries` empty) → restore.
 
 - [ ] **Step 3 (e3): 16KB `page_size_log2=14` behavioral test**
 
 File: `crates/zsign-core/src/codesign/verify.rs` tests mod, next to
 `cd_bytes_with_page_size` (`:1785`). The builder always writes pageSize=12
-and hashes at 4KB boundaries, so the test hand-patches a multi-page CD:
+and hashes at 4KB boundaries, so the test hand-patches a multi-page CD.
+**Header offsets are sourced from the real layout** — builder
+`code_directory.rs:464-476`, parser `verify.rs:595-601` (magic@0,
+length@4, version@8, flags@12, hashOffset@16, identOffset@20,
+nSpecialSlots@24, nCodeSlots@28, codeLimit@32, hashSize@36,
+pageSize@39; header u32s big-endian) — and mirror the repo's own
+patch-and-relength idiom at `verify.rs:1770-1771`:
 
 ```rust
 /// Patch a builder-produced CD to `log2`-byte pages: page size byte,
-/// stored slot count, and the code-slot digests recomputed at the new
-/// page boundary. `code` is the region the digests cover.
+/// stored slot count, code-slot digests recomputed at the new page
+/// boundary, and the declared length kept honest. `code` is the region
+/// the digests cover. (Offsets per code_directory.rs:464-476 /
+/// verify.rs:595-601.)
 fn cd_with_log2_pages(code: &[u8], log2: u8) -> Vec<u8> {
     let mut cd = CodeDirectoryBuilder::new("com.example.pages16k", code).build_sha256();
     let page = 1usize << log2;
     let slots = code.len().div_ceil(page);
-    // header: nCodeSlots u32 BE at offset 24, pageSize u8 at offset 39
-    cd[24..28].copy_from_slice(&(slots as u32).to_be_bytes());
-    cd[39] = log2;
-    // hashes start at hashOffset (u32 BE at offset 12), digest i covers
-    // code[i*page .. min((i+1)*page, len)]
-    let hash_offset = u32::from_be_bytes(cd[12..16].try_into().unwrap()) as usize;
+    cd[28..32].copy_from_slice(&(slots as u32).to_be_bytes()); // nCodeSlots
+    cd[39] = log2;                                             // pageSize log2
+    let hash_offset = u32::from_be_bytes(cd[16..20].try_into().unwrap()) as usize;
+    let hash_size = cd[36] as usize; // 32 for SHA-256
     for (i, chunk) in code.chunks(page).enumerate() {
         let digest = sha2::Sha256::digest(chunk);
-        let at = hash_offset + i * digest.len();
-        cd[at..at + digest.len()].copy_from_slice(&digest);
+        let at = hash_offset + i * hash_size;
+        cd[at..at + hash_size].copy_from_slice(&digest);
     }
+    let new_len = (hash_offset + slots * hash_size) as u32;
+    cd[4..8].copy_from_slice(&new_len.to_be_bytes()); // declared length
     cd
 }
 ```
 
-Verify header offsets against `CodeDirectory::parse` (`verify.rs:618-742`)
-before running — if nCodeSlots/hashOffset live elsewhere, fix the helper,
-not the assertions. Tests:
+The builder's original blob always has room for the patched slot count in
+these tests (4KB slot count > 16KB slot count), so digests are overwritten
+in place and the length only shrinks to the logical end. If
+`CodeDirectory::parse` rejects the patched bytes, fix the helper's
+offsets against the parser — never loosen the parser. Tests:
 
 ```rust
 #[test]
 fn check_code_pages_accepts_16k_pages() {
-    let code = vec![0x5au8; 16384 * 2 + 1000]; // two full pages + partial tail
+    // two full 16 KiB pages + partial tail → 3 slots
+    let code = vec![0x5au8; 16384 * 2 + 1000];
     let cd = CodeDirectory::parse(&cd_with_log2_pages(&code, 14)).unwrap();
     assert_eq!(check_code_pages(&cd, &code), PageCheck::Matched);
-    // exact-multiple boundary: no partial page
+    // exact-multiple boundary: no partial page (div_ceil edge)
     let exact = vec![0x5au8; 16384 * 2];
-    let cd = CodeDirectory::parse(&cd_with_log2_pages(&exact, 14)).unwrap();
-    assert_eq!(check_code_pages(&cd, &exact), PageCheck::Matched);
-    // corruption in the second page is localized
+    let cd_exact = CodeDirectory::parse(&cd_with_log2_pages(&exact, 14)).unwrap();
+    assert_eq!(check_code_pages(&cd_exact, &exact), PageCheck::Matched);
+    // corruption in the middle page is localized
     let mut bad = code.clone();
-    bad[20000] ^= 0x01;
+    bad[20000] ^= 0x01; // page 1 covers [16384, 32768)
     assert_eq!(
         check_code_pages(&cd, &bad),
         PageCheck::Mismatch { page_index: 1 }
@@ -627,10 +792,14 @@ fn check_code_pages_accepts_16k_pages() {
 
 #[test]
 fn check_code_pages_16k_count_mismatch() {
-    let code = vec![0x5au8; 16384 + 10]; // 2 pages at 16k …
+    // two pages at 16 KiB … but claim three stored slots
+    let code = vec![0x5au8; 16384 + 10];
     let mut cd_bytes = cd_with_log2_pages(&code, 14);
-    // … but claim 3 stored slots
-    cd_bytes[24..28].copy_from_slice(&3u32.to_be_bytes());
+    let hash_offset = u32::from_be_bytes(cd_bytes[16..20].try_into().unwrap()) as usize;
+    cd_bytes[28..32].copy_from_slice(&3u32.to_be_bytes()); // nCodeSlots = 3
+    // declared length must cover the claimed third slot or parse rejects it
+    let new_len = (hash_offset + 3 * 32) as u32;
+    cd_bytes[4..8].copy_from_slice(&new_len.to_be_bytes());
     let cd = CodeDirectory::parse(&cd_bytes).unwrap();
     assert_eq!(
         check_code_pages(&cd, &code),
@@ -755,8 +924,10 @@ Subject: `ci: drop stale determinism skip from release test job (ZSN-30)`
 - [ ] **Step 4:** `hk check` (runs lint + clippy + `cargo test --workspace`
   via `hk.pkl:52-54`) → exit 0. If hk is unavailable at run time, record
   that and rely on Steps 1-3 (which are its constituent commands).
-- [ ] **Step 5:** `grep -rn -- "--skip" . --include="*.yml" --include="*.toml" --include="*.pkl" --include="*.sh"`
-  → zero matches (final skip-free evidence).
+- [ ] **Step 5:** `grep -rn -- "--skip" .github/ scripts/ mise.toml hk.pkl Cargo.toml crates/ fuzz/`
+  → zero matches (final skip-free evidence; scope is code/config — this
+  lane's design/plan docs mention `--skip` in prose on purpose, and
+  including them would muddy the evidence).
 
 ---
 
@@ -771,9 +942,11 @@ Subject: `ci: drop stale determinism skip from release test job (ZSN-30)`
   explicit read-then-act instruction with line numbers.
 - **Type consistency:** `test_signing_credentials() -> SigningCredentials`
   (owned) everywhere; `make_minimal_macho_32_encrypted`,
-  `make_linkedit_only_macho`, `team_ou_test_credentials`,
-  `team_ou_test_credentials_with_key`, `test_root_credentials`,
-  `fresh_rsa_credentials` names are identical across tasks 3-6.
+  `make_text_segment_macho`, `test_root_credentials`,
+  `fresh_rsa_credentials` (zsign-core fixtures/cms_verify) and
+  `test_credentials` / `test_credentials_with_key` (zsign `test_util`,
+  signature-preserved) are identical across tasks 3-6; no
+  `team_ou_test_credentials` (dropped with the per-crate credential split).
 - **Dependency order:** Task 2 (feature) precedes Tasks 4-5 (cross-crate
   use); Task 5 Step 0 precedes any caching; Task 6 assumes Tasks 1-5
   landed (uses `fixtures::` paths). Task 7 independent; Task 8 last.

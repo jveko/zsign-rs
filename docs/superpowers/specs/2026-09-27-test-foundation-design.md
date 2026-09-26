@@ -7,18 +7,23 @@
 > current source, then specifies only the still-open work.
 
 **Goal:** delete the remaining plumbing tests, consolidate Mach-O fixture
-builders and shared test credentials behind a single home
-(`zsign_core::macho::fixtures` + `OnceLock`), fill the remaining coverage
+builders behind one home (`zsign_core::macho::fixtures`) and shared test
+credentials behind per-crate `OnceLock` caches, fill the remaining coverage
 gaps red-first, and make the documented local gate (`hk check`) trustworthy
 (the suite it runs has no stale skip flags left).
 
 **Architecture:** the fixtures module is currently `#[cfg(test)] pub(crate)`
-inside `zsign-core`, unreachable from sibling crates. We expose it to
-workspace test builds via a dev-dependency-only `test-fixtures` feature
-(resolver 2 ⇒ enabled only when dev-deps are active, so release and wasm
-artifacts are unaffected), migrate every straggler builder and duplicated
-leaf-credential recipe into it behind `OnceLock`, and delete the committed
-byte-duplicate `.bin` fixture (proven byte-identical to the builder output).
+inside `zsign-core`, unreachable from sibling crates. We expose its **byte
+builders** to workspace test builds via a dev-dependency-only
+`test-fixtures` feature (resolver 2 ⇒ enabled only when dev-deps are active,
+so release and wasm artifacts are unaffected). Credential recipes inside the
+module stay `#[cfg(test)]` — they need dev-only `rand` and the
+`x509-cert/builder` feature, which are not linked when the feature compiles
+the lib for a sibling (§3.1) — and are cached with `OnceLock` per crate
+(zsign-core's in `fixtures`, zsign's in its own `test_util`). Every
+straggler builder migrates into the one home, exact-duplicate recipes are
+deleted, and the committed byte-duplicate `.bin` fixture goes away (proven
+byte-identical to the builder output).
 
 **Tech stack:** Rust workspace (4 crates + fuzz), cargo/hk gates, `OnceLock`
 (std), no new external dependencies.
@@ -42,7 +47,7 @@ OPEN = in scope for this lane.
 | 1c-5 | **`debug_req_slot` println-only scratch (successor found by re-audit)** | **OPEN → delete** | `crates/zsign-core/src/macho/verify.rs:512-549`: signs a Mach-O and `println!`s slot data; zero assertions, zero panics — same class as the deleted `debug_certs_dump`, cannot fail on a behavior regression |
 | 1c-6 | other no-assert tests (AST scan) | KEEP | 3 hits are legitimate unwrap-driven behavior tests (`cert.rs:1276`, `cert.rs:1418`, `writer.rs:2257`) — they *can* fail |
 | 1d | 5 duplicate Mach-O fixture builders (now 16 in-scope stragglers) | **OPEN → consolidate** | Full table in §3.2; canon home `crates/zsign-core/src/macho/fixtures.rs` (13 fns) |
-| 1d | RSA-2048 keygen sites (now 18 counted) | **OPEN → consolidate + OnceLock** | Full disposition in §4; 3 exact/near-duplicate leaf recipes + canon to merge/OnceLock; the rest are distinct-by-design and stay (justified) |
+| 1d | RSA-2048 keygen sites (30 `RsaPrivateKey::new` sites re-counted) | **OPEN → consolidate + OnceLock** | Full disposition in §4; exact/near-duplicate leaf recipes merge, every distinct recipe gets a `OnceLock`, the rest are distinct-by-design and stay (justified) |
 | 1e-1 | FAT sign→re-parse→verify round-trip | **LANDED** | `crates/zsign-core/src/macho/verify.rs:1014-1058` `verify_signed_fat_armv7_arm64_round_trip`: make_fat_macho → parse → sign → verify with per-slice pages/cms/cdhash assertions (ZSN-33). Disk-path extension added anyway — see §5 e1b |
 | 1e-2 | sign-IPA → `verify_ipa` end-to-end | **OPEN** | `verify_ipa` (`crates/zsign/src/verify.rs:390`) is never called from any test — only production (`verify.rs:390` re-export `lib.rs:61`, CLI `main.rs:316`). ZSN-41's determinism test signs twice but never verifies via `verify_ipa` |
 | 1e-3 | 16KB `page_size_log2=14` CodeDirectory test | **PARTIAL** | Parse acceptance landed (`crates/zsign-core/src/codesign/verify.rs:1811-1817`, helper `cd_bytes_with_page_size` :1785, ZSN-29) but `check_code_pages` is never driven with log2=14 — only log2=0 gets behavioral coverage (:1820-1826) |
@@ -87,6 +92,18 @@ exposure:
 - Gate becomes `#[cfg(any(test, feature = "test-fixtures"))] pub mod fixtures;`
   and the fixture fns the other crates need become `pub` (they are already
   documented).
+- **Dep-class split (compile guard):** only *byte builders* are `pub` under
+  the feature. Credential recipes inside the module
+  (`test_signing_credentials` and anything moved next to it) get an
+  explicit `#[cfg(test)]`, because they use dev-only deps — `rand`
+  (`zsign-core/Cargo.toml` `[dev-dependencies]`) and the
+  `x509-cert/builder` feature (also dev-only) — which are not linked when
+  the feature compiles the lib for a sibling crate; a feature-gated
+  non-test build of a fn that names `rand` fails with `E0433`. Consequence:
+  credentials are consolidated **per crate** — zsign-core's live in
+  `fixtures` (its own test builds only), zsign's stay in its own
+  `test_util` (§4.1). This matches the brief: one home is mandated for
+  *fixture builders*; credentials only need `OnceLock`.
 - Each consumer (`zsign`, `zsign-cli`, `zsign-wasm`) adds
   `zsign-core = { path = "../zsign-core", features = ["test-fixtures"] }`
   to **dev-dependencies only**. Workspace `resolver = "2"`
@@ -123,7 +140,7 @@ wrapper around it are therefore deletable in favor of the builder.
 | `parser.rs:714` `minimal_macho_32_with_encryption()` | 1 (`:744`) | **Move to canon** as `make_minimal_macho_32_encrypted` (no canon equivalent; distinct parse arm must survive) |
 | `signer.rs:1596` `make_fat_with_encrypted_second_slice()` | 1 (`:1627`) | **Delete** — compose `make_fat_macho(&[make_minimal_macho(), make_minimal_macho_encrypted(1, 0x1000)], &[12, 12])` |
 | `verify.rs:795` `build_two_slice_fat()` | 1 (`:817`) | **Delete** — `make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12])` |
-| `writer.rs:1814` `build_test_binary(segment_fileoff)` | 3 (`:1845,:1915,:1926`) | **Move to canon** as `make_linkedit_only_macho(segment_fileoff)` (no-`__text` shape is the point of those tests; keep bytes, relocate home) |
+| `writer.rs:1814` `build_test_binary(segment_fileoff)` | 3 (`:1845,:1915,:1926`) | **Move to canon** as `make_text_segment_macho(segment_fileoff)` (header + one *unsectioned* `LC_SEGMENT_64 __TEXT`, `fileoff` parametrized — no canon equivalent; keep bytes, relocate home). The body's `write_u32`/`write_u64` calls are private to `writer` (`writer.rs:1648`/`:1669`) and do not travel: rewrite them as direct little-endian slice stores (buffer is pre-sized, offsets constant ⇒ infallible) |
 | `writer.rs:2648` in-test FAT writer | 1 (`test_embed_fat_rejects_overlapping_slices`, `:2640`) | **Keep in place** — deliberately *invalid* (overlapping slices) hostile-input fixture; canon `make_fat_macho` produces only well-formed lipo layouts, so it is not a duplicate. Justified exception, documented here. |
 | `benches/signing.rs:29` `build_synthetic_macho` + `:100` `test_credentials` | bench only | **Keep in place** — bench target, not a test; variable `code_size ≥ 4096` shape has no canon equivalent; benches compile without `cfg(test)` and without the feature. Justified exception. |
 | `zsign/src/test_util.rs:9` `minimal_macho()` (include_bytes) | ~30 | **Delete** → `fixtures::make_minimal_macho()` (byte-identity proven) |
@@ -133,7 +150,7 @@ wrapper around it are therefore deletable in favor of the builder.
 | `zsign-wasm/src/lib.rs:1035` `build_fat_macho` | 3 | **Delete** → `make_fat_macho(&[make_minimal_macho(), make_minimal_macho()], &[12, 12])` (fixed 20 480 B output equals canon layout for two 8 KiB slices, align 12) |
 | `zsign-wasm/src/lib.rs:1054` `build_fat_macho_one_arch` | 1 | **Delete** → `make_fat_macho(&[make_minimal_macho()], &[12])` (12 288 B output) |
 | `zsign-cli/src/main.rs:979` `encrypted_macho()` | 1 (`:1073`) | **Delete** → `fixtures::make_minimal_macho_encrypted(1, 0x1000)` |
-| `MINIMAL_MACHO` `include_bytes!` consts: `zsign-cli/src/main.rs:1130` (15 uses), `zsign-wasm/src/lib.rs:769` (9 uses), `zsign/src/ipa/mod.rs:1972` (zip write) | 25 | **Delete** → `fixtures::make_minimal_macho()` (byte-identity proven) |
+| `MINIMAL_MACHO` `include_bytes!` consts: `zsign-cli/src/main.rs:1130` (19 uses), `zsign-wasm/src/lib.rs:769` (9 uses), `zsign/src/ipa/mod.rs:1972` (zip write) | 29 | **Delete** → `fixtures::make_minimal_macho()` (byte-identity proven) |
 | Committed `crates/zsign/src/ipa/fixtures/minimal_macho.bin` | 4 include sites | **Delete file** once all four migrate — a byte-for-byte duplicate of builder output is a second source of truth |
 
 Migration rule: every call site moves in the same change that deletes its
@@ -150,20 +167,20 @@ green after each crate's migration batch.
 
 ## 4. Credential consolidation + OnceLock (queue item 3)
 
-### 4.1 Recipe taxonomy (18 keygen sites counted, dispositioned)
+### 4.1 Recipe taxonomy (30 `RsaPrivateKey::new` sites counted, dispositioned)
 
 Only helpers that build a **full self-signed `SigningCredentials` leaf from
-scratch** are consolidation candidates; the rest of the 18 RSA-2048 sites
+scratch** are consolidation candidates; the rest of the 30 RSA-2048 sites
 are chain builders, payload keys, or parametrized factories and stay
 (justified, §4.3).
 
 | Recipe (file:line) | Callers | Disposition |
 |---|---|---|
-| canon `fixtures.rs:603` `test_signing_credentials` — `CN=zsign verify test`, serial 7, Leaf+E KU, `team_id=Some("TESTTEAM")` | 8 (`signer.rs:1912`, `writer.rs` ×7) | **Wrap in `OnceLock`** inside the canon home |
+| canon `fixtures.rs:603` `test_signing_credentials` — `CN=zsign verify test`, serial 7, Leaf+E KU, `team_id=Some("TESTTEAM")` | 8 (`signer.rs:1912`, `writer.rs` ×7) | **Wrap in `OnceLock`** inside the canon home (fn and static stay `#[cfg(test)]` per §3.1) |
 | `macho/verify.rs:573` `rsa_credentials` — byte-equivalent recipe (same CN/serial/Leaf/EKU/team) | 13 | **Delete** → canon (exact duplicate) |
-| `macho/signer.rs:960` `test_credentials` — `CN=zsign roundtrip,OU=TESTTEAM`, serial 7, **`Profile::Root`** (no EKU ext) | 12 | **Not a duplicate** — `Profile::Root` vs `Leaf` changes BasicConstraints and the subject; migrating would alter signed-bytes and chain-shape assertions. **Move into fixtures** as a second named recipe (`test_root_credentials`), wrapped in its own `OnceLock`. One home, no recipe change. |
-| `zsign/src/test_util.rs:37` `test_credentials` — `CN=zsign test,OU=TESTTEAM`, serial 7, Leaf+E KU, team | ~40 | **Move into canon home** as named recipe (`team_ou_test_credentials`), `OnceLock`-wrapped; `zsign` callers reach it via the `test-fixtures` feature. Subject differs from canon (`OU=TESTTEAM` present) so it is *not* merged into the canon recipe — but it is the same recipe as the next row, so one entry serves both. |
-| `zsign/src/verify.rs:948` `local_test_credentials` — byte-equivalent to the row above, additionally returns `(creds, RsaPrivateKey)` | 2 (`:1049`, `:1227`) | **Delete** — replace with a `OnceLock<(SigningCredentials, RsaPrivateKey)>` accessor in the fixtures home (`test_credentials_with_key`) so the raw key (needed to rebuild a second creds set for anchored verify) is still reachable. |
+| `macho/signer.rs:960` `test_credentials` — `CN=zsign roundtrip,OU=TESTTEAM`, serial 7, **`Profile::Root`** (no EKU ext) | 12 | **Not a duplicate** — `Profile::Root` vs `Leaf` changes BasicConstraints and the subject; migrating would alter signed-bytes and chain-shape assertions. **Move into fixtures** as a second named recipe (`test_root_credentials`), wrapped in its own `OnceLock` (same `#[cfg(test)]` gate). One home for zsign-core's recipes, no recipe change. |
+| `zsign/src/test_util.rs:37` `test_credentials` — `CN=zsign test,OU=TESTTEAM`, serial 7, Leaf+E KU, team | ~40 | **OnceLock in place** in `zsign`'s own `test_util` — credential recipes cannot cross the crate boundary (§3.1), and the brief only mandates *OnceLock* for credentials. One cached `(creds, RsaPrivateKey)` pair backs two accessors: `test_credentials()` (signature unchanged ⇒ ~40 callers untouched) and a new `test_credentials_with_key()`. Same recipe as the next row, so one cache serves both. |
+| `zsign/src/verify.rs:948` `local_test_credentials` — byte-equivalent to the row above, additionally returns `(creds, RsaPrivateKey)` | 2 (`:1049`, `:1227`) | **Delete** — callers switch to `test_util::test_credentials_with_key()` (the keyed accessor on the same cache); the raw key stays reachable for the anchored-verify rebuild. |
 | `crypto/cms_verify.rs:1744` `rsa_credentials` — `CN=zsign verify test`, serial **42**, `team_id=None`, returns key | 18 | **Stay local, gain `OnceLock`** *with one carve-out*: `attacker_self_signed_resign_is_invalid` (`:2231-2232`) calls it twice **expecting two independent identities**; `:2259` needs a third. Design: split into `OnceLock`-cached `rsa_credentials()` for the 16 single-identity callers and a `fresh_rsa_credentials()` for the three independence-dependent call sites (same recipe, uncached). Serial 42 / `team_id=None` differ from canon, so it does **not** merge into fixtures canon. |
 | `crypto/cms.rs:926` `build_test_rsa_credentials(bits)` | 2 | **Keep** — parametrized by key size (1024-bit weak-key path exists) |
 | `crypto/cms.rs:1059` / `:1166`, `signer.rs:1026` ECDSA builders | 1 each | **Keep** — P-256, fixed-scalar determinism twins with pinned validity windows; deterministic-by-construction, `OnceLock` buys nothing |
@@ -204,6 +221,11 @@ pub fn test_signing_credentials() -> crate::crypto::SigningCredentials {
   moved by value everywhere — and is the smallest possible surface for
   making a cached identity shareable. `RsaPrivateKey` (needed by the
   with-key variant) is already `Clone`.
+- **Homes are per crate:** zsign-core's recipes live in `fixtures`
+  (every credential fn/static gated `#[cfg(test)]` per §3.1); zsign's live
+  in its own `test_util` (also `#[cfg(test)]`, `pub(crate)`). The feature
+  seam exposes byte builders only — the brief mandates one home for
+  fixture *builders* and `OnceLock` for credentials, and both hold.
 - Process-wide caching is safe because: certs are minted
   `Validity::from_now(3600s)` (a test process lives well under an hour);
   tests never mutate credential contents (field access is read-only at all
@@ -212,9 +234,12 @@ pub fn test_signing_credentials() -> crate::crypto::SigningCredentials {
 - Exceptions that must *not* share an identity: the three
   `cms_verify` independence sites (handled by `fresh_rsa_credentials`),
   `cert.rs:852 fresh_2048` (stays uncached by design), `provisioning.rs`
-  (fresh CMS per profile), `attacker`/`victim` pattern anywhere else — the
-  implementer must re-grep each migrated helper's callers for
-  *two-calls-one-test* before wrapping (recorded as a plan step).
+  (fresh CMS per profile), `attacker`/`victim` pattern anywhere else — and
+  the reverse direction: a cached identity makes two signings of identical
+  content byte-identical, so any test asserting two signings *differ* would
+  break (the determinism tests assert *equality*, which caching preserves —
+  `ipa/mod.rs:2203-2206`). The plan's pre-flight greps each migrated
+  helper's callers for **both** directions before wrapping.
 
 ### 4.3 Why the rest are not consolidated
 
@@ -241,25 +266,52 @@ new test goes red, restore — proving the test can actually fail.
 - **e1b — disk FAT write → verify (extension of landed e1).** The in-memory
   round-trip landed (`verify.rs:1014-1058`), but the on-disk FAT path
   (`zsign/src/builder.rs:898-921` `test_sign_macho_fat_default_sha256_only_…`)
-  asserts only "both slices signed", never re-parses+verifies the written
-  file. Add `MachOFile::parse` + `verify_macho` on the bytes read back from
-  disk. Plausible-bug surface: emission slicing on write. Mutation probe:
-  corrupt slice-offset arithmetic → red.
+  asserts only "both slices signed", never verifies the written file.
+  Add `crate::verify::verify_macho_file(&output)` (`zsign/src/verify.rs:333`,
+  re-exported `lib.rs:61`) and assert `report.macho` is FAT, both slices
+  `signed`, `pages == PageCheck::Matched`, and every slice error is the
+  anchoring gate only (dual-pin, same contract as e2). Plausible-bug
+  surface: emission slicing on write. Mutation probe: corrupt slice-offset
+  arithmetic → red.
 - **e2 — sign-IPA → `verify_ipa` end-to-end (OPEN).** `verify_ipa`
   (`zsign/src/verify.rs:390`) extracts to a `TempDir` then verifies — the
   extraction path is untested by any test today (only `verify_bundle` on
-  hand-built dirs is). Test: sign a minimal IPA (reuse the zip-builder test
-  helper pattern at `ipa/mod.rs:1954-1980`), write it, call `verify_ipa`,
-  assert `report.valid()`; plus a tampered-entry negative (flip a byte in
-  the sealed executable → `!valid`). Mutation probe: make extraction skip a
-  file → red on the tamper half.
+  hand-built dirs is). **`report.valid()` is architecturally false for
+  self-signed test credentials** — they are never Apple-anchored
+  (`cms_verify.rs:1113-1114` pushes "not anchored to a trusted root"
+  whenever `!outcome.anchored`; only Apple's embedded assets repair a
+  chain, `cert.rs:374-375`) — so the test pins the repo's *dual-pin
+  contract*, exactly as documented at `verify.rs:1160-1162` and
+  implemented at `verify.rs:1164-1173`: sign a minimal `Test.app` in place
+  (`ZSign::sign_bundle(&app, None)`, the flow `build_signed_bundle_with`
+  already uses), zip it with `Payload/Test.app/…` entries (zip crate, in
+  deps), call `verify_ipa`, then assert (1) `bundle.errors.is_empty()`,
+  (2) every slice `errors.len() == 1` and
+  `errors[0].contains("not anchored to a trusted root")`,
+  (3) `bundle.code_resources` `valid()`, (4) the CMS verifies anchored
+  against the test root — `cms_report_with_test_anchor` on the executable
+  read back out of the IPA → `valid && anchored`. Negative: the same
+  layout zipped *without* signing → `!valid` **plus** `binaries`
+  non-empty with `signed == false` (guards the "verification always
+  passes" mode; a bare `!valid` alone is not the pinned signal).
+  Mutation probe: make extraction skip the executable → the positive
+  dual-pin goes red (`bundle.errors` non-empty / binaries missing).
 - **e3 — 16KB `page_size_log2=14` behavioral test (PARTIAL→fill).** Parse
   acceptance landed; behavior did not. Test drives `check_code_pages`
-  (`codesign/verify.rs:875`) with a CD patched to `log2=14`
-  (`cd_bytes_with_page_size(14)` helper `:1785`): (a) one full 16384-byte
-  page + partial tail → `Matched`; (b) exact-multiple boundary (2×16384) →
-  `Matched` (div_ceil edge); (c) corrupted second page → `Mismatch { page_index: 1 }`;
-  (d) stored slot count vs computed → `CountMismatch`. Plausible-bug surface:
+  (`codesign/verify.rs:875`) with a CD patched to `log2=14`. The existing
+  `cd_bytes_with_page_size(14)` helper (`:1785`) only covers the
+  single-page case (≤16384 B hashes identically either way); the
+  multi-page cases use a test-local `cd_with_log2_pages(code, log2)`
+  helper that patches `nCodeSlots` (header `28..32`), `pageSize` (`39`),
+  the code-slot digests at `hashOffset` (header `16..20`), and the
+  declared length (`4..8`) — offsets read from the real layout
+  (builder `code_directory.rs:464-476`, parser `verify.rs:595-601`),
+  mirroring the repo's own patch idiom at `verify.rs:1770-1771`. Cases:
+  (a) multi-page region + partial tail → `Matched`; (b) exact-multiple
+  boundary → `Matched` (div_ceil edge); (c) one flipped byte in a later
+  page → `Mismatch { page_index: … }` for that page; (d) stale
+  stored-slot count (claim one more slot than `div_ceil`) →
+  `CountMismatch { stored, computed }`. Plausible-bug surface:
   the `log2 @ 12..=16 => 1u64 << log2` arm (`:886`) and partial-last-page
   handling have zero behavioral coverage at 14. Mutation probe: force the
   arm to `1u64 << 12` → red.
@@ -345,10 +397,16 @@ formatting). Decision recorded here per brief; no `Cargo.toml` change.
    row lands with its callers migrated in the same change; both justified
    exceptions documented; `minimal_macho.bin` deleted; a repo grep for the
    deleted fn names returns zero hits; `cargo test --workspace` green.
-4. **Credentials** — §4.1 table executed: canon + root + team-OU recipes
-   each `OnceLock`-wrapped in the fixtures home; exact dups deleted;
+4. **Credentials** — §4.1 table executed: zsign-core canon + root recipes
+   `OnceLock`-wrapped in `fixtures` (fn, static, and builders' credential
+   section all `#[cfg(test)]` per §3.1); zsign's team-OU recipe
+   `OnceLock`-wrapped in its own `test_util` with
+   `test_credentials_with_key()` added; exact dups deleted
+   (`macho/verify.rs:573`, `zsign/src/verify.rs:948`);
    `fresh_rsa_credentials` preserves the three independence sites; grep
-   evidence that no two-calls-one-test caller shares an identity wrongly.
+   evidence in **both** directions — no caller that needs a *distinct*
+   identity wrongly shares one, and no caller that expects two signings to
+   *differ* gets a cached identity.
 5. **Gap tests** — e1b/e2/e3/e4 exist, first run recorded (red → fixed, or
    green + mutation-probe red → restore); none assert production internals.
 6. **hk/skip** — ci.yml edit landed; grep evidence recorded; determinism
@@ -366,3 +424,31 @@ formatting). Decision recorded here per brief; no `Cargo.toml` change.
   remove and receives no other edits from this lane.
 - **Design-vs-actual deviations** are appended here during implementation,
   never silently.
+
+### Cold-review round 1 ledger (2026-09-27, verdict NOT-READY → all applied)
+
+- **B1/F1** dep-class split: feature-gated module cannot use dev-only
+  `rand`/`x509-cert/builder` ⇒ byte builders `pub` under the feature,
+  credential recipes `#[cfg(test)]`, zsign-side credentials `OnceLock` in
+  their own `test_util` (§3.1, §4.1, Architecture).
+- **B2/F2** e2 `report.valid()` premise false for self-signed creds ⇒
+  dual-pin contract per `verify.rs:1164-1173`; `!valid` tamper negative
+  and its mutation probe replaced (§5 e2).
+- **B3/F3** CD header offsets: `nCodeSlots` `28..32` (not `24..28`),
+  `hashOffset` `16..20` (not `12..16`), declared length `4..8` patched,
+  count-mismatch test patches `28..32` (§5 e3, plan Task 6 Step 3).
+- **F4** counts: 18 → 30 `RsaPrivateKey::new` sites (§1 1d, §4.1).
+- **F5** cli `MINIMAL_MACHO` uses: 15 → 19, total 25 → 29 (§3.2).
+- **F6** `macho/verify.rs` caller list corrected (`:3415/:3437` were
+  `cms_verify.rs` lines; that file is 1557 lines) (plan Task 5 Step 3).
+- **F7** `build_test_binary` moves as `make_text_segment_macho` with
+  `write_u32`/`write_u64` rewritten as direct slice stores (private fns
+  don't travel); segment is `__TEXT`, not linkedit (§3.2, plan Task 3).
+- **F8** caller sizing: ~54 zsign-side sites, exhaustive grep is the
+  authority (plan Task 4 Step 1).
+- Notes folded in: `make_fat_macho` length assert (`fixtures.rs:568`),
+  equality-direction identity check in the pre-flight, evidence greps
+  scoped to code/config (this doc's prose mentions `--skip`).
+
+Round 2 reviews only whether these landed; prior findings weigh solely on
+landing, new material defects only.
