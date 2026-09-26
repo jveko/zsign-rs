@@ -508,7 +508,15 @@ impl ZSign {
     /// Loads entitlements from the provisioning profile if set.
     fn load_entitlements_from_profile(&self) -> Result<Option<Vec<u8>>> {
         if let Some(ref profile_path) = self.provisioning_profile {
-            let profile_data = std::fs::read(profile_path)?;
+            let profile_data = std::fs::read(profile_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read provisioning profile '{}': {e}",
+                        profile_path.display()
+                    ),
+                )
+            })?;
             match extract_entitlements_from_profile(&profile_data)? {
                 Some(entitlements) => return Ok(Some(entitlements)),
                 None => return Ok(None),

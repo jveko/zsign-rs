@@ -1740,4 +1740,40 @@ mod tests {
             r.stderr
         );
     }
+
+    #[test]
+    fn missing_profile_error_names_the_file() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        let out = dir.path().join("out.bin");
+        let profile = dir.path().join("absent.mobileprovision");
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-m"),
+                profile.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 1, "expected 1, stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("absent.mobileprovision"),
+            "stderr must name the profile file: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("provisioning profile"),
+            "stderr must name the label: {}",
+            r.stderr
+        );
+    }
 }
