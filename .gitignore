@@ -41,3 +41,7 @@ profile.json
 
 # Local agent MCP config (never commit)
 /.mcp.json
+
+# Lane scratch dirs (scoped cargo gates keep TMPDIR inside the worktree)
+.tmptmp/
+.tmptmp-orch/
