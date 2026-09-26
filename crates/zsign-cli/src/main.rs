@@ -137,8 +137,7 @@ struct Cli {
     /// warning if an authenticated responder says it is revoked. Signing always
     /// proceeds — this is a signal, not a gate. One bounded network request
     /// (3s budget) per run; unreachable responders and offline use stay silent.
-    /// Ignored for ad-hoc signing and verification.
-    #[arg(short = 'C', long)]
+    #[arg(short = 'C', long, conflicts_with_all = ["verify", "adhoc"])]
     check_revocation: bool,
 
     /// Verify a signed Mach-O, app bundle, or IPA the way
@@ -167,7 +166,8 @@ struct Cli {
             "force",
             "adhoc",
             "dylibs",
-            "weak"
+            "weak",
+            "check_revocation"
         ]
     )]
     verify: bool,
@@ -1511,6 +1511,31 @@ mod tests {
         );
         assert_eq!(r.code, 0, "-C must never gate signing: {}", r.stderr);
         assert!(out.exists());
+    }
+
+    #[test]
+    fn check_revocation_rejects_verify_and_adhoc_at_parse_time() {
+        // -C only means something on a credentialed signing run, so clap must
+        // reject the combinations where it would be silently ignored.
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, MINIMAL_MACHO).unwrap();
+        for extra in [OsStr::new("-V"), OsStr::new("-a")] {
+            let r = run_cli(&[OsStr::new("-C"), extra, input.as_os_str()], &[]);
+            assert_eq!(
+                r.code, 2,
+                "conflicting combination must be a clap usage error: {}",
+                r.stderr
+            );
+            // The exit code alone cannot separate clap's conflict rejection
+            // from a later runtime error (both exit 2), so the message itself
+            // is what proves the conflict declaration still fires.
+            assert!(
+                r.stderr.contains("cannot be used with"),
+                "expected a clap conflict message: {}",
+                r.stderr
+            );
+        }
     }
 
     #[test]
