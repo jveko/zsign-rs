@@ -413,11 +413,12 @@ Signing the same input twice produces byte-identical output. The mechanisms:
   `crates/zsign/src/ipa/archive.rs`.
 - **Pinned timestamps** — every zip entry carries 1980-01-01 (`zip::DateTime::default()`).
 - **Deterministic signatures** — RFC 6979 ECDSA nonces and PKCS#1 v1.5 RSA; adding a
-  `signingTime` attribute or moving ECDSA to a randomized signer is rejected by tests
-  (contract in `crates/zsign-core/src/crypto/cms.rs`). Upstream zsign inherits OpenSSL's
-  randomized nonce, so its output is not reproducible run to run.
-- **Ordered structures** — CodeResources files live in a `BTreeMap`; error lists are
-  sorted; the wasm build uses a pinned clock (cert-validity checks only).
+  `signingTime` attribute or moving ECDSA to a randomized signer would make the
+  module's byte-identical tests fail (contract in `crates/zsign-core/src/crypto/cms.rs`).
+  Upstream zsign inherits OpenSSL's randomized nonce, so its output is not
+  reproducible run to run.
+- **Ordered structures** — CodeResources files live in a `BTreeMap`; the wasm build
+  uses a pinned clock (cert-validity checks only).
 
 Pinned by tests: `test_create_ipa_writes_entries_in_sorted_order`,
 `test_create_ipa_from_root_is_byte_identical_across_creation_order`,

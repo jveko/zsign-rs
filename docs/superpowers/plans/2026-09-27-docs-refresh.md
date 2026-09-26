@@ -735,3 +735,13 @@ and look only for NEW material defects.
 |---|---|---|---|
 | R2-1 | material | Plan cited `2026-09-25-cli-surface-design.md` for the 14-flag upstream no-equivalent list; that doc does not contain it, and the commit hash was mis-copied (`614caa8`) | Citation replaced with the true provenance: upstream `src/zsign.cpp` long-option table + `usage()` @ `614caa8d` (2026-08-21), transcribed by this lane's upstream parity research; ledger row 7 corrected in the same pass |
 | R2-2 | P2 | The rayon fix deleted the true invariant "nothing on the wasm path reaches `std::fs`/`std::net`/`std::thread`" from the AGENTS core row | Clause restored ahead of the keychain/OCSP gating and rayon-shim wording |
+
+## Post-verification fixes (DocsVerifier PASS + 2 accuracy notes, applied)
+
+- Determinism bullet claimed "error lists are sorted" — no counterpart in current
+  source (repo-wide `errors.sort*` search empty; the design doc's `mod.rs:825-835`
+  citation now points at a doc comment). Clause dropped; `BTreeMap` + pinned-clock
+  halves kept (verified at `bundle/code_resources.rs:67`, `cert.rs:402-409`).
+- "is rejected by tests" implied named guard tests for `signingTime`/`RandomizedSigner`
+  (they exist only in the module's contract comment). Reworded to "would make the
+  module's byte-identical tests fail" — mutation-proven true per the crypto design doc.
