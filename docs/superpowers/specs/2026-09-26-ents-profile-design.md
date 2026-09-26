@@ -132,25 +132,27 @@ shared with the verifier — ZSN-34 invariant).
 ### 3.1 Pipeline shape
 
 ```
-sign_bundle (option resolution absorbed; entry: sign_bundle_from_options :337)
+sign_bundle (option resolution absorbed; entry: sign_bundle_from_options)
   1. capture old_root_id = root CFBundleIdentifier (pre-rewrite)
-  2. root Info.plist rewrites (existing :377-385)   [unchanged entry point]
-  3. collect + sort bundles deepest-first (existing :393-395)
-  4. ZSN-11 cascade (only when bundle_id override set): nested
-       CFBundleIdentifier, WKCompanionAppBundleIdentifier,
-       WKAppBundleIdentifier (top level AND NSExtension>NSExtensionAttributes>)
-       rewritten by the boundary-aware rule (value == old, or old = prefix of
-       a sub-id; NEVER a bare substring)                        [new]
-  5. build the resolution plan ONCE, before the first sign mutation: for each
-       bundle (deepest-first) read its id, resolve (entitlements, profile)
-       through the precedence table — every option-input read/validate (-e,
-       dir hits, map loads) and the unused-key check (map keys vs discovered
-       nested ids) happen here; failure aborts before any binary is signed
-  6. ZSN-11 entitlements transform (when override active) during plan build
-  7. dylib pass (existing :387-391) then the sign loop from the plan:
+  2. collect + sort bundles deepest-first (pure read, moved above all writes)
+  3. ZSN-11 cascade PREVIEW (only when bundle_id override set): compute each
+       nested bundle's FINAL id in memory with the boundary-aware rule
+       (value == old, or old = prefix of a sub-id; NEVER a bare substring)
+       — nothing written yet                                              [new]
+  4. build the resolution plan ONCE, read-only: root_id_final = override or
+       old root id; resolve (entitlements, profile) per bundle through the
+       precedence table — every option-input read/validate (-e, dir hits,
+       map loads, profile documents) and the unused-key check land HERE;
+       any rejection aborts with the tree byte-untouched
+  5. ZSN-11 entitlements transform (when override active) during plan build
+  6. requested-rewrite phase (only after all validation): root Info.plist
+       rewrites first, then nested cascade plist writes — a mid-phase
+       failure can at worst leave the root rewritten (HEAD's exposure for a
+       broken root)                                                       [new]
+  7. dylib pass, then the sign loop from the plan:
        sign_single_bundle(b, ents, profile_data, already_signed)
-       embed embedded.mobileprovision iff plan profile_data.is_some() && !remove_profile
-       strip existing embedded.mobileprovision when remove_profile (before signing/seal)
+       strip existing embedded.mobileprovision at TOP of the bundle's work
+       embed iff plan profile_data.is_some() && !remove_profile, before seal
 ```
 
 `sign_single_bundle` loses its `copy_provisioning_profile: bool` parameter (the
@@ -215,7 +217,7 @@ CLI (`crates/zsign-cli/src/main.rs`): `-e/--entitlements <path>`,
 :296-304). Rejections at build time: empty id, duplicate id, id equal to the root
 bundle's identifier ("the root profile belongs in `--profile`"), id containing a
 path separator or `..` component (never legal, and it is the lookup key for the
-entitlements directory too). During the pre-sign plan build (§3.1 step 5), an
+entitlements directory too). During the pre-sign plan build (§3.1 step 4), an
 entry whose key matches no discovered nested bundle id is a hard error listing
 unused keys and the discovered ids (match's "readonly miss lists available
 profiles" posture, §2) — before any on-disk mutation, and silent fallthrough to
@@ -275,9 +277,9 @@ recorded as a future seam, §7).
      key untouched (cert-type sniffing would mean crypto-lane internals — seam).
    - `com.apple.security.application-groups` and every other key: untouched
      (team-scoped, §2).
-3. Child profile lookup then runs on the **rewritten** ids (stage 1 precedes
-   stages 2/§3.1 step 6), which is what makes `--profile-map` usable together
-   with `-b` (map key = new id).
+3. Child profile lookup then runs on the **rewritten** ids (the stage-1
+   preview of §3.1 step 3 feeds the step-4 lookups), which is what makes
+   `--profile-map` usable together with `-b` (map key = new id).
 
 Profile plist fields (`Entitlements["application-identifier"]`, `TeamIdentifier`,
 `ProvisionedDevices`) come from a new tiny unverified reader in
@@ -403,13 +405,13 @@ rejected alternatives are recorded here with the tradeoff that killed them.
    own final CFBundleIdentifier>`, all `keychain-access-groups` prefixes equal
    that prefix, `get-task-allow` is absent when the bundle's resolved profile is
    distribution, and app-group values are byte-unchanged.
-5. Every option-input rejection happens before the first SIGN mutation of the
-   target tree (the pre-sign plan build of §3.1 step 5 performs every option
-   read and validation — including directory hits and unused-map-key detection
-   — before the first binary is signed, embedded, or sealed; the only earlier
-   writes are the explicitly requested CFBundle identity rewrites of steps
-   2/4, which are pure data edits, not signing output; the only fallible step
-   afterwards is fs I/O itself).
+5. Every rejection — option-input or otherwise — happens before ANY on-disk
+   mutation of the target tree (the read-only plan build of §3.1 step 4
+   performs every read and validation, including directory hits, profile
+   documents, and unused-map-key detection; even the requested identity
+   rewrites are deferred to step 6, so a rejected sign leaves every plist
+   byte-untouched; the only fallible steps afterwards are the requested
+   rewrites and fs I/O itself).
 6. No new entitlements slots for non-executables, no profile for standalone
    dylibs/frameworks (fe176bd / ZSN-34 contract).
 
