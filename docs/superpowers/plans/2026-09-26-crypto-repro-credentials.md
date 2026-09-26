@@ -442,19 +442,17 @@ impl<'a> DerReader<'a> {
   `read_any`, `read_integer_u32`, `read_len`, `expect_tag`, `remaining`) stays module-private, and
   the PBES2 machinery is reached through `decrypt_key_bag`.
 
-- [ ] **Step 2: Verify the module still compiles and its tests pass**
+- [ ] **Step 2: Verify the module still compiles, and do not commit yet.**
 
 Run: `TMPDIR=$PWD/.tmptmp cargo test -p zsign-core crypto::pkcs12 -- --skip test_ipa_signing_is_deterministic`
-Expected: all pass, unchanged behaviour. A `dead_code` warning on the widened helpers is expected
-until Tasks 5/6/9 add callers; do not add `#[allow]` — the lane's final clippy gate runs after
-they land.
+Expected: all pass, behaviour unchanged.
 
-- [ ] **Step 3: Commit**
+  Task 4 deliberately has no commit of its own: a `pub(crate)` item with no caller is a
+  `dead_code` warning, and this lane's rule is that a green commit means a warning-free tree
+  (ground rules: scoped test gate; lane gate: `clippy -D warnings`). The widened items therefore
+  land **inside Task 5's commit**, which is the first task with a caller. Until then keep the
+  edits in the working tree; `git status --short` should show `pkcs12.rs` modified.
 
-```
-git add crates/zsign-core/src/crypto/pkcs12.rs
-git commit -m "refactor(crypto): expose the pkcs-5 v2.0 decrypt path for pem key loading"
-```
 
 ---
 
