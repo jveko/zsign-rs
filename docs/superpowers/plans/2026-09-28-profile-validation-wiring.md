@@ -129,8 +129,8 @@ extractor; `extract_entitlements_from_profile`'s own doc keeps its historical-co
   The test prints `NAME=<base64>` lines for the four profile byte blobs plus the root
   certificate DER, using the crate's `base64` dependency. Run
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core generate -- --nocapture`, capture the output,
-  **delete the temporary test**, and paste the base64 strings as consts into the `ipa/mod.rs`
-  tests module: `VALID_PROFILE_B64`, `EXPIRED_PROFILE_B64`, `WRONG_TEAM_PROFILE_B64`,
+  and paste the base64 strings as consts into the `ipa/mod.rs` tests module:
+  `VALID_PROFILE_B64`, `EXPIRED_PROFILE_B64`, `WRONG_TEAM_PROFILE_B64`,
   `WRONG_APP_PROFILE_B64`, `PROFILE_TEST_ROOT_DER_B64`, plus the bare-XML forgery const
   `FORGED_PROFILE_XML` carrying the brief's payload: no CMS envelope, `TeamIdentifier=[EVILTEAM]`,
   `application-identifier=EVILTEAM.com.other.app`, `ExpirationDate=2001-01-02`,
@@ -167,10 +167,12 @@ fn valid_fixture_validates_against_injected_root() {
 }
 ```
 
-  (`base64_engine` = a small helper using `base64::engine::general_purpose::STANDARD`, already a
+  `base64_engine` = a small helper using `base64::engine::general_purpose::STANDARD`, already a
   facade dependency; `TrustAnchors` via `zsign_core::crypto::cms_verify::TrustAnchors`; `from_der`
   via `spki::der::Decode`, a facade dev-dependency. Adapt imports to the file's existing `use`
-  block style.) If this fails, the generated window/chain is wrong — regenerate before proceeding.
+  block style.) If this fails, the generated window/chain is wrong — fix the generator and
+  regenerate. **Only after this test passes, delete the temporary generator** from
+  `provisioning.rs`; it must not survive into any commit.
 
 - [ ] **Step 3: Red regression tests** (add to `ipa/mod.rs` tests; these fail before Step 4 —
   `allow_unsafe_profile`/`profile_anchors` do not exist, and the forged profile currently signs):
@@ -202,8 +204,8 @@ fn valid_fixture_validates_against_injected_root() {
 
   `crates/zsign/Cargo.toml` `[dependencies]`: add `time = "0.3"`.
 
-  `ipa/mod.rs` — add three fields to `IpaSigner` and initialize them in **both** `new` (:401)
-  and `new_adhoc` (:420):
+  `ipa/mod.rs` — add three fields to `IpaSigner` and initialize them in **both** `new` (:385)
+  and `new_adhoc` (:405):
 
 ```rust
 /// Skip CMS/expiry/team/App-ID validation of provisioning profiles (explicit opt-in)
@@ -216,7 +218,7 @@ profile_now: Option<OffsetDateTime>,
 ```
 
   Setters (builder style, `mut self -> Self`, docs naming the default and the risk, following
-  `remove_embedded_profile` at :438): `allow_unsafe_profile(bool)`,
+  `remove_embedded_profile` at :434): `allow_unsafe_profile(bool)`,
   `profile_anchors(TrustAnchors)`, `profile_now(OffsetDateTime)`.
 
   Private helper used by both loaders:
@@ -233,8 +235,9 @@ fn profile_request(&self, target_bundle_id: Option<String>) -> ProfileRequest {
 }
 ```
 
-  `load_profile` gains a `root_id: &str` parameter (sole caller: sign_bundle_from_options :878 —
-  pass `&root_id_final`), builds `self.profile_request(Some(root_id.to_string()))`, and replaces
+  `load_profile` gains a `root_id: &str` parameter (sole caller: `sign_bundle` (:842), the
+  `load_profile()` call at :878 — pass `&root_id_final`), builds
+  `self.profile_request(Some(root_id.to_string()))`, and replaces
   both `zsign_core::extract_entitlements_from_profile` calls (:646, :650) with
   `zsign_core::extract_entitlements_checked(&data, &request, self.allow_unsafe_profile)`.
   Keep the `fs::read` and error shape unchanged.
@@ -296,8 +299,13 @@ match extract_entitlements_checked(&profile_data, &request, self.allow_unsafe_pr
 ### Task 3: wasm wiring (constructor + static extractor + IPA forwarding)
 
 **Files:**
+- Modify: `crates/zsign-wasm/Cargo.toml` (add `time = "0.3"` dependency)
 - Modify: `crates/zsign-wasm/src/lib.rs` (fields, `new` signature, static
   `extract_entitlements`, `sign_ipa` forwarding at :680-683, tests at :770+, :819+, :1646+, :1659+)
+
+- [ ] **Step 0: Manifest** — add `time = "0.3"` to `crates/zsign-wasm/Cargo.toml`
+  `[dependencies]` (the `host_now` helper below constructs `OffsetDateTime`; the wasm-bindgen
+  feature of `time` is not needed — only type construction).
 
 - [ ] **Step 1: Red tests** in `zsign-wasm` `mod tests` (bare-XML const `FORGED_PROFILE_XML`,
   same payload as Task 2: no CMS envelope, EVILTEAM, wrong app-id, `ExpirationDate` 2001-01-02,

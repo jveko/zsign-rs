@@ -142,7 +142,9 @@ fixtures (D7). Production checks are not weakened anywhere.
 - not `wasm32` (native `cargo test -p zsign-wasm`): `None` → `resolve_now` uses the wall clock.
 
 This follows the existing `resolve_now` contract — the caller passes an explicit instant on
-wasm32 — instead of fixing the core clock (crypto-5, lane 1). The wasm IPA path forwards the
+wasm32 — instead of fixing the core clock (crypto-5, lane 1). `zsign-wasm` therefore takes a
+direct `time = "0.3"` dependency (type construction only; the wasm-bindgen feature is not
+needed — zsign-core still resolves `time` without it). The wasm IPA path forwards the
 same instant through a new `IpaSigner::profile_now(OffsetDateTime)` setter, because the facade
 plan build re-validates on wasm32 where `now: None` errors.
 
