@@ -312,3 +312,33 @@ ZSN-99 (`cms.rs`), verify.rs (Wave 2), Mach-O (Wave 3), CLI flags
 `Credential` erasure (no pin, different ticket's surface), `P12Error`
 Display wording, `pem_load_error`'s body (owned by lane-1 crypto tickets),
 lane-1's `cert.rs`/`pkcs12.rs` regions outside the three hunks named in §4.
+
+## 10. Process note (phase-2 dispatch + independent re-verification)
+
+Deviation, recorded as instructed: the phase-2 research dispatch failed
+twice on harness tool-list format (`tools` rejected in both explicit and
+empty form) before succeeding on the third attempt without that field. The
+prescribed single batch did run — three read-only agents (SurfaceInventory,
+TestInventory, P12ErrorTaxonomy) — and their findings are what §1, §2
+("Taxonomy verification"), §6 and §8 cite.
+
+After the ticket landed, the orchestrator independently re-verified every
+load-bearing research claim by direct `read`/`grep` against the worktree —
+no subagent intermediation — and all were confirmed:
+
+- both `cert.rs` flatten sites route through `p12_load_error`
+  (`cert.rs:710`, `:772`), whose arms match §3 (`pkcs12.rs:841-844`);
+- wasm: zero sniffer-literal matches under `crates/zsign-wasm/src`;
+  `p12_code` (`lib.rs:187-192`) and the `code_for_core_error` arm
+  (`lib.rs:141`) present;
+- CLI: zero sniffer-literal matches under `crates/zsign-cli/src`;
+  typed branch at `main.rs:965`; both adapted assertions at
+  `main.rs:1580`, `:1633`;
+- taxonomy: `P12Error::Mac` constructed only at `pkcs12.rs:126`;
+  `Decrypt` at `:430`, `:440`, `:450`, `:460`, `:632-633`; the two marker
+  strings survive only as `P12Error`'s own `Display` (`:88-89`), the
+  frozen producer §4.5 records.
+
+Final gate exit codes were captured directly from the tools (no
+pipelines): `CLIPPY_RC=0`, `WS_RC=0` (789 passed / 0 failed / 1+12
+ignored), `WP_RC=0` (29 passed / 0 failed).
