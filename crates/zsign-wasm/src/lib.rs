@@ -286,31 +286,7 @@ impl WasmSigner {
         let credentials = SigningCredentials::from_p12(p12_bytes, p12_password).map_err(p12_err)?;
 
         let allow = allow_unsafe_profile.unwrap_or(false);
-        let entitlements = match profile_bytes.as_deref() {
-            Some(data) => {
-                let request = ProfileRequest {
-                    now: host_now(),
-                    anchors: None,
-                    expected_team_id: credentials.team_id.clone(),
-                    target_bundle_id: None,
-                    target_device_udid: None,
-                };
-                extract_entitlements_checked(data, &request, allow).map_err(core_err)?
-            }
-            None => None,
-        };
-
-        Ok(WasmSigner {
-            credentials,
-            profile_bytes,
-            allow_unsafe_profile: allow,
-            profile_entitlements: entitlements,
-            entitlements_override: None,
-            main_executable: None,
-            resource_builder: CodeResourcesBuilder::new(),
-            streaming_hashes: HashMap::new(),
-            finalized_paths: HashSet::new(),
-        })
+        Self::assemble(credentials, profile_bytes, allow)
     }
 
     /// Get the effective entitlements: the override when set, otherwise the
@@ -767,6 +743,41 @@ impl WasmSigner {
     }
 }
 
+impl WasmSigner {
+    /// Builds a signer from already-loaded credentials and an optional
+    /// provisioning profile, extracting profile entitlements once.
+    fn assemble(
+        credentials: SigningCredentials,
+        profile_bytes: Option<Vec<u8>>,
+        allow_unsafe_profile: bool,
+    ) -> Result<WasmSigner, JsValue> {
+        let entitlements = match profile_bytes.as_deref() {
+            Some(data) => {
+                let request = ProfileRequest {
+                    now: host_now(),
+                    anchors: None,
+                    expected_team_id: credentials.team_id.clone(),
+                    target_bundle_id: None,
+                    target_device_udid: None,
+                };
+                extract_entitlements_checked(data, &request, allow_unsafe_profile).map_err(core_err)?
+            }
+            None => None,
+        };
+        Ok(WasmSigner {
+            credentials,
+            profile_bytes,
+            allow_unsafe_profile,
+            profile_entitlements: entitlements,
+            entitlements_override: None,
+            main_executable: None,
+            resource_builder: CodeResourcesBuilder::new(),
+            streaming_hashes: HashMap::new(),
+            finalized_paths: HashSet::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -905,20 +916,20 @@ pub mod tests {
     }
 
     fn new_signer() -> WasmSigner {
-        WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", None, None)
-            .expect("fixture p12 loads")
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        WasmSigner::assemble(credentials, None, false).expect("fixture p12 assembles")
     }
 
     /// The fixture profile is a bare plist with no CMS envelope, so it only
     /// loads under the explicit unsafe-profile opt-in.
     fn new_signer_with_profile() -> WasmSigner {
-        WasmSigner::new(
-            &decode_base64(LEAF_P12_B64),
-            "test",
-            Some(PROFILE_XML.as_bytes().to_vec()),
-            Some(true),
-        )
-        .expect("fixture p12 + profile load")
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        WasmSigner::assemble(credentials, Some(PROFILE_XML.as_bytes().to_vec()), true)
+            .expect("fixture p12 + profile load")
     }
 
     fn err_message(err: impl Into<JsValue>) -> String {
@@ -1752,13 +1763,11 @@ pub mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn constructor_rejects_bad_profile() {
-        let e = match WasmSigner::new(
-            &decode_base64(LEAF_P12_B64),
-            "test",
-            Some(b"<not a profile".to_vec()),
-            None,
-        ) {
+    fn assemble_rejects_bad_profile() {
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        let e = match WasmSigner::assemble(credentials, Some(b"<not a profile".to_vec()), false) {
             Ok(_) => panic!("bad profile must be rejected"),
             Err(e) => e,
         };
@@ -1767,12 +1776,14 @@ pub mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn constructor_rejects_forged_profile() {
-        let e = match WasmSigner::new(
-            &decode_base64(LEAF_P12_B64),
-            "test",
+    fn assemble_rejects_forged_profile() {
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        let e = match WasmSigner::assemble(
+            credentials,
             Some(FORGED_PROFILE_XML.as_bytes().to_vec()),
-            None,
+            false,
         ) {
             Ok(_) => panic!("an unsigned profile must be rejected"),
             Err(e) => e,
@@ -1781,12 +1792,14 @@ pub mod tests {
     }
 
     #[wasm_bindgen_test(unsupported = test)]
-    fn constructor_accepts_forged_profile_with_explicit_bypass() {
-        let signer = WasmSigner::new(
-            &decode_base64(LEAF_P12_B64),
-            "test",
+    fn assemble_accepts_forged_profile_with_explicit_bypass() {
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        let signer = WasmSigner::assemble(
+            credentials,
             Some(FORGED_PROFILE_XML.as_bytes().to_vec()),
-            Some(true),
+            true,
         )
         .expect("explicit bypass keeps the raw byte scan");
         let ents = String::from_utf8(signer.entitlements().expect("profile entitlements"))
@@ -1808,6 +1821,22 @@ pub mod tests {
         assert!(
             String::from_utf8_lossy(&bypassed).contains("get-task-allow"),
             "bypassed extraction must return the raw-scan entitlements"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn constructor_rejects_unanchored_credentials() {
+        let Err(err) = WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", None, None) else {
+            panic!("self-issued chain must not load through the public constructor");
+        };
+        assert_eq!(
+            error_code(&err).as_deref(),
+            Some("ZSIGN_INVALID_CERTIFICATE"),
+            "anchoring failures surface as a certificate error"
+        );
+        assert!(
+            err_message(err).contains("not anchored to a trusted root"),
+            "message must name the anchoring failure"
         );
     }
 
