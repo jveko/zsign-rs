@@ -1776,6 +1776,22 @@ pub mod tests {
         assert_eq!(error_code(&e), Some("ZSIGN_VERIFICATION".into()));
     }
 
+    /// A profile whose document is not a dictionary is a bad profile, not a
+    /// failed signature: the error code the matrix exposes is
+    /// `ZSIGN_INVALID_PROFILE`.
+    #[wasm_bindgen_test]
+    fn assemble_rejects_non_dictionary_profile_with_invalid_profile_code() {
+        let credentials =
+            SigningCredentials::from_p12_unanchored(&decode_base64(LEAF_P12_B64), "test")
+                .expect("fixture p12 loads");
+        let non_dict = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><string>not a dictionary</string></plist>";
+        let e = match WasmSigner::assemble(credentials, Some(non_dict.to_vec()), true) {
+            Ok(_) => panic!("a non-dictionary profile must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PROFILE".into()));
+    }
+
     #[wasm_bindgen_test]
     fn assemble_rejects_forged_profile() {
         let credentials =

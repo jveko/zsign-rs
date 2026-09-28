@@ -1951,6 +1951,54 @@ mod tests {
         );
     }
 
+    /// A failed profile validation must name the file that failed, not just
+    /// the class: the caller pointed at a path and needs it echoed back.
+    #[test]
+    fn sign_macho_forged_profile_names_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (profile, input) = forged_profile_sign_paths(dir.path());
+        let out = dir.path().join("signed.bin");
+        let err = ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .provisioning_profile(&profile)
+            .sign_macho(&input, &out)
+            .expect_err("a CMS-less profile must not sign a Mach-O");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Verification(_))),
+            "class pin: {err:?}"
+        );
+        let file_name = profile.file_name().unwrap().to_str().unwrap();
+        assert!(
+            err.to_string().contains(file_name),
+            "the validation failure must name the profile file: {err}"
+        );
+    }
+
+    /// A profile path that does not exist is an I/O failure, and it must name
+    /// the path it could not read.
+    #[test]
+    fn sign_macho_missing_profile_names_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_profile, input) = forged_profile_sign_paths(dir.path());
+        let out = dir.path().join("signed.bin");
+        let missing = dir.path().join("absent.mobileprovision");
+        let err = ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .provisioning_profile(&missing)
+            .sign_macho(&input, &out)
+            .expect_err("an unreadable profile must not sign a Mach-O");
+        assert!(matches!(&err, Error::Io(_)), "got: {err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("provisioning profile"),
+            "the read failure must name what it was reading: {message}"
+        );
+        assert!(
+            message.contains("absent.mobileprovision"),
+            "the read failure must name the path: {message}"
+        );
+    }
+
     #[test]
     fn sign_macho_accepts_forged_profile_with_explicit_bypass() {
         let dir = tempfile::TempDir::new().unwrap();

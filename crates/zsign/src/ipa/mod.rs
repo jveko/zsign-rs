@@ -4124,13 +4124,25 @@ mod tests {
             message.contains("com.test.app.ext") && message.contains("huge-ext.mobileprovision"),
             "the error must still name the offending bundle and file: {message}"
         );
+        // The context appends detail; it must never add a second prefix.
+        assert!(
+            message.starts_with("Input too large: "),
+            "the size rejection keeps a single prefix: {message}"
+        );
+        assert_eq!(
+            message.matches("Input too large:").count(),
+            1,
+            "the prefix must never double: {message}"
+        );
     }
 
-    /// Pins the shape of every non-size profile-map rejection: a malformed
-    /// profile stays `Core(Config(_))` naming the bundle and file, so widening
-    /// the size rejection does not silently reclassify unrelated failures.
+    /// Pins that a malformed map entry keeps the class its own validator
+    /// produced and gains the offending entry's name from the context wrap.
+    /// Preserving the class is what lets the wrap name the entry without
+    /// hiding whether this was a configuration mistake or a failed
+    /// validation.
     #[test]
-    fn malformed_profile_map_entry_keeps_the_config_shape() {
+    fn malformed_profile_map_entry_keeps_the_validation_class() {
         let temp = TempDir::new().unwrap();
         let (app, _appex) = create_bundle_with_appex(temp.path());
         let bad = temp.path().join("broken.mobileprovision");
@@ -4142,13 +4154,70 @@ mod tests {
             .sign_folder_in_place(&app)
             .expect_err("a malformed mapped profile must fail the sign");
         assert!(
-            matches!(&err, Error::Core(zsign_core::Error::Config(_))),
-            "only the size rejection changes shape; malformed profiles keep Core(Config), got {err:?}"
+            matches!(&err, Error::Core(zsign_core::Error::ProvisioningProfile(_))),
+            "a malformed map entry must keep its validation class, got: {err:?}"
         );
         let message = err.to_string();
         assert!(
-            message.contains("com.test.app.bad") && message.contains("broken.mobileprovision"),
-            "the Config wrap must keep naming bundle and file: {message}"
+            message.contains("com.test.app.bad"),
+            "the wrap must name the offending entry: {message}"
+        );
+        assert!(
+            message.contains("broken.mobileprovision"),
+            "the wrap must name the offending file: {message}"
+        );
+    }
+
+    /// A mapped profile that parses but carries no CMS envelope is a
+    /// verification failure; the per-entry context wrap must not reclassify
+    /// it as a configuration error.
+    #[test]
+    fn nested_cms_less_profile_keeps_verification_class() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let forged = temp.path().join("forged.mobileprovision");
+        std::fs::write(&forged, FORGED_PROFILE_XML).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.test.app.bad".to_string(), forged.clone())])
+            .sign_folder_in_place(&app)
+            .expect_err("a CMS-less mapped profile must fail the sign");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Verification(_))),
+            "a CMS-less map entry is a verification failure, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.bad"),
+            "the wrap must name the offending entry: {message}"
+        );
+        assert!(
+            message.contains("forged.mobileprovision"),
+            "the wrap must name the offending file: {message}"
+        );
+    }
+
+    /// An unreadable root profile names the path it failed to read, the same
+    /// way a mapped entry already does — the root arm is not exempt.
+    #[test]
+    fn missing_root_profile_read_names_the_path() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let missing = temp.path().join("nope.mobileprovision");
+
+        let err = IpaSigner::new_adhoc()
+            .provisioning_profile(&missing)
+            .sign_folder_in_place(&app)
+            .expect_err("an unreadable root profile must fail the sign");
+        assert!(matches!(&err, Error::Io(_)), "got: {err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("provisioning profile"),
+            "the read failure must name what it was reading: {message}"
+        );
+        assert!(
+            message.contains("nope.mobileprovision"),
+            "the read failure must name the path: {message}"
         );
     }
 
@@ -4163,6 +4232,10 @@ mod tests {
             .bundle_profiles(vec![("com.test.app".to_string(), ext_profile)])
             .sign_folder_in_place(&app)
             .expect_err("the root id must be rejected as a map key");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Config(_))),
+            "a map-key rejection is a config error, got: {err:?}"
+        );
         let message = err.to_string();
         assert!(
             message.contains("--profile"),
@@ -4185,10 +4258,39 @@ mod tests {
             ])
             .sign_folder_in_place(&app)
             .expect_err("a duplicate map key must fail the sign");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Config(_))),
+            "a map-key rejection is a config error, got: {err:?}"
+        );
         let message = err.to_string();
         assert!(
             message.contains("com.test.app.ext") && message.contains("duplicate"),
             "the error must name the duplicated key: {message}"
+        );
+    }
+
+    /// A map key that could escape the exact-key lookup is a malformed
+    /// configuration, not a profile that failed validation.
+    #[test]
+    fn profile_map_invalid_bundle_id_is_config() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let ext_profile = temp.path().join("ext.mobileprovision");
+        std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
+            .bundle_profiles(vec![("com.test.app/../escape".to_string(), ext_profile)])
+            .sign_folder_in_place(&app)
+            .expect_err("a traversing map key must be rejected");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Config(_))),
+            "a map-key rejection is a config error, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app/../escape"),
+            "the error must name the offending bundle id: {message}"
         );
     }
 
@@ -5088,6 +5190,29 @@ mod tests {
         assert!(
             matches!(err, Error::Core(zsign_core::Error::Verification(_))),
             "a profile without a CMS envelope must fail verification, got: {err}"
+        );
+    }
+
+    /// The path arm of the root profile must behave like the bytes arm: a
+    /// CMS-less profile keeps the verification class, and the failure names
+    /// the file the signer actually read.
+    #[test]
+    fn sign_ipa_path_profile_forged_keeps_verification_class_and_names_path() {
+        let temp = TempDir::new().unwrap();
+        let forged = temp.path().join("forged.mobileprovision");
+        std::fs::write(&forged, FORGED_PROFILE_XML).unwrap();
+
+        let err = IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile(&forged)
+            .sign_ipa_bytes(&test_ipa_bytes(&[]))
+            .expect_err("a CMS-less profile must not sign");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Verification(_))),
+            "the path arm must keep the verification class, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("forged.mobileprovision"),
+            "the validation failure must name the profile file: {err}"
         );
     }
 
