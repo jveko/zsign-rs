@@ -84,6 +84,10 @@ dependencies.
   ```
 
   Verify: `openssl pkcs12 -in crates/zsign-core/src/crypto/fixtures/evil_root_chain.p12 -nokeys -passin pass:testpassword 2>/dev/null | grep -c "BEGIN CERTIFICATE"` → `3`.
+  The private-key commit gate refuses private-key *PEM files*; `.p12` fixtures
+  containing keys are the established committed convention (`identity_single.p12`
+  et al.), so this fixture commits normally. If the pre-commit hook rejects it
+  anyway, STOP and report — do not bypass the hook.
 
 - [ ] **Step 1.2: Write the failing regression tests** (Tester) — in the `tests`
   module of `crates/zsign-core/src/crypto/cert.rs`: first refactor `build_cert`
@@ -175,7 +179,10 @@ dependencies.
 - [ ] **Step 1.3: Run the tests, confirm RED.**
 
   Run: `mkdir -p target/tmp .tmptmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core`
-  Expected: the three new load tests fail with `got Ok(...)`/chain-len 0 (the
+  Expected: the three new load tests (`from_p12_rejects_evil_root_chain`,
+  `from_p12_rejects_self_issued_identity`, `from_pem_rejects_self_signed_leaf`)
+  fail with `got Ok(...)`, and `build_chain_appends_embedded_root_for_direct_issue`
+  fails on the chain length (the
   remaining suite still passes — enforcement does not exist yet). Record the
   failing test names as the red evidence.
 
@@ -254,12 +261,15 @@ dependencies.
     `Some(&TrustAnchors::apple_root()?)`.
   - Rename the body of `from_pem` to `fn load_pem(cert_pem: &[u8], key_pem: &[u8],
     password: Option<&str>, anchors: Option<&TrustAnchors>) -> Result<Self>`;
-    insert the same `if let Some(anchors)` enforcement **after** the existing
-    `code_signing_policy_violation` check (ordering guarantee: policy errors keep
-    precedence over anchoring errors). `from_pem` passes `Some(&TrustAnchors::apple_root()?)`.
+    insert the `if let Some(anchors) { require_anchored_chain(&certificate, &cert_chain, anchors)?; }`
+    block **after the `code_signing_policy_violation` check — the last check before
+    the final `Ok(Self { ... })`, NOT after `build_chain_from_leaf`** (ordering
+    guarantee: policy errors keep precedence over anchoring errors on the PEM route
+    too). `from_pem` passes `Some(&TrustAnchors::apple_root()?)`.
 
   d) Root completion in `build_chain_from_leaf`: replace the
-     `has_wwdr && !chain.iter().any(is_apple_root)` block with:
+     `has_wwdr && !chain.iter().any(is_apple_root)` block (`cert.rs:376-380`, the
+     append block — the `has_wwdr` binding itself is at 373-375) with:
 
   ```rust
   // Complete the chain at the embedded Apple Root CA whenever the walk dangles
@@ -363,21 +373,20 @@ dependencies.
       leaf_sha1: &[u8; 20],
   ) -> Result<crate::crypto::SigningCredentials, KeychainError> {
       #[cfg(test)]
-      {
-          crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1_unanchored(
-              data, "", leaf_sha1,
-          )
-          .map_err(KeychainError::Credential)
-      }
+      return crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1_unanchored(
+          data, "", leaf_sha1,
+      )
+      .map_err(KeychainError::Credential);
       #[cfg(not(test))]
-      {
-          crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1(
-              data, "", leaf_sha1,
-          )
+      crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1(data, "", leaf_sha1)
           .map_err(KeychainError::Credential)
-      }
   }
   ```
+
+  (The two `#[cfg]` arms are mutually exclusive, so each build sees exactly one
+  body: `return` first under `cfg(test)`, tail expression otherwise. Consecutive
+  cfg-gated blocks in tail position were also compiled with `rustc --edition 2021
+  --test` as a sanity check; the `return` form removes any doubt.)
 
   and have `load_with` call `runner.export_identities(&path)`, `std::fs::read`,
   then `load_pair(&data, &selected.hash)`. `load_with_selects_one_identity_from_multi_identity_export`
@@ -438,22 +447,43 @@ dependencies.
   }
   ```
 
-  Then the five policy tests (each builds a proper leaf with
-  `Some(code_signing_eku())` and `present()` validity):
+  Then a shared chain builder plus six self-contained policy tests:
 
   ```rust
-  #[test]
-  fn require_anchored_chain_accepts_anchor_terminated_chain() {
+  /// root → int → leaf, all properly signed, with the root and intermediate
+  /// keys returned because several tests rebuild one link of the chain.
+  fn anchored_test_chain() -> (
+      Certificate,
+      Certificate,
+      Certificate,
+      rsa::RsaPrivateKey,
+      rsa::RsaPrivateKey,
+  ) {
       let root_key = fresh_2048();
       let int_key = fresh_2048();
       let leaf_key = fresh_2048();
       let root = build_root_cert("CN=zsn test root", &root_key, present());
-      let root_name = root.tbs_certificate.subject.clone();
-      let int = build_subca_cert("CN=zsn test int", &root_name, &int_key, &root_key, present());
-      let leaf = build_cert_issuer_name(
-          "CN=zsn leaf", &int.tbs_certificate.subject,
-          &leaf_key, &int_key, present(), Some(code_signing_eku()),
+      let int = build_subca_cert(
+          "CN=zsn test int",
+          &root.tbs_certificate.subject,
+          &int_key,
+          &root_key,
+          present(),
       );
+      let leaf = build_cert_issuer_name(
+          "CN=zsn leaf",
+          &int.tbs_certificate.subject,
+          &leaf_key,
+          &int_key,
+          present(),
+          Some(code_signing_eku()),
+      );
+      (root, int, leaf, root_key, int_key)
+  }
+
+  #[test]
+  fn require_anchored_chain_accepts_anchor_terminated_chain() {
+      let (root, int, leaf, _, _) = anchored_test_chain();
       let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
       let res = require_anchored_chain(&leaf, &[int, root], &anchors);
       assert!(res.is_ok(), "properly anchored chain must be accepted, got {:?}", res.err());
@@ -461,7 +491,8 @@ dependencies.
 
   #[test]
   fn require_anchored_chain_rejects_chain_under_production_anchors() {
-      // same chain as above; production callers pin the embedded Apple root
+      // same well-formed chain; production callers pin the embedded Apple root
+      let (root, int, leaf, _, _) = anchored_test_chain();
       let res = require_anchored_chain(&leaf, &[int, root], &TrustAnchors::apple_root().unwrap());
       assert!(
           matches!(&res, Err(Error::Certificate(m)) if m.contains("not anchored")),
@@ -471,13 +502,20 @@ dependencies.
 
   #[test]
   fn require_anchored_chain_rejects_link_signed_by_the_wrong_key() {
-      // leaf names the intermediate as issuer but is signed by another key;
-      // terminus reaches the injected anchor, so only the link check can fail
+      // the leaf names the intermediate as issuer but was signed by another
+      // key; the terminus reaches the injected anchor, so only the link check
+      // can produce the failure
+      let (root, int, _, _, _) = anchored_test_chain();
       let wrong = fresh_2048();
       let leaf = build_cert_issuer_name(
-          "CN=zsn leaf", &int.tbs_certificate.subject,
-          &wrong, &wrong, present(), Some(code_signing_eku()),
+          "CN=zsn leaf",
+          &int.tbs_certificate.subject,
+          &wrong,
+          &wrong,
+          present(),
+          Some(code_signing_eku()),
       );
+      let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
       let res = require_anchored_chain(&leaf, &[int, root], &anchors);
       assert!(matches!(&res, Err(Error::Certificate(m))
           if m.contains("issuer-signature verification")), "got {:?}", res.err());
@@ -485,36 +523,72 @@ dependencies.
 
   #[test]
   fn require_anchored_chain_rejects_non_ca_intermediate() {
-      // Profile::Leaf cert acting as issuer: basicConstraints CA:FALSE
-      let int = build_cert("CN=zsn not a ca", &root_name, &int_key, &root_key,
-                           present(), None);
-      let leaf = build_cert_issuer_name("CN=zsn leaf", &int.tbs_certificate.subject,
-                                        &leaf_key, &int_key, present(), Some(code_signing_eku()));
+      // a Profile::Leaf certificate acting as the issuer: CA:FALSE, and the
+      // basicConstraints check fires before any signature check
+      let (root, _, _, root_key, _) = anchored_test_chain();
+      let int_key = fresh_2048();
+      let leaf_key = fresh_2048();
+      let int = build_cert_issuer_name(
+          "CN=zsn not a ca",
+          &root.tbs_certificate.subject,
+          &int_key,
+          &root_key,
+          present(),
+          None,
+      );
+      let leaf = build_cert_issuer_name(
+          "CN=zsn leaf",
+          &int.tbs_certificate.subject,
+          &leaf_key,
+          &int_key,
+          present(),
+          Some(code_signing_eku()),
+      );
+      let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
       let res = require_anchored_chain(&leaf, &[int, root], &anchors);
       assert!(matches!(&res, Err(Error::Certificate(m))
           if m.contains("basicConstraints")), "got {:?}", res.err());
   }
 
   #[test]
+  fn require_anchored_chain_rejects_expired_intermediate() {
+      // issuer validity (design §6.4) is checked before anything cryptographic
+      let (root, _, leaf, root_key, _) = anchored_test_chain();
+      let int_key = fresh_2048();
+      let int = build_subca_cert(
+          "CN=zsn test int",
+          &root.tbs_certificate.subject,
+          &int_key,
+          &root_key,
+          window(1_600_000_000, 1_650_000_000),
+      );
+      let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+      let res = require_anchored_chain(&leaf, &[int, root], &anchors);
+      assert!(matches!(&res, Err(Error::Certificate(m))
+          if m.contains("outside validity")), "got {:?}", res.err());
+  }
+
+  #[test]
   fn require_anchored_chain_rejects_forged_terminus_with_anchor_key() {
       // self-issued certificate carrying the anchor root's public key but
-      // signed by a different key: SPKI pin matches, self-signature must fail
+      // signed by a different key: the intermediate link verifies against that
+      // key, so only the terminus self-signature check can catch the forgery
+      use std::str::FromStr;
+      let (root, int, leaf, root_key, _) = anchored_test_chain();
       let attacker = fresh_2048();
       let forged = build_subca_cert(
-          "CN=zsn test root", &Name::from_str("CN=zsn test root").unwrap(),
-          &root_key, &attacker, present(),
+          "CN=zsn test root",
+          &x509_cert::name::Name::from_str("CN=zsn test root").unwrap(),
+          &root_key,
+          &attacker,
+          present(),
       );
-      let leaf = build_cert_issuer_name("CN=zsn leaf", &int.tbs_certificate.subject,
-                                        &leaf_key, &int_key, present(), Some(code_signing_eku()));
+      let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
       let res = require_anchored_chain(&leaf, &[int, forged], &anchors);
       assert!(matches!(&res, Err(Error::Certificate(m))
           if m.contains("self-signature")), "got {:?}", res.err());
   }
   ```
-
-  (`Name`/`FromStr` imports as needed; where the snippets reference `int`, `root`,
-  `anchors` — rebuild the same chain setup as the accept test inside each test,
-  since tests must be self-contained.)
 
 - [ ] **Step 1.8: Scoped gate** (Implementer self-check, then reviewer):
 
@@ -525,8 +599,8 @@ dependencies.
   ```
 
   Expected: all green (the previously listed success tests now run through the
-  unanchored constructors; the four red tests from Step 1.2 and the five policy
-  tests pass).
+  unanchored constructors; the four tests from Step 1.2 and the six policy
+  tests from Step 1.7 pass).
 
 - [ ] **Step 1.9: Controller commit** after spec + quality reviews:
   `feat: reject certificate chains that do not reach the apple root (ZSN-96)`
@@ -615,7 +689,7 @@ dependencies.
   let credentials = SigningCredentials::from_p12_unanchored(
       &decode_base64(LEAF_P12_B64), "test",
   ).expect("fixture p12 loads");
-  let e = match WasmSigner::assemble(credentials, Some(<the same bad profile bytes>)) {
+  let e = match WasmSigner::assemble(credentials, Some(b"<not a profile".to_vec())) {
       Err(e) => e,
       Ok(_) => panic!("bad profile must be rejected"),
   };
@@ -623,8 +697,11 @@ dependencies.
   ```
 
 - [ ] **Step 2.5: Add the binding-level regression test** (Tester), beside the
-  other constructor tests, using the module's plain `#[wasm_bindgen_test]`
-  convention for js_err-touching tests (runs under `wasm-pack test --node`):
+  other constructor tests, with the same attribute as
+  `errors_carry_stable_zsign_codes_and_real_error_instances` (`lib.rs:1594`,
+  plain `#[wasm_bindgen_test]` — the convention this module uses for
+  `error_code`/`err_message`-touching tests; they run under
+  `wasm-pack test --node`):
 
   ```rust
   #[wasm_bindgen_test]
@@ -671,7 +748,11 @@ dependencies.
   Task 1): `key_route_pkcs12_content_loads_with_password`,
   `check_revocation_flag_never_gates_a_signing_run`, `env_password_signs_p12_without_flag`,
   `argv_password_beats_env_password`, `encrypted_pem_routes_through_the_password_flow`,
-  `missing_profile_error_names_the_file`. Any additional failure must be
+  `missing_profile_error_names_the_file`. Expected to stay green — verify, don't
+  assume: `pkcs12_content_with_certificate_names_the_conflict` (`:1357`, misuse
+  guard fires before loading), the PEM-route password tests (`:2022`,
+  `:2053` — key decode/parse fails before anchoring), and `:1544`/`:1573`
+  (MAC/policy precede anchoring). Any additional failure must be
   triaged against `docs/superpowers/specs/2026-09-28-apple-root-anchor-design.md`
   §5.3 (error-class rewrite if password/routing-shaped, in-process conversion if
   downstream-of-load-shaped) and reported — not silently skipped.
@@ -799,8 +880,7 @@ dependencies.
   }
   ```
 
-  (Check the long flag name for the p12 route against the `Cli` struct — the
-  field is `pkcs12`, long flag `--pkcs12`.)
+  (`--pkcs12` is a long-only flag, `main.rs:39-45`.)
 
 - [ ] **Step 3.6: Scoped gate:**
 

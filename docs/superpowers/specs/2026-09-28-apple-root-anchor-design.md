@@ -83,8 +83,9 @@ in-tree `verify_code_signature` / `verify_code_signature_with_anchors` split.
   its own self-signature check under that key).
 - *Embed Apple Root CA - G2/G3 as additional anchors* (real gap — WWDR G2/G6 chain to
   Apple Root CA - G3, WWDR MP CA 1 to G2): deferred. It requires new embedded assets
-  and `p384` signature support (`verify_cert_signature` is P-256-only and `p384` is
-  absent from `Cargo.lock`), which is outside this ticket's files. Documented as a
+  and `p384` signature support (`verify_cert_signature` handles RSA with SHA-1/256/384/512
+  and ECDSA P-256 only — no P-384, and `p384` is absent from `Cargo.lock`), which is
+  outside this ticket's files. Documented as a
   known limitation in §6.
 - *Name-only `is_apple_root` CN check as the anchor test*: rejected — CN equality is
   exactly the hole this ticket closes.
@@ -98,7 +99,8 @@ in-tree `verify_code_signature` / `verify_code_signature_with_anchors` split.
 `build_chain_from_leaf` keeps its walk and the WWDR injection
 (`embedded_wwdr_for_leaf`, `cert.rs:384-398`) unchanged, but the root-completion rule
 is generalized. Today the embedded root is appended only when a WWDR intermediate is
-present (`cert.rs:375-381`). New rule, replacing the `has_wwdr` gate:
+present (`cert.rs:373-380`: the `has_wwdr` binding at 373-375, the append block at
+376-380). New rule, replacing the `has_wwdr` gate:
 
 > Let `terminal` be the last chain element, or the leaf when the chain is empty. If
 > `terminal` is not self-signed (`subject != issuer`), and `terminal`'s issuer
@@ -116,10 +118,14 @@ not CN substring. Consequences:
 - WWDR chains behave exactly as before (`cert.rs:1221` stays green);
 - a forged issuer that merely *names* Apple Root CA either fails the DN match (no
   injection → `verify_chain` reports a missing issuer) or, when the DN matches,
-  fails leaf→root signature verification. Both fail closed.
+  has its root appended and is then rejected at the policy step by leaf→root
+  signature verification (§4.2). Both fail closed.
 
-A dangling terminal whose issuer is not the Apple root (evil chains) is left as-is;
-the policy step rejects it.
+Assembly itself performs no validation — completion is name-driven by design, and a
+self-issued leaf whose issuer DN equals the Apple root DN gets the root appended
+(the plan's assembly test pins exactly that shape; only the policy step decides
+trust). A dangling terminal whose issuer is not the Apple root (evil chains) is
+left as-is; the policy step rejects it.
 
 ### 4.2 Policy: `require_anchored_chain`
 
@@ -211,7 +217,10 @@ artifacts") and already enabled by all three sibling crates' dev-dependencies
 (`zsign/Cargo.toml:31`, `zsign-cli/Cargo.toml:19`, `zsign-wasm/Cargo.toml:26`).
 The workspace uses resolver "2" (root `Cargo.toml:2`), so those dev features cannot
 leak into release builds or the CLI child binary that the subprocess tests build
-(`cargo build -p zsign-cli`, `main.rs:1016-1027`).
+(`cargo build -p zsign-cli`, `main.rs:1016-1027`). The `zsign` facade enables
+`test-fixtures` for its tests but never calls the credential loaders (struct
+literals only, §5.5); the `fuzz` package enables nothing and its `pkcs12` target
+ignores the loader's `Result` — neither needs a gated constructor.
 
 ## 5. Test strategy
 
@@ -265,6 +274,13 @@ New (red first, written by the Tester):
 - `require_anchored_chain_rejects_forged_terminus_with_anchor_key` — a
   self-issued certificate carrying the *test root's* SPKI but signed by a
   different key (the §4.2 forgery) → `Err` containing `"self-signature"`.
+- `require_anchored_chain_rejects_expired_intermediate` — intermediate built
+  with a validity window entirely in the past → `Err` containing
+  `"outside validity"`, pinning the §6.4 issuer-validity claim (the check fires
+  before any signature verification).
+
+All six share one `anchored_test_chain()` builder (root → int → leaf, properly
+signed) so each test is self-contained.
 
 Migrated to the unanchored constructors (they assert success on self-issued
 material; behavior otherwise unchanged): `from_p12_with_leaf_sha1_selects_the_matching_pair`
@@ -329,7 +345,13 @@ stays anchored in every build. Test-by-test:
   *trial* at `main.rs:931` keeps calling the anchored `from_p12` in all builds —
   it probes password shape, and no in-process test uses it (both pass `-p`).
 - Unchanged: every parse/help/error test, `:1544` (MAC), `:1573` (policy error
-  before anchoring — the ordering guarantee in §4.3), adhoc success tests.
+  before anchoring — the ordering guarantee in §4.3), adhoc success tests. The
+  PEM-route password tests `:2022` (wrong password) and `:2053` (undecodable key)
+  stay green because their failures occur at key decode/parse, before anchoring,
+  and the PEM loader sites (`main.rs:874`, `main.rs:906`) deliberately stay on the
+  anchored `from_pem` in all builds. After `:1412` converts to in-process `-p`
+  usage, subprocess coverage of `ZSIGN_PASSWORD` resolution rests on `:1473` (and
+  `:1495`'s first half) — both kept as subprocess tests on purpose.
 
 ### 5.4 `zsign-wasm` (`lib.rs`)
 
@@ -351,8 +373,9 @@ stays anchored in every build. Test-by-test:
 ### 5.5 Facade and fuzz
 
 `crates/zsign` tests build `SigningCredentials` struct literals via
-`test_util.rs:62`; `from_p12`/`from_pem` there appear only in non-running doc
-examples. `fuzz/fuzz_targets/pkcs12.rs:14` ignores the `Result`. No changes.
+`test_util.rs:62`; `from_p12`/`from_pem` there appear only in ```no_run doctests —
+compiled but never executed — and this change keeps both public signatures intact,
+so they keep compiling. `fuzz/fuzz_targets/pkcs12.rs:14` ignores the `Result`.
 `cms.rs` is untouched: it embeds `credentials.cert_chain` as given
 (`cms.rs:394-398`) and its tests construct credentials directly.
 
@@ -378,13 +401,30 @@ examples. `fuzz/fuzz_targets/pkcs12.rs:14` ignores the `Result`. No changes.
    before only the leaf's window was checked. This matches the verify side and RFC
    5280 §6.1.3(a)(2). The only in-repo Apple intermediate that has expired (legacy
    WWDR, 2023-02-07) could only accompany already-expired leaves, which the leaf
-   check rejects first.
+   check rejects first. `require_anchored_chain_rejects_expired_intermediate`
+   (plan Step 1.7) pins this ordering at the policy layer.
 5. **RFC 5280 completeness.** The policy covers anchor match, name chaining, link
    signatures, terminus self-signature, CA constraints (BC/pathLen/keyCertSign),
    leaf purpose and validity. Revocation stays a device concern (module doc,
    `cms_verify.rs:32-33`); certificate policy processing and name constraints are
    not implemented — §6.1 permits omitting optional steps, and Apple code-signing
    intermediates carry their private OIDs non-critically.
+6. **The macOS `interop` CI job will fail after this lands — accepted and owned by
+   the orchestrator who lands the branch.** `scripts/verify-apple-interop.sh:57-65`
+   mints a self-signed `CN=zsign interop CI` PKCS#12 and the script signs with the
+   shipped CLI at `:123-124` and `:157-158`; `sign_and_verify` (`:103-118`) hard-fails
+   on a non-zero exit, and `.github/workflows/ci.yml:96-107` runs it as the `interop`
+   job. Anchored loading makes exactly those cert-signed invocations fail with the
+   anchoring error. Decision: **this ticket does not modify `scripts/` or
+   `.github/`** — neither file is in the ticket's FILES list, and editing them here
+   would be a scope expansion; the fail-closed contract is the point of the ticket,
+   so the script is the side that must change, not the loader. Migration options for
+   the owner (pick at landing time): drop the self-signed cert-signed steps and keep
+   the adhoc/format ground truth, assert the new rejection as an expected-fail case,
+   or re-anchor the script on an Apple-issued CI credential if one ever exists.
+   Precedent for recording this class of consequence: the credential-hardening
+   design did the same for this script
+   (`docs/superpowers/specs/2026-09-25-credential-hardening-design.md:584-587`).
 
 ## 7. Out of scope
 
@@ -393,6 +433,10 @@ examples. `fuzz/fuzz_targets/pkcs12.rs:14` ignores the `Result`. No changes.
   (`builder.rs`, `ipa/mod.rs`, `provisioning.rs`), all Wave-2 `verify.rs` work,
   Wave-3 Mach-O work, Wave-8 docs/README. `team_id` handling, `cms.rs` embedding
   behavior, and `resolve_p12_password` logic are unchanged.
+- `scripts/verify-apple-interop.sh` and `.github/workflows/ci.yml`: the `interop`
+  job breaks by design when the anchored loader lands — recorded as a known
+  consequence with migration options in §6.6, owned by the orchestrator; not
+  modified by this ticket.
 
 ## 8. Acceptance mapping
 
