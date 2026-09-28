@@ -32,7 +32,7 @@ rayon = "1.11"
 # PKCS#12 decryption (pure Rust, wasm-compatible)
 aes = "0.8"
 des = "0.8"
-rc2 = "0.8"
+rc2 = "0.9"
 pbkdf2 = "0.12"
 hmac = "0.12"
 digest = "0.10"
