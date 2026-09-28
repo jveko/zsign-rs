@@ -26,6 +26,7 @@ walkdir = "2.5"
 tempfile = "3.10"
 base64 = "0.22"
 rayon = "1.11"
+time = "0.3"
 
 [dev-dependencies]
 zsign-core = { path = "../zsign-core", version = "0.1.0", features = ["test-fixtures"] }

@@ -26,7 +26,6 @@
 //! - [`crate::ipa::IpaSigner`] - Lower-level IPA signing API
 
 use crate::crypto::SigningCredentials;
-use crate::extract_entitlements_from_profile;
 use crate::ipa::{CompressionLevel, IpaSigner};
 use crate::macho::{sign_macho, MachOFile};
 use crate::{Error, Result};
@@ -94,6 +93,8 @@ pub struct ZSign {
     bundle_profiles: Vec<(String, PathBuf)>,
     /// Strip `embedded.mobileprovision` from every bundle before sealing
     remove_embedded_profile: bool,
+    /// Skip CMS/expiry/team/App-ID validation of provisioning profiles (explicit opt-in)
+    allow_unsafe_profile: bool,
 }
 
 impl ZSign {
@@ -123,6 +124,7 @@ impl ZSign {
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
             remove_embedded_profile: false,
+            allow_unsafe_profile: false,
         }
     }
 
@@ -256,6 +258,18 @@ impl ZSign {
     /// ```
     pub fn remove_embedded_profile(mut self, remove: bool) -> Self {
         self.remove_embedded_profile = remove;
+        self
+    }
+
+    /// Skips CMS, expiry, team and App-ID validation of every provisioning
+    /// profile this builder loads.
+    ///
+    /// Profiles are validated by default; the opt-in falls back to the
+    /// historical raw byte scan, so a forged, expired or foreign profile is
+    /// signed and embedded verbatim. Only useful for fixtures and for
+    /// re-signing flows that install where validation is bypassed.
+    pub fn allow_unsafe_profile(mut self, allow: bool) -> Self {
+        self.allow_unsafe_profile = allow;
         self
     }
 
@@ -524,6 +538,9 @@ impl ZSign {
         }
         signer = signer.allow_encrypted(self.allow_encrypted);
         signer = signer.remove_embedded_profile(self.remove_embedded_profile);
+        if self.allow_unsafe_profile {
+            signer = signer.allow_unsafe_profile(true);
+        }
 
         if let Some(ref profile_path) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile_path);
@@ -590,6 +607,9 @@ impl ZSign {
         }
         signer = signer.allow_encrypted(self.allow_encrypted);
         signer = signer.remove_embedded_profile(self.remove_embedded_profile);
+        if self.allow_unsafe_profile {
+            signer = signer.allow_unsafe_profile(true);
+        }
         if let Some(ref profile) = self.provisioning_profile {
             signer = signer.provisioning_profile(profile);
         }
@@ -644,7 +664,18 @@ impl ZSign {
                     ),
                 )
             })?;
-            match extract_entitlements_from_profile(&profile_data)? {
+            let request = zsign_core::ProfileRequest {
+                now: None,
+                anchors: None,
+                expected_team_id: self.credentials.as_ref().and_then(|c| c.team_id.clone()),
+                target_bundle_id: self.bundle_id.clone(),
+                target_device_udid: None,
+            };
+            match zsign_core::extract_entitlements_checked(
+                &profile_data,
+                &request,
+                self.allow_unsafe_profile,
+            )? {
                 Some(entitlements) => return Ok(Some(entitlements)),
                 None => return Ok(None),
             }
@@ -1244,6 +1275,7 @@ mod tests {
         ZSign::new()
             .adhoc(true)
             .provisioning_profile(&profile)
+            .allow_unsafe_profile(true)
             .sign_macho(&input, &out)
             .expect("adhoc sign with profile");
         let signed_bytes = std::fs::read(&out).unwrap();
@@ -1328,6 +1360,7 @@ mod tests {
         ZSign::new()
             .adhoc(true)
             .provisioning_profile(&profile)
+            .allow_unsafe_profile(true)
             .entitlements(&ents)
             .sign_macho(&input, &out)
             .expect("adhoc sign with entitlements override");
@@ -1358,6 +1391,7 @@ mod tests {
         ZSign::new()
             .credentials(crate::test_util::test_credentials())
             .provisioning_profile(&profile)
+            .allow_unsafe_profile(true)
             .entitlements(&ents)
             .sign_macho(&input, &out)
             .expect("certificate sign with entitlements override");
@@ -1747,6 +1781,7 @@ mod tests {
 
         ZSign::new()
             .adhoc(true)
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![(
                 "com.zsign.test.ext".to_string(),
                 ext_profile.clone(),
@@ -1780,6 +1815,7 @@ mod tests {
         // entry is itself the evidence that the forward happened.
         ZSign::new()
             .adhoc(true)
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![(
                 "com.zsign.test.ext".to_string(),
                 ext_profile.clone(),
@@ -1857,5 +1893,74 @@ mod tests {
                 .any(|n| n.ends_with("embedded.mobileprovision")),
             "sign_ipa must forward remove_embedded_profile to IpaSigner: {names:?}"
         );
+    }
+
+    /// The brief's forgery: no CMS envelope, foreign team, another app id,
+    /// long expired, `get-task-allow` and a wildcard keychain group.
+    const FORGED_PROFILE_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Name</key>
+    <string>Forged Profile</string>
+    <key>CreationDate</key>
+    <date>2001-01-01T00:00:00Z</date>
+    <key>ExpirationDate</key>
+    <date>2001-01-02T00:00:00Z</date>
+    <key>TeamIdentifier</key>
+    <array>
+        <string>EVILTEAM</string>
+    </array>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>EVILTEAM.com.other.app</string>
+        <key>get-task-allow</key>
+        <true/>
+        <key>keychain-access-groups</key>
+        <array>
+            <string>*</string>
+        </array>
+    </dict>
+</dict>
+</plist>"#;
+
+    /// Writes the forged profile and a minimal Mach-O into `dir`, returning
+    /// the two paths both sign_macho tests use.
+    fn forged_profile_sign_paths(dir: &Path) -> (PathBuf, PathBuf) {
+        let profile = dir.join("forged.mobileprovision");
+        std::fs::write(&profile, FORGED_PROFILE_XML).unwrap();
+        let input = dir.join("app.bin");
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
+        (profile, input)
+    }
+
+    #[test]
+    fn sign_macho_rejects_forged_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (profile, input) = forged_profile_sign_paths(dir.path());
+        let out = dir.path().join("signed.bin");
+        let err = ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .provisioning_profile(&profile)
+            .sign_macho(&input, &out)
+            .expect_err("a CMS-less profile must not sign a Mach-O");
+        assert!(
+            matches!(err, Error::Core(zsign_core::Error::Verification(_))),
+            "a profile without a CMS envelope must fail verification, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sign_macho_accepts_forged_profile_with_explicit_bypass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (profile, input) = forged_profile_sign_paths(dir.path());
+        let out = dir.path().join("signed.bin");
+        ZSign::new()
+            .credentials(crate::test_util::test_credentials())
+            .provisioning_profile(&profile)
+            .allow_unsafe_profile(true)
+            .sign_macho(&input, &out)
+            .expect("the explicit bypass signs the same forged bytes");
     }
 }

@@ -342,6 +342,13 @@ pub struct IpaSigner<'a> {
     bundle_profiles: Vec<(String, PathBuf)>,
     /// Strip `embedded.mobileprovision` from every bundle before sealing
     remove_embedded_profile: bool,
+    /// Skip CMS/expiry/team/App-ID validation of provisioning profiles (explicit opt-in)
+    allow_unsafe_profile: bool,
+    /// Injected trust anchors for profile CMS verification; `None` anchors to Apple's root
+    profile_anchors: Option<zsign_core::crypto::cms_verify::TrustAnchors>,
+    /// Explicit verification instant for profile validation; `None` uses the wall
+    /// clock on native and errors on wasm32
+    profile_now: Option<time::OffsetDateTime>,
 }
 
 /// Two-byte `PK` check over an IPA held in memory, the bytes analogue of
@@ -398,6 +405,9 @@ impl<'a> IpaSigner<'a> {
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
             remove_embedded_profile: false,
+            allow_unsafe_profile: false,
+            profile_anchors: None,
+            profile_now: None,
         }
     }
 
@@ -418,6 +428,9 @@ impl<'a> IpaSigner<'a> {
             entitlements_dir: None,
             bundle_profiles: Vec::new(),
             remove_embedded_profile: false,
+            allow_unsafe_profile: false,
+            profile_anchors: None,
+            profile_now: None,
         }
     }
 
@@ -433,6 +446,40 @@ impl<'a> IpaSigner<'a> {
     /// re-signing flows); a stock device rejects it at install time.
     pub fn remove_embedded_profile(mut self, remove: bool) -> Self {
         self.remove_embedded_profile = remove;
+        self
+    }
+
+    /// Skips CMS, expiry, team and App-ID validation of every provisioning
+    /// profile this signer loads.
+    ///
+    /// Profiles are validated by default; the opt-in falls back to the
+    /// historical raw byte scan, so a forged, expired or foreign profile is
+    /// signed and embedded verbatim. Only useful for fixtures and for
+    /// re-signing flows that install where validation is bypassed.
+    pub fn allow_unsafe_profile(mut self, allow: bool) -> Self {
+        self.allow_unsafe_profile = allow;
+        self
+    }
+
+    /// Anchors profile CMS verification to the given trust anchors instead of
+    /// Apple's roots.
+    ///
+    /// The default (`None`) verifies against the Apple root store; injected
+    /// anchors exist for test fixtures signed by a private root.
+    pub fn profile_anchors(
+        mut self,
+        anchors: zsign_core::crypto::cms_verify::TrustAnchors,
+    ) -> Self {
+        self.profile_anchors = Some(anchors);
+        self
+    }
+
+    /// Sets the instant used as "now" when validating provisioning profiles.
+    ///
+    /// The default (`None`) uses the wall clock on native targets and fails
+    /// validation on wasm32, where no clock is available.
+    pub fn profile_now(mut self, now: time::OffsetDateTime) -> Self {
+        self.profile_now = Some(now);
         self
     }
 
@@ -638,16 +685,38 @@ impl<'a> IpaSigner<'a> {
         create_ipa_from_store(&store, Path::new(""), self.compression_level)
     }
 
-    /// Loads the provisioning profile and its entitlements.
-    fn load_profile(&self) -> Result<ProfilePayload> {
+    /// The validation request both profile loaders share, targeting the given
+    /// bundle id.
+    fn profile_request(&self, target_bundle_id: Option<String>) -> zsign_core::ProfileRequest {
+        zsign_core::ProfileRequest {
+            now: self.profile_now,
+            anchors: self.profile_anchors.clone(),
+            expected_team_id: self.credentials.and_then(|c| c.team_id.clone()),
+            target_bundle_id,
+            target_device_udid: None,
+        }
+    }
+
+    /// Loads the provisioning profile and its entitlements, validating it
+    /// against `root_id` — the bundle's post-rewrite identifier.
+    fn load_profile(&self, root_id: &str) -> Result<ProfilePayload> {
+        let request = self.profile_request(Some(root_id.to_string()));
         match &self.provisioning_profile {
             Some(BlobSource::Path(path)) => {
                 let data = fs::read(path)?;
-                let ent = zsign_core::extract_entitlements_from_profile(&data)?;
+                let ent = zsign_core::extract_entitlements_checked(
+                    &data,
+                    &request,
+                    self.allow_unsafe_profile,
+                )?;
                 Ok((Some(data), ent))
             }
             Some(BlobSource::Bytes(data)) => {
-                let ent = zsign_core::extract_entitlements_from_profile(data)?;
+                let ent = zsign_core::extract_entitlements_checked(
+                    data,
+                    &request,
+                    self.allow_unsafe_profile,
+                )?;
                 Ok((Some(data.clone()), ent))
             }
             None => Ok((None, None)),
@@ -693,7 +762,13 @@ impl<'a> IpaSigner<'a> {
             // Bare propagation here would report only "No XML plist found in
             // profile data", which cannot say which entry of a multi-entry map
             // is at fault.
-            let ent = zsign_core::extract_entitlements_from_profile(&data).map_err(|e| {
+            let request = self.profile_request(Some(id.clone()));
+            let ent = zsign_core::extract_entitlements_checked(
+                &data,
+                &request,
+                self.allow_unsafe_profile,
+            )
+            .map_err(|e| {
                 Error::Core(zsign_core::Error::Config(format!(
                     "provisioning profile for bundle '{id}' at '{}' is invalid: {e}",
                     path.display()
@@ -875,7 +950,7 @@ impl<'a> IpaSigner<'a> {
         }
 
         // --- plan build: read-only; every rejection lands here ---
-        let (root_profile_data, root_profile_ent) = self.load_profile()?;
+        let (root_profile_data, root_profile_ent) = self.load_profile(&root_id_final)?;
         let root_entitlements = match self.load_entitlements_override()? {
             // The directory is consulted only when the explicit override did
             // not win — §3.2 precedence must not let a losing tier fail the sign.
@@ -1865,6 +1940,95 @@ mod tests {
     use zip::{ZipArchive, ZipWriter};
     use zsign_core::macho::fixtures;
 
+    // ---- CMS-signed provisioning-profile fixtures ----
+    //
+    // Generated by a throwaway test in zsign-core's provisioning.rs (a single
+    // RSA root/leaf chain valid 2020-01-01..2099-01-01, so the profiles
+    // validate at any wall clock). All four profiles anchor to the SAME root,
+    // so an injected `profile_anchors` is the only trust source they need.
+    const VALID_PROFILE_B64: &str = "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";
+    const EXPIRED_PROFILE_B64: &str = "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";
+    const WRONG_TEAM_PROFILE_B64: &str = "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";
+    const WRONG_APP_PROFILE_B64: &str = "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";
+    const PROFILE_TEST_ROOT_DER_B64: &str = "MIIC+zCCAeOgAwIBAgIBKTANBgkqhkiG9w0BAQsFADAeMRwwGgYDVQQDDBN6c24xMTggZml4dHVyZSByb290MCAXDTIwMDEwMTAwMDAwMFoYDzIwOTgxMjMwMDI0MDAwWjAeMRwwGgYDVQQDDBN6c24xMTggZml4dHVyZSByb290MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtAb2duMuJ01mRhSGvrrfwQ9tWRDYnMAlMFW4DaJL1F5iaJlwkxhP/0Q3Tbwm9AOEgeJkFxregL+He4HEMPnbR+bmWUia4yeHBUtsLK/YT36WdQeJOHgKY/7q9LeS0YkRN+3IRNUcaDQEtY5x8DrXtxQeDT0UEkiSYuIn4uMXzmPDm1r8iRsy1N4qSCcvv1EfxJHSD9Ra1857EME1G/+PdOT37TsRETgtTLe+D/6KuulXZf93d59QDthcecc3dswKFvZ3aHbMLXPdJR8gyvCuJDdd5KPifTCLPc0RZ5adaPCipgBirhRGlk0Iqk6Bs8tXpR0ekYW6tHWH7AV0NrN0HwIDAQABo0IwQDAdBgNVHQ4EFgQUMNeWKNo7q6eGih28ddNfBndEUakwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQELBQADggEBAGu11AnnrmRr/IRLjPya73dW4BJLaisgKB98Z4DNdsJ487YyvDXVwes+zqeGSY5w5/bTTwMhYFVzMII6CYyw41Rn6Tk8QmT7AT5aEfE+bKzrGr++h2njAtYD16SgaY1dB0KKkspRZOhLVD1+kflypq6/07eZ956ZY55hPeAm8t1u8wDYHrKVVOxHj1afV1WDJEOzH0jxABDzdQRlFTfhQjNoJQddR5tRpAFRluCLSybpAvK6d0u81Jdvu3LKQUIqqz5iwBw9NK0qVxb4/jL5+kTCoe1uiVk1LRx1+55VxnchXCZov5lbzbeTAVad4cC1sAFLkD462ttBfYLVJcFyGXE=";
+
+    /// The brief's forgery: no CMS envelope, a foreign team, another app id,
+    /// long expired, and the dangerous entitlements.
+    const FORGED_PROFILE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Name</key>
+    <string>Forged Profile</string>
+    <key>CreationDate</key>
+    <date>2001-01-01T00:00:00Z</date>
+    <key>ExpirationDate</key>
+    <date>2001-01-02T00:00:00Z</date>
+    <key>TeamIdentifier</key>
+    <array>
+        <string>EVILTEAM</string>
+    </array>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>EVILTEAM.com.other.app</string>
+        <key>get-task-allow</key>
+        <true/>
+        <key>keychain-access-groups</key>
+        <array>
+            <string>*</string>
+        </array>
+    </dict>
+</dict>
+</plist>"#;
+
+    /// STANDARD base64 engine, named for the fixture decode helper below.
+    fn base64_engine() -> base64::engine::general_purpose::GeneralPurpose {
+        base64::engine::general_purpose::STANDARD
+    }
+
+    /// The fixture root certificate, parsed for `TrustAnchors` injection.
+    fn profile_fixture_anchors() -> zsign_core::crypto::cms_verify::TrustAnchors {
+        use base64::Engine as _;
+        use spki::der::Decode as _;
+        let root = x509_cert::Certificate::from_der(
+            &base64_engine().decode(PROFILE_TEST_ROOT_DER_B64).unwrap(),
+        )
+        .expect("root fixture must be a certificate");
+        zsign_core::crypto::cms_verify::TrustAnchors::from_certificates(vec![root])
+    }
+
+    /// The raw profile bytes behind one of the embedded base64 fixtures.
+    fn profile_fixture_bytes(b64: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64_engine().decode(b64).expect("fixture must be base64")
+    }
+
+    #[test]
+    fn valid_fixture_validates_against_injected_root() {
+        let profile = profile_fixture_bytes(VALID_PROFILE_B64);
+        let info = zsign_core::validate_and_extract_profile(
+            &profile,
+            &zsign_core::ProfileRequest {
+                anchors: Some(profile_fixture_anchors()),
+                expected_team_id: Some("TESTTEAM".into()),
+                target_bundle_id: Some("com.test.app".into()),
+                ..Default::default()
+            },
+        )
+        .expect("valid fixture must validate at the wall clock");
+        assert!(
+            info.entitlements_xml.is_some(),
+            "the valid fixture must carry entitlements"
+        );
+        assert!(
+            String::from_utf8(info.entitlements_xml.unwrap())
+                .unwrap()
+                .contains("get-task-allow"),
+            "fixture entitlements round-trip"
+        );
+    }
+
     #[test]
     fn test_ipa_signing_is_deterministic() {
         let temp_dir = TempDir::new().unwrap();
@@ -2259,6 +2423,7 @@ mod tests {
     fn test_sign_ipa_bytes_entitlements_bytes_override() {
         let input = test_ipa_bytes(&[]);
         let signed = IpaSigner::new(&crate::test_util::test_credentials())
+            .allow_unsafe_profile(true)
             .provisioning_profile_bytes(OVERRIDE_TEST_PROFILE.to_vec())
             .entitlements_bytes(OVERRIDE_TEST_ENTITLEMENTS.as_bytes().to_vec())
             .sign_ipa_bytes(&input)
@@ -3258,6 +3423,7 @@ mod tests {
         std::fs::write(&ents, OVERRIDE_TEST_ENTITLEMENTS).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements(&ents)
             .sign_folder_in_place(&app)
@@ -3288,6 +3454,7 @@ mod tests {
         // The bytes form must sign exactly as the path form does: the profile
         // is embedded, and the supplied entitlements reach the root binary.
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile_bytes(std::fs::read(&profile).unwrap())
             .entitlements_bytes(OVERRIDE_TEST_ENTITLEMENTS.as_bytes().to_vec())
             .sign_folder_in_place(&app)
@@ -3415,6 +3582,7 @@ mod tests {
         .unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements_dir(&dir)
             .sign_folder_in_place(&app)
@@ -3451,6 +3619,7 @@ mod tests {
         .unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements_dir(&dir)
             .sign_folder_in_place(&app)
@@ -3487,6 +3656,7 @@ mod tests {
         .unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements_dir(&dir)
             .sign_folder_in_place(&app)
@@ -3690,6 +3860,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("com.test.app.plist")).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements_dir(&dir)
             .sign_folder_in_place(&app)
@@ -3756,6 +3927,7 @@ mod tests {
         std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&root_profile)
             .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile.clone())])
             .sign_folder_in_place(&app)
@@ -3808,6 +3980,7 @@ mod tests {
         .unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .entitlements_dir(&dir)
             .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile.clone())])
             .sign_folder_in_place(&app)
@@ -3849,6 +4022,7 @@ mod tests {
         std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
 
         let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![("com.test.app.nope".to_string(), ext_profile)])
             .sign_folder_in_place(&app)
             .expect_err("a map key matching no bundle must fail the sign");
@@ -3883,6 +4057,7 @@ mod tests {
         std::fs::write(&bad, b"not a provisioning profile at all").unwrap();
 
         let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![
                 ("com.test.app.ext".to_string(), good),
                 ("com.test.app.bad".to_string(), bad.clone()),
@@ -3926,6 +4101,7 @@ mod tests {
         std::fs::write(&ext_profile, EXT_PROFILE_FIXTURE).unwrap();
 
         let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![
                 ("com.test.app.ext".to_string(), ext_profile.clone()),
                 ("com.test.app.ext".to_string(), ext_profile),
@@ -4110,6 +4286,7 @@ mod tests {
         std::fs::write(dir.join("com.test.app.plist"), &churned).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .entitlements_dir(&dir)
             .sign_folder_in_place(&app)
@@ -4167,6 +4344,7 @@ mod tests {
         std::fs::write(&profile, LEGACY_APPID_PROFILE_FIXTURE).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .bundle_id("com.new.app")
             .sign_folder_in_place(&app)
@@ -4320,6 +4498,7 @@ mod tests {
         // A map entry naming the appex's NEW id plus one bogus key: the bogus
         // key must be rejected before ANY plist is written.
         let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![
                 ("com.new.app.ext".to_string(), profile.clone()),
                 ("com.new.app.nope".to_string(), profile),
@@ -4454,6 +4633,7 @@ mod tests {
         std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .bundle_id("com.new.app")
             .sign_folder_in_place(&app)
@@ -4499,6 +4679,7 @@ mod tests {
         std::fs::write(&profile, DIST_PROFILE_FIXTURE).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .bundle_id("com.new.app")
             .sign_folder_in_place(&app)
@@ -4528,6 +4709,7 @@ mod tests {
         std::fs::write(&profile, DEV_PROFILE_FIXTURE).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .bundle_id("com.new.app")
             .sign_folder_in_place(&app)
@@ -4583,6 +4765,7 @@ mod tests {
 
         IpaSigner::new_adhoc()
             .provisioning_profile(&root_profile)
+            .allow_unsafe_profile(true)
             // The map is keyed by the post-rewrite id, exactly as the sibling
             // integration test pins.
             .bundle_profiles(vec![("com.new.app.ext".to_string(), ext_profile)])
@@ -4612,6 +4795,7 @@ mod tests {
         // The map key is the POST-rewrite id, so the cascade must run before
         // plan build for this to resolve at all.
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .bundle_profiles(vec![("com.new.app.ext".to_string(), ext_profile.clone())])
             .bundle_id("com.new.app")
             .sign_folder_in_place(&app)
@@ -4643,6 +4827,7 @@ mod tests {
         let before = std::fs::read(&profile).unwrap();
 
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&profile)
             .sign_folder_in_place(&app)
             .expect("signing without a bundle-id change must succeed");
@@ -4780,6 +4965,7 @@ mod tests {
         // Derive-but-don't-embed: entitlements still come from the profiles, but
         // no profile bytes are written and none are left behind.
         IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
             .provisioning_profile(&root_profile)
             .bundle_profiles(vec![("com.test.app.ext".to_string(), ext_profile)])
             .remove_embedded_profile(true)
@@ -4813,5 +4999,107 @@ mod tests {
             String::from_utf8_lossy(&appex_blob).contains("com.zsign.ext.ent"),
             "the appex entitlements are still derived from its mapped profile: {appex_blob:?}"
         );
+    }
+
+    /// A profile with no CMS envelope is never signed, whatever its fields.
+    #[test]
+    fn sign_ipa_bytes_rejects_forged_profile() {
+        let err = IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile_bytes(FORGED_PROFILE_XML.as_bytes().to_vec())
+            .sign_ipa_bytes(&test_ipa_bytes(&[]))
+            .expect_err("a CMS-less profile must not sign");
+        assert!(
+            matches!(err, Error::Core(zsign_core::Error::Verification(_))),
+            "a profile without a CMS envelope must fail verification, got: {err}"
+        );
+    }
+
+    /// The bypass is the only way the same forged bytes sign.
+    #[test]
+    fn sign_ipa_bytes_accepts_forged_profile_with_explicit_bypass() {
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile_bytes(FORGED_PROFILE_XML.as_bytes().to_vec())
+            .allow_unsafe_profile(true)
+            .sign_ipa_bytes(&test_ipa_bytes(&[]))
+            .expect("the explicit bypass signs the same forged bytes");
+    }
+
+    /// A CMS-valid profile whose chain is anchored by an injected root signs
+    /// and is embedded in the output bundle.
+    #[test]
+    fn sign_ipa_bytes_accepts_valid_profile_with_injected_anchors() {
+        let signed = IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile_bytes(profile_fixture_bytes(VALID_PROFILE_B64))
+            .profile_anchors(profile_fixture_anchors())
+            .sign_ipa_bytes(&test_ipa_bytes(&[]))
+            .expect("a CMS-valid profile with injected anchors must sign");
+        assert!(
+            zip_entry_names(&signed).contains(&"Payload/Test.app/embedded.mobileprovision".into()),
+            "the validated profile must be embedded in the root bundle, got: {:?}",
+            zip_entry_names(&signed)
+        );
+    }
+
+    /// Each rejected profile must name the gate that rejected it, so an
+    /// unrelated failure (CMS, parsing) can never satisfy these tests.
+    #[test]
+    fn sign_ipa_bytes_rejects_expired_profile() {
+        let err = sign_with_fixture_profile(EXPIRED_PROFILE_B64);
+        assert!(
+            matches!(err, Error::Core(zsign_core::Error::ProvisioningProfile(_))),
+            "an expired profile must fail the profile gate, got: {err}"
+        );
+        let msg = err.to_string();
+        for expected in ["\"Valid Fixture\"", "expired"] {
+            assert!(
+                msg.contains(expected),
+                "the expiry gate must name the profile and the gate, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_ipa_bytes_rejects_wrong_team_profile() {
+        let err = sign_with_fixture_profile(WRONG_TEAM_PROFILE_B64);
+        assert!(
+            matches!(err, Error::Core(zsign_core::Error::ProvisioningProfile(_))),
+            "a foreign-team profile must fail the profile gate, got: {err}"
+        );
+        let msg = err.to_string();
+        for expected in ["\"Wrong Team Fixture\"", "not the signing team TESTTEAM"] {
+            assert!(
+                msg.contains(expected),
+                "the team gate must name the profile and the gate, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_ipa_bytes_rejects_wrong_app_id_profile() {
+        let err = sign_with_fixture_profile(WRONG_APP_PROFILE_B64);
+        assert!(
+            matches!(err, Error::Core(zsign_core::Error::ProvisioningProfile(_))),
+            "a profile for another app id must fail the profile gate, got: {err}"
+        );
+        let msg = err.to_string();
+        for expected in [
+            "\"Wrong App Fixture\"",
+            "App ID TESTTEAM.com.other.app does not cover bundle identifier com.test.app",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "the App-ID gate must name the profile and the gate, got: {msg}"
+            );
+        }
+    }
+
+    /// Signs the fixture IPA with one CMS fixture profile, anchored to the
+    /// fixture root; returns the error so each test can pin its own gate.
+    fn sign_with_fixture_profile(b64: &str) -> Error {
+        IpaSigner::new(&crate::test_util::test_credentials())
+            .provisioning_profile_bytes(profile_fixture_bytes(b64))
+            .profile_anchors(profile_fixture_anchors())
+            .sign_ipa_bytes(&test_ipa_bytes(&[]))
+            .expect_err("this profile must be rejected")
     }
 }
