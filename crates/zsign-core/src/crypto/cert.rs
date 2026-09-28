@@ -707,7 +707,7 @@ impl SigningCredentials {
     /// `anchors` is `Some`.
     fn load_p12(p12_data: &[u8], password: &str, anchors: Option<&TrustAnchors>) -> Result<Self> {
         let contents = super::pkcs12::extract_p12(p12_data, password)
-            .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
+            .map_err(super::pkcs12::p12_load_error)?;
         let keys = contents.keys;
         let certs = contents.certs;
 
@@ -769,7 +769,7 @@ impl SigningCredentials {
         anchors: Option<&TrustAnchors>,
     ) -> Result<Self> {
         let contents = super::pkcs12::extract_p12(p12_data, password)
-            .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
+            .map_err(super::pkcs12::p12_load_error)?;
         let matches_leaf = |c: &[u8]| Sha1::digest(c).as_slice() == leaf_sha1;
         let selected: Vec<Vec<u8>> = contents
             .certs
@@ -1367,7 +1367,11 @@ mod tests {
     #[test]
     fn test_from_p12_invalid_data() {
         let result = SigningCredentials::from_p12(b"not valid p12 data", "password");
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(Error::Certificate(m)) if m.contains("Failed to parse PKCS#12")),
+            "a corrupt container must keep its certificate class, got {:?}",
+            result.as_ref().err()
+        );
     }
 
     #[test]
@@ -1475,6 +1479,27 @@ mod tests {
             matches!(&res, Err(Error::Certificate(m))
                 if m.contains("SHA-1") && m.contains("0000000000000000000000000000000000000000")),
             "actionable mismatch message required, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_wrong_password_is_invalid_password() {
+        let res = SigningCredentials::from_p12(IDENTITY_DUP, "wrong-password");
+        assert!(
+            matches!(&res, Err(Error::InvalidPassword)),
+            "a wrong p12 password must be InvalidPassword, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_with_leaf_sha1_wrong_password_is_invalid_password() {
+        let res =
+            SigningCredentials::from_p12_with_leaf_sha1(IDENTITY_DUP, "wrong-password", &[0u8; 20]);
+        assert!(
+            matches!(&res, Err(Error::InvalidPassword)),
+            "the leaf selector must not change the password class, got {:?}",
             res.as_ref().err()
         );
     }

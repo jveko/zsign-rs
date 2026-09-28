@@ -832,6 +832,18 @@ pub(crate) fn pem_load_error(e: P12Error) -> Error {
     }
 }
 
+/// Translates a container failure into the credential error a caller
+/// reports. MAC verification failure and password-derived decryption
+/// failure are passphrase outcomes; malformed or unsupported containers
+/// keep their certificate class with the same wrapper text the PKCS#12
+/// loaders have always produced.
+pub(crate) fn p12_load_error(e: P12Error) -> Error {
+    match e {
+        P12Error::Mac | P12Error::Decrypt(_) => Error::InvalidPassword,
+        other => Error::Certificate(format!("Failed to parse PKCS#12: {other}")),
+    }
+}
+
 /// certBag ::= SEQUENCE { certId OBJECT IDENTIFIER,
 ///                        certValue [0] EXPLICIT OCTET STRING }
 fn parse_cert_bag(value: &[u8]) -> Result<Vec<u8>> {
