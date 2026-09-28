@@ -951,21 +951,22 @@ fn load_p12_credentials(
 }
 
 /// Resolves the PKCS#12 password: flag/env first; otherwise the historical
-/// empty-password attempt, and only a *password-shaped* trial failure may
-/// prompt (TTY) or name the password channels (non-TTY). Other failures
-/// (policy rejection, corruption) surface verbatim — they are not password
-/// problems and must not be reported as "no password supplied".
+/// empty-password attempt, and only a trial failure carrying the typed
+/// `Error::InvalidPassword` variant may prompt (TTY) or name the password
+/// channels (non-TTY). Other failures (policy rejection, corruption) surface
+/// verbatim — they are not password problems and must not be reported as
+/// "no password supplied".
 fn resolve_p12_password(cli: &Cli, data: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(pw) = &cli.password {
         return Ok(pw.clone());
     }
-    let trial_err = match SigningCredentials::from_p12(data, "") {
+    let trial = SigningCredentials::from_p12(data, "");
+    // Classify by variant, before the error is consumed for its message text.
+    let password_shaped = matches!(&trial, Err(zsign_core::Error::InvalidPassword));
+    let trial_err = match trial {
         Ok(_) => return Ok(String::new()), // empty-password containers never prompt
         Err(e) => e.to_string(),
     };
-    // Same two markers the wasm adapter sniffs for "wrong/needed password"
-    let password_shaped = trial_err.contains("invalid PKCS#12 password (MAC mismatch)")
-        || trial_err.contains("PKCS#12 decryption failed");
     if !password_shaped {
         return Err(trial_err.into());
     }
@@ -1574,7 +1575,9 @@ mod tests {
             env_only.stderr
         );
         assert!(
-            env_only.stderr.contains("MAC mismatch"),
+            env_only
+                .stderr
+                .contains("Invalid password for private key or PKCS#12"),
             "stderr: {}",
             env_only.stderr
         );
@@ -1626,7 +1629,8 @@ mod tests {
         assert!(r.stderr.contains("--password"), "stderr: {}", r.stderr);
         assert!(r.stderr.contains("ZSIGN_PASSWORD"), "stderr: {}", r.stderr);
         assert!(
-            r.stderr.contains("MAC mismatch"),
+            r.stderr
+                .contains("Invalid password for private key or PKCS#12"),
             "must surface the real cause: {}",
             r.stderr
         );
