@@ -36,8 +36,8 @@
 - Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (test module; insert after `sign_code_directory_rejects_mismatched_key_and_certificate`, i.e. between its closing brace (~cms_verify.rs:1867) and the `#[test] fn tampered_content_fails_digest` attribute at cms_verify.rs:1869)
 
 **Interfaces:**
-- Consumes: `sign_code_directory(content, &creds, None, &cd_sha256) -> Result<Vec<u8>>`; `wrap(&cms) -> Vec<u8>` (cms_verify.rs:1801); `verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors) -> Result<CmsVerifyReport>` (cms_verify.rs:333); `fresh_rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey)` (cms_verify.rs:1756); `build_subca(cn, path_len) -> (Certificate, SigningKey)` (cms_verify.rs:2386); `build_subca_issued_by(cn, issuer_name, issuer_signing) -> (Certificate, SigningKey)` (cms_verify.rs:2415); struct-literal `SigningCredentials` construction (pattern: cms_verify.rs:1840-1845).
-- Produces: three `#[test]` fns that FAIL (red) today with a panic — Task 2 greens them. Tests must use struct literals / unanchored fixtures only, never anchored public constructors, and must pair the signer's own key with its own certificate so the ZSN-98 guard at `cms.rs:296` passes first.
+- Consumes: `sign_code_directory(content, &creds, None, &cd_sha256) -> Result<Vec<u8>>`; `wrap(&cms) -> Vec<u8>` (cms_verify.rs:1801); `verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors) -> Result<CmsVerifyReport>` (cms_verify.rs:333); `fresh_rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey)` (cms_verify.rs:1756); `build_subca(cn, path_len) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>)` (cms_verify.rs:2386); struct-literal `SigningCredentials` construction (pattern: cms_verify.rs:1840-1845).
+- Produces: three `#[test]` fns that FAIL (red) today with a panic — Task 2 greens them. Tests must use struct literals / unanchored fixtures only, never anchored public constructors, and must pair the signer's own key with its own certificate so the ZSN-98 guard at `cms.rs:300` passes first.
 
 - [ ] **Step 1: Write regression test A (duplicate = signer cert only)**
 
@@ -96,11 +96,7 @@ fn sign_code_directory_dedupes_signer_certificate_repeated_mid_chain() {
     let creds = SigningCredentials {
         certificate: identity.certificate.clone(),
         signing_key: identity.signing_key.clone(),
-        cert_chain: vec![
-            inter.clone(),
-            identity.certificate.clone(),
-            root.clone(),
-        ],
+        cert_chain: vec![inter.clone(), identity.certificate.clone(), root.clone()],
         team_id: identity.team_id.clone(),
     };
     let content: &[u8] = b"the code directory bytes";
@@ -117,6 +113,10 @@ fn sign_code_directory_dedupes_signer_certificate_repeated_mid_chain() {
     let members: Vec<Vec<u8>> = certs
         .0
         .iter()
+        // CertificateChoices::Certificate re-encodes byte-identically to the
+        // inner Certificate (der-derive choice.rs encodes the variant's own
+        // header), so raw to_der() equals Certificate::to_der() — the same
+        // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
         .map(|c| c.to_der().expect("member re-encodes"))
         .collect();
     let signer_der = identity.certificate.to_der().unwrap();
@@ -179,6 +179,10 @@ fn sign_code_directory_dedupes_repeated_chain_member() {
     let members: Vec<Vec<u8>> = certs
         .0
         .iter()
+        // CertificateChoices::Certificate re-encodes byte-identically to the
+        // inner Certificate (der-derive choice.rs encodes the variant's own
+        // header), so raw to_der() equals Certificate::to_der() — the same
+        // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
         .map(|c| c.to_der().expect("member re-encodes"))
         .collect();
     let signer_der = identity.certificate.to_der().unwrap();

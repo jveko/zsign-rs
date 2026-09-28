@@ -21,7 +21,7 @@ Our signing path accumulates certificates without any dedupe:
   member (`cms.rs:397-401`); the trailing `builder.build().map_err(...)`
   (`cms.rs:407-409`) is dead for the duplicate case because the panic fires
   inside `build()` before any `Result` exists;
-- test twin: `build_test_cms` (`cms.rs:219-237`) has the identical shape.
+- test twin: `build_test_cms` (`cms.rs:197-239`) has the identical shape.
 
 `add_certificate` (cms-0.2.3 `builder.rs:349-357`) only pushes into a `Vec`
 and always returns `Ok`, so duplicates survive to the `unwrap`.
@@ -34,7 +34,7 @@ dedupe by walking issuer links (`cert.rs:355-395`); a struct literal, or a
 `.p12` containing two byte-identical intermediate bags loaded via the
 unanchored constructors, can still reach the panic. Proven: with
 `cert_chain = vec![certificate.clone()]` the public `sign_code_directory`
-panics with `Error { kind: SetDuplicate }`.
+panics with `Error { kind: SetDuplicate, position: None }`.
 
 This is the single uncontrolled panic in the signing path — every other fallible
 call in `build_cms_signed_data` is `?`-propagated.
@@ -99,7 +99,7 @@ fn deduped_certificates<'a>(
 
 ### SignerInfo sid interaction
 
-`sid` is `IssuerAndSerialNumber` (`cms.rs:321-329`); a verifier resolves it by
+`sid` is `IssuerAndSerialNumber` (`cms.rs:323-330`); a verifier resolves it by
 (issuer, serial) content match against the certificate set, not by position.
 The signer's certificate is kept first-wins, so `sid` resolution is
 unaffected. Deduping cannot drop the signer's certificate — it is always the
@@ -140,8 +140,8 @@ layer for this fix. Recorded here as the ticket requires.
    dedupe is over the whole set, not just against the signer's certificate.
 4. Zero-warning gate: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
-   `TMPDIR=$PWD/target/tmp cargo test --workspace` (baseline 779 passed /
-   1+12 ignored),
+   `TMPDIR=$PWD/target/tmp cargo test --workspace` (779 baseline; 782
+   expected after the three regressions, 1+12 ignored),
    `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm` (28 passed).
 
 Tests live beside the existing `sign_code_directory` behavior tests in the
