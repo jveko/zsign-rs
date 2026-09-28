@@ -1834,6 +1834,39 @@ mod tests {
     }
 
     #[test]
+    fn sign_code_directory_rejects_mismatched_key_and_certificate() {
+        let (identity_a, _) = fresh_rsa_credentials();
+        let (identity_b, _) = fresh_rsa_credentials();
+        let mismatched = SigningCredentials {
+            certificate: identity_a.certificate.clone(),
+            signing_key: identity_b.signing_key.clone(),
+            cert_chain: vec![],
+            team_id: identity_a.team_id.clone(),
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let res = sign_code_directory(content, &mismatched, None, &cd_sha256);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("does not match")),
+            "mismatched key and certificate must fail closed at sign time, got {:?}",
+            res.as_ref().err()
+        );
+
+        let cms = sign_code_directory(content, &identity_a, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&identity_a),
+        )
+        .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+    }
+
+    #[test]
     fn tampered_content_fails_digest() {
         let (creds, _key) = rsa_credentials();
         let content: &[u8] = b"the code directory bytes";
