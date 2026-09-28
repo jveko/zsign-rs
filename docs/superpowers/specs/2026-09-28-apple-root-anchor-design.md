@@ -49,7 +49,7 @@ root. The load path simply never calls any of it.
 
 **A — hard-anchor inside `build_chain_from_leaf`** (make it return `Result`,
 terminate-SPKI check inline). Rejected: couples assembly with policy, so the existing
-pure-assembly unit tests (`cert.rs:1191,1207,1221,1265`) can no longer be written,
+pure-assembly unit tests (`cert.rs:1153,1204,1211,1236`) can no longer be written,
 and a termination check alone (no link-signature/CA checks) is forgeable — an
 attacker's leaf claiming `issuer=Apple WWDR CA` plus the *publicly available* real
 WWDR and real Apple Root certificates as `rest` would pass name-walk + SPKI pin.
@@ -122,10 +122,11 @@ not CN substring. Consequences:
   signature verification (§4.2). Both fail closed.
 
 Assembly itself performs no validation — completion is name-driven by design, and a
-self-issued leaf whose issuer DN equals the Apple root DN gets the root appended
-(the plan's assembly test pins exactly that shape; only the policy step decides
-trust). A dangling terminal whose issuer is not the Apple root (evil chains) is
-left as-is; the policy step rejects it.
+leaf whose issuer DN equals the Apple root DN (regardless of who actually signed it)
+gets the root appended; the plan's assembly test pins exactly that shape — its leaf
+has subject `CN=zsn direct` with the Apple root as issuer, so it is *not*
+self-issued. Only the policy step decides trust. A dangling terminal whose issuer is
+not the Apple root (evil chains) is left as-is; the policy step rejects it.
 
 ### 4.2 Policy: `require_anchored_chain`
 
@@ -205,8 +206,14 @@ pub(crate) fn from_p12_with_leaf_sha1_unanchored(p12_data: &[u8], password: &str
 They run every existing check (parse, pairing, weak-key, code-signing policy) and
 skip only `require_anchored_chain`. Their doc comments state they exist for
 self-issued test fixtures and must not be used in production. Shared bodies are
-private (`finish_p12(..., ChainTrust)` / `from_pem_inner(..., ChainTrust)` with a
-module-private `enum ChainTrust { AppleRoot, Unanchored }`) — the public anchored
+private: `load_p12(..., anchors: Option<&TrustAnchors>)`,
+`load_pem(..., anchors: Option<&TrustAnchors>)`, `finish_p12(..., anchors:
+Option<&TrustAnchors>)`, and `from_p12_with_leaf_sha1_impl(..., anchors)` — the
+public anchored entry points pass `Some(&TrustAnchors::apple_root()?)`, the
+test-only ones pass `None`. A `ChainTrust` enum was rejected in favor of
+`Option<&TrustAnchors>` because its `Unanchored` variant is never constructed in
+release builds, which trips `dead_code` under the zero-warning gate. The public
+anchored
 constructors never branch on build configuration: **`from_p12`/`from_pem` are
 anchored in every build, including test builds**, so the primary regression test can
 always call them.
@@ -289,11 +296,11 @@ material; behavior otherwise unchanged): `from_p12_with_leaf_sha1_selects_the_ma
 (`:1278`), `from_pem_accepts_leaf_without_ku_and_bc` (`:1420`),
 `from_pem_loads_every_supported_key_form` (`:1500`),
 `from_pem_keeps_the_password_free_pkcs8_path_unchanged` (`:1537`),
-`from_pem_loads_unencrypted_traditional_keys` (`:1555`),
-`from_pem_still_pairs_the_decrypted_key_with_the_certificate` (`:1603`), and any
+`from_pem_loads_unencrypted_traditional_keys` (`:1555`), and any
 other success-asserting load found by running the suite. Error-expecting tests
-(policy, weak key, password, ambiguity) are untouched: those gates still fire
-before anchoring. Assembly tests (`:1191,1207,1221,1265`) stay on
+(policy, weak key, password, ambiguity, and `from_pem_still_pairs_the_decrypted_key_with_the_certificate`
+at `:1603`, which asserts an SPKI-mismatch failure) are untouched: those gates
+still fire before anchoring. Assembly tests (`:1153,1204,1211,1236`) stay on
 `build_chain_from_leaf`, which remains pure; one new assembly test covers the
 direct-issue root completion.
 

@@ -354,14 +354,16 @@ dependencies.
   `from_p12_with_leaf_sha1_selects_the_matching_pair`, `from_p12_selects_single_identity_with_empty_chain`,
   `from_pem_self_signed_leaf_yields_empty_chain`, `from_pem_accepts_compliant_leaf`,
   `from_pem_accepts_leaf_without_ku_and_bc`, `from_pem_loads_every_supported_key_form`,
-  `from_pem_keeps_the_password_free_pkcs8_path_unchanged`, `from_pem_loads_unencrypted_traditional_keys`,
-  `from_pem_still_pairs_the_decrypted_key_with_the_certificate` — i.e.
+  `from_pem_keeps_the_password_free_pkcs8_path_unchanged`, `from_pem_loads_unencrypted_traditional_keys` — i.e.
   `SigningCredentials::from_p12(` → `from_p12_unanchored(`,
   `SigningCredentials::from_pem(` → `from_pem_unanchored(` (the `load()` helper
   keeps calling `from_pem` — its rejection tests stay on the anchored path; the
   success tests that go through `load()` switch to a `load_unanchored()` helper
   that wraps `from_pem_unanchored`). Add the tiny `load_unanchored` helper beside
-  `load`. All error-expecting tests stay on the public anchored constructors.
+  `load`. All error-expecting tests stay on the public anchored constructors —
+  including `from_pem_still_pairs_the_decrypted_key_with_the_certificate`
+  (`:1603`), which asserts an SPKI-mismatch failure that fires before anchoring
+  and needs no migration.
 
 - [ ] **Step 1.6: Route the keychain test pipeline through the unanchored loader.**
   In `crates/zsign-core/src/crypto/keychain.rs`, extract the body of the
