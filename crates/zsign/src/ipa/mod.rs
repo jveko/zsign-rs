@@ -703,12 +703,13 @@ impl<'a> IpaSigner<'a> {
         let request = self.profile_request(Some(root_id.to_string()));
         match &self.provisioning_profile {
             Some(BlobSource::Path(path)) => {
-                let data = fs::read(path)?;
+                let data = crate::builder::read_profile_file(path, None)?;
                 let ent = zsign_core::extract_entitlements_checked(
                     &data,
                     &request,
                     self.allow_unsafe_profile,
-                )?;
+                )
+                .map_err(|e| crate::builder::profile_validation_error(e, path, None))?;
                 Ok((Some(data), ent))
             }
             Some(BlobSource::Bytes(data)) => {
@@ -750,35 +751,19 @@ impl<'a> IpaSigner<'a> {
                     "duplicate profile map key '{id}'"
                 ))));
             }
-            let data = fs::read(path).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to read provisioning profile for bundle '{id}' at '{}': {e}",
-                        path.display()
-                    ),
-                )
-            })?;
-            // Bare propagation here would report only "No XML plist found in
-            // profile data", which cannot say which entry of a multi-entry map
-            // is at fault. The wrap adds that context but must not reclassify
-            // a size rejection, which carries its own error contract.
+            let data = crate::builder::read_profile_file(path, Some(id))?;
+            // Bare propagation would report only "No XML plist found in profile
+            // data", which cannot say which entry of a multi-entry map is at
+            // fault. The shared wrap adds that context while keeping the class
+            // the validator produced, so a malformed profile, a failed CMS
+            // verification, and a size rejection stay distinguishable.
             let request = self.profile_request(Some(id.clone()));
             let ent = zsign_core::extract_entitlements_checked(
                 &data,
                 &request,
                 self.allow_unsafe_profile,
             )
-            .map_err(|e| match e {
-                zsign_core::Error::InputTooLarge(detail) => Error::InputTooLarge(format!(
-                    "{detail} (provisioning profile for bundle '{id}' at '{}')",
-                    path.display()
-                )),
-                other => Error::Core(zsign_core::Error::Config(format!(
-                    "provisioning profile for bundle '{id}' at '{}' is invalid: {other}",
-                    path.display()
-                ))),
-            })?;
+            .map_err(|e| crate::builder::profile_validation_error(e, path, Some(id)))?;
             map.insert(id.clone(), (Some(data), ent));
         }
         Ok(map)

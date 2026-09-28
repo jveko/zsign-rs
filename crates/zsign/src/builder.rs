@@ -655,15 +655,7 @@ impl ZSign {
     /// Loads entitlements from the provisioning profile if set.
     fn load_entitlements_from_profile(&self) -> Result<Option<Vec<u8>>> {
         if let Some(ref profile_path) = self.provisioning_profile {
-            let profile_data = std::fs::read(profile_path).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to read provisioning profile '{}': {e}",
-                        profile_path.display()
-                    ),
-                )
-            })?;
+            let profile_data = read_profile_file(profile_path, None)?;
             let request = zsign_core::ProfileRequest {
                 now: None,
                 anchors: None,
@@ -675,7 +667,9 @@ impl ZSign {
                 &profile_data,
                 &request,
                 self.allow_unsafe_profile,
-            )? {
+            )
+            .map_err(|e| profile_validation_error(e, profile_path, None))?
+            {
                 Some(entitlements) => return Ok(Some(entitlements)),
                 None => return Ok(None),
             }
@@ -712,6 +706,54 @@ pub(crate) fn entitlements_read_error(path: &Path, e: std::io::Error) -> Error {
         e.kind(),
         format!("failed to read entitlements file '{}': {e}", path.display()),
     ))
+}
+
+/// Source label for a provisioning-profile failure: the path is always named,
+/// and a mapped entry also names the bundle id whose lookup selected it.
+fn profile_source(path: &Path, bundle_id: Option<&str>) -> String {
+    match bundle_id {
+        Some(id) => format!(
+            "provisioning profile for bundle '{id}' at '{}'",
+            path.display()
+        ),
+        None => format!("provisioning profile '{}'", path.display()),
+    }
+}
+
+/// Single owner of the "failed to read provisioning profile" text, shared by
+/// every profile-loading site so a read failure always names the file.
+pub(crate) fn read_profile_file(path: &Path, bundle_id: Option<&str>) -> Result<Vec<u8>> {
+    let source = profile_source(path, bundle_id);
+    std::fs::read(path).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read {source}: {e}"),
+        ))
+    })
+}
+
+/// Single owner of the profile-validation context wrap. The offending profile
+/// is always named; the failure keeps the class its own validator produced, so
+/// a malformed profile, a failed CMS verification, and a size rejection stay
+/// distinguishable after the wrap.
+pub(crate) fn profile_validation_error(
+    e: zsign_core::Error,
+    path: &Path,
+    bundle_id: Option<&str>,
+) -> Error {
+    let source = profile_source(path, bundle_id);
+    match e {
+        zsign_core::Error::ProvisioningProfile(detail) => Error::Core(
+            zsign_core::Error::ProvisioningProfile(format!("{detail} ({source})")),
+        ),
+        zsign_core::Error::Verification(detail) => Error::Core(zsign_core::Error::Verification(
+            format!("{detail} ({source})"),
+        )),
+        zsign_core::Error::InputTooLarge(detail) => {
+            Error::InputTooLarge(format!("{detail} ({source})"))
+        }
+        other => Error::Core(other),
+    }
 }
 
 /// Validates entitlements bytes against the blob contract: XML-or-binary
