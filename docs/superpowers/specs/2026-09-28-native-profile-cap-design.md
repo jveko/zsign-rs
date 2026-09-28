@@ -46,7 +46,17 @@ no equivalent:
   facade re-exports `extract_entitlements_from_profile` and `profile_document`
   (`crates/zsign/src/lib.rs:49-50`); fuzz target `fuzz/fuzz_targets/provisioning.rs:17-18`
   calls both `validate_and_extract_profile` and `extract_entitlements_from_profile`.
-  CLI touches profiles only via the facade (`crates/zsign-cli/src/main.rs:237,240,556,622`).
+  CLI reaches profiles only through the facade: `crates/zsign-cli/src/main.rs:237`
+  (`provisioning_profile`), `:240` (`allow_unsafe_profile`),
+  `:252-253` (`bundle_profiles` from `--profile-map`).
+- One facade site re-wraps core profile errors: `IpaSigner::load_bundle_profiles`
+  (`crates/zsign/src/ipa/mod.rs:771-776`) formats ANY `extract_entitlements_checked`
+  error into `Error::Core(Config("… is invalid: {e}"))` to name the offending
+  bundle id + path. Without a deliberate arm, a size rejection on a `--profile-map`
+  entry would surface as `Config`, not `InputTooLarge` (decision D8). Root-profile
+  paths (`load_profile` `ipa/mod.rs:707,715`, builder
+  `load_entitlements_from_profile` `builder.rs:674`) propagate via `?` and map
+  through the `From` arm unchanged.
 - `plist` 1.10.1 (Cargo.lock:988-992) enforces NO element-count and NO depth limit on
   the XML path (`stream/xml_reader.rs` has no depth/count/size field; `de.rs` has no
   recursion guard). quick-xml 0.42.0's `max_depth: 128` guard lives in its serde
@@ -97,13 +107,20 @@ Add `zsign_core::Error::InputTooLarge(m) => Error::InputTooLarge(m)` to
 `crates/zsign/src/error.rs:62-68`. Payload passed through (not the rendered string),
 so Display stays `"Input too large: <detail>"`.
 
-**D5 — Wasm stays byte-identical; constant becomes a re-export.**
-The two wasm `ensure_size` pre-checks remain in place, unchanged messages and codes —
-their behavior for >16 MiB is exactly today's `ZSIGN_INPUT_TOO_LARGE`. The local
+**D5 — Wasm pre-check behavior byte-identical; constant becomes a re-export.**
+"Byte-identical" scopes to the two surfaces that already reject today (the
+`ensure_size` pre-checks): their messages and codes for >16 MiB are exactly
+today's `ZSIGN_INPUT_TOO_LARGE`. Paths that had NO cap before (wasm `sign_ipa`
+plan build) newly reject — that is the fail-closed fix, not a regression, and
+the contract table below records it. The local
 `const MAX_PROFILE_BYTES` at `lib.rs:76` becomes a re-export of the core constant
 (same value, one source of truth). The forced `code_for_core_error` arm maps core
 `InputTooLarge` → `WasmErrorCode::InputTooLarge` (defense in depth: any future
-direct-core call also codes correctly).
+direct-core call also codes correctly). The `sign_ipa` limitation note
+(`lib.rs:40`, "profile validation during plan build can surface
+`ZSIGN_VERIFICATION` or `ZSIGN_INVALID_PROFILE`") gains `ZSIGN_INPUT_TOO_LARGE`:
+that path now rejects oversized embedded profiles via the facade arm — crate
+rustdoc in a file already being edited, not the Wave 8-owned README caps claim.
 
 **D6 — Boundary semantics match `ensure_size`: reject `len > MAX`, accept `len == MAX`.**
 Verified against wasm test `ensure_size_accepts_exactly_at_limit` (`lib.rs:1384-1398`).
@@ -117,14 +134,28 @@ enough to overflow). Decision: do not add a guard here; record the residual risk
 below for a dedicated follow-up. The 550 KB / 50k-element wide-document behavior
 stays exactly as today (accepted by `profile_document`; no element budget added).
 
+**D8 — The profile-map context wrap preserves the `InputTooLarge` variant.**
+`load_bundle_profiles` keeps its bundle-id/path context for every rejection, but
+for the size rejection it returns `Error::InputTooLarge` (context appended to the
+payload) instead of `Error::Core(Config(…))`. Rationale: the wrap exists to name
+the offending map entry, not to reclassify failures; swallowing the variant would
+make the facade contract below false for exactly the fail-closed case the cap is
+about, and would force wasm `sign_ipa` plan-build size rejections through the
+`Config` code instead of `ZSIGN_INPUT_TOO_LARGE`. Every other error from that
+site keeps today's `Config` shape byte-for-byte. This is not the ZSN-143
+error-code unification (which reorganizes codes across profile entry points); it
+is the propagation rule for this change's own new variant.
+
 ## Error contract after this change
 
 | Surface | Path | >16 MiB result |
 |---|---|---|
 | native core | `validate_and_extract_profile` | `Err(zsign_core::Error::InputTooLarge(detail))` before CMS/scanning |
 | native core | `profile_document` (and delegates) | `Err(zsign_core::Error::InputTooLarge(detail))` before `windows()` scans |
-| native facade | any profile entry (builder, ipa, re-exports) | `Err(zsign_rs::Error::InputTooLarge(detail))` via the new `From` arm — Display `Input too large: <detail>` |
+| native facade | root profile entries (builder, ipa `load_profile`, re-exports) | `Err(zsign_rs::Error::InputTooLarge(detail))` via the new `From` arm — Display `Input too large: <detail>` |
+| native facade | `--profile-map` entries (`load_bundle_profiles`) | `Err(zsign_rs::Error::InputTooLarge)` with bundle id + path appended to the payload (D8); other errors from that site keep their `Config` shape |
 | wasm `WasmSigner` ctor / `extract_entitlements` | `ensure_size` pre-check first | `ZSIGN_INPUT_TOO_LARGE`, message shape unchanged from today |
+| wasm `sign_ipa` plan build (embedded/bundle profile) | facade `Error::InputTooLarge` (existing arm `lib.rs:161`) | `ZSIGN_INPUT_TOO_LARGE` — newly rejectable: this path had no cap anywhere before this change (the wasm-only cap covered only the two `WasmSigner` pre-checks), and fail-closed requires the error here too |
 | wasm direct-core callers (future) | `code_for_core_error` new arm | `ZSIGN_INPUT_TOO_LARGE` |
 | CLI | inherits via facade | exit contract unchanged (variant-specific mapping is ZSN-143's scope; this change only feeds `InputTooLarge`, the already-established variant) |
 
@@ -136,24 +167,46 @@ parsing/validation — same semantics as wasm `ensure_size`.
 1. **Native 17 MiB rejected before scanning.** Feed `17 * 1024 * 1024` bytes (no XML
    marker, no CMS) to `validate_and_extract_profile`, `profile_document`, and
    `extract_entitlements_from_profile` (+ `extract_entitlements_checked` both
-   `allow_unsafe` values). All must return `Error::InputTooLarge`, NOT
-   `ProvisioningProfile("No XML plist found")` / CMS errors — the error *kind*
-   distinguishes pre-scan rejection: reaching the scanner would produce a different
-   variant and (for the scan path) requires O(n) windows passes first. Assert the
-   message carries the observed length and the 16 MiB limit.
-   Boundary: exactly `MAX_PROFILE_BYTES` does NOT produce `InputTooLarge`.
+   `allow_unsafe` values — the `true` arm is the raw byte-scan bypass reachable
+   from `--allow-unsafe-profile`, and must reject exactly the same way). All must
+   return `Error::InputTooLarge`. The observed kind distinguishes pre-scan
+   rejection: without the cap the scan funnels would return
+   `ProvisioningProfile("No XML plist found …")`, and the validate funnel would
+   return `Error::Verification` (its first operation is
+   `cms_verify::resolve_now` → CMS envelope verification at
+   `provisioning.rs:99-105` — on wasm32 a `None` clock errors even earlier with
+   the same variant). The 17 MiB heap buffer is never touched beyond `.len()` —
+   the guard runs before any scan, mirroring how the wasm oversize test
+   (`lib.rs:1466-1469`) allocates `MAX_PROFILE_BYTES + 1` without ever scanning it;
+   the wasm 512/128 MiB guards by contrast take `len` as a bare number and never
+   allocate at all (`lib.rs:1380-1383`) — boundary behavior is pinned by calling
+   `ensure_profile_size` directly with `MAX_PROFILE_BYTES` (Ok) and
+   `MAX_PROFILE_BYTES + 1` (Err), NOT by running an end-to-end parse over a 16 MiB
+   buffer. Assert the message carries the observed length and the 16 MiB limit.
 2. **Wasm unchanged.** Existing tests already pin `MAX_PROFILE_BYTES + 1` →
    `ZSIGN_INPUT_TOO_LARGE` / "too large" (`lib.rs:1400-1420`, `:1466-1469`); they
-   must stay green without modification. Additionally assert the core constant
+   must stay green without modification. These run under `wasm-pack test --node`,
+   NOT under the workspace gate — the plan records whether wasm-pack ran, and the
+   native `ensure_profile_size` boundary test (`MAX+1` ⇒ Err) is the in-gate
+   assertion for the shared constant. Additionally assert the core constant
    equals the wasm-consumed value (re-export makes this structural).
 3. **100 KB valid profile still works.** A valid signed profile padded to ~100 KB
    (extra non-validated key with a large string value) passes
    `validate_and_extract_profile` and `extract_entitlements_checked`.
 4. **550 KB / 50k-element document pinned as today.** Build an XML plist with 50k
-   top-level array elements (~550 KB); assert `profile_document` parses it to `Ok`
-   (pinning current behavior: no element budget in this change).
-5. **Facade variant live.** Native facade-level call returns
-   `zsign_rs::Error::InputTooLarge` (not `Error::Core`) for an oversized profile.
+   top-level array elements (fixture built in one `std::fmt::Write` pass over a
+   pre-sized String; the failure message reports counts, never Debug-formats the
+   document); assert `profile_document` parses it to `Ok` with exactly 50k
+   elements (pinning current behavior: no element budget in this change).
+5. **Facade variant live — via a real funnel, end to end.** A facade-level signer
+   fed an oversized profile file (root `provisioning_profile` AND a
+   `bundle_profiles` entry) returns `zsign_rs::Error::InputTooLarge` — not
+   `Error::Core` — with the limit bytes in the message; the `--profile-map` case
+   additionally names the bundle id and profile path (D8). A synthetic
+   `From`-conversion unit test may complement but not replace this.
+6. **Context-wrap regression.** A malformed (non-oversized) `--profile-map`
+   profile still surfaces as `Error::Core(Config(…))` naming bundle id + path —
+   pinning that D8 changed exactly one arm and nothing else.
 
 ## Residual risks (recorded, out of scope here)
 
