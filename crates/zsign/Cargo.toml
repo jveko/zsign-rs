@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "cryptography", "development-tools"]
 [dependencies]
 zsign-core = { path = "../zsign-core", version = "0.1.0" }
 goblin = "0.10"
-zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd", "time"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd", "time"] }
 plist = "1.7"
 # sha1 intentionally portable: the `asm` feature is broken on aarch64.
 sha1 = { version = "0.10" }

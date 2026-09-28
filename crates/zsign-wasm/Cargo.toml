@@ -26,4 +26,4 @@ time = "0.3"
 [dev-dependencies]
 zsign-core = { path = "../zsign-core", version = "0.1.0", features = ["test-fixtures"] }
 wasm-bindgen-test = "0.3"
-zip = { version = "7.0", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
