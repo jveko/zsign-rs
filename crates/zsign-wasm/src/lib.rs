@@ -147,6 +147,7 @@ fn code_for_core_error(e: &zsign_core::Error) -> WasmErrorCode {
         zsign_core::Error::Plist(_) => WasmErrorCode::InvalidPlist,
         zsign_core::Error::DerEncoding(_) => WasmErrorCode::DerEncoding,
         zsign_core::Error::Verification(_) => WasmErrorCode::Verification,
+        zsign_core::Error::InputTooLarge(_) => WasmErrorCode::InputTooLarge,
     }
 }
 

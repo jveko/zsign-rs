@@ -39,4 +39,8 @@ pub enum Error {
 
     #[error("Verification failed: {0}")]
     Verification(String),
+
+    /// An input exceeds its published size limit; rejected before any parsing.
+    #[error("Input too large: {0}")]
+    InputTooLarge(String),
 }

@@ -12,6 +12,21 @@ use crate::{Error, Result};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 
+/// The profile size cap enforced by this module; every surface that reads
+/// profile bytes funnels through it, rejected before parsing begins.
+pub const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Rejects an oversized profile before a single byte of it is scanned.
+fn ensure_profile_size(profile_data: &[u8]) -> Result<()> {
+    let len = profile_data.len();
+    if len > MAX_PROFILE_BYTES {
+        return Err(Error::InputTooLarge(format!(
+            "provisioning profile is {len} bytes; the limit is {MAX_PROFILE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// Inputs that scope *when* and *against what* a profile is validated.
 ///
 /// Every field is optional: an omitted check simply does not run, so callers
@@ -86,6 +101,8 @@ pub struct ProfileInfo {
 ///
 /// # Errors
 ///
+/// Returns [`Error::InputTooLarge`] when `profile_data` exceeds
+/// [`MAX_PROFILE_BYTES`], before any parsing of its bytes.
 /// Returns [`Error::Verification`] for a malformed CMS envelope or, on wasm32,
 /// when `now` is `None`; browser callers must pass `Date.now() / 1000`.
 /// Returns [`Error::ProvisioningProfile`] for every failed check. Window, team,
@@ -96,6 +113,7 @@ pub fn validate_and_extract_profile(
     profile_data: &[u8],
     request: &ProfileRequest,
 ) -> Result<ProfileInfo> {
+    ensure_profile_size(profile_data)?;
     let now = cms_verify::resolve_now(request.now)?;
     let envelope = match &request.anchors {
         Some(anchors) => {
@@ -384,6 +402,9 @@ fn entitlements_to_xml(dict: &plist::Dictionary) -> Result<Option<Vec<u8>>> {
 ///
 /// Returns `Ok(None)` if the plist is valid but contains no `Entitlements` key.
 /// Returns `Err` for parse failures (no XML found, invalid plist, serialization error).
+///
+/// Size limit: delegates to [`profile_document`], which rejects inputs over
+/// [`MAX_PROFILE_BYTES`] before scanning.
 pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<Vec<u8>>> {
     let plist = profile_document(profile_data)?;
     let dict = plist
@@ -408,6 +429,10 @@ pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<V
 /// Returns the same shape as the raw extractor: `Ok(None)` when a valid
 /// profile carries no `Entitlements` key, `Err` for a rejected profile or a
 /// parse failure.
+///
+/// Size limit: both arms reject inputs over [`MAX_PROFILE_BYTES`] before
+/// scanning — the validating arm through [`validate_and_extract_profile`], the
+/// `allow_unsafe` arm through [`profile_document`].
 pub fn extract_entitlements_checked(
     profile_data: &[u8],
     request: &ProfileRequest,
@@ -429,7 +454,11 @@ pub fn extract_entitlements_checked(
 /// `</plist>` tag is found, the boundaries are inverted, or the slice fails
 /// to parse. The document is returned as-is; a dictionary guarantee belongs
 /// to the caller that needs one.
+///
+/// Returns [`Error::InputTooLarge`] when `profile_data` exceeds
+/// [`MAX_PROFILE_BYTES`], before any byte of it is scanned.
 pub fn profile_document(profile_data: &[u8]) -> Result<plist::Value> {
+    ensure_profile_size(profile_data)?;
     let plist_start = profile_data
         .windows(6)
         .position(|w| w == b"<?xml ")
@@ -1066,5 +1095,123 @@ mod tests {
         // One instant before CreationDate — rejected as not yet valid.
         let err = validate_and_extract_profile(&sp.data, &request(&sp, T_2025)).unwrap_err();
         assert!(err.to_string().contains("not valid until"), "{err}");
+    }
+
+    // Why this proves the guard runs BEFORE any scanning: the buffer has no
+    // `<?xml ` marker and no CMS envelope, so without a pre-scan cap the scan
+    // funnels fall through to
+    // `ProvisioningProfile("No XML plist found …")` and the validate funnel
+    // returns `Error::Verification` (its first statements are
+    // `cms_verify::resolve_now` then CMS verification). Reaching
+    // `InputTooLarge` from all four seams is only possible if each reads
+    // `.len()` and returns before touching the bytes. The `allow_unsafe = true`
+    // arm is the raw byte-scan bypass and must reject identically, so the cap
+    // is not confined to the validating path.
+    #[test]
+    fn oversized_profile_is_rejected_before_any_scanning() {
+        let big = vec![0u8; 17 * 1024 * 1024];
+        let req = ProfileRequest::default();
+        let res = validate_and_extract_profile(&big, &req);
+        assert!(
+            matches!(&res, Err(Error::InputTooLarge(m)) if m.contains("17825792") && m.contains("16777216")),
+            "expected pre-scan InputTooLarge, got {:?}",
+            res.as_ref().err()
+        );
+        let res = profile_document(&big);
+        assert!(
+            matches!(&res, Err(Error::InputTooLarge(_))),
+            "expected pre-scan InputTooLarge, got {:?}",
+            res.as_ref().err()
+        );
+        let res = extract_entitlements_from_profile(&big);
+        assert!(
+            matches!(&res, Err(Error::InputTooLarge(_))),
+            "expected pre-scan InputTooLarge, got {:?}",
+            res.as_ref().err()
+        );
+        for allow_unsafe in [false, true] {
+            let res = extract_entitlements_checked(&big, &req, allow_unsafe);
+            assert!(
+                matches!(&res, Err(Error::InputTooLarge(_))),
+                "allow_unsafe={allow_unsafe}: expected pre-scan InputTooLarge, got {:?}",
+                res.as_ref().err()
+            );
+        }
+    }
+
+    #[test]
+    fn size_guard_boundaries_are_inclusive_at_the_limit() {
+        // Pinned at the helper, not end-to-end: a full profile_document run over a
+        // 16 MiB buffer would execute two O(n) window scans plus a plist parse in
+        // debug — exactly the work the guard exists to avoid testing. The guard is
+        // a pure `len > MAX` predicate over the shared constant, so these three
+        // assertions pin the inclusive boundary (and the native MAX+1 rejection
+        // the wasm guest tests cover only under wasm-pack).
+        assert!(
+            ensure_profile_size(&[]).is_ok(),
+            "empty input must pass the size guard"
+        );
+        let at_limit = vec![0u8; MAX_PROFILE_BYTES];
+        assert!(
+            ensure_profile_size(&at_limit).is_ok(),
+            "exactly-at-limit input must pass the size guard"
+        );
+        let over_limit = vec![0u8; MAX_PROFILE_BYTES + 1];
+        let res = ensure_profile_size(&over_limit);
+        assert!(
+            matches!(&res, Err(Error::InputTooLarge(m)) if m.contains("16777217")),
+            "one byte over the limit must be rejected, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn hundred_kb_valid_profile_still_validates() {
+        let pad = "x".repeat(100 * 1024);
+        let xml = plist_xml(&format!(
+            "<key>PPDDebugInfo</key>\n  <string>{pad}</string>\n"
+        ));
+        let sp = signed_profile(&xml);
+        let req = request(&sp, T_2026_APR); // inside the plist_xml fixture window
+        let info =
+            validate_and_extract_profile(&sp.data, &req).expect("100 KB profile must validate");
+        assert!(info.entitlements_xml.is_some());
+        let raw = extract_entitlements_checked(&sp.data, &req, false)
+            .expect("checked seam must accept a 100 KB profile");
+        assert!(raw.is_some());
+    }
+
+    #[test]
+    fn wide_fifty_thousand_element_document_parses_as_today() {
+        use std::fmt::Write as _;
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><array>"#,
+        );
+        // One pass over a pre-sized buffer: 50k format! temporaries would dominate
+        // the test's runtime for no behavioral gain.
+        for i in 0..50_000 {
+            write!(xml, "<string>element-{i:06}</string>").unwrap();
+        }
+        xml.push_str("</array></plist>");
+        let mut profile = vec![b'X'; 64];
+        profile.extend_from_slice(xml.as_bytes());
+        profile.extend_from_slice(&[b'Y'; 64]);
+        let res = profile_document(&profile);
+        match &res {
+            Ok(plist::Value::Array(a)) => assert_eq!(
+                a.len(),
+                50_000,
+                "all 50k elements must parse (no element budget in this change)"
+            ),
+            other => panic!(
+                "50k-element document must parse exactly as today; got {}",
+                match other {
+                    Ok(_) => "non-array top-level value".to_string(),
+                    Err(e) => e.to_string(),
+                }
+            ),
+        }
     }
 }
