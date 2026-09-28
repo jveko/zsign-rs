@@ -6,7 +6,7 @@ All file:line citations refer to that revision.
 ## 1. Problem
 
 `sign_code_directory` (`crates/zsign-core/src/crypto/cms.rs:292`) builds the
-SignerInfo `sid` from `credentials.certificate` (`cms.rs:322-329`) while the
+SignerInfo `sid` from `credentials.certificate` (`cms.rs:320-327`) while the
 signature bytes are produced by `credentials.signing_key` (`cms.rs:342-347`).
 Nothing at sign time checks that the two belong together.
 
@@ -111,7 +111,7 @@ runs before the `match &credentials.signing_key` dispatch (`cms.rs:342`).
 
 Only `certificate` vs `signing_key` is compared — never `cert_chain`
 members, which legitimately hold unrelated issuer keys (pinned by the
-existing `test_estimate_cms_size_rsa_with_chain` at `cms.rs:1035`).
+existing `test_estimate_cms_size_rsa_with_chain` at `cms.rs:967`).
 
 Cost: two SPKI DER encodes per call (microseconds) against an RSA-2048
 sign operation (milliseconds); `signer.rs` calls the function at most twice
@@ -122,7 +122,7 @@ per slice. Negligible.
 `verify_key_matches_cert` is module-private (`fn`, `cert.rs:882`); `cms.rs`
 is a sibling module. Widen it to `pub(crate)` — the same visibility
 `verify_cert_signature` uses to cross modules inside the crate
-(`cms_verify.rs:1518`). This is the sanctioned "cert.rs reuse only" change;
+(`cms_verify.rs:1520`). This is the sanctioned "cert.rs reuse only" change;
 it touches no anchoring code and exposes nothing outside the crate.
 
 ### 4.3 Error surface — no new mapping anywhere

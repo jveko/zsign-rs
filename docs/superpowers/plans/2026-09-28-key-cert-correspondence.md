@@ -23,7 +23,7 @@
 ## Review Focus
 
 1. **Guard placement:** the check must run before any CMS construction and before `match &credentials.signing_key` (`cms.rs:342`), as one call, not duplicated per key arm. The regression's negative assertion pins "errors, no bytes"; a reviewer must confirm the placement is the function's first statement (ECDSA mismatches are caught by the same pre-dispatch check).
-2. **Chain non-interference:** only `certificate` vs `signing_key` is compared — never `cert_chain` members (they legitimately hold unrelated issuer keys). The existing `test_estimate_cms_size_rsa_with_chain` (`cms.rs:1035`) must stay green; it is the tripwire for a naive fix that compares chain entries.
+2. **Chain non-interference:** only `certificate` vs `signing_key` is compared — never `cert_chain` members (they legitimately hold unrelated issuer keys). The existing `test_estimate_cms_size_rsa_with_chain` (`cms.rs:967`) must stay green; it is the tripwire for a naive fix that compares chain entries.
 3. **Error-shape assertion:** the test asserts the typed variant plus the payload substring `does not match`, NOT the full Display string (`Invalid certificate: …`) — full-string pins would break message tuning and duplicate the Display layer.
 4. **Positive control completeness:** the matched pair must not merely sign — its CMS must verify (`report.valid` AND `report.signature_ok` via `verify_code_signature_with_anchors` + `anchors_for`), otherwise a guard that rejects everything still passes the negative half.
 5. **Fail-closed, no fallback:** no `unwrap_or`, warn-path, or best-effort signing may exist beside the guard; on error the function returns `Err` with zero output bytes.
@@ -33,7 +33,7 @@
 ### Task 1: Regression test (red) — authored by the Tester agent
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (inline `mod tests`; place next to `round_trip_rsa_signs_and_verifies` at `:1811`)
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (inline `mod tests`; place next to `round_trip_rsa_signs_and_verifies` at `:1810`)
 
 **Interfaces:**
 - Consumes: `sign_code_directory(data, credentials, cdhash_sha1, cdhash_sha256) -> Result<Vec<u8>>` (`cms.rs:292`); `fresh_rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey)` (`cms_verify.rs:1756`, fresh identity per call); `anchors_for(&creds) -> TrustAnchors` (`cms_verify.rs:1797`); `wrap(&cms) -> Vec<u8>` (`cms_verify.rs:1801`); `verify_code_signature_with_anchors(&wrap(&cms), content, None, &cd_sha256, &anchors_for(&creds)) -> Result<report>` (`cms_verify.rs:333`); `SigningCredentials` literal fields `certificate`, `signing_key`, `cert_chain`, `team_id` (`cert.rs:107-127`); `Error::Certificate(String)` (`error.rs:16`).
@@ -41,7 +41,7 @@
 
 - [ ] **Step 1: Write the failing test**
 
-Insert into `crates/zsign-core/src/crypto/cms_verify.rs` tests, following the surrounding import conventions (`sign_code_directory` is already imported at `:1731`; add `SigningCredentials`/`Error` to the module's existing use block only if not already in scope):
+Insert into `crates/zsign-core/src/crypto/cms_verify.rs` tests, following the surrounding import conventions (`sign_code_directory` is already imported at `:1731`; `SigningCredentials` is already in scope at `:1735` and `Error` arrives via the module's `use super::*` at `:44` — no import changes needed):
 
 ```rust
 #[test]
@@ -132,6 +132,16 @@ Expected: PASS (1 passed).
 Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && TMPDIR=$PWD/target/tmp cargo test -p zsign-core`
 Expected: no diff, no warnings, all `zsign-core` tests pass (the chain test `test_estimate_cms_size_rsa_with_chain` among them).
 
-- [ ] **Step 6: Report**
+- [ ] **Step 6: Run the full gates**
 
-Report status, exact file paths modified, verbatim test/clippy output, and concerns. Do not commit.
+Run: `TMPDIR=$PWD/target/tmp cargo test --workspace`
+Expected: all workspace tests pass (baseline 778 passed / 1+12 ignored, plus the new regression test — 779 passed).
+
+Run: `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm`
+Expected: 28 passed.
+
+These two are the ticket's shipping gates: they exercise the P12→sign paths outside `zsign-core` (CLI `IDENTITY_P12` fixture test at `crates/zsign-cli/src/main.rs:1466-1487`, wasm `new_signer`→`sign_macho` round trip at `crates/zsign-wasm/src/lib.rs:919-923`) where the PKCS#12 pairing encoder (`DecodedKey::spki_der`, `cert.rs:165`) and the new sign-time guard encoder must agree byte-for-byte.
+
+- [ ] **Step 7: Report**
+
+Report status, exact file paths modified, verbatim test/clippy output including both full-gate runs, and concerns. Do not commit.
