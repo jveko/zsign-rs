@@ -1733,6 +1733,8 @@ mod tests {
         sign_attached_content, sign_attached_content_ecdsa, sign_detached_content, TestDigest,
     };
     use crate::crypto::SigningCredentials;
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::SignedData;
     use sha2::Sha256;
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
@@ -1862,6 +1864,157 @@ mod tests {
             &anchors_for(&identity_a),
         )
         .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+    }
+    /// A signing certificate repeated in `cert_chain` must be carried once.
+    #[test]
+    fn sign_code_directory_dedupes_repeated_signing_certificate() {
+        let (identity, _key) = fresh_rsa_credentials();
+        let creds = SigningCredentials {
+            certificate: identity.certificate.clone(),
+            signing_key: identity.signing_key.clone(),
+            cert_chain: vec![identity.certificate.clone()],
+            team_id: identity.team_id.clone(),
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256)
+            .expect("a duplicated signing certificate must not panic or fail");
+        // Parse idiom mirrors cms.rs:760-761.
+        let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
+        let signed_data =
+            SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
+                .expect("emitted CMS parses as SignedData");
+        let certs = signed_data.certificates.expect("certificate set present");
+        assert_eq!(
+            certs.0.len(),
+            1,
+            "signing certificate repeated in chain must be carried exactly once"
+        );
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .expect("verification of deduplicated CMS");
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+    }
+
+    /// The signer certificate repeated in the middle of the chain appears once.
+    #[test]
+    fn sign_code_directory_dedupes_signer_certificate_repeated_mid_chain() {
+        let (identity, _key) = fresh_rsa_credentials();
+        let (inter, _inter_signing) = build_subca("CN=zsign dup int", None);
+        let (root, _root_signing) = build_subca("CN=zsign dup root", None);
+        let creds = SigningCredentials {
+            certificate: identity.certificate.clone(),
+            signing_key: identity.signing_key.clone(),
+            cert_chain: vec![inter.clone(), identity.certificate.clone(), root.clone()],
+            team_id: identity.team_id.clone(),
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256)
+            .expect("signer certificate repeated mid-chain must not panic or fail");
+        // Parse idiom mirrors cms.rs:760-761.
+        let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
+        let signed_data =
+            SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
+                .expect("emitted CMS parses as SignedData");
+        let certs = signed_data.certificates.expect("certificate set present");
+        let members: Vec<Vec<u8>> = certs
+            .0
+            .iter()
+            // CertificateChoices::Certificate re-encodes byte-identically to the
+            // inner Certificate (der-derive choice.rs encodes the variant's own
+            // header), so raw to_der() equals Certificate::to_der() — the same
+            // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
+            .map(|c| c.to_der().expect("member re-encodes"))
+            .collect();
+        let signer_der = identity.certificate.to_der().unwrap();
+        assert_eq!(
+            members.iter().filter(|m| **m == signer_der).count(),
+            1,
+            "signing certificate must appear exactly once in the emitted set"
+        );
+        assert_eq!(
+            members.len(),
+            3,
+            "deduplicated set is signer + inter + root, got {}",
+            members.len()
+        );
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .expect("verification of deduplicated CMS");
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(report.signature_ok);
+    }
+
+    /// A non-signer chain member repeated twice is deduplicated too.
+    #[test]
+    fn sign_code_directory_dedupes_repeated_chain_member() {
+        let (identity, _key) = fresh_rsa_credentials();
+        let (inter, _inter_signing) = build_subca("CN=zsign dup int", None);
+        let (root, _root_signing) = build_subca("CN=zsign dup root", None);
+        let creds = SigningCredentials {
+            certificate: identity.certificate.clone(),
+            signing_key: identity.signing_key.clone(),
+            cert_chain: vec![inter.clone(), inter.clone(), root.clone()],
+            team_id: identity.team_id.clone(),
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256)
+            .expect("a repeated non-signer chain member must not panic or fail");
+        let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
+        let signed_data =
+            SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
+                .expect("emitted CMS parses as SignedData");
+        let certs = signed_data.certificates.expect("certificate set present");
+        let members: Vec<Vec<u8>> = certs
+            .0
+            .iter()
+            // CertificateChoices::Certificate re-encodes byte-identically to the
+            // inner Certificate (der-derive choice.rs encodes the variant's own
+            // header), so raw to_der() equals Certificate::to_der() — the same
+            // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
+            .map(|c| c.to_der().expect("member re-encodes"))
+            .collect();
+        let signer_der = identity.certificate.to_der().unwrap();
+        assert_eq!(
+            members.iter().filter(|m| **m == signer_der).count(),
+            1,
+            "signing certificate must appear exactly once in the emitted set"
+        );
+        assert_eq!(
+            members.len(),
+            3,
+            "deduplicated set is signer + inter + root, got {}",
+            members.len()
+        );
+
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .expect("verification of deduplicated CMS");
         assert!(report.valid, "errors: {:?}", report.errors);
         assert!(report.signature_ok);
     }
