@@ -1,6 +1,6 @@
 # Design: Provisioning-Profile Error Unification (ZSN-143)
 
-Status: proposed (subject to cold review)
+Status: final (cold-reviewed before implementation; whole-branch reviewed)
 Base: main @ a77ca09 (ZSN-118 validation + `allow_unsafe_profile`, ZSN-123 `InputTooLarge` all landed)
 
 ## 1. Problem
@@ -56,8 +56,10 @@ plist failures). `Error::Plist` and `Error::Config` are **not reachable** from
     single `Input too large:` prefix, detail-only payload (ZSN-123 D3/D4
     convention), suffix format for map entries identical to today;
   - any other core variant (not currently reachable) passes through as
-    `Error::Core(other)` unchanged — its payload is not a `String`, so no
-    context can be appended without changing its class.
+    `Error::Core(other)` unchanged — appending context is opt-in per variant:
+    `ProvisioningProfile`, `Verification` and `InputTooLarge` opt in, every
+    other variant is forwarded verbatim as the safe default, so a future
+    reachable variant is never silently reclassified or reworded.
 - **Bytes sources** (wasm ctor, `BlobSource::Bytes`) get no appended context:
   there is no file to name and the root profile is unique; their behavior is
   unchanged today and stays unchanged.

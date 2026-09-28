@@ -4084,6 +4084,10 @@ mod tests {
             matches!(&err, Error::InputTooLarge(m) if m.contains("17825792") && m.contains("16777216")),
             "oversized root profile must surface as InputTooLarge with lengths named, got {err:?}"
         );
+        assert!(
+            err.to_string().contains("huge.mobileprovision"),
+            "the size rejection must name the offending root profile file, got {err:?}"
+        );
     }
 
     /// Pins that an oversized profile in the bundle map keeps its

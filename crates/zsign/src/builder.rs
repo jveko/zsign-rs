@@ -721,10 +721,12 @@ fn profile_source(path: &Path, bundle_id: Option<&str>) -> String {
 }
 
 /// Single owner of the "failed to read provisioning profile" text, shared by
-/// every profile-loading site so a read failure always names the file.
+/// every profile-loading site so a read failure always names the file. A site
+/// must pass the same `bundle_id` here and to [`profile_validation_error`], so
+/// its read and validation failures name the same source.
 pub(crate) fn read_profile_file(path: &Path, bundle_id: Option<&str>) -> Result<Vec<u8>> {
-    let source = profile_source(path, bundle_id);
     std::fs::read(path).map_err(|e| {
+        let source = profile_source(path, bundle_id);
         Error::Io(std::io::Error::new(
             e.kind(),
             format!("failed to read {source}: {e}"),
@@ -736,6 +738,8 @@ pub(crate) fn read_profile_file(path: &Path, bundle_id: Option<&str>) -> Result<
 /// is always named; the failure keeps the class its own validator produced, so
 /// a malformed profile, a failed CMS verification, and a size rejection stay
 /// distinguishable after the wrap.
+/// Callers must pass the same `bundle_id` they gave [`read_profile_file`], so
+/// read and validation failures for one profile name the same source.
 pub(crate) fn profile_validation_error(
     e: zsign_core::Error,
     path: &Path,
