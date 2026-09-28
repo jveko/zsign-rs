@@ -35,7 +35,7 @@
 //! )?;
 //! ```
 
-use crate::crypto::cert::SigningKeyType;
+use crate::crypto::cert::{verify_key_matches_cert, SigningKeyType};
 use crate::crypto::SigningCredentials;
 use crate::{Error, Result};
 use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
@@ -288,13 +288,16 @@ pub(crate) fn sign_attached_content_ecdsa(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Signing`] if CMS signature construction fails.
+/// Returns [`Error::Signing`] if CMS signature construction fails, or
+/// [`Error::Certificate`] if `credentials.signing_key` does not
+/// match the public key in `credentials.certificate`.
 pub fn sign_code_directory(
     data: &[u8],
     credentials: &SigningCredentials,
     cdhash_sha1: Option<&[u8; 20]>,
     cdhash_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
+    verify_key_matches_cert(&credentials.signing_key, &credentials.certificate)?;
     let cdhash_plist = build_cdhash_plist(cdhash_sha1, cdhash_sha256);
     let cdhash_v2_value = build_cdhash_v2_attribute(cdhash_sha256);
 

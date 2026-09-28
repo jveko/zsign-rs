@@ -879,7 +879,7 @@ fn extract_issuer_cn(cert: &Certificate) -> Option<String> {
 ///
 /// Compares the DER-encoded Subject Public Key Info from the certificate with
 /// the public key derived from the private key. Returns an error if they differ.
-fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<()> {
+pub(crate) fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) -> Result<()> {
     use der::Encode;
     use spki::EncodePublicKey;
 
