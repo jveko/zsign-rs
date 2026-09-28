@@ -248,7 +248,7 @@ assert!(
 - [ ] **Step 3: Run CLI tests to verify red**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-cli`
-Expected: FAIL — both adapted tests go red **solely on their real-cause substring assertion**: at this step the old sniffer is still present and the empty-password trial still yields `Certificate("Failed to parse PKCS#12: invalid PKCS#12 password (MAC mismatch)")` (via `cert.rs:709-710`), whose text contains neither `Invalid password for private key or PKCS#12`. The `--password`/`ZSIGN_PASSWORD` hint assertions still PASS at this step (the sniffer still fires) — they become the at-risk guard only after Step 4 rewires the classifier, which is why Step 5 re-runs the whole suite. Record actual output.
+Expected: FAIL. **Observed red (errata — execution superseded the original prediction):** at this point Task 1 has already landed, so the empty-password trial yields `Error::InvalidPassword` with text `Invalid password for private key or PKCS#12`, which the not-yet-rewritten sniffer matches against neither marker — the sniffer therefore does NOT fire and the hint dies. Observed: `missing_password_on_non_tty_degrades_to_clear_error` fails at the untouched `--password` assertion (`main.rs:1626`) with stderr `error: Invalid password for private key or PKCS#12` (behavioral red — this IS the regression the typed rewrite in Step 4 must restore); `argv_password_beats_env_password` passes as soon as its assertion is adapted (the env-password path never reaches the sniffer). Record actual output.
 
 - [ ] **Step 4: Rewrite `resolve_p12_password`**
 

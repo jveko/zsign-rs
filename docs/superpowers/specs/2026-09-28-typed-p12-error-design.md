@@ -283,7 +283,7 @@ Native (`zsign-core`):
 |---|---|---|---|
 | N1 | `from_p12` (anchored) | `IDENTITY_DUP`, wrong password | `Err(Error::InvalidPassword)` — **red today** (`Certificate`) |
 | N2 | `from_p12_with_leaf_sha1` | `IDENTITY_DUP`, wrong password, any leaf | `Err(Error::InvalidPassword)` — **red today** |
-| N3 | `from_p12_unanchored` | `b"not valid p12 data"` | `Err(Error::Certificate(_))`, msg contains `Failed to parse PKCS#12` — existing `test_from_p12_invalid_data` upgraded from bare `is_err()` (corrupt keeps its class: crypto-11's concern pinned) |
+| N3 | `from_p12` (anchored; the pre-existing test's entry — equivalent to unanchored for this input, the flatten fires before any anchoring policy) | `b"not valid p12 data"` | `Err(Error::Certificate(_))`, msg contains `Failed to parse PKCS#12` — existing `test_from_p12_invalid_data` upgraded from bare `is_err()` (corrupt keeps its class: crypto-11's concern pinned) |
 | N4 | `from_p12_unanchored` | `IDENTITY_DUP`, correct password | loads (existing tests untouched) |
 | R1–R6 | policy/weak-key/anchoring/identity pins | existing fixtures | byte-identical messages, existing tests pass **unmodified** |
 
