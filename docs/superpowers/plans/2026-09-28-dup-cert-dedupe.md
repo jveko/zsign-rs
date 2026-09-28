@@ -23,6 +23,7 @@
 
 - Duplicate of the signer's certificate *only* (`cert_chain = vec![certificate.clone()]`): expected — sign succeeds, emitted `SignedData` holds exactly one certificate, sid still resolves. Owner: Task 1 regression A.
 - Signer's certificate repeated *mid-chain* in a 3-element chain: expected — sign succeeds, emitted set equals the deduplicated set (signer first), full verify reports `valid`. Owner: Task 1 regression B.
+- A *non-signer* chain member repeated intra-chain (`[inter, inter, root]`): expected — sign succeeds with a 3-member set; an implementation that only dedupes against the signer must fail this. Owner: Task 1 regression C.
 - Chain with no duplicates (the common path): expected — byte-for-byte behavior unchanged; existing round-trip and chain tests keep passing. Owner: Task 2 gate (existing suite) plus Task 1's tests which run the untouched path too.
 - `to_der()` failure inside the helper: expected — typed `Error` via `signing_err`, never a panic. Owner: Task 2 (error propagates with `?`; no test possible for a parsed cert, code inspection).
 - Test-only builder `build_test_cms` left undeduped while production is fixed: expected — both loops collapse onto the same helper so the convention has exactly one home. Owner: Task 2 diff review.
@@ -32,11 +33,11 @@
 ### Task 1: Red regression tests for duplicate certificates
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (test module; insert after `sign_code_directory_rejects_mismatched_key_and_certificate`, currently ending ~line 1863)
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` (test module; insert after `sign_code_directory_rejects_mismatched_key_and_certificate`, i.e. between its closing brace (~cms_verify.rs:1867) and the `#[test] fn tampered_content_fails_digest` attribute at cms_verify.rs:1869)
 
 **Interfaces:**
 - Consumes: `sign_code_directory(content, &creds, None, &cd_sha256) -> Result<Vec<u8>>`; `wrap(&cms) -> Vec<u8>` (cms_verify.rs:1801); `verify_code_signature_with_anchors(&wrapped, content, None, &cd_sha256, &anchors) -> Result<CmsVerifyReport>` (cms_verify.rs:333); `fresh_rsa_credentials() -> (SigningCredentials, rsa::RsaPrivateKey)` (cms_verify.rs:1756); `build_subca(cn, path_len) -> (Certificate, SigningKey)` (cms_verify.rs:2386); `build_subca_issued_by(cn, issuer_name, issuer_signing) -> (Certificate, SigningKey)` (cms_verify.rs:2415); struct-literal `SigningCredentials` construction (pattern: cms_verify.rs:1840-1845).
-- Produces: two `#[test]` fns that FAIL (red) today with a panic — Task 2 greens them. Tests must use struct literals / unanchored fixtures only, never anchored public constructors, and must pair the signer's own key with its own certificate so the ZSN-98 guard at `cms.rs:296` passes first.
+- Produces: three `#[test]` fns that FAIL (red) today with a panic — Task 2 greens them. Tests must use struct literals / unanchored fixtures only, never anchored public constructors, and must pair the signer's own key with its own certificate so the ZSN-98 guard at `cms.rs:296` passes first.
 
 - [ ] **Step 1: Write regression test A (duplicate = signer cert only)**
 
@@ -82,7 +83,7 @@ fn sign_code_directory_dedupes_repeated_signing_certificate() {
 }
 ```
 
-If imports are missing in the test module, add them to the existing `use` block (lines 1729-1745): `use cms::{ContentInfo, SignedData};` and `der::Decode` is already in scope via `use super::*` (cms_verify.rs:48). Match the file's import style.
+If imports are missing in the test module, add them to the existing `use` block (lines 1729-1745): `use cms::content_info::ContentInfo;` and `use cms::signed_data::SignedData;` (module paths, not crate-root re-exports — cms 0.2.3 exports no root items; precedent: `crates/zsign-core/src/crypto/cms.rs:706-707`). `der::Decode` is already in scope via `use super::*` (cms_verify.rs:48). Match the file's import style.
 
 - [ ] **Step 2: Write regression test B (signer cert repeated mid-chain)**
 
@@ -146,12 +147,72 @@ fn sign_code_directory_dedupes_signer_certificate_repeated_mid_chain() {
 
 Note: `anchors_for(&creds)` anchors on the signer's certificate (self-signed test leaf), so `chain_ok`/`anchored` do not depend on inter/root links — the assertion targets the dedup + signature contract, not chain building. Do not weaken `report.valid`.
 
-- [ ] **Step 3: Run the two tests to verify they fail by panic (red)**
+- [ ] **Step 3: Write regression test C (non-signer chain member duplicated)**
+
+A test where only the *signer's* certificate is duplicated would pass an
+implementation that deduped solely against the signer and let intra-chain
+duplicates through (that shape also panics today: `cert_chain =
+vec![inter.clone(), inter.clone()]` reaches `builder.rs:407`). Pin it:
+
+```rust
+#[test]
+fn sign_code_directory_dedupes_repeated_chain_member() {
+    let (identity, _key) = fresh_rsa_credentials();
+    let (inter, _inter_signing) = build_subca("CN=zsign dup int", None);
+    let (root, _root_signing) = build_subca("CN=zsign dup root", None);
+    let creds = SigningCredentials {
+        certificate: identity.certificate.clone(),
+        signing_key: identity.signing_key.clone(),
+        cert_chain: vec![inter.clone(), inter.clone(), root.clone()],
+        team_id: identity.team_id.clone(),
+    };
+    let content: &[u8] = b"the code directory bytes";
+    let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+    let cms = sign_code_directory(content, &creds, None, &cd_sha256)
+        .expect("a repeated non-signer chain member must not panic or fail");
+    let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
+    let signed_data =
+        SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
+            .expect("emitted CMS parses as SignedData");
+    let certs = signed_data.certificates.expect("certificate set present");
+    let members: Vec<Vec<u8>> = certs
+        .0
+        .iter()
+        .map(|c| c.to_der().expect("member re-encodes"))
+        .collect();
+    let signer_der = identity.certificate.to_der().unwrap();
+    assert_eq!(
+        members.iter().filter(|m| **m == signer_der).count(),
+        1,
+        "signing certificate must appear exactly once in the emitted set"
+    );
+    assert_eq!(
+        members.len(),
+        3,
+        "deduplicated set is signer + inter + root, got {}",
+        members.len()
+    );
+
+    let report = verify_code_signature_with_anchors(
+        &wrap(&cms),
+        content,
+        None,
+        &cd_sha256,
+        &anchors_for(&creds),
+    )
+    .expect("verification of deduplicated CMS");
+    assert!(report.valid, "errors: {:?}", report.errors);
+    assert!(report.signature_ok);
+}
+```
+
+- [ ] **Step 4: Run the three tests to verify they fail by panic (red)**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core sign_code_directory_dedup`
-Expected: both tests FAIL with a panic `Error { kind: SetDuplicate }` (or "SET OF contains duplicate") from `SignedDataBuilder::build`. Paste the failure output.
+Expected: all three tests FAIL with a panic `Error { kind: SetDuplicate, position: None }` from `SignedDataBuilder::build` (the `unwrap` Debug output; the Display string "SET OF contains duplicate" never appears in the panic message). Paste the failure output.
 
-- [ ] **Step 4: Commit the red tests**
+- [ ] **Step 5: Commit the red tests**
 
 Run: `cargo fmt --all && git add crates/zsign-core/src/crypto/cms_verify.rs && git commit -m "test: pin duplicate certificate handling at cms signing (ZSN-99)"`
 Expected: commit created; pre-commit hook passes.
@@ -176,7 +237,7 @@ fn deduped_certificates<'a>(
     signing_cert: &'a Certificate,
     cert_chain: &'a [Certificate],
 ) -> Result<Vec<&'a Certificate>> {
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(1 + cert_chain.len());
     for cert in std::iter::once(signing_cert).chain(cert_chain) {
         let der = cert
@@ -190,7 +251,7 @@ fn deduped_certificates<'a>(
 }
 ```
 
-Add `use std::collections::HashSet;` to the file's import block, matching its std/external grouping style.
+Add no import: `cms.rs:38-50` has no std imports, so use the fully-qualified form `std::collections::HashSet` at both the type and constructor positions — matching the in-repo precedent `crates/zsign-core/src/codesign/verify.rs:131` (`let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();`).
 
 - [ ] **Step 2: Collapse the production loop**
 
@@ -211,7 +272,7 @@ Apply the identical replacement in `build_test_cms` (`cms.rs:223-230`), using it
 - [ ] **Step 4: Green the regression tests**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core sign_code_directory_dedup`
-Expected: both Task 1 tests PASS.
+Expected: all three Task 1 tests PASS.
 
 - [ ] **Step 5: Scoped gate**
 
@@ -232,7 +293,7 @@ Expected: commit created.
 - [ ] **Step 1: Zero-warning gate + full test suite**
 
 Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && TMPDIR=$PWD/target/tmp cargo test --workspace`
-Expected: fmt clean, clippy clean, 779+2 passed / 1+12 ignored (779 baseline + the 2 new tests).
+Expected: fmt clean, clippy clean, 782 passed / 1+12 ignored (779 baseline + the 3 new tests).
 
 - [ ] **Step 2: wasm suite**
 

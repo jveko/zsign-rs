@@ -134,7 +134,11 @@ layer for this fix. Recorded here as the ticket requires.
    repeated mid-chain — after the fix `sign_code_directory` returns `Ok`, the
    emitted set carries exactly the deduplicated certificates, and
    `verify_code_signature_with_anchors` reports `valid` for the result.
-3. Zero-warning gate: `cargo fmt --all -- --check`,
+3. Regression C (red first): a non-signer chain member repeated intra-chain
+   (`[inter, inter, root]`) — the same shape also panics today; after the fix
+   `sign_code_directory` returns `Ok` with a 3-member set. This pins that the
+   dedupe is over the whole set, not just against the signer's certificate.
+4. Zero-warning gate: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
    `TMPDIR=$PWD/target/tmp cargo test --workspace` (baseline 779 passed /
    1+12 ignored),
