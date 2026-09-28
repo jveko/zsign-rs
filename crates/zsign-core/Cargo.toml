@@ -18,7 +18,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 const-oid = { version = "0.9", features = ["db"] }
 
 # RustCrypto x509/CMS — pure Rust, WASM-compatible
-x509-cert = { version = "0.2.5", features = ["pem"] }
+x509-cert = { version = "0.3.0", features = ["pem"] }
 cms = { version = "0.2.3", features = ["builder"] }
 
 # Signing key types
@@ -54,7 +54,7 @@ sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
-x509-cert = { version = "0.2.5", features = ["pem", "builder"] }
+x509-cert = { version = "0.3.0", features = ["pem", "builder"] }
 rand = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 
