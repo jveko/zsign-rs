@@ -140,7 +140,7 @@ Expected: all workspace tests pass (baseline 778 passed / 1+12 ignored, plus the
 Run: `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm`
 Expected: 28 passed.
 
-These two are the ticket's shipping gates: they exercise the P12→sign paths outside `zsign-core` (CLI `IDENTITY_P12` fixture test at `crates/zsign-cli/src/main.rs:1466-1487`, wasm `new_signer`→`sign_macho` round trip at `crates/zsign-wasm/src/lib.rs:919-923`) where the PKCS#12 pairing encoder (`DecodedKey::spki_der`, `cert.rs:165`) and the new sign-time guard encoder must agree byte-for-byte.
+These two are the ticket's shipping gates: they exercise the P12→sign paths outside `zsign-core` (CLI `IDENTITY_P12` fixture test at `crates/zsign-cli/src/main.rs:1466-1486`, wasm `new_signer`→`sign_macho` round trip at `crates/zsign-wasm/src/lib.rs:919-923`) where the PKCS#12 pairing encoder (`DecodedKey::spki_der`, `cert.rs:165`) and the new sign-time guard encoder must agree byte-for-byte.
 
 - [ ] **Step 7: Report**
 
