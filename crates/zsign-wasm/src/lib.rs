@@ -179,25 +179,21 @@ fn core_err(e: zsign_core::Error) -> JsValue {
     js_err(code, e)
 }
 
-/// `from_p12` wraps every PKCS#12 failure as `Error::Certificate`. A MAC
-/// mismatch is a password-layer outcome for the standard unencrypted-authSafe
-/// flow, proven across all nine core fixtures; a decryption failure is the
-/// corresponding password-layer outcome for encrypted-authSafe or no-MAC
-/// files. A wrong password that degenerates into a malformed-ASN.1 parse error
-/// carries no password signal and degrades to the generic certificate code.
+/// Classifies a PKCS#12 credential-load failure. A typed password
+/// failure keeps the password code on every p12 route; malformed or
+/// unsupported containers keep the certificate code, as does a wrong
+/// password that degenerates into an ASN.1 parse failure — that
+/// outcome carries no password signal.
+fn p12_code(e: &zsign_core::Error) -> WasmErrorCode {
+    match e {
+        zsign_core::Error::InvalidPassword => WasmErrorCode::InvalidPassword,
+        other => code_for_core_error(other),
+    }
+}
+
+/// Wraps a credential-load failure raised while reading a PKCS#12 container.
 fn p12_err(e: zsign_core::Error) -> JsValue {
-    let code = if [
-        "invalid PKCS#12 password (MAC mismatch)",
-        "PKCS#12 decryption failed",
-    ]
-    .iter()
-    .any(|marker| e.to_string().contains(marker))
-    {
-        WasmErrorCode::InvalidPassword
-    } else {
-        code_for_core_error(&e)
-    };
-    js_err(code, e)
+    js_err(p12_code(&e), e)
 }
 
 fn ensure_size(len: usize, max: usize, surface: &str, remedy: &str) -> Result<(), JsValue> {
@@ -1199,29 +1195,14 @@ pub mod tests {
         assert!(err_message(err2).contains("sign_macho_fat"));
     }
 
-    #[wasm_bindgen_test]
+    #[wasm_bindgen_test(unsupported = test)]
     fn p12_classifier_maps_password_layer_failures() {
-        let mac = zsign_core::Error::Certificate(
-            "Failed to parse PKCS#12: invalid PKCS#12 password (MAC mismatch)".into(),
-        );
-        assert_eq!(
-            error_code(&p12_err(mac)),
-            Some("ZSIGN_INVALID_PASSWORD".into())
-        );
-        let dec = zsign_core::Error::Certificate(
-            "Failed to parse PKCS#12: PKCS#12 decryption failed: bad padding".into(),
-        );
-        assert_eq!(
-            error_code(&p12_err(dec)),
-            Some("ZSIGN_INVALID_PASSWORD".into())
-        );
+        let pw = zsign_core::Error::InvalidPassword;
+        assert_eq!(p12_code(&pw), WasmErrorCode::InvalidPassword);
         let other = zsign_core::Error::Certificate(
             "Failed to parse PKCS#12: malformed PKCS#12: value length exceeds input".into(),
         );
-        assert_eq!(
-            error_code(&p12_err(other)),
-            Some("ZSIGN_INVALID_CERTIFICATE".into())
-        );
+        assert_eq!(p12_code(&other), WasmErrorCode::InvalidCertificate);
     }
 
     #[wasm_bindgen_test(unsupported = test)]
