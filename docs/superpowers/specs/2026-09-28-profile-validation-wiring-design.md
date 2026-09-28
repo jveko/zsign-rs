@@ -34,7 +34,7 @@ different app, `ExpirationDate` 2001-01-02, `get-task-allow: true`,
   subject OU) — public field, available at every credential-holding site.
 - **wasm clock**: `cms_verify::resolve_now` (crates/zsign-core/src/crypto/cms_verify.rs:1684-1700)
   hard-errors on wasm32 when `now` is `None`, with the message "pass Date.now() / 1000".
-  `js-sys` is a direct dependency of zsign-wasm (Cargo.toml:19); `js_sys::Date` is used nowhere
+  `js-sys` is a direct dependency of zsign-wasm (Cargo.toml:20); `js_sys::Date` is used nowhere
   yet. zsign-core alone resolves `time` without the wasm-bindgen feature — core must not take a
   wasm wall clock (crypto-5's lane; untouched here).
 - **Wasm bundle id**: the `WasmSigner` constructor has credentials + profile bytes but no
@@ -138,7 +138,9 @@ fixtures (D7). Production checks are not weakened anywhere.
 `host_now()` helper in crates/zsign-wasm/src/lib.rs:
 
 - `wasm32`: `js_sys::Date::now()` (ms) → `OffsetDateTime::from_unix_timestamp_nanos(ms·1e6)`;
-  conversion failure yields `None`, which makes validation error (fail-closed).
+  conversion failure yields `None` — at the constructor and static extractor that makes
+  validation error via `resolve_now(None)` (fail-closed), and on the `sign_ipa` forwarding path
+  the facade plan build then validates with `now: None`, which also errors under wasm32.
 - not `wasm32` (native `cargo test -p zsign-wasm`): `None` → `resolve_now` uses the wall clock.
 
 This follows the existing `resolve_now` contract — the caller passes an explicit instant on
