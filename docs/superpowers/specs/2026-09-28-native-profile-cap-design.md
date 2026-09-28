@@ -103,9 +103,11 @@ rejection is a distinct, already-established taxonomy (`ZSIGN_INPUT_TOO_LARGE`,
 facade `InputTooLarge`). Fail-closed: rejected before any byte is scanned or parsed.
 
 **D4 — Facade mapping arm makes `Error::InputTooLarge` live natively.**
-Add `zsign_core::Error::InputTooLarge(m) => Error::InputTooLarge(m)` to
+`zsign_core::Error::InputTooLarge(m) => Error::InputTooLarge(m)` added to
 `crates/zsign/src/error.rs:62-68`. Payload passed through (not the rendered string),
-so Display stays `"Input too large: <detail>"`.
+so Display stays `"Input too large: <detail>"`. Where a facade site appends its
+own context to the payload (D8), that context rides inside `<detail>` — one
+prefix, never doubled.
 
 **D5 — Wasm pre-check behavior byte-identical; constant becomes a re-export.**
 "Byte-identical" scopes to the two surfaces that already reject today (the

@@ -346,7 +346,7 @@ with a match that changes exactly one arm (see design D8):
 ```rust
             .map_err(|e| match e {
                 zsign_core::Error::InputTooLarge(detail) => Error::InputTooLarge(format!(
-                    "provisioning profile for bundle '{id}' at '{}' is invalid: {detail}",
+                    "{detail} (provisioning profile for bundle '{id}' at '{}')",
                     path.display()
                 )),
                 other => Error::Core(zsign_core::Error::Config(format!(
@@ -356,7 +356,10 @@ with a match that changes exactly one arm (see design D8):
             })?;
 ```
 
-The context string is identical in both arms; only the outer variant differs.
+Both arms append the bundle id + path context; only the outer variant differs.
+The size arm appends it AFTER the core detail so the facade's single
+`Input too large: <detail>` Display prefix stays intact (D4) and the message
+still matches a bare `too large` predicate like the wasm `ensure_size` messages.
 Keep the existing explanatory comment above this `map_err` and extend it: the
 wrap exists to name the offending map entry, and it must not reclassify the size
 rejection (which has its own contract row).
