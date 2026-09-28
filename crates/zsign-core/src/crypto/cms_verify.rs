@@ -1882,7 +1882,7 @@ mod tests {
 
         let cms = sign_code_directory(content, &creds, None, &cd_sha256)
             .expect("a duplicated signing certificate must not panic or fail");
-        // Parse idiom mirrors cms.rs:760-761.
+        // Parse idiom mirrors cms.rs:774-775.
         let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
         let signed_data =
             SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
@@ -1923,7 +1923,7 @@ mod tests {
 
         let cms = sign_code_directory(content, &creds, None, &cd_sha256)
             .expect("signer certificate repeated mid-chain must not panic or fail");
-        // Parse idiom mirrors cms.rs:760-761.
+        // Parse idiom mirrors cms.rs:774-775.
         let content_info = ContentInfo::from_der(&cms).expect("emitted CMS parses as ContentInfo");
         let signed_data =
             SignedData::from_der(&content_info.content.to_der().expect("content re-encodes"))
@@ -1938,7 +1938,10 @@ mod tests {
             // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
             .map(|c| c.to_der().expect("member re-encodes"))
             .collect();
-        let signer_der = identity.certificate.to_der().unwrap();
+        let signer_der = identity
+            .certificate
+            .to_der()
+            .expect("signer certificate re-encodes");
         assert_eq!(
             members.iter().filter(|m| **m == signer_der).count(),
             1,
@@ -1947,8 +1950,7 @@ mod tests {
         assert_eq!(
             members.len(),
             3,
-            "deduplicated set is signer + inter + root, got {}",
-            members.len()
+            "deduplicated set is signer + inter + root"
         );
 
         let report = verify_code_signature_with_anchors(
@@ -1994,7 +1996,10 @@ mod tests {
             // equality cms's SetOfVec uses (cms-0.2.3 src/cert.rs:37-43).
             .map(|c| c.to_der().expect("member re-encodes"))
             .collect();
-        let signer_der = identity.certificate.to_der().unwrap();
+        let signer_der = identity
+            .certificate
+            .to_der()
+            .expect("signer certificate re-encodes");
         assert_eq!(
             members.iter().filter(|m| **m == signer_der).count(),
             1,
@@ -2003,8 +2008,7 @@ mod tests {
         assert_eq!(
             members.len(),
             3,
-            "deduplicated set is signer + inter + root, got {}",
-            members.len()
+            "deduplicated set is signer + inter + root"
         );
 
         let report = verify_code_signature_with_anchors(

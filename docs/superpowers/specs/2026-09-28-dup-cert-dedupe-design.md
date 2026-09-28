@@ -87,7 +87,9 @@ fn deduped_certificates<'a>(
 
 - Keys a `std::collections::HashSet<Vec<u8>>` on `cert.to_der()?`, returns the
   signing certificate first followed by chain members in input order,
-  skipping any DER already seen.
+  skipping any DER already seen. The helper emits the signer first; the
+  builder's `SetOfVec` re-sorts canonically on `build()`, so this order is the
+  helper's input order, not the order of the emitted DER.
 - A `to_der()` failure propagates as a typed error via the existing
   `signing_err` helper (fail-closed; cannot happen for a parsed certificate,
   but must not panic either).

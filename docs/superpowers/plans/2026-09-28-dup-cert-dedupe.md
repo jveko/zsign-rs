@@ -4,7 +4,7 @@
 
 **Goal:** Make `sign_code_directory` return a typed result (never panic) when the caller supplies a `cert_chain` containing byte-identical duplicates, by deduplicating the certificate set before it reaches the cms 0.2.3 builder.
 
-**Architecture:** One private helper `deduped_certificates(signing_cert, cert_chain) -> Result<Vec<&Certificate>>` in `crates/zsign-core/src/crypto/cms.rs` performs order-preserving first-wins dedupe keyed on DER bytes; both certificate-adding loops (production `build_cms_signed_data` and test-only `build_test_cms`) collapse into a single loop over its output. The cms crate's internal `.unwrap()` becomes unreachable from our inputs.
+**Architecture:** One private helper `deduped_certificates(signing_cert, cert_chain) -> Result<Vec<&Certificate>>` in `crates/zsign-core/src/crypto/cms.rs` performs order-preserving first-wins dedupe keyed on DER bytes; both certificate-adding loops (production `build_cms_signed_data` and test-only `build_test_cms`) collapse into a single loop over its output. The helper emits the signer first; `SetOfVec` re-sorts canonically on `build()`, so the emitted DER order is the cms crate's canonical order, not the helper's input order. The cms crate's internal `.unwrap()` becomes unreachable from our inputs.
 
 **Tech Stack:** Rust, edition 2021, MSRV 1.88; `cms` 0.2.3 / `der` 0.7.10; `x509-cert` certificate builder for fixtures.
 
@@ -22,7 +22,7 @@
 ## Review Focus
 
 - Duplicate of the signer's certificate *only* (`cert_chain = vec![certificate.clone()]`): expected — sign succeeds, emitted `SignedData` holds exactly one certificate, sid still resolves. Owner: Task 1 regression A.
-- Signer's certificate repeated *mid-chain* in a 3-element chain: expected — sign succeeds, emitted set equals the deduplicated set (signer first), full verify reports `valid`. Owner: Task 1 regression B.
+- Signer's certificate repeated *mid-chain* in a 3-element chain: expected — sign succeeds, emitted set holds the three deduplicated certificates (the helper emits the signer first; the builder re-sorts canonically on `build()`), full verify reports `valid`. Owner: Task 1 regression B.
 - A *non-signer* chain member repeated intra-chain (`[inter, inter, root]`): expected — sign succeeds with a 3-member set; an implementation that only dedupes against the signer must fail this. Owner: Task 1 regression C.
 - Chain with no duplicates (the common path): expected — byte-for-byte behavior unchanged; existing round-trip and chain tests keep passing. Owner: Task 2 gate (existing suite) plus Task 1's tests which run the untouched path too.
 - `to_der()` failure inside the helper: expected — typed `Error` via `signing_err`, never a panic. Owner: Task 2 (error propagates with `?`; no test possible for a parsed cert, code inspection).

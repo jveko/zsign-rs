@@ -364,8 +364,9 @@ struct CmsBuildContext<'a> {
 
 /// Returns the signing certificate followed by the chain certificates, with
 /// repeated certificates removed while keeping the first occurrence of each.
-/// The `cms` builder panics with `SetDuplicate` when the same certificate is
-/// added twice, so the set must be deduplicated before it is handed over.
+/// `SignedDataBuilder::build` panics with `SetDuplicate` when the same
+/// certificate is added twice, so the set must be deduplicated before it is
+/// handed over.
 fn deduped_certificates<'a>(
     signing_cert: &'a Certificate,
     cert_chain: &'a [Certificate],
