@@ -220,13 +220,10 @@ where
     builder
         .add_digest_algorithm(digest_algorithm)
         .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
-    builder
-        .add_certificate(CertificateChoices::Certificate(signing_cert.clone()))
-        .map_err(|e| signing_err("Failed to add signing certificate", e))?;
-    for cert in cert_chain {
+    for cert in deduped_certificates(signing_cert, cert_chain)? {
         builder
             .add_certificate(CertificateChoices::Certificate(cert.clone()))
-            .map_err(|e| signing_err("Failed to add chain certificate", e))?;
+            .map_err(|e| signing_err("Failed to add certificate", e))?;
     }
     builder
         .add_signer_info::<S, Sig>(sib)
@@ -365,6 +362,27 @@ struct CmsBuildContext<'a> {
     cert_chain: &'a [Certificate],
 }
 
+/// Returns the signing certificate followed by the chain certificates, with
+/// repeated certificates removed while keeping the first occurrence of each.
+/// The `cms` builder panics with `SetDuplicate` when the same certificate is
+/// added twice, so the set must be deduplicated before it is handed over.
+fn deduped_certificates<'a>(
+    signing_cert: &'a Certificate,
+    cert_chain: &'a [Certificate],
+) -> Result<Vec<&'a Certificate>> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(1 + cert_chain.len());
+    for cert in std::iter::once(signing_cert).chain(cert_chain) {
+        let der = cert
+            .to_der()
+            .map_err(|e| signing_err("Failed to encode certificate", e))?;
+        if seen.insert(der) {
+            out.push(cert);
+        }
+    }
+    Ok(out)
+}
+
 fn build_cms_signed_data<S, Sig>(signer: &S, ctx: CmsBuildContext<'_>) -> Result<Vec<u8>>
 where
     S: signature::Keypair + spki::DynSignatureAlgorithmIdentifier + signature::Signer<Sig>,
@@ -390,14 +408,10 @@ where
         .add_digest_algorithm(ctx.digest_algorithm)
         .map_err(|e| signing_err("Failed to add digest algorithm", e))?;
 
-    builder
-        .add_certificate(CertificateChoices::Certificate(ctx.signing_cert.clone()))
-        .map_err(|e| signing_err("Failed to add signing certificate", e))?;
-
-    for cert in ctx.cert_chain {
+    for cert in deduped_certificates(ctx.signing_cert, ctx.cert_chain)? {
         builder
             .add_certificate(CertificateChoices::Certificate(cert.clone()))
-            .map_err(|e| signing_err("Failed to add chain certificate", e))?;
+            .map_err(|e| signing_err("Failed to add certificate", e))?;
     }
 
     builder
