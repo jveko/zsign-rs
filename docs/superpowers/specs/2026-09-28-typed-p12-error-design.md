@@ -74,8 +74,10 @@ Fail-closed posture: wrong password still fails on every route; only the
   behavior rather than changing it.
 - `P12Error::Decrypt(_)` has five construction sites (`pkcs12.rs:430, 440,
   450, 460, 632-633`); non-block-aligned ciphertext, short IV and bad
-  PKCS#7 padding all surface as `Decrypt` (`cbc_decrypt` `:642, :645-647,
-  :669-671` → `:488`/`:633`) — crypto-11's claim confirmed against source.
+  PKCS#7 padding all surface as `Decrypt` (`cbc_decrypt` `:642-644,
+  :645-647, :663-665`, the padding check delegating to `unpad_pkcs7`
+  whose invalid-padding returns are `:671-679` → `:488`/`:633`) —
+  crypto-11's claim confirmed against source.
   These were also sniffer-matched before; parity holds.
 - A wrong password can degenerate into `Der` only on no-MAC files with a
   lucky padding byte (~1/256); that case carried no password signal under
@@ -134,31 +136,45 @@ Resulting messages:
    (`crypto/keychain.rs:228-234`, which erases any class into
    `KeychainError::Credential` — no pin depends on the inner class there,
    recorded not changed).
-3. **`crates/zsign-wasm/src/lib.rs:188-199` `p12_err`** — delete the
+3. **`crates/zsign-wasm/src/lib.rs:182-199` `p12_err`** — delete the
    substring sniffer. `code_for_core_error` already maps
    `Error::InvalidPassword → WasmErrorCode::InvalidPassword` (`:141`), so
    after (1)-(2) the typed signal reaches the mapper directly, and
    `p12_err`'s doc comment (claiming `from_p12` flattens everything to
-   `Certificate`) is stale. New body is a typed branch for clarity at the
-   call site, then delegate:
+   `Certificate`) is stale. The classification is extracted into a pure
+   helper so the mapping is natively unit-testable (cold-review FIX:
+   `cargo test -p zsign-wasm` cannot observe a `js_err`-touching test —
+   the crate's own convention is `unsupported = test` for pure tests,
+   plain `#[wasm_bindgen_test]` for js-touching ones, `lib.rs:1483-1488`):
 
    ```rust
-   /// Wraps a credential-load failure raised while reading a PKCS#12
-   /// container. Password-layer failures are typed (`InvalidPassword`);
-   /// malformed or unsupported containers keep the certificate code, as
-   /// does a wrong password that degenerates into an ASN.1 parse failure —
-   /// that outcome carries no password signal.
-   fn p12_err(e: zsign_core::Error) -> JsValue {
-       let code = match e {
+   /// Classifies a PKCS#12 credential-load failure. A typed password
+   /// failure keeps the password code on every p12 route; malformed or
+   /// unsupported containers keep the certificate code, as does a wrong
+   /// password that degenerates into an ASN.1 parse failure — that
+   /// outcome carries no password signal.
+   fn p12_code(e: &zsign_core::Error) -> WasmErrorCode {
+       match e {
            zsign_core::Error::InvalidPassword => WasmErrorCode::InvalidPassword,
-           other => code_for_core_error(&other),
-       };
-       js_err(code, e)
+           other => code_for_core_error(other),
+       }
+   }
+
+   /// Wraps a credential-load failure raised while reading a PKCS#12 container.
+   fn p12_err(e: zsign_core::Error) -> JsValue {
+       js_err(p12_code(&e), e)
    }
    ```
 
-   Both substring literals (`:190-191`) are **deleted**; a grep of
-   `crates/zsign-wasm/src` for them must return nothing.
+   Notes: (i) the explicit `InvalidPassword` arm is the brief's mandated
+   typed branch at the p12 boundary — it mirrors `code_for_core_error:141`
+   by design (contract locality, not accidental duplication); (ii) matching
+   on `&e`/`p12_code(&e)` is required — matching `e` by value and then
+   reusing `e` in `js_err` is a compile error (E0382, cold-review
+   BLOCKER); (iii) signature and the sole caller (`:286
+   .map_err(p12_err)`) are unchanged.
+   Both substring literals (`:190-191`) are **deleted** with the old body;
+   a grep of `crates/zsign-wasm/src` for them must return nothing.
 4. **`crates/zsign-cli/src/main.rs:958-985` `resolve_p12_password`**
    (scope override — see §6) — stop stringifying before classifying; keep
    the trial error, branch on the typed variant:
@@ -183,7 +199,7 @@ Resulting messages:
    and JSON envelope are untouched.
 5. **No changes**: `crates/zsign/src/error.rs` (facade forwards
    `InvalidPassword` transparently as `Error::Core` already),
-   `code_for_core_error` (`lib.rs:135-154`, arm already present),
+   `code_for_core_error` (`lib.rs:135-150`, arm already present),
    the wasm doc table (`lib.rs:26` already documents
    `ZSIGN_INVALID_PASSWORD`), CLI exit codes / `--json` schema,
    `P12Error`'s `Display` (`pkcs12.rs:84-92` — its text is now consumed by
@@ -220,7 +236,9 @@ chose: minimal typed fix in CLI now** (candidate 1 of 3). Recorded effects:
 
 - ZSN-138 (facade-10) inherits **only**: docs (README `:286-290` password
   flow prose, Wave 8) and residual p12 surface — *not* the CLI sniffer,
-  which this ticket retires.
+  which this ticket retires. Recorded effect of this override:
+  `crates/zsign-cli/Cargo.toml` gains `zsign-core` as a direct
+  `[dependencies]` entry (mirroring zsign-wasm's arrangement).
 - Two CLI test assertions adapt, meaning preserved (each still asserts
   "the real cause surfaced / env password was read", with the new message
   text):
@@ -272,10 +290,10 @@ wasm:
 
 | # | Entry | Assert |
 |---|---|---|
-| W1 | `WasmSigner::new(LEAF_P12_B64, "wrong-password", …)` | `ZSIGN_INVALID_PASSWORD` (existing `errors_carry_stable_zsign_codes…` `:1703` keeps passing — it now proves the typed path) |
-| W2 | `p12_err(Error::InvalidPassword)` | `ZSIGN_INVALID_PASSWORD` (rewritten `p12_classifier_maps_password_layer_failures`, typed input) |
-| W3 | `p12_err(Error::Certificate("Failed to parse PKCS#12: malformed…"))` | `ZSIGN_INVALID_CERTIFICATE` (same rewritten test — corrupt stays distinguishable) |
-| W4 | source grep | neither sniffer literal exists anywhere under `crates/zsign-wasm/src` |
+| W1 | `WasmSigner::new(LEAF_P12_B64, "wrong-password", …)` | `ZSIGN_INVALID_PASSWORD` (existing `errors_carry_stable_zsign_codes…` `:1703` keeps passing — it now proves the typed path through `p12_err` end-to-end, under `wasm-pack test`) |
+| W2 | `p12_code(&Error::InvalidPassword)` (rewritten `p12_classifier_maps_password_layer_failures`, typed input, `unsupported = test`) | `ZSIGN_INVALID_PASSWORD` — natively runnable via `cargo test -p zsign-wasm` |
+| W3 | `p12_code(&Error::Certificate("Failed to parse PKCS#12: malformed…"))` | `ZSIGN_INVALID_CERTIFICATE` (same rewritten test — corrupt stays distinguishable) |
+| W4 | source grep | neither sniffer literal exists anywhere under `crates/zsign-wasm/src` — records that the textual basis of the coupling is gone; the behavioral pin is W1/W2, W4 alone proves only absence |
 
 CLI (subprocess, existing suites):
 

@@ -4,7 +4,7 @@
 
 **Goal:** Replace cross-crate substring-sniffing of PKCS#12 failure messages with a typed `Error::InvalidPassword` signal from core through wasm and the CLI, deleting every sniffer literal.
 
-**Architecture:** Two core flatten sites route `P12Error` through a new `p12_load_error` (mirror of the existing `pem_load_error`) so `Mac|Decrypt → Error::InvalidPassword`; wasm's `p12_err` and the CLI's `resolve_p12_password` branch on the typed variant instead of Display text; both substring sniffers are deleted. Classification parity with the old sniffer is the contract — see the spec's §2 table.
+**Architecture:** Two core flatten sites route `P12Error` through a new `p12_load_error` (mirror of the existing `pem_load_error`) so `Mac|Decrypt → Error::InvalidPassword`; wasm's `p12_err` delegates to a new pure `p12_code` classifier and the CLI's `resolve_p12_password` branches on the typed variant instead of Display text; both substring sniffers are deleted. Classification parity with the old sniffer is the contract — see the spec's §2 table.
 
 **Tech Stack:** Rust 2021 / MSRV 1.88, thiserror, wasm-bindgen + wasm-pack, clap.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Zero-warning gate: `cargo fmt --all -- --check` AND `cargo clippy --workspace --all-targets -- -D warnings` — both clean.
-- Tests: `TMPDIR=$PWD/target/tmp cargo test --workspace` must end **785 passed / 1+12 ignored** baseline (new tests add to 785); wasm: `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm` baseline **29 passed** (counts may only grow).
+- Tests: `TMPDIR=$PWD/target/tmp cargo test --workspace` baseline **785 passed / 1+12 ignored**; this plan adds 3 native tests (2 core in Task 1 + 1 wasm in Task 2) → **788 expected**; counts may only grow. wasm: `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm` baseline **29 passed** (unchanged — no wasm-only tests added or removed).
 - Fail-closed: wrong password still fails everywhere; only classification changes.
 - Anchor/ordering (ZSN-96), key↔cert guard (ZSN-98), profile-error unification (ZSN-143): untouched — their pinned texts byte-identical.
 - No ticket IDs in code comments (ZSN-230 in commit subjects only); no `println!`/`eprintln!` in `src/`; no placeholders/TODOs.
@@ -85,7 +85,7 @@ assert!(
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core wrong_password_is_invalid_password test_from_p12_invalid_data`
-Expected: the two new tests FAIL (`InvalidPassword` vs `Certificate` mismatch) and `test_from_p12_invalid_data` FAILS (bare `is_err()` upgrade passes only if the class is right — it is `Certificate` today so this specific one may PASS at this step; the two new tests are the red set). Record actual output.
+Expected: exactly the two new `*_is_invalid_password` tests FAIL (red set — wrong password is `Certificate` today). `test_from_p12_invalid_data`'s upgraded assertion PASSES already (a corrupt container is `Certificate` today; it is an invariant pin that must not regress, not red). Record actual output.
 
 - [ ] **Step 3: Implement `p12_load_error` in `pkcs12.rs`**
 
@@ -120,60 +120,75 @@ Run: `git add crates/zsign-core/src/crypto/pkcs12.rs crates/zsign-core/src/crypt
 
 ---
 
-### Task 2: Wasm — typed `p12_err`, delete the substring sniffer
+### Task 2: Wasm — typed `p12_code` classifier, delete the substring sniffer
 
 **Files:**
-- Modify: `crates/zsign-wasm/src/lib.rs:182-199` (`p12_err` doc comment + body)
+- Modify: `crates/zsign-wasm/src/lib.rs:182-199` (`p12_err` doc comment + body; new pure `p12_code` above it)
 - Test: `crates/zsign-wasm/src/lib.rs:1202-1225` (`p12_classifier_maps_password_layer_failures`, rewritten)
 
 **Interfaces:**
-- Consumes: Task 1's behavior (wrong p12 password → `zsign_core::Error::InvalidPassword`); `code_for_core_error` `lib.rs:135-154` (arm at `:141` already exists — do not touch).
-- Produces: `fn p12_err(e: zsign_core::Error) -> JsValue` with unchanged signature (caller at `:286` untouched).
+- Consumes: Task 1's behavior (wrong p12 password → `zsign_core::Error::InvalidPassword`); `code_for_core_error` `lib.rs:135-150` (arm at `:141` already exists — do not touch).
+- Produces: `fn p12_err(e: zsign_core::Error) -> JsValue` with unchanged signature (caller at `:286` untouched); new `fn p12_code(e: &zsign_core::Error) -> WasmErrorCode` (private, used by `p12_err` and the rewritten test).
 
-- [ ] **Step 1: Rewrite the classifier test with typed inputs**
+**Honest red note:** no *behavioral* red is possible in this task — after Task 1 the old sniffer body already falls through to `code_for_core_error:141` for typed input, so classification parity held even before the rewrite (the cold review established this). The red for this task is API-level: Step 1's test references `p12_code` before Step 2 defines it. Task 1's N1/N2 carry the behavioral red for the ticket.
 
-Replace the three hand-built `Error::Certificate` cases in
-`p12_classifier_maps_password_layer_failures` (`lib.rs:1202-1225`):
+- [ ] **Step 1: Rewrite the classifier test (red: `p12_code` undefined)**
+
+Replace the whole body of `p12_classifier_maps_password_layer_failures` (`lib.rs:1202-1225`) — the three hand-built `Error::Certificate` cases go away with it — and change its attribute from plain `#[wasm_bindgen_test]` to `#[wasm_bindgen_test(unsupported = test)]` (the crate's convention for tests that do not touch js_sys at runtime, e.g. `:962`, `:1483-1488`):
 
 ```rust
-#[wasm_bindgen_test]
+#[wasm_bindgen_test(unsupported = test)]
 fn p12_classifier_maps_password_layer_failures() {
     let pw = zsign_core::Error::InvalidPassword;
-    assert_eq!(
-        error_code(&p12_err(pw)),
-        Some("ZSIGN_INVALID_PASSWORD".into())
-    );
+    assert_eq!(p12_code(&pw), WasmErrorCode::InvalidPassword);
     let other = zsign_core::Error::Certificate(
         "Failed to parse PKCS#12: malformed PKCS#12: value length exceeds input".into(),
     );
-    assert_eq!(
-        error_code(&p12_err(other)),
-        Some("ZSIGN_INVALID_CERTIFICATE".into())
-    );
+    assert_eq!(p12_code(&other), WasmErrorCode::InvalidCertificate);
 }
 ```
 
-- [ ] **Step 2: Run wasm native tests to verify red**
+(`WasmErrorCode` derives `PartialEq, Eq, Debug` — `lib.rs:85` — so `assert_eq!` works directly.)
+
+- [ ] **Step 2: Run native wasm tests to verify red**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-wasm`
-Expected: FAIL — `p12_err(Error::InvalidPassword)` currently falls through to `code_for_core_error`… note for the implementer: if this PASSES already (the `:141` arm means the typed input may map correctly even before the rewrite), the red evidence for this task is instead **the deleted literals**: the old test body still *constructs* the marker strings, which the design forbids. Record which of the two you observed.
+Expected: FAIL to compile — `cannot find function p12_code` (the test is red by missing API). Record actual output.
 
-- [ ] **Step 3: Replace `p12_err` doc comment and body**
+- [ ] **Step 3: Implement `p12_code` + rewrite `p12_err`**
 
-New comment + body exactly as in spec §4.3: typed match on
-`zsign_core::Error::InvalidPassword` → `WasmErrorCode::InvalidPassword`,
-`other => code_for_core_error(&other)`, then `js_err(code, e)`. The two
-substring literals at `:190-191` disappear with the old body.
+In `crates/zsign-wasm/src/lib.rs`, directly above `p12_err` (replacing its current doc comment at `:182-187`), add exactly (spec §4.3):
 
-- [ ] **Step 4: Run wasm native tests to verify green**
+```rust
+/// Classifies a PKCS#12 credential-load failure. A typed password
+/// failure keeps the password code on every p12 route; malformed or
+/// unsupported containers keep the certificate code, as does a wrong
+/// password that degenerates into an ASN.1 parse failure — that
+/// outcome carries no password signal.
+fn p12_code(e: &zsign_core::Error) -> WasmErrorCode {
+    match e {
+        zsign_core::Error::InvalidPassword => WasmErrorCode::InvalidPassword,
+        other => code_for_core_error(other),
+    }
+}
+
+/// Wraps a credential-load failure raised while reading a PKCS#12 container.
+fn p12_err(e: zsign_core::Error) -> JsValue {
+    js_err(p12_code(&e), e)
+}
+```
+
+Matching on `&e`/`p12_code(&e)` is mandatory: matching `e` by value and reusing `e` in `js_err` is E0382 (`zsign_core::Error` carries `String` payloads, not `Copy`). The two substring literals (`:190-191`) die with the old body. Signature of `p12_err` and its sole caller (`:286`) stay unchanged.
+
+- [ ] **Step 4: Run native wasm tests to verify green**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-wasm`
-Expected: PASS.
+Expected: PASS — the classifier test now runs natively (this is why Step 1 added `unsupported = test`; a plain `#[wasm_bindgen_test]` would be invisible to this command).
 
 - [ ] **Step 5: Run wasm-pack suite**
 
 Run: `TMPDIR=$PWD/target/tmp wasm-pack test --node crates/zsign-wasm`
-Expected: 29 passed (count unchanged — this task adds no tests).
+Expected: 29 passed (the classifier test still runs on wasm; count unchanged).
 
 - [ ] **Step 6: Verify sniffer literals are gone**
 
@@ -273,7 +288,7 @@ Expected: both clean (zero-warning gate).
 - [ ] **Step 2: Workspace suite**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test --workspace`
-Expected: all pass; baseline 785 + 2 new core tests = **787 passed / 1+12 ignored** (adjust to actual if the baseline drifted; report the number, never drop tests).
+Expected: all pass; baseline 785 + 2 core tests (Task 1) + 1 wasm native test (Task 2) = **788 passed / 1+12 ignored** (report the number actually observed; never drop tests).
 
 - [ ] **Step 3: wasm-pack suite**
 
