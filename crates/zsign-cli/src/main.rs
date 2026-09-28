@@ -2313,53 +2313,56 @@ mod tests {
 
     #[test]
     fn forged_profile_fails_closed() {
+        // In-process per design §5.3: the subprocess child is Apple-root
+        // anchored and this identity is self-issued, so success-path runs go
+        // through `run(cli)` (cfg(test) unanchored loader) while the shipped
+        // loader's rejection stays pinned by the subprocess anchoring tests.
+        // `main` maps a returned Err to exit 1, so an Err here is the same
+        // contract as the old child exit code.
         let dir = TempDir::new().unwrap();
         let (key, profile, input, out) = forged_profile_cli_paths(dir.path());
-        let r = run_cli(
-            &[
-                OsStr::new("-k"),
-                key.as_os_str(),
-                OsStr::new("-p"),
-                OsStr::new("testpassword"),
-                OsStr::new("-m"),
-                profile.as_os_str(),
-                OsStr::new("-o"),
-                out.as_os_str(),
-                input.as_os_str(),
-            ],
-            &[],
-        );
-        // Control: the same identity and input sign to exit 0 without `-m`, so a
-        // non-zero code above can only come from the profile, not a broken key or
+        // Control: the same identity and input sign without `-m`, so the
+        // rejection below can only come from the profile, not a broken key or
         // an unsignable fixture.
         let ctrl_out = dir.path().join("ctrl.bin");
-        let control = run_cli(
-            &[
-                OsStr::new("-k"),
-                key.as_os_str(),
-                OsStr::new("-p"),
-                OsStr::new("testpassword"),
-                OsStr::new("-o"),
-                ctrl_out.as_os_str(),
-                input.as_os_str(),
-            ],
-            &[],
-        );
-        assert_eq!(
-            control.code, 0,
-            "control sign must succeed, stderr: {}",
-            control.stderr
-        );
+        let ctrl_cli = Cli::try_parse_from([
+            "zsign",
+            "-k",
+            key.to_str().unwrap(),
+            "-p",
+            "testpassword",
+            "-o",
+            ctrl_out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .expect("control args parse");
+        let code = run(ctrl_cli).expect("control sign must succeed");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(ctrl_out.exists(), "control output must be written");
 
-        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "-k",
+            key.to_str().unwrap(),
+            "-p",
+            "testpassword",
+            "-m",
+            profile.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .expect("args parse");
+        let err = run(cli).expect_err("a forged profile must be rejected");
+        let msg = err.to_string();
         assert!(
-            !r.stderr.trim().is_empty(),
+            !msg.trim().is_empty(),
             "a rejected profile must explain itself"
         );
         assert!(
-            r.stderr.contains("Verification failed"),
-            "stderr must name the rejection class, not just fail: {}",
-            r.stderr
+            msg.contains("Verification failed"),
+            "error must name the rejection class, not just fail: {}",
+            msg
         );
         assert!(
             !out.exists(),
@@ -2369,24 +2372,26 @@ mod tests {
 
     #[test]
     fn allow_unsafe_profile_flag_accepts_forged_profile() {
+        // In-process per design §5.3 (self-issued identity; the subprocess
+        // child stays anchored in every build).
         let dir = TempDir::new().unwrap();
         let (key, profile, input, out) = forged_profile_cli_paths(dir.path());
-        let r = run_cli(
-            &[
-                OsStr::new("--allow-unsafe-profile"),
-                OsStr::new("-k"),
-                key.as_os_str(),
-                OsStr::new("-p"),
-                OsStr::new("testpassword"),
-                OsStr::new("-m"),
-                profile.as_os_str(),
-                OsStr::new("-o"),
-                out.as_os_str(),
-                input.as_os_str(),
-            ],
-            &[],
-        );
-        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-        assert!(out.exists(), "the explicit bypass must sign: {}", r.stderr);
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "--allow-unsafe-profile",
+            "-k",
+            key.to_str().unwrap(),
+            "-p",
+            "testpassword",
+            "-m",
+            profile.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .expect("args parse");
+        let code = run(cli).expect("the explicit bypass must sign");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.exists(), "the explicit bypass must sign output");
     }
 }

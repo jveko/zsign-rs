@@ -760,7 +760,8 @@ impl WasmSigner {
                     target_bundle_id: None,
                     target_device_udid: None,
                 };
-                extract_entitlements_checked(data, &request, allow_unsafe_profile).map_err(core_err)?
+                extract_entitlements_checked(data, &request, allow_unsafe_profile)
+                    .map_err(core_err)?
             }
             None => None,
         };
