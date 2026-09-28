@@ -432,6 +432,12 @@ so they keep compiling. `fuzz/fuzz_targets/pkcs12.rs:14` ignores the `Result`.
    Precedent for recording this class of consequence: the credential-hardening
    design did the same for this script
    (`docs/superpowers/specs/2026-09-25-credential-hardening-design.md:584-587`).
+7. **Anchoring is a loader invariant, not a type invariant (pre-existing).**
+   `SigningCredentials` fields are all `pub` and the struct is publicly
+   constructible, so a caller can assemble a credentials value with an arbitrary
+   `cert_chain` that reaches CMS embedding without ever passing the policy.
+   Public loaders are the enforced boundary by design; tightening the type is
+   deferred (relevant to the later key↔cert correspondence ticket).
 
 ## 7. Out of scope
 

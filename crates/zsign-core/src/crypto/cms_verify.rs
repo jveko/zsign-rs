@@ -1295,22 +1295,22 @@ fn verify_signer_signature(
 }
 
 /// The result of walking a certificate chain toward a trust anchor.
-struct ChainOutcome {
+pub(crate) struct ChainOutcome {
     /// Structural + cryptographic checks passed (every link verified).
-    ok: bool,
+    pub(crate) ok: bool,
     /// The terminus was matched against the trust anchors.
-    anchored: bool,
+    pub(crate) anchored: bool,
     /// Certificate subjects, leaf first.
     subjects: Vec<String>,
     /// Why `ok` is false, when it is.
-    reason: Option<String>,
+    pub(crate) reason: Option<String>,
     /// Non-fatal observations (SHA-1 signatures — added by queue item 5).
     warnings: Vec<String>,
 }
 
 /// Which end-entity policy applies to the signer certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignerPurpose {
+pub(crate) enum SignerPurpose {
     /// Mach-O code signatures: the leaf must assert the codeSigning EKU.
     CodeSigning,
     /// Provisioning-profile CMS: Apple's profile-signing leaves carry no EKU
@@ -1333,7 +1333,9 @@ fn sha1_warning(child: &x509_cert::Certificate) -> Option<String> {
 /// Walks the embedded certificate set from `leaf` toward a trust anchor,
 /// enforcing leaf and issuer purpose constraints, then verifying each
 /// certificate's signature with its issuer's public key and validity window.
-fn verify_chain(
+/// The credential load path also uses this walk to require an Apple-root
+/// anchored chain.
+pub(crate) fn verify_chain(
     certs: &[x509_cert::Certificate],
     leaf: &x509_cert::Certificate,
     anchors: &TrustAnchors,

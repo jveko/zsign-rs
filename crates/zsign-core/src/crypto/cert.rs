@@ -4,6 +4,9 @@
 //! containers. It supports RSA and ECDSA (P-256) private keys commonly used in
 //! Apple code signing certificates.
 //!
+//! Credentials loaded through the public constructors are anchored to the
+//! Apple Root CA: the chain is walked and every link verified at load time.
+//!
 //! # Supported Formats
 //!
 //! - **PEM**: Separate certificate and private key files. The key may be an unencrypted
@@ -28,6 +31,7 @@
 //! # Ok::<(), zsign_core::Error>(())
 //! ```
 
+use super::cms_verify::TrustAnchors;
 use crate::{Error, Result};
 use const_oid::ObjectIdentifier;
 use der::{Decode, DecodePem};
@@ -111,6 +115,9 @@ pub struct SigningCredentials {
     /// Intermediate CA certificates for building the certificate chain.
     ///
     /// These certificates connect the signing certificate to the Apple Root CA.
+    ///
+    /// Chains assembled by the public constructors are verified at load time
+    /// to terminate at the Apple Root CA, so this list is chain-complete.
     pub cert_chain: Vec<Certificate>,
 
     /// Apple Team ID extracted from the certificate's Organizational Unit (OU) field.
@@ -342,8 +349,9 @@ fn select_identity(
 ///
 /// Unrelated certificates fall out of the walk. The embedded WWDR intermediate
 /// is injected only when no provided certificate links to the leaf's issuer and
-/// the issuer is an Apple WWDR CA; the Apple Root CA is appended only when a
-/// WWDR intermediate is in the chain and the root is not already present.
+/// the issuer is an Apple WWDR CA; the Apple Root CA is then appended whenever
+/// the walk dangles at an issuer naming it, whether that last link came from
+/// the container or from the WWDR injection.
 fn build_chain_from_leaf(leaf: &Certificate, mut rest: Vec<Certificate>) -> Vec<Certificate> {
     let mut chain: Vec<Certificate> = Vec::new();
     let mut current = leaf.clone();
@@ -370,15 +378,52 @@ fn build_chain_from_leaf(leaf: &Certificate, mut rest: Vec<Certificate>) -> Vec<
         }
     }
 
-    let has_wwdr = chain.iter().any(|c| {
-        extract_subject_cn(c).is_some_and(|cn| cn.contains("Apple Worldwide Developer Relations"))
-    });
-    if has_wwdr && !chain.iter().any(is_apple_root) {
-        if let Ok(root) = Certificate::from_pem(super::assets::APPLE_ROOT_CA_CERT.as_bytes()) {
+    // Complete the chain at the embedded Apple Root CA whenever the walk dangles
+    // at an issuer that names it, whether the last link came from the container
+    // or from the WWDR injection above. A name match alone proves nothing — the
+    // policy step verifies the final link against this certificate's key.
+    let root = Certificate::from_pem(super::assets::APPLE_ROOT_CA_CERT.as_bytes()).ok();
+    let complete = match (&root, chain.last().unwrap_or(leaf)) {
+        (Some(root), terminal) => {
+            terminal.tbs_certificate.subject != terminal.tbs_certificate.issuer
+                && terminal.tbs_certificate.issuer == root.tbs_certificate.subject
+        }
+        _ => false,
+    };
+    if complete && !chain.iter().any(is_apple_root) {
+        if let Some(root) = root {
             chain.push(root);
         }
     }
     chain
+}
+
+/// Requires `chain` to pass the verify-side walk and terminate at one of
+/// `anchors`: every link signed by its parent, intermediates valid CAs, and
+/// the terminus self-signed with a pinned anchor key. Fail-closed — any
+/// structural or trust failure names the unanchored leaf.
+fn require_anchored_chain(
+    leaf: &Certificate,
+    chain: &[Certificate],
+    anchors: &TrustAnchors,
+) -> Result<()> {
+    let outcome = super::cms_verify::verify_chain(
+        chain,
+        leaf,
+        anchors,
+        time_now(),
+        super::cms_verify::SignerPurpose::CodeSigning,
+    );
+    if outcome.ok && outcome.anchored {
+        return Ok(());
+    }
+    let detail = outcome
+        .reason
+        .unwrap_or_else(|| "certificate chain is not anchored to a trusted root".to_string());
+    Err(Error::Certificate(format!(
+        "signing certificate \"{}\": {}",
+        leaf.tbs_certificate.subject, detail
+    )))
 }
 
 /// The embedded Apple WWDR intermediate matching `leaf`'s issuer, if the
@@ -392,6 +437,10 @@ fn embedded_wwdr_for_leaf(leaf: &Certificate) -> Option<Certificate> {
     let pem = if extract_issuer_ou(leaf).unwrap_or_default() == "G3" {
         APPLE_WWDR_CA_G3_CERT
     } else {
+        // Legacy generation — this certificate expired 2023-02-07. Load-time
+        // chain validation checks issuer validity, so a chain built on it is
+        // rejected either way; injecting it only makes the failure name the
+        // expired issuer instead of a missing one.
         APPLE_WWDR_CA_CERT
     };
     Certificate::from_pem(pem.as_bytes()).ok()
@@ -532,6 +581,8 @@ impl SigningCredentials {
     /// - The certificate is missing the codeSigning extended key usage
     /// - The certificate's keyUsage lacks digitalSignature when present
     /// - The certificate asserts CA=true
+    /// - The certificate chain does not reach the Apple Root CA (each link must
+    ///   be signed by its parent and the terminus must match the embedded Apple root)
     ///
     /// # Examples
     ///
@@ -544,6 +595,34 @@ impl SigningCredentials {
     /// # Ok::<(), zsign_core::Error>(())
     /// ```
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8], password: Option<&str>) -> Result<Self> {
+        Self::load_pem(
+            cert_pem,
+            key_pem,
+            password,
+            Some(&TrustAnchors::apple_root()?),
+        )
+    }
+
+    /// Loads PEM credentials without requiring the certificate chain to reach
+    /// the Apple Root CA. Test fixtures only — see
+    /// [`SigningCredentials::from_p12_unanchored`].
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn from_pem_unanchored(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        password: Option<&str>,
+    ) -> Result<Self> {
+        Self::load_pem(cert_pem, key_pem, password, None)
+    }
+
+    /// Loads PEM credentials, requiring an Apple-root-anchored chain when
+    /// `anchors` is `Some`.
+    fn load_pem(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        password: Option<&str>,
+        anchors: Option<&TrustAnchors>,
+    ) -> Result<Self> {
         let certificate = Certificate::from_pem(cert_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse certificate PEM: {}", e)))?;
 
@@ -560,6 +639,12 @@ impl SigningCredentials {
 
         if let Some(violation) = code_signing_policy_violation(&certificate, time_now()) {
             return Err(Error::Certificate(violation));
+        }
+
+        // Anchoring is the last load-time check, so a policy violation keeps
+        // precedence over an unanchored chain on this route too.
+        if let Some(anchors) = anchors {
+            require_anchored_chain(&certificate, &cert_chain, anchors)?;
         }
 
         Ok(Self {
@@ -597,6 +682,8 @@ impl SigningCredentials {
     /// - The certificate is missing the codeSigning extended key usage
     /// - The certificate's keyUsage lacks digitalSignature when present
     /// - The certificate asserts CA=true
+    /// - The certificate chain does not reach the Apple Root CA (each link must
+    ///   be signed by its parent and the terminus must match the embedded Apple root)
     ///
     /// # Security
     ///
@@ -613,6 +700,12 @@ impl SigningCredentials {
     /// # Ok::<(), zsign_core::Error>(())
     /// ```
     pub fn from_p12(p12_data: &[u8], password: &str) -> Result<Self> {
+        Self::load_p12(p12_data, password, Some(&TrustAnchors::apple_root()?))
+    }
+
+    /// Loads a PKCS#12 container, requiring an Apple-root-anchored chain when
+    /// `anchors` is `Some`.
+    fn load_p12(p12_data: &[u8], password: &str, anchors: Option<&TrustAnchors>) -> Result<Self> {
         let contents = super::pkcs12::extract_p12(p12_data, password)
             .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
         let keys = contents.keys;
@@ -626,7 +719,19 @@ impl SigningCredentials {
         }
 
         let (decoded, certificate, rest) = select_identity(&keys, &certs)?;
-        Self::finish_p12(decoded, certificate, rest)
+        Self::finish_p12(decoded, certificate, rest, anchors)
+    }
+
+    /// Loads a PKCS#12 container without requiring the certificate chain to
+    /// reach the Apple Root CA.
+    ///
+    /// Exists for test fixtures built from self-issued certificates, which can
+    /// never satisfy the anchoring policy. Production callers must use
+    /// [`SigningCredentials::from_p12`]; every other load-time check (parse,
+    /// identity pairing, key strength, code-signing policy) still applies.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn from_p12_unanchored(p12_data: &[u8], password: &str) -> Result<Self> {
+        Self::load_p12(p12_data, password, None)
     }
 
     /// Load from PKCS#12, selecting the identity whose leaf certificate's
@@ -645,6 +750,23 @@ impl SigningCredentials {
         p12_data: &[u8],
         password: &str,
         leaf_sha1: &[u8; 20],
+    ) -> Result<Self> {
+        Self::from_p12_with_leaf_sha1_impl(
+            p12_data,
+            password,
+            leaf_sha1,
+            Some(&TrustAnchors::apple_root()?),
+        )
+    }
+
+    /// The body of [`Self::from_p12_with_leaf_sha1`], parameterized on the
+    /// anchoring requirement.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn from_p12_with_leaf_sha1_impl(
+        p12_data: &[u8],
+        password: &str,
+        leaf_sha1: &[u8; 20],
+        anchors: Option<&TrustAnchors>,
     ) -> Result<Self> {
         let contents = super::pkcs12::extract_p12(p12_data, password)
             .map_err(|e| Error::Certificate(format!("Failed to parse PKCS#12: {}", e)))?;
@@ -672,15 +794,28 @@ impl SigningCredentials {
             .filter(|c| !matches_leaf(c))
             .filter_map(|d| Certificate::from_der(d).ok())
             .collect();
-        Self::finish_p12(decoded, certificate, rest)
+        Self::finish_p12(decoded, certificate, rest, anchors)
+    }
+
+    /// [`Self::from_p12_with_leaf_sha1`] without the Apple-root anchoring
+    /// requirement; test builds only.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn from_p12_with_leaf_sha1_unanchored(
+        p12_data: &[u8],
+        password: &str,
+        leaf_sha1: &[u8; 20],
+    ) -> Result<Self> {
+        Self::from_p12_with_leaf_sha1_impl(p12_data, password, leaf_sha1, None)
     }
 
     /// Runs the checks every PKCS#12 entry point shares on a selected
-    /// key/certificate pair and assembles the credentials.
+    /// key/certificate pair and assembles the credentials. When `anchors` is
+    /// `Some`, the assembled chain must terminate at one of them.
     fn finish_p12(
         decoded: DecodedKey,
         certificate: Certificate,
         rest: Vec<Certificate>,
+        anchors: Option<&TrustAnchors>,
     ) -> Result<Self> {
         let signing_key = decoded.into_signing_key()?;
 
@@ -688,6 +823,9 @@ impl SigningCredentials {
             return Err(Error::Certificate(violation));
         }
         let cert_chain = build_chain_from_leaf(&certificate, rest);
+        if let Some(anchors) = anchors {
+            require_anchored_chain(&certificate, &cert_chain, anchors)?;
+        }
         let team_id = extract_team_id(&certificate);
 
         Ok(Self {
@@ -814,6 +952,8 @@ mod tests {
     const IDENTITY_DUP: &[u8] = include_bytes!("fixtures/identity_duplicate_certs.p12");
     const WEAK_RSA1024: &[u8] = include_bytes!("fixtures/weak_rsa1024.p12");
 
+    const EVIL_CHAIN: &[u8] = include_bytes!("fixtures/evil_root_chain.p12");
+
     // Encrypted-key fixtures are committed as base64 blobs of byte-exact OpenSSL output: the
     // repository's private-key commit gate refuses every private-key PEM file, PBES2 containers
     // included. The certificates are committed readable, because a certificate is not a key.
@@ -879,11 +1019,11 @@ mod tests {
     }
 
     /// Builds a certificate for `subject` signed by `issuer_key` (which may be the
-    /// subject's own key). Signatures are irrelevant to every helper under test —
-    /// pairing compares SPKIs and the chain walk compares names.
-    fn build_cert(
+    /// subject's own key), with `issuer` supplied as an already-parsed name so a caller
+    /// can reproduce an embedded root's subject byte-for-byte.
+    fn build_cert_issuer_name(
         subject: &str,
-        issuer: &str,
+        issuer: &x509_cert::name::Name,
         subject_key: &rsa::RsaPrivateKey,
         issuer_key: &rsa::RsaPrivateKey,
         validity: Validity,
@@ -907,7 +1047,7 @@ mod tests {
         let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(issuer_key.clone());
         let mut b = CertificateBuilder::new(
             Profile::Leaf {
-                issuer: Name::from_str(issuer).unwrap(),
+                issuer: issuer.clone(),
                 enable_key_agreement: false,
                 enable_key_encipherment: false,
             },
@@ -922,6 +1062,246 @@ mod tests {
             b.add_extension(eku).unwrap();
         }
         b.build::<rsa::pkcs1v15::Signature>().unwrap()
+    }
+
+    /// Builds a certificate for `subject` signed by `issuer_key` (which may be the
+    /// subject's own key). Signatures are irrelevant to every helper under test —
+    /// pairing compares SPKIs and the chain walk compares names.
+    fn build_cert(
+        subject: &str,
+        issuer: &str,
+        subject_key: &rsa::RsaPrivateKey,
+        issuer_key: &rsa::RsaPrivateKey,
+        validity: Validity,
+        eku: Option<ExtendedKeyUsage>,
+    ) -> Certificate {
+        use std::str::FromStr;
+
+        build_cert_issuer_name(
+            subject,
+            &x509_cert::name::Name::from_str(issuer).unwrap(),
+            subject_key,
+            issuer_key,
+            validity,
+            eku,
+        )
+    }
+
+    fn build_root_cert(subject: &str, key: &rsa::RsaPrivateKey, validity: Validity) -> Certificate {
+        use spki::EncodePublicKey;
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone());
+        CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(11u32),
+            validity,
+            x509_cert::name::Name::from_str(subject).unwrap(),
+            spki,
+            &signer,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap()
+    }
+
+    fn build_subca_cert(
+        subject: &str,
+        issuer: &x509_cert::name::Name,
+        subject_key: &rsa::RsaPrivateKey,
+        issuer_key: &rsa::RsaPrivateKey,
+        validity: Validity,
+    ) -> Certificate {
+        use spki::EncodePublicKey;
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            subject_key
+                .to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(issuer_key.clone());
+        CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: issuer.clone(),
+                path_len_constraint: None,
+            },
+            SerialNumber::from(12u32),
+            validity,
+            x509_cert::name::Name::from_str(subject).unwrap(),
+            spki,
+            &signer,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap()
+    }
+
+    /// root → int → leaf, all properly signed, with the root and intermediate
+    /// keys returned because several tests rebuild one link of the chain.
+    fn anchored_test_chain() -> (
+        Certificate,
+        Certificate,
+        Certificate,
+        rsa::RsaPrivateKey,
+        rsa::RsaPrivateKey,
+    ) {
+        let root_key = fresh_2048();
+        let int_key = fresh_2048();
+        let leaf_key = fresh_2048();
+        let root = build_root_cert("CN=zsn test root", &root_key, present());
+        let int = build_subca_cert(
+            "CN=zsn test int",
+            &root.tbs_certificate.subject,
+            &int_key,
+            &root_key,
+            present(),
+        );
+        let leaf = build_cert_issuer_name(
+            "CN=zsn leaf",
+            &int.tbs_certificate.subject,
+            &leaf_key,
+            &int_key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        (root, int, leaf, root_key, int_key)
+    }
+
+    #[test]
+    fn require_anchored_chain_accepts_anchor_terminated_chain() {
+        let (root, int, leaf, _, _) = anchored_test_chain();
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let res = require_anchored_chain(&leaf, &[int, root], &anchors);
+        assert!(
+            res.is_ok(),
+            "properly anchored chain must be accepted, got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn require_anchored_chain_rejects_chain_under_production_anchors() {
+        // same well-formed chain; production callers pin the embedded Apple root
+        let (root, int, leaf, _, _) = anchored_test_chain();
+        let res = require_anchored_chain(&leaf, &[int, root], &TrustAnchors::apple_root().unwrap());
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("not anchored")),
+            "got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn require_anchored_chain_rejects_link_signed_by_the_wrong_key() {
+        // the leaf names the intermediate as issuer but was signed by another
+        // key; the terminus reaches the injected anchor, so only the link check
+        // can produce the failure
+        let (root, int, _, _, _) = anchored_test_chain();
+        let wrong = fresh_2048();
+        let leaf = build_cert_issuer_name(
+            "CN=zsn leaf",
+            &int.tbs_certificate.subject,
+            &wrong,
+            &wrong,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let res = require_anchored_chain(&leaf, &[int, root], &anchors);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+            if m.contains("issuer-signature verification")),
+            "got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn require_anchored_chain_rejects_non_ca_intermediate() {
+        // a Profile::Leaf certificate acting as the issuer: CA:FALSE, and the
+        // basicConstraints check fires before any signature check
+        let (root, _, _, root_key, _) = anchored_test_chain();
+        let int_key = fresh_2048();
+        let leaf_key = fresh_2048();
+        let int = build_cert_issuer_name(
+            "CN=zsn not a ca",
+            &root.tbs_certificate.subject,
+            &int_key,
+            &root_key,
+            present(),
+            None,
+        );
+        let leaf = build_cert_issuer_name(
+            "CN=zsn leaf",
+            &int.tbs_certificate.subject,
+            &leaf_key,
+            &int_key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let res = require_anchored_chain(&leaf, &[int, root], &anchors);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+            if m.contains("basicConstraints")),
+            "got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn require_anchored_chain_rejects_expired_intermediate() {
+        // issuer validity is checked before anything cryptographic
+        let (root, _, leaf, root_key, _) = anchored_test_chain();
+        let int_key = fresh_2048();
+        let int = build_subca_cert(
+            "CN=zsn test int",
+            &root.tbs_certificate.subject,
+            &int_key,
+            &root_key,
+            window(1_600_000_000, 1_650_000_000),
+        );
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let res = require_anchored_chain(&leaf, &[int, root], &anchors);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+            if m.contains("outside validity")),
+            "got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn require_anchored_chain_rejects_forged_terminus_with_anchor_key() {
+        // self-issued certificate carrying the anchor root's public key but
+        // signed by a different key: the intermediate link verifies against that
+        // key, so only the terminus self-signature check can catch the forgery
+        use std::str::FromStr;
+        let (root, int, leaf, root_key, _) = anchored_test_chain();
+        let attacker = fresh_2048();
+        let forged = build_subca_cert(
+            "CN=zsn test root",
+            &x509_cert::name::Name::from_str("CN=zsn test root").unwrap(),
+            &root_key,
+            &attacker,
+            present(),
+        );
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let res = require_anchored_chain(&leaf, &[int, forged], &anchors);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+            if m.contains("self-signature")),
+            "got {:?}",
+            res.err()
+        );
     }
 
     fn der_of(cert: &Certificate) -> Vec<u8> {
@@ -951,6 +1331,13 @@ mod tests {
     fn load(cert: &Certificate, key: &rsa::RsaPrivateKey) -> Result<SigningCredentials> {
         let (cert_pem, key_pem) = leaf_pems(cert, key);
         SigningCredentials::from_pem(&cert_pem, &key_pem, None)
+    }
+
+    /// PEM-encoded load attempt through `from_pem_unanchored`, for fixtures
+    /// built from self-issued certificates that no anchor can terminate.
+    fn load_unanchored(cert: &Certificate, key: &rsa::RsaPrivateKey) -> Result<SigningCredentials> {
+        let (cert_pem, key_pem) = leaf_pems(cert, key);
+        SigningCredentials::from_pem_unanchored(&cert_pem, &key_pem, None)
     }
 
     fn code_signing_eku() -> ExtendedKeyUsage {
@@ -1070,9 +1457,12 @@ mod tests {
             "duplicate fixture must carry both identities"
         );
         let target = sha1_of(&contents.certs[0]);
-        let creds =
-            SigningCredentials::from_p12_with_leaf_sha1(IDENTITY_DUP, "testpassword", &target)
-                .expect("selected identity must load through every load-time check");
+        let creds = SigningCredentials::from_p12_with_leaf_sha1_unanchored(
+            IDENTITY_DUP,
+            "testpassword",
+            &target,
+        )
+        .expect("selected identity must load through every load-time check");
         let leaf_der = creds.certificate.to_der().expect("leaf DER");
         assert_eq!(sha1_of(&leaf_der), target, "leaf must be the selected one");
     }
@@ -1117,7 +1507,7 @@ mod tests {
 
     #[test]
     fn from_p12_selects_single_identity_with_empty_chain() {
-        let creds = SigningCredentials::from_p12(IDENTITY_SINGLE, "testpassword")
+        let creds = SigningCredentials::from_p12_unanchored(IDENTITY_SINGLE, "testpassword")
             .expect("unique pair must load");
         assert_eq!(
             creds.certificate.tbs_certificate.subject.to_string(),
@@ -1144,7 +1534,7 @@ mod tests {
             Some(eku),
         );
         let (cert_pem, key_pem) = leaf_pems(&cert, &key);
-        let creds = SigningCredentials::from_pem(&cert_pem, &key_pem, None)
+        let creds = SigningCredentials::from_pem_unanchored(&cert_pem, &key_pem, None)
             .expect("policy-compliant self-signed leaf must load");
         assert!(creds.cert_chain.is_empty());
     }
@@ -1285,7 +1675,7 @@ mod tests {
             present(),
             Some(code_signing_eku()),
         );
-        load(&cert, &key).expect("policy-compliant leaf must load");
+        load_unanchored(&cert, &key).expect("policy-compliant leaf must load");
     }
 
     #[test]
@@ -1433,7 +1823,7 @@ mod tests {
                 exts.retain(|e| e.extn_id != id);
             }
         }
-        load(&cert, &key).expect("absent KU/BC must be tolerated");
+        load_unanchored(&cert, &key).expect("absent KU/BC must be tolerated");
     }
 
     #[test]
@@ -1499,7 +1889,7 @@ mod tests {
     #[test]
     fn from_pem_loads_every_supported_key_form() {
         for (cert, key) in encrypted_forms() {
-            let res = SigningCredentials::from_pem(cert, key.as_bytes(), Some(PASS));
+            let res = SigningCredentials::from_pem_unanchored(cert, key.as_bytes(), Some(PASS));
             assert!(
                 res.is_ok(),
                 "certificate and encrypted key must load, got {:?}",
@@ -1546,9 +1936,11 @@ mod tests {
             Some(code_signing_eku()),
         );
         let (cert_pem, key_pem) = leaf_pems(&cert, &key);
-        assert!(SigningCredentials::from_pem(&cert_pem, &key_pem, None).is_ok());
+        assert!(SigningCredentials::from_pem_unanchored(&cert_pem, &key_pem, None).is_ok());
         // A password on an unencrypted key is accepted and ignored, as OpenSSL does.
-        assert!(SigningCredentials::from_pem(&cert_pem, &key_pem, Some("ignored")).is_ok());
+        assert!(
+            SigningCredentials::from_pem_unanchored(&cert_pem, &key_pem, Some("ignored")).is_ok()
+        );
     }
 
     #[test]
@@ -1568,7 +1960,7 @@ mod tests {
             "RSA PRIVATE KEY",
             rsa_key.to_pkcs1_der().unwrap().as_bytes(),
         );
-        let res = SigningCredentials::from_pem(&rsa_cert_pem, pkcs1.as_bytes(), None);
+        let res = SigningCredentials::from_pem_unanchored(&rsa_cert_pem, pkcs1.as_bytes(), None);
         assert!(
             res.is_ok(),
             "plaintext PKCS#1 must load, got {:?}",
@@ -1583,7 +1975,7 @@ mod tests {
                 .unwrap()
                 .as_slice(),
         );
-        let res = SigningCredentials::from_pem(&rsa_cert_pem, sec1.as_bytes(), None);
+        let res = SigningCredentials::from_pem_unanchored(&rsa_cert_pem, sec1.as_bytes(), None);
         assert!(
             matches!(
                 res,
@@ -1608,5 +2000,69 @@ mod tests {
             "an encrypted key must still be SPKI-paired, got {:?}",
             res.as_ref().err()
         );
+    }
+
+    #[test]
+    fn from_p12_rejects_evil_root_chain() {
+        let res = SigningCredentials::from_p12(EVIL_CHAIN, PASS);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("Evil") && m.contains("not anchored to a trusted root")),
+            "self-issued chain must be rejected, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_p12_rejects_self_issued_identity() {
+        let res = SigningCredentials::from_p12(IDENTITY_SINGLE, PASS);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("not anchored to a trusted root")),
+            "self-signed leaf must be rejected, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_self_signed_leaf() {
+        let key = fresh_2048();
+        let cert = build_cert(
+            "CN=zsn unanchored",
+            "CN=zsn unanchored",
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let res = load(&cert, &key);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m))
+                if m.contains("not anchored to a trusted root")),
+            "got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn build_chain_appends_embedded_root_for_direct_issue() {
+        let root = Certificate::from_pem(crate::crypto::assets::APPLE_ROOT_CA_CERT.as_bytes())
+            .expect("embedded root parses");
+        let key = fresh_2048();
+        let cert = build_cert_issuer_name(
+            "CN=zsn direct",
+            &root.tbs_certificate.subject,
+            &key,
+            &key,
+            present(),
+            Some(code_signing_eku()),
+        );
+        let chain = build_chain_from_leaf(&cert, vec![]);
+        assert_eq!(
+            chain.len(),
+            1,
+            "dangling issuer at the Apple Root CA must complete the chain"
+        );
+        assert!(chain.iter().any(is_apple_root));
     }
 }

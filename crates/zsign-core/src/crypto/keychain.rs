@@ -212,11 +212,26 @@ pub fn load_with(
         runner.export_identities(&path)?;
         let data = std::fs::read(&path)
             .map_err(|e| KeychainError::ExportFile(format!("{}: {e}", path.display())))?;
-        crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1(&data, "", &selected.hash)
-            .map_err(KeychainError::Credential)
+        load_pair(&data, &selected.hash)
     })();
     let _ = std::fs::remove_file(&path);
     result
+}
+
+/// Loads one exported identity. Test builds use the unanchored constructor: the
+/// keychain fixtures are self-issued and can never reach the Apple Root CA.
+fn load_pair(
+    data: &[u8],
+    leaf_sha1: &[u8; 20],
+) -> Result<crate::crypto::SigningCredentials, KeychainError> {
+    #[cfg(test)]
+    return crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1_unanchored(
+        data, "", leaf_sha1,
+    )
+    .map_err(KeychainError::Credential);
+    #[cfg(not(test))]
+    crate::crypto::cert::SigningCredentials::from_p12_with_leaf_sha1(data, "", leaf_sha1)
+        .map_err(KeychainError::Credential)
 }
 
 /// Runs the real `/usr/bin/security` keychain.
