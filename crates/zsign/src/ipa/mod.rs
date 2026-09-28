@@ -761,18 +761,23 @@ impl<'a> IpaSigner<'a> {
             })?;
             // Bare propagation here would report only "No XML plist found in
             // profile data", which cannot say which entry of a multi-entry map
-            // is at fault.
+            // is at fault. The wrap adds that context but must not reclassify
+            // a size rejection, which carries its own error contract.
             let request = self.profile_request(Some(id.clone()));
             let ent = zsign_core::extract_entitlements_checked(
                 &data,
                 &request,
                 self.allow_unsafe_profile,
             )
-            .map_err(|e| {
-                Error::Core(zsign_core::Error::Config(format!(
-                    "provisioning profile for bundle '{id}' at '{}' is invalid: {e}",
+            .map_err(|e| match e {
+                zsign_core::Error::InputTooLarge(detail) => Error::InputTooLarge(format!(
+                    "{detail} (provisioning profile for bundle '{id}' at '{}')",
                     path.display()
-                )))
+                )),
+                other => Error::Core(zsign_core::Error::Config(format!(
+                    "provisioning profile for bundle '{id}' at '{}' is invalid: {other}",
+                    path.display()
+                ))),
             })?;
             map.insert(id.clone(), (Some(data), ent));
         }
@@ -4072,6 +4077,78 @@ mod tests {
         assert!(
             message.contains("broken.mobileprovision"),
             "the error must name the offending file: {message}"
+        );
+    }
+
+    /// Pins that an oversized root provisioning profile is rejected by the
+    /// documented size cap and surfaces to the caller as `Error::InputTooLarge`
+    /// naming both the offending length and the limit — never as a generic
+    /// forwarded core error.
+    #[test]
+    fn oversized_root_profile_surfaces_as_input_too_large() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let big = temp.path().join("huge.mobileprovision");
+        std::fs::write(&big, vec![0u8; 17 * 1024 * 1024]).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .provisioning_profile(&big)
+            .sign_folder_in_place(&app)
+            .expect_err("a 17 MiB root profile must fail the sign");
+        assert!(
+            matches!(&err, Error::InputTooLarge(m) if m.contains("17825792") && m.contains("16777216")),
+            "oversized root profile must surface as InputTooLarge with lengths named, got {err:?}"
+        );
+    }
+
+    /// Pins that an oversized profile in the bundle map keeps its
+    /// `Error::InputTooLarge` variant through the per-bundle context wrap, and
+    /// that the wrap still names the offending bundle id and file path.
+    #[test]
+    fn oversized_profile_map_entry_surfaces_as_input_too_large_naming_bundle() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let big = temp.path().join("huge-ext.mobileprovision");
+        std::fs::write(&big, vec![0u8; 17 * 1024 * 1024]).unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .bundle_profiles(vec![("com.test.app.ext".to_string(), big.clone())])
+            .sign_folder_in_place(&app)
+            .expect_err("a 17 MiB mapped profile must fail the sign");
+        assert!(
+            matches!(&err, Error::InputTooLarge(_)),
+            "the size rejection must keep its variant through the map context wrap, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.ext") && message.contains("huge-ext.mobileprovision"),
+            "the error must still name the offending bundle and file: {message}"
+        );
+    }
+
+    /// Pins the shape of every non-size profile-map rejection: a malformed
+    /// profile stays `Core(Config(_))` naming the bundle and file, so widening
+    /// the size rejection does not silently reclassify unrelated failures.
+    #[test]
+    fn malformed_profile_map_entry_keeps_the_config_shape() {
+        let temp = TempDir::new().unwrap();
+        let (app, _appex) = create_bundle_with_appex(temp.path());
+        let bad = temp.path().join("broken.mobileprovision");
+        std::fs::write(&bad, b"not a provisioning profile at all").unwrap();
+
+        let err = IpaSigner::new_adhoc()
+            .allow_unsafe_profile(true)
+            .bundle_profiles(vec![("com.test.app.bad".to_string(), bad.clone())])
+            .sign_folder_in_place(&app)
+            .expect_err("a malformed mapped profile must fail the sign");
+        assert!(
+            matches!(&err, Error::Core(zsign_core::Error::Config(_))),
+            "only the size rejection changes shape; malformed profiles keep Core(Config), got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("com.test.app.bad") && message.contains("broken.mobileprovision"),
+            "the Config wrap must keep naming bundle and file: {message}"
         );
     }
 

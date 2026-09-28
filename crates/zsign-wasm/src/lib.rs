@@ -47,7 +47,7 @@ use wasm_bindgen::prelude::*;
 use zsign_core::bundle::CodeResourcesBuilder;
 use zsign_core::crypto::SigningCredentials;
 use zsign_core::extract_entitlements_checked;
-use zsign_core::provisioning::ProfileRequest;
+use zsign_core::provisioning::{ProfileRequest, MAX_PROFILE_BYTES};
 
 /// Verification instant for profile validation: the browser clock on wasm32
 /// (the core resolver hard-errors on an omitted instant there), and `None` on
@@ -72,8 +72,6 @@ const MAX_MACHO_BYTES: usize = 512 * 1024 * 1024;
 const MAX_HASH_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum size of plist inputs (Info.plist, CodeResources, entitlements).
 const MAX_PLIST_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum size of a provisioning profile.
-const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum size of a PKCS#12 file.
 const MAX_P12_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum size of a whole IPA input to `sign_ipa` (compressed bytes).

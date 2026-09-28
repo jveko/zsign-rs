@@ -383,12 +383,18 @@ use zsign_core::provisioning::MAX_PROFILE_BYTES;
 `ensure_size(..., MAX_PROFILE_BYTES, ...)` call sites and all tests compile
 unchanged. Value identical by construction.)
 
-- [ ] **Step 2.6: Update the `sign_ipa` limitation note**
+- [ ] **Step 2.6: Leave the `sign_ipa` limitation note unchanged**
 
-In `crates/zsign-wasm/src/lib.rs:40`, the sentence listing what plan-build
-profile validation can surface gains `ZSIGN_INPUT_TOO_LARGE` (design D5) —
-e.g. `… can surface ZSIGN_VERIFICATION, ZSIGN_INVALID_PROFILE, or
-ZSIGN_INPUT_TOO_LARGE (oversized profile)`. Do not touch any other doc line.
+An implementation-time review established the original Step 2.6 premise was
+wrong: on the wasm surface an oversized profile is unreachable at plan build —
+the `WasmSigner` constructor's `ensure_size` (`lib.rs:277-284`) caps the only
+profile source, `sign_ipa` forwards only that pre-capped `self.profile_bytes`
+(`lib.rs:740-741`), and the crate has no `bundle_profiles` setter. Therefore
+`crates/zsign-wasm/src/lib.rs:40` keeps its original text
+(`ZSIGN_VERIFICATION` / `ZSIGN_INVALID_PROFILE`); if a temporary edit was made
+there, revert it so `git diff HEAD -- crates/zsign-wasm/src/lib.rs` shows only
+the constant re-export (import change + const deletion) and the Task 1 match
+arm. Do not touch any doc line.
 
 - [ ] **Step 2.7: Run scoped gates**
 
@@ -447,7 +453,8 @@ must hit only commit subjects — verify via `git log main..HEAD --format=%s`).
 - **Spec coverage:** D1 → Task 1 Step 1.5; D2 → Step 1.5 funnel placement +
   invariant doc note; D3 → Step 1.3; D4 → Task 2 Steps 2.1-2.3 (real-funnel
   tests + From arm); D5 → Step 1.4 (forced wasm arm) + Step 2.5 (constant
-  re-export) + Step 2.6 (sign_ipa note), byte-identity via unchanged
+  re-export) + Step 2.6 (doc note deliberately unchanged — wasm plan build
+  unreachable for size), byte-identity via unchanged
   `ensure_size` call sites + green unmodified wasm tests (Step 2.7); D6 → Step 1.5
   (`len > MAX`) + boundary test; D7 → Task 1 wide-document pin test; D8 → Task 2
   Steps 2.1 (three ipa tests incl. Config-shape regression) + 2.4 (match arm).

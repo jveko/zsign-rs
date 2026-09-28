@@ -63,6 +63,7 @@ impl From<zsign_core::Error> for Error {
     fn from(e: zsign_core::Error) -> Self {
         match e {
             zsign_core::Error::Plist(e) => Error::Plist(e),
+            zsign_core::Error::InputTooLarge(m) => Error::InputTooLarge(m),
             other => Error::Core(other),
         }
     }

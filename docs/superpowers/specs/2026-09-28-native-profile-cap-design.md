@@ -110,19 +110,20 @@ own context to the payload (D8), that context rides inside `<detail>` — one
 prefix, never doubled.
 
 **D5 — Wasm pre-check behavior byte-identical; constant becomes a re-export.**
-"Byte-identical" scopes to the two surfaces that already reject today (the
-`ensure_size` pre-checks): their messages and codes for >16 MiB are exactly
-today's `ZSIGN_INPUT_TOO_LARGE`. Paths that had NO cap before (wasm `sign_ipa`
-plan build) newly reject — that is the fail-closed fix, not a regression, and
-the contract table below records it. The local
+Every wasm profile input is already capped before it can reach plan build: the
+`WasmSigner` constructor's `ensure_size` (`lib.rs:277-284`) rejects >16 MiB
+profile bytes at construction, `sign_ipa` forwards only that pre-capped
+`self.profile_bytes` (`lib.rs:740-741`), the crate exposes no `bundle_profiles`
+setter, and archive-embedded profiles are hashed/copied, never parsed. So this
+change makes wasm reject nothing it did not already reject — messages and codes
+for >16 MiB stay exactly today's `ZSIGN_INPUT_TOO_LARGE`, and the `sign_ipa`
+doc-table note at `lib.rs:40` stays UNCHANGED (its plan-build clause remains
+accurate: `ZSIGN_VERIFICATION` / `ZSIGN_INVALID_PROFILE` only; an oversized
+profile never gets that far on wasm). The local
 `const MAX_PROFILE_BYTES` at `lib.rs:76` becomes a re-export of the core constant
 (same value, one source of truth). The forced `code_for_core_error` arm maps core
 `InputTooLarge` → `WasmErrorCode::InputTooLarge` (defense in depth: any future
-direct-core call also codes correctly). The `sign_ipa` limitation note
-(`lib.rs:40`, "profile validation during plan build can surface
-`ZSIGN_VERIFICATION` or `ZSIGN_INVALID_PROFILE`") gains `ZSIGN_INPUT_TOO_LARGE`:
-that path now rejects oversized embedded profiles via the facade arm — crate
-rustdoc in a file already being edited, not the Wave 8-owned README caps claim.
+direct-core call also codes correctly).
 
 **D6 — Boundary semantics match `ensure_size`: reject `len > MAX`, accept `len == MAX`.**
 Verified against wasm test `ensure_size_accepts_exactly_at_limit` (`lib.rs:1384-1398`).
@@ -142,8 +143,8 @@ for the size rejection it returns `Error::InputTooLarge` (context appended to th
 payload) instead of `Error::Core(Config(…))`. Rationale: the wrap exists to name
 the offending map entry, not to reclassify failures; swallowing the variant would
 make the facade contract below false for exactly the fail-closed case the cap is
-about, and would force wasm `sign_ipa` plan-build size rejections through the
-`Config` code instead of `ZSIGN_INPUT_TOO_LARGE`. Every other error from that
+about, and would demote a size rejection on the native `--profile-map` path to a
+generic `Config` error. Every other error from that
 site keeps today's `Config` shape byte-for-byte. This is not the ZSN-143
 error-code unification (which reorganizes codes across profile entry points); it
 is the propagation rule for this change's own new variant.
@@ -157,7 +158,7 @@ is the propagation rule for this change's own new variant.
 | native facade | root profile entries (builder, ipa `load_profile`, re-exports) | `Err(zsign_rs::Error::InputTooLarge(detail))` via the new `From` arm — Display `Input too large: <detail>` |
 | native facade | `--profile-map` entries (`load_bundle_profiles`) | `Err(zsign_rs::Error::InputTooLarge)` with bundle id + path appended to the payload (D8); other errors from that site keep their `Config` shape |
 | wasm `WasmSigner` ctor / `extract_entitlements` | `ensure_size` pre-check first | `ZSIGN_INPUT_TOO_LARGE`, message shape unchanged from today |
-| wasm `sign_ipa` plan build (embedded/bundle profile) | facade `Error::InputTooLarge` (existing arm `lib.rs:161`) | `ZSIGN_INPUT_TOO_LARGE` — newly rejectable: this path had no cap anywhere before this change (the wasm-only cap covered only the two `WasmSigner` pre-checks), and fail-closed requires the error here too |
+| wasm `sign_ipa` plan build | unreachable for size: ctor `ensure_size` pre-caps the only profile source (`lib.rs:277-284`, forwarded at `:740-741`; no `bundle_profiles` setter on this surface) | never reached — profile bytes >16 MiB are rejected at construction with `ZSIGN_INPUT_TOO_LARGE`, unchanged from today |
 | wasm direct-core callers (future) | `code_for_core_error` new arm | `ZSIGN_INPUT_TOO_LARGE` |
 | CLI | inherits via facade | exit contract unchanged (variant-specific mapping is ZSN-143's scope; this change only feeds `InputTooLarge`, the already-established variant) |
 
