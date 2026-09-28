@@ -1,10 +1,11 @@
 //! Provisioning profile parsing and validation utilities.
 //!
-//! Profiles are CMS-signed XML plists. [`extract_entitlements_from_profile`]
-//! is the historical unvalidated extractor (raw byte scan — kept byte-for-byte
-//! for existing consumers); [`validate_and_extract_profile`] verifies the CMS
-//! envelope against Apple's roots (or injected anchors) and validates the
-//! profile fields before any consumer touches them.
+//! Profiles are CMS-signed XML plists. [`extract_entitlements_checked`] is the
+//! seam consumers should call: it validates by default (CMS chain, window,
+//! team, App-ID via [`validate_and_extract_profile`]) and only falls back to
+//! the historical unvalidated extractor (raw byte scan — kept byte-for-byte
+//! for existing consumers) when the caller explicitly passes
+//! `allow_unsafe = true`.
 
 use crate::crypto::cms_verify::{self, TrustAnchors};
 use crate::{Error, Result};
@@ -14,9 +15,10 @@ use time::OffsetDateTime;
 /// Inputs that scope *when* and *against what* a profile is validated.
 ///
 /// Every field is optional: an omitted check simply does not run, so callers
-/// validate only the context they have. A bypass (`allow-unsafe`) is a
-/// caller-side choice — keep calling [`extract_entitlements_from_profile`] for
-/// unvalidated extraction.
+/// validate only the context they have. A bypass is a caller-side choice: pass
+/// `allow_unsafe = true` to [`extract_entitlements_checked`] (backed by the
+/// surface's own `allow_unsafe_profile` opt-in) to keep the raw
+/// [`extract_entitlements_from_profile`] scan.
 ///
 /// ```ignore
 /// let request = ProfileRequest {
@@ -390,6 +392,33 @@ pub fn extract_entitlements_from_profile(profile_data: &[u8]) -> Result<Option<V
     entitlements_to_xml(dict)
 }
 
+/// Extract entitlements from a provisioning profile, validated by default.
+///
+/// Without `allow_unsafe` the profile goes through
+/// [`validate_and_extract_profile`] first — CMS chain against Apple's roots (or
+/// injected anchors), profile window, team, and App-ID — and only its
+/// validated `entitlements_xml` is returned. A forged, expired, or
+/// wrong-team profile is rejected instead of parsed.
+///
+/// `allow_unsafe` is the explicit caller-side bypass: it keeps the historical
+/// raw byte scan ([`extract_entitlements_from_profile`]) for surfaces that
+/// expose an `allow_unsafe_profile` opt-in to their own callers. The bypass is
+/// never implicit.
+///
+/// Returns the same shape as the raw extractor: `Ok(None)` when a valid
+/// profile carries no `Entitlements` key, `Err` for a rejected profile or a
+/// parse failure.
+pub fn extract_entitlements_checked(
+    profile_data: &[u8],
+    request: &ProfileRequest,
+    allow_unsafe: bool,
+) -> Result<Option<Vec<u8>>> {
+    if allow_unsafe {
+        return extract_entitlements_from_profile(profile_data);
+    }
+    Ok(validate_and_extract_profile(profile_data, request)?.entitlements_xml)
+}
+
 /// Reads the XML document embedded in a provisioning profile WITHOUT any
 /// cryptographic or expiry validation. For metadata that only needs to be
 /// consistent with the profile bytes about to be embedded (App ID prefix,
@@ -676,6 +705,46 @@ mod tests {
         };
         let err = validate_and_extract_profile(xml.as_bytes(), &req).unwrap_err();
         assert!(matches!(err, crate::Error::Verification(_)), "got: {err}");
+    }
+
+    #[test]
+    fn checked_seam_validates_by_default_and_bypasses_only_when_asked() {
+        let sp = signed_profile(&plist_xml(""));
+        let req = ProfileRequest {
+            now: Some(at(T_2026_APR)),
+            anchors: Some(sp.anchors.clone()),
+            ..Default::default()
+        };
+        let checked = extract_entitlements_checked(&sp.data, &req, false)
+            .unwrap()
+            .unwrap();
+        let legacy = extract_entitlements_from_profile(&sp.data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checked, legacy,
+            "validated extraction must yield the extractor's entitlement bytes"
+        );
+
+        let forged = plist_xml("");
+        let plain = ProfileRequest {
+            now: Some(at(T_2026_APR)),
+            ..Default::default()
+        };
+        let err = extract_entitlements_checked(forged.as_bytes(), &plain, false).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Verification(_)),
+            "a profile without a CMS envelope must be rejected, got: {err}"
+        );
+        let bypassed = extract_entitlements_checked(forged.as_bytes(), &plain, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8(bypassed)
+                .unwrap()
+                .contains("get-task-allow"),
+            "explicit bypass keeps the raw byte-scan contract"
+        );
     }
 
     #[test]
