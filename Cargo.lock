@@ -1906,6 +1906,7 @@ dependencies = [
  "plist",
  "sha1",
  "sha2",
+ "time",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "zip",

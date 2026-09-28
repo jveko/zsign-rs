@@ -37,15 +37,33 @@
 //! | `ZSIGN_PATH_IN_PROGRESS` | A streamed resource path is hashed directly. |
 //! | `ZSIGN_FAT_UNSUPPORTED` | FAT input is passed to thin signing. |
 //! | `ZSIGN_INTERNAL` | An internal JavaScript object operation fails. |
-//! | `ZSIGN_SIGNING_FAILED` / `ZSIGN_INPUT_TOO_LARGE` | `sign_ipa` adds no new codes: a malformed archive maps to `ZSIGN_SIGNING_FAILED`, and the IPA, per-entry, and total-uncompressed caps map to `ZSIGN_INPUT_TOO_LARGE`. |
+//! | `ZSIGN_SIGNING_FAILED` / `ZSIGN_INPUT_TOO_LARGE` | `sign_ipa` archive and size failures map to `ZSIGN_SIGNING_FAILED` (malformed archive) and `ZSIGN_INPUT_TOO_LARGE` (the IPA, per-entry, and total-uncompressed caps); profile validation during plan build can surface `ZSIGN_VERIFICATION` or `ZSIGN_INVALID_PROFILE`. |
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
+use time::OffsetDateTime;
 use wasm_bindgen::prelude::*;
 use zsign_core::bundle::CodeResourcesBuilder;
 use zsign_core::crypto::SigningCredentials;
-use zsign_core::provisioning::extract_entitlements_from_profile;
+use zsign_core::extract_entitlements_checked;
+use zsign_core::provisioning::ProfileRequest;
+
+/// Verification instant for profile validation: the browser clock on wasm32
+/// (the core resolver hard-errors on an omitted instant there), and `None` on
+/// native targets, where the resolver falls back to the wall clock.
+fn host_now() -> Option<OffsetDateTime> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = js_sys::Date::now();
+        OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000).ok()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 /// Maximum size of a single Mach-O input (parse/sign): the wasm32 address
 /// space is 4 GiB and signing peaks at roughly 2-3x the input.
 const MAX_MACHO_BYTES: usize = 512 * 1024 * 1024;
@@ -225,6 +243,12 @@ pub struct WasmSigner {
     profile_entitlements: Option<Vec<u8>>,
     profile_bytes: Option<Vec<u8>>,
     entitlements_override: Option<Vec<u8>>,
+    /// Whether CMS/expiry/team validation of the profile is bypassed; `true`
+    /// keeps the historical raw byte scan. Defaults to `false`, so a forged or
+    /// expired profile is rejected rather than parsed. App-ID coverage is not
+    /// checkable here: the bundle id is unknown at construction, and the IPA
+    /// path checks it at plan build.
+    allow_unsafe_profile: bool,
     resource_builder: CodeResourcesBuilder,
     streaming_hashes: HashMap<String, StreamingHashState>,
     main_executable: Option<String>,
@@ -234,11 +258,16 @@ pub struct WasmSigner {
 #[wasm_bindgen]
 impl WasmSigner {
     /// Create a new signer from a PKCS#12 (.p12) file, optionally extracting entitlements from a provisioning profile.
+    ///
+    /// `allow_unsafe_profile` skips CMS/expiry/team validation of the profile
+    /// and keeps the historical raw byte scan. It defaults to `false`, so a
+    /// forged or expired profile is rejected rather than parsed.
     #[wasm_bindgen(constructor)]
     pub fn new(
         p12_bytes: &[u8],
         p12_password: &str,
         profile_bytes: Option<Vec<u8>>,
+        allow_unsafe_profile: Option<bool>,
     ) -> Result<WasmSigner, JsValue> {
         ensure_size(
             p12_bytes.len(),
@@ -257,14 +286,25 @@ impl WasmSigner {
 
         let credentials = SigningCredentials::from_p12(p12_bytes, p12_password).map_err(p12_err)?;
 
+        let allow = allow_unsafe_profile.unwrap_or(false);
         let entitlements = match profile_bytes.as_deref() {
-            Some(data) => extract_entitlements_from_profile(data).map_err(core_err)?,
+            Some(data) => {
+                let request = ProfileRequest {
+                    now: host_now(),
+                    anchors: None,
+                    expected_team_id: credentials.team_id.clone(),
+                    target_bundle_id: None,
+                    target_device_udid: None,
+                };
+                extract_entitlements_checked(data, &request, allow).map_err(core_err)?
+            }
             None => None,
         };
 
         Ok(WasmSigner {
             credentials,
             profile_bytes,
+            allow_unsafe_profile: allow,
             profile_entitlements: entitlements,
             entitlements_override: None,
             main_executable: None,
@@ -474,7 +514,15 @@ impl WasmSigner {
     }
 
     /// Extract entitlements from a provisioning profile.
-    pub fn extract_entitlements(profile_data: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+    ///
+    /// `allow_unsafe_profile` skips CMS/expiry validation and keeps the
+    /// historical raw byte scan. It defaults to `false`; the team is never
+    /// checked here because this static surface holds no credentials, and
+    /// App-ID coverage is not checkable either — the caller has no bundle id.
+    pub fn extract_entitlements(
+        profile_data: &[u8],
+        allow_unsafe_profile: Option<bool>,
+    ) -> Result<Option<Vec<u8>>, JsValue> {
         ensure_size(
             profile_data.len(),
             MAX_PROFILE_BYTES,
@@ -482,7 +530,19 @@ impl WasmSigner {
             "supply a smaller provisioning profile",
         )?;
 
-        extract_entitlements_from_profile(profile_data).map_err(core_err)
+        let request = ProfileRequest {
+            now: host_now(),
+            anchors: None,
+            expected_team_id: None,
+            target_bundle_id: None,
+            target_device_udid: None,
+        };
+        extract_entitlements_checked(
+            profile_data,
+            &request,
+            allow_unsafe_profile.unwrap_or(false),
+        )
+        .map_err(core_err)
     }
 
     /// Parse a Mach-O binary and return metadata.
@@ -681,6 +741,12 @@ impl WasmSigner {
         if let Some(data) = &self.profile_bytes {
             signer = signer.provisioning_profile_bytes(data.clone());
         }
+        if self.allow_unsafe_profile {
+            signer = signer.allow_unsafe_profile(true);
+        }
+        if let Some(now) = host_now() {
+            signer = signer.profile_now(now);
+        }
         if let Some(data) = &self.entitlements_override {
             signer = signer.entitlements_bytes(data.clone());
         }
@@ -782,6 +848,33 @@ pub mod tests {
 </plist>
 "#;
 
+    /// Bare plist carrying a plausible but unsigned profile: no CMS envelope,
+    /// an unknown team, an expired window and a foreign App ID.
+    const FORGED_PROFILE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>TeamIdentifier</key>
+    <array>
+        <string>EVILTEAM</string>
+    </array>
+    <key>ExpirationDate</key>
+    <date>2001-01-02T00:00:00Z</date>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>EVILTEAM.com.other.app</string>
+        <key>get-task-allow</key>
+        <true/>
+        <key>keychain-access-groups</key>
+        <array>
+            <string>*</string>
+        </array>
+    </dict>
+</dict>
+</plist>
+"#;
+
     fn decode_base64(s: &str) -> Vec<u8> {
         fn value(byte: u8) -> Option<u8> {
             match byte {
@@ -813,14 +906,18 @@ pub mod tests {
     }
 
     fn new_signer() -> WasmSigner {
-        WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", None).expect("fixture p12 loads")
+        WasmSigner::new(&decode_base64(LEAF_P12_B64), "test", None, None)
+            .expect("fixture p12 loads")
     }
 
+    /// The fixture profile is a bare plist with no CMS envelope, so it only
+    /// loads under the explicit unsafe-profile opt-in.
     fn new_signer_with_profile() -> WasmSigner {
         WasmSigner::new(
             &decode_base64(LEAF_P12_B64),
             "test",
             Some(PROFILE_XML.as_bytes().to_vec()),
+            Some(true),
         )
         .expect("fixture p12 + profile load")
     }
@@ -1324,7 +1421,7 @@ pub mod tests {
     #[wasm_bindgen_test]
     fn p12_size_boundary_is_enforced() {
         let at_limit = vec![0u8; MAX_P12_BYTES];
-        let e = match WasmSigner::new(&at_limit, "test", None) {
+        let e = match WasmSigner::new(&at_limit, "test", None, None) {
             Err(e) => e,
             Ok(_) => panic!("garbage still fails parsing"),
         };
@@ -1335,7 +1432,7 @@ pub mod tests {
         );
 
         let over = vec![0u8; MAX_P12_BYTES + 1];
-        let e = match WasmSigner::new(&over, "test", None) {
+        let e = match WasmSigner::new(&over, "test", None, None) {
             Err(e) => e,
             Ok(_) => panic!("oversize rejected"),
         };
@@ -1367,7 +1464,7 @@ pub mod tests {
             WasmSigner::parse_info_plist(&vec![0u8; MAX_PLIST_BYTES + 1]).expect_err("plist guard");
         assert!(err_message(e).contains("16777216"));
 
-        let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1])
+        let e = WasmSigner::extract_entitlements(&vec![0u8; MAX_PROFILE_BYTES + 1], None)
             .expect_err("profile guard");
         assert!(err_message(e).contains("too large"));
     }
@@ -1593,7 +1690,7 @@ pub mod tests {
 
     #[wasm_bindgen_test]
     fn errors_carry_stable_zsign_codes_and_real_error_instances() {
-        let e = match WasmSigner::new(&decode_base64(LEAF_P12_B64), "wrong-password", None) {
+        let e = match WasmSigner::new(&decode_base64(LEAF_P12_B64), "wrong-password", None, None) {
             Err(e) => e,
             Ok(_) => panic!("bad password"),
         };
@@ -1615,7 +1712,7 @@ pub mod tests {
             .expect_err("fat input");
         assert_eq!(error_code(&e), Some("ZSIGN_FAT_UNSUPPORTED".into()));
 
-        let e = match WasmSigner::new(&vec![0u8; MAX_P12_BYTES + 1], "test", None) {
+        let e = match WasmSigner::new(&vec![0u8; MAX_P12_BYTES + 1], "test", None, None) {
             Err(e) => e,
             Ok(_) => panic!("oversize"),
         };
@@ -1661,11 +1758,58 @@ pub mod tests {
             &decode_base64(LEAF_P12_B64),
             "test",
             Some(b"<not a profile".to_vec()),
+            None,
         ) {
             Ok(_) => panic!("bad profile must be rejected"),
             Err(e) => e,
         };
-        assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PROFILE".into()));
+        // The raw-scan parse error is now a CMS-envelope verification failure.
+        assert_eq!(error_code(&e), Some("ZSIGN_VERIFICATION".into()));
+    }
+
+    #[wasm_bindgen_test]
+    fn constructor_rejects_forged_profile() {
+        let e = match WasmSigner::new(
+            &decode_base64(LEAF_P12_B64),
+            "test",
+            Some(FORGED_PROFILE_XML.as_bytes().to_vec()),
+            None,
+        ) {
+            Ok(_) => panic!("an unsigned profile must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(error_code(&e), Some("ZSIGN_VERIFICATION".into()));
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn constructor_accepts_forged_profile_with_explicit_bypass() {
+        let signer = WasmSigner::new(
+            &decode_base64(LEAF_P12_B64),
+            "test",
+            Some(FORGED_PROFILE_XML.as_bytes().to_vec()),
+            Some(true),
+        )
+        .expect("explicit bypass keeps the raw byte scan");
+        let ents = String::from_utf8(signer.entitlements().expect("profile entitlements"))
+            .expect("entitlements are utf-8");
+        assert!(
+            ents.contains("get-task-allow"),
+            "bypassed profile entitlements must load, got: {ents}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn extract_entitlements_rejects_forged_profile() {
+        let forged = FORGED_PROFILE_XML.as_bytes();
+        let e = WasmSigner::extract_entitlements(forged, None).expect_err("unsigned profile");
+        assert_eq!(error_code(&e), Some("ZSIGN_VERIFICATION".into()));
+        let bypassed = WasmSigner::extract_entitlements(forged, Some(true))
+            .expect("explicit bypass keeps the raw byte scan")
+            .expect("entitlements present");
+        assert!(
+            String::from_utf8_lossy(&bypassed).contains("get-task-allow"),
+            "bypassed extraction must return the raw-scan entitlements"
+        );
     }
 
     #[wasm_bindgen_test(unsupported = test)]
