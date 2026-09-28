@@ -866,7 +866,7 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
     if let Some(p12_path) = &cli.pkcs12 {
         let p12_data = read_credential_file(p12_path, "pkcs12")?;
         let password = resolve_p12_password(cli, &p12_data)?;
-        let creds = SigningCredentials::from_p12(&p12_data, &password)?;
+        let creds = load_p12_credentials(&p12_data, &password)?;
         return Ok(creds);
     }
 
@@ -923,10 +923,31 @@ fn load_credentials(cli: &Cli) -> Result<SigningCredentials, Box<dyn std::error:
         // no PEM marker + no certificate => PKCS#12 content
         None => {
             let password = resolve_p12_password(cli, &key_data)?;
-            let creds = SigningCredentials::from_p12(&key_data, &password)?;
+            let creds = load_p12_credentials(&key_data, &password)?;
             Ok(creds)
         }
     }
+}
+
+/// Loads PKCS#12 credentials for a CLI run. Test builds use the unanchored
+/// loader so fixture-driven tests can exercise behavior downstream of
+/// credential loading; the shipped binary is always Apple-root anchored —
+/// a subprocess test proves it.
+#[cfg(test)]
+fn load_p12_credentials(
+    p12_data: &[u8],
+    password: &str,
+) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
+    Ok(SigningCredentials::from_p12_unanchored(p12_data, password)?)
+}
+
+/// Shipped arm: the production loader, always Apple-root anchored.
+#[cfg(not(test))]
+fn load_p12_credentials(
+    p12_data: &[u8],
+    password: &str,
+) -> Result<SigningCredentials, Box<dyn std::error::Error>> {
+    Ok(SigningCredentials::from_p12(p12_data, password)?)
 }
 
 /// Resolves the PKCS#12 password: flag/env first; otherwise the historical
@@ -1339,8 +1360,10 @@ mod tests {
 
     #[test]
     fn key_route_pkcs12_content_loads_with_password() {
-        // `-k` carrying p12 bytes + `-p` password signs a bare Mach-O to exit 0:
-        // proves content routing (p12 branch) and that -p feeds from_p12.
+        // `-k` carrying p12 bytes + `-p` password must get past decryption and
+        // policy to the anchoring stage: reaching "not anchored" rather than a
+        // MAC/channel error proves p12 content routing and that -p fed the
+        // loader.
         let dir = TempDir::new().unwrap();
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
@@ -1359,8 +1382,14 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(r.code, 0, "expected signed output, stderr: {}", r.stderr);
-        assert!(out.exists());
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("not anchored to a trusted root"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(!r.stderr.contains("MAC mismatch"), "stderr: {}", r.stderr);
+        assert!(!out.exists());
     }
 
     #[test]
@@ -1439,18 +1468,20 @@ mod tests {
         let input = dir.path().join("in.bin");
         std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
-        let r = run_cli(
-            &[
-                OsStr::new("-k"),
-                key.as_os_str(),
-                OsStr::new("-C"),
-                OsStr::new("-o"),
-                out.as_os_str(),
-                input.as_os_str(),
-            ],
-            &[("ZSIGN_PASSWORD", "testpassword")],
-        );
-        assert_eq!(r.code, 0, "-C must never gate signing: {}", r.stderr);
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "-k",
+            key.to_str().unwrap(),
+            "-p",
+            "testpassword",
+            "-C",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .expect("args parse");
+        let code = run(cli).expect("-C must never gate signing");
+        assert_eq!(code, ExitCode::SUCCESS);
         assert!(out.exists());
     }
 
@@ -1497,15 +1528,30 @@ mod tests {
             ],
             &[("ZSIGN_PASSWORD", "testpassword")],
         );
-        assert_eq!(r.code, 0, "env password must work, stderr: {}", r.stderr);
-        assert!(out.exists());
+        // The env value must reach the loader: reaching the anchoring stage
+        // with the correct password proves the env channel was honored — an
+        // ignored env would fail the empty-password trial with a MAC error or
+        // a "no password supplied" channel error instead.
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("not anchored to a trusted root"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("no password supplied"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(!r.stderr.contains("MAC mismatch"), "stderr: {}", r.stderr);
     }
 
     #[test]
     fn argv_password_beats_env_password() {
         // env-only wrong password must FAIL first (proves the env value is read
-        // at all), then flag+wrong-env must succeed (proves the flag wins) —
-        // either case alone cannot distinguish precedence from env being ignored
+        // at all), then flag+wrong-env must reach the anchoring stage (proves
+        // the flag wins) — either case alone cannot distinguish precedence
+        // from env being ignored
         let dir = TempDir::new().unwrap();
         let key = dir.path().join("identity.p12");
         std::fs::write(&key, IDENTITY_P12).unwrap();
@@ -1546,8 +1592,15 @@ mod tests {
             ],
             &[("ZSIGN_PASSWORD", "wrong-password")],
         );
-        assert_eq!(r.code, 0, "flag must win over env, stderr: {}", r.stderr);
-        assert!(out.exists());
+        // The flag must beat the env value: reaching the anchoring stage with
+        // no MAC mismatch proves the wrong env password was not the one used.
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("not anchored to a trusted root"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(!r.stderr.contains("MAC mismatch"), "stderr: {}", r.stderr);
     }
 
     #[test]
@@ -2010,7 +2063,8 @@ mod tests {
             r.stderr
         );
 
-        // Correct password: the key loads and the binary signs.
+        // Correct password: the key loads and the run reaches the anchoring
+        // stage — no password-shaped failure of any kind.
         let r = run_cli(
             &[
                 OsStr::new("-k"),
@@ -2025,8 +2079,22 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-        assert!(out.exists(), "signed output missing");
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("not anchored to a trusted root"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("Invalid password"),
+            "stderr: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("requires a password"),
+            "stderr: {}",
+            r.stderr
+        );
     }
 
     #[test]
@@ -2144,31 +2212,60 @@ mod tests {
         std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
         let profile = dir.path().join("absent.mobileprovision");
+        let cli = Cli::try_parse_from([
+            "zsign",
+            "-k",
+            key.to_str().unwrap(),
+            "-p",
+            "testpassword",
+            "-m",
+            profile.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .expect("args parse");
+        let err = run(cli).expect_err("missing profile must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absent.mobileprovision"),
+            "stderr must name the profile file: {msg}"
+        );
+        assert!(
+            msg.contains("provisioning profile"),
+            "stderr must name the label: {msg}"
+        );
+    }
+
+    #[test]
+    fn pkcs12_load_rejects_unanchored_chain() {
+        // The shipped binary must refuse a self-issued chain even with the
+        // correct password: anchoring is a production load-time contract.
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
+        let out = dir.path().join("out.bin");
         let r = run_cli(
             &[
-                OsStr::new("-k"),
+                OsStr::new("--pkcs12"),
                 key.as_os_str(),
                 OsStr::new("-p"),
                 OsStr::new("testpassword"),
-                OsStr::new("-m"),
-                profile.as_os_str(),
                 OsStr::new("-o"),
                 out.as_os_str(),
                 input.as_os_str(),
             ],
             &[],
         );
-        assert_eq!(r.code, 1, "expected 1, stderr: {}", r.stderr);
+        assert_eq!(r.code, 1, "unanchored chain must be refused: {}", r.stderr);
         assert!(
-            r.stderr.contains("absent.mobileprovision"),
-            "stderr must name the profile file: {}",
+            r.stderr.contains("not anchored to a trusted root"),
+            "stderr: {}",
             r.stderr
         );
-        assert!(
-            r.stderr.contains("provisioning profile"),
-            "stderr must name the label: {}",
-            r.stderr
-        );
+        assert!(!out.exists(), "no output may be produced");
     }
 
     /// The brief's forgery: no CMS envelope, foreign team, another app id,
