@@ -146,7 +146,8 @@ cat > "$WORK/entitlements.xml" <<'ENTXML'
 ENTXML
 
 # Minimal fixture profile: the entitlements extractor only needs the XML
-# plist window, not a real CMS signature.
+# plist window, not a real CMS signature, so signing opts into the
+# profile-validation bypass explicitly.
 python3 - "$WORK/entitlements.xml" "$WORK/fixture.mobileprovision" <<'PYPROF'
 import plistlib, sys
 ent = plistlib.load(open(sys.argv[1], "rb"))
@@ -155,7 +156,8 @@ with open(sys.argv[2], "wb") as fh:
 PYPROF
 
 sign_and_verify "$WORK/ent" "cert-signed (RSA, entitlements)" \
-    --pkcs12 "$WORK/cs.p12" --password test -m "$WORK/fixture.mobileprovision"
+    --pkcs12 "$WORK/cs.p12" --password test -m "$WORK/fixture.mobileprovision" \
+    --allow-unsafe-profile
 
 app="$WORK/ent/Test.app"
 D=$(codesign -d --verbose=4 "$app/Test" 2>&1)

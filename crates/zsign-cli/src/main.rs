@@ -53,6 +53,11 @@ struct Cli {
     #[arg(short = 'm', long)]
     profile: Option<PathBuf>,
 
+    /// Skip CMS/expiry/team/App-ID validation of every provisioning profile this
+    /// run loads (unsafe)
+    #[arg(long)]
+    allow_unsafe_profile: bool,
+
     /// Per-bundle provisioning profile as bundle-id=profile-path (repeatable).
     /// Applies to app bundles only; ignored when signing a bare Mach-O.
     #[arg(
@@ -159,6 +164,7 @@ struct Cli {
             "pkcs12",
             "keychain_identity",
             "profile",
+            "allow_unsafe_profile",
             "profile_map",
             "remove_profile",
             "entitlements",
@@ -229,6 +235,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if let Some(profile) = cli.profile {
         signer = signer.provisioning_profile(profile);
+    }
+
+    if cli.allow_unsafe_profile {
+        signer = signer.allow_unsafe_profile(true);
     }
 
     if let Some(entitlements) = cli.entitlements {
@@ -1643,6 +1653,7 @@ mod tests {
             vec!["zsign", "-V", "-c", "c.pem", "-k", "k.pem", "in.ipa"],
             vec!["zsign", "-V", "--pkcs12", "x.p12", "in.ipa"],
             vec!["zsign", "-V", "-2", "in.ipa"],
+            vec!["zsign", "-V", "--allow-unsafe-profile", "in.ipa"],
         ] {
             assert_eq!(
                 parse_err(&extra).kind(),
@@ -2158,5 +2169,127 @@ mod tests {
             "stderr must name the label: {}",
             r.stderr
         );
+    }
+
+    /// The brief's forgery: no CMS envelope, foreign team, another app id,
+    /// long expired, `get-task-allow` and a wildcard keychain group.
+    const FORGED_PROFILE_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Name</key>
+    <string>Forged Profile</string>
+    <key>CreationDate</key>
+    <date>2001-01-01T00:00:00Z</date>
+    <key>ExpirationDate</key>
+    <date>2001-01-02T00:00:00Z</date>
+    <key>TeamIdentifier</key>
+    <array>
+        <string>EVILTEAM</string>
+    </array>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>EVILTEAM.com.other.app</string>
+        <key>get-task-allow</key>
+        <true/>
+        <key>keychain-access-groups</key>
+        <array>
+            <string>*</string>
+        </array>
+    </dict>
+</dict>
+</plist>"#;
+
+    /// Writes the forged profile, the identity and a minimal Mach-O into `dir`,
+    /// returning the key, profile, input and output paths.
+    fn forged_profile_cli_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let key = dir.join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        let profile = dir.join("forged.mobileprovision");
+        std::fs::write(&profile, FORGED_PROFILE_XML).unwrap();
+        let input = dir.join("in.bin");
+        std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
+        let out = dir.join("out.bin");
+        (key, profile, input, out)
+    }
+
+    #[test]
+    fn forged_profile_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let (key, profile, input, out) = forged_profile_cli_paths(dir.path());
+        let r = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-m"),
+                profile.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        // Control: the same identity and input sign to exit 0 without `-m`, so a
+        // non-zero code above can only come from the profile, not a broken key or
+        // an unsignable fixture.
+        let ctrl_out = dir.path().join("ctrl.bin");
+        let control = run_cli(
+            &[
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-o"),
+                ctrl_out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(
+            control.code, 0,
+            "control sign must succeed, stderr: {}",
+            control.stderr
+        );
+
+        assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+        assert!(
+            !r.stderr.trim().is_empty(),
+            "a rejected profile must explain itself"
+        );
+        assert!(
+            r.stderr.contains("Verification failed"),
+            "stderr must name the rejection class, not just fail: {}",
+            r.stderr
+        );
+        assert!(
+            !out.exists(),
+            "no signed output may be written for a rejected profile"
+        );
+    }
+
+    #[test]
+    fn allow_unsafe_profile_flag_accepts_forged_profile() {
+        let dir = TempDir::new().unwrap();
+        let (key, profile, input, out) = forged_profile_cli_paths(dir.path());
+        let r = run_cli(
+            &[
+                OsStr::new("--allow-unsafe-profile"),
+                OsStr::new("-k"),
+                key.as_os_str(),
+                OsStr::new("-p"),
+                OsStr::new("testpassword"),
+                OsStr::new("-m"),
+                profile.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                input.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert!(out.exists(), "the explicit bypass must sign: {}", r.stderr);
     }
 }
