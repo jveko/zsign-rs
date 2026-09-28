@@ -178,8 +178,8 @@ Native (class + message; the wasm mapper is exhaustive by construction):
 
 | # | Entry | Input | Assert |
 |---|---|---|---|
-| N1 | `ZSign::sign_macho` | missing path | `Error::Io(_)`; msg contains `provisioning profile` + path (exists via CLI pin; facade-level pin added) |
-| N2 | `ZSign::sign_macho` | CMS-less profile | `Core(Verification(_))`; msg contains path (extends `builder.rs:1939`) |
+| N1 | `ZSign::sign_macho` | missing path | `Error::Io(_)`; msg contains `provisioning profile` + path — facade-level pin added (plan Task 1 Step 6); CLI pin `missing_profile_error_names_the_file` covers end-to-end |
+| N2 | `ZSign::sign_macho` | CMS-less profile | `Core(Verification(_))`; msg contains the file name — new pin beside the existing `builder.rs:1939` class pin (plan Task 1 Step 5) |
 | N3 | `sign_ipa`/`sign_bundle` root, path | missing path | `Error::Io(_)`; msg contains `provisioning profile` + path — **red today** |
 | N4 | root, path | forged/CMS-less profile | `Core(Verification(_))`; msg contains path — **red for path** |
 | N5 | `--profile-map` | missing path | `Error::Io(_)`; msg contains id + path (exists, `ipa/mod.rs:4196`) |

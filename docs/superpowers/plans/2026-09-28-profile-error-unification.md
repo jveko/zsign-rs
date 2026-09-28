@@ -19,6 +19,13 @@ tests via `wasm-pack test --node`.
 
 **Spec:** `docs/superpowers/specs/2026-09-28-profile-error-unification-design.md`
 
+**Supersedes (landed specs are not edited):** the `Config`-shape sentences in
+`docs/superpowers/specs/2026-09-28-native-profile-cap-design.md:159` ("other
+errors from that site keep their `Config` shape") and
+`docs/superpowers/specs/2026-09-28-profile-validation-wiring-design.md:176`
+("`load_bundle_profiles` keeps its existing Config wrapper"). This plan's
+Task 1 Step 1 migrates the pin those sentences describe.
+
 ## Global Constraints
 
 - Zero-warning gate: `cargo fmt --all -- --check` and
@@ -50,8 +57,10 @@ tests via `wasm-pack test --node`.
    format must survive — pin: Task 1 additions to
    `oversized_profile_map_entry_surfaces_as_input_too_large_naming_bundle`.
 4. Map-key rejections (invalid/root-id/duplicate) must STAY
-   `Core(Config(_))` — existing pins `test_profile_map_root_id_rejected`,
-   `test_profile_map_duplicate_key_errors` must pass untouched.
+   `Core(Config(_))` — pinned by Task 1 Step 9 (class assertions added to
+   `test_profile_map_root_id_rejected`,
+   `test_profile_map_duplicate_key_errors`, plus the new invalid-bundle-id
+   test).
 5. Bytes-arm messages (wasm sign_ipa path) must stay byte-identical —
    existing pins `sign_ipa_bytes_rejects_{forged,expired,wrong_team,wrong_app}_profile`
    must pass untouched.
@@ -165,22 +174,54 @@ assert!(msg.contains("forged.mobileprovision"), "…");
 
 Expected: class assertion passes, path assertion FAILS today.
 
-- [ ] **Step 5: Extend the sign_macho forged pin with the path (red)**
+- [ ] **Step 5: Pin that sign_macho names the profile file (red)**
 
-In `crates/zsign/src/builder.rs`, extend `sign_macho_rejects_forged_profile`
-(~:1939) with one assertion (the profile path variable already exists in the
-test):
+New test in `crates/zsign/src/builder.rs` — do NOT edit
+`sign_macho_rejects_forged_profile` (:1939); it stays pristine as the ZSN-118
+class pin. Model the new test on it, reusing `forged_profile_sign_paths`
+(:1930-1936):
 
 ```rust
+#[test]
+fn sign_macho_forged_profile_names_the_file() { … }
+```
+
+```rust
+let file_name = profile.file_name().unwrap().to_str().unwrap();
 assert!(
-    err.to_string().contains(<profile path str>),
+    matches!(&err, Error::Core(zsign_core::Error::Verification(_))),
+    "class pin: {err:?}"
+);
+assert!(
+    err.to_string().contains(file_name),
     "the validation failure must name the profile file: {err}"
 );
 ```
 
-Expected: FAIL today (bare `?` at builder.rs:674-680 adds no path).
+Expected: class assertion passes, file-name assertion FAILS today (bare `?`
+at builder.rs:674-680 adds no path).
 
-- [ ] **Step 6: Pin the single `Input too large:` prefix (green — regression)**
+- [ ] **Step 6: Pin that sign_macho's missing profile names the file (green — regression)**
+
+New test in `crates/zsign/src/builder.rs`, same shape but with a profile path
+that does not exist:
+
+```rust
+#[test]
+fn sign_macho_missing_profile_names_the_file() { … }
+```
+
+```rust
+assert!(matches!(&err, Error::Io(_)), "got: {err:?}");
+assert!(msg.contains("provisioning profile"), "…");
+assert!(msg.contains("absent.mobileprovision"), "…");
+```
+
+Expected: PASS today (builder's read wrap already names the path) — this is
+the facade-level N1 pin; the CLI pin
+`missing_profile_error_names_the_file` covers only the end-to-end stderr.
+
+- [ ] **Step 7: Pin the single `Input too large:` prefix (green — regression)**
 
 In `crates/zsign/src/ipa/mod.rs`, add to
 `oversized_profile_map_entry_surfaces_as_input_too_large_naming_bundle`
@@ -194,38 +235,74 @@ assert_eq!(msg.matches("Input too large:").count(), 1, "prefix never doubled: {m
 
 Expected: PASS today and after Task 2.
 
-- [ ] **Step 7: wasm `ZSIGN_INVALID_PROFILE` pin (green — contract)**
+- [ ] **Step 8: wasm `ZSIGN_INVALID_PROFILE` pin (green — contract)**
 
-In `crates/zsign-wasm/src/lib.rs`, new `#[wasm_bindgen_test]` modeled on
-`new_signer_with_profile` (:928-934): construct `WasmSigner` with
-`allow_unsafe_profile = true` and profile bytes that parse as an XML plist
-but whose root is not a dictionary
-(`<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist …><plist version="1.0"><string>not a dictionary</string></plist>`):
+In `crates/zsign-wasm/src/lib.rs`, new `#[wasm_bindgen_test]`. Build the
+signer through the same path `new_signer_with_profile` (:928-934) uses —
+`WasmSigner::assemble` with `allow_unsafe = true` — NOT the public
+`WasmSigner::new`, whose Apple-root-anchored p12 load rejects the self-issued
+fixture identity (see `constructor_rejects_unanchored_credentials` :1832).
+Profile bytes: an XML plist whose root is not a dictionary, starting with
+`<?xml ` so the raw byte scan finds the document marker:
 
 ```rust
-let e = ….expect_err("non-dictionary profile must be rejected");
+let non_dict = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><string>not a dictionary</string></plist>";
+let e = WasmSigner::assemble(credentials, Some(non_dict.to_vec()), true)
+    .expect_err("non-dictionary profile must be rejected");
 assert_eq!(error_code(&e), Some("ZSIGN_INVALID_PROFILE".into()));
 ```
 
-Expected: PASS today (ctor maps core directly; this pins the stable code the
-matrix requires).
+(Adapt the exact `assemble` signature to what `new_signer_with_profile`
+calls — credentials source and argument shape stay as in that helper.)
 
-- [ ] **Step 8: Run scoped suites; record the red list**
+Expected: PASS today (raw scan reaches `profile_document`, whose non-dict
+root returns `ProvisioningProfile` → `ZSIGN_INVALID_PROFILE`); pins the
+stable code the matrix requires.
+
+- [ ] **Step 9: Pin that map-key rejections stay `Config` (green — contract)**
+
+These are the genuine configuration errors that must NOT move with the
+validation failures:
+
+1. In `crates/zsign/src/ipa/mod.rs`, add a class assertion to
+   `test_profile_map_root_id_rejected` (:4156) and
+   `test_profile_map_duplicate_key_errors` (:4174):
+
+```rust
+assert!(
+    matches!(&err, Error::Core(zsign_core::Error::Config(_))),
+    "a map-key rejection is a config error, got: {err:?}"
+);
+```
+
+2. New test for the third rejection, which currently has no pin at all
+   (ipa/mod.rs:739-741), e.g. map key `com.test.app/../escape`:
+
+```rust
+#[test]
+fn profile_map_invalid_bundle_id_is_config() { … }
+// same class assertion as above, message contains the offending id
+```
+
+Expected: PASS today and after Task 2 (Task 2 must not touch these arms).
+
+- [ ] **Step 10: Run scoped suites; record the red list**
 
 Run:
 ```
 TMPDIR=$PWD/target/tmp cargo test -p zsign-rs profile
 TMPDIR=$PWD/target/tmp cargo test -p zsign-rs oversized
+TMPDIR=$PWD/target/tmp cargo test -p zsign-core provisioning
 wasm-pack test --node crates/zsign-wasm
 ```
 Expected: the new/migrated tests from Steps 1-5 FAIL with the documented
-expectations; Step 6-7 and every regression pin in the brief (ZSN-118
+expectations; Steps 6-9 and every regression pin in the brief (ZSN-118
 `sign_macho_rejects_forged_profile`, `sign_ipa_bytes_rejects_*`,
 `missing_profile_error_names_the_file`, `forged_profile_fails_closed`,
 core provisioning pins, ZSN-123 oversized pins) PASS. Paste the red list
 into the task output.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 11: Commit**
 
 `git add crates/zsign/src/ipa/mod.rs crates/zsign/src/builder.rs crates/zsign-wasm/src/lib.rs`
 → `test: pin provisioning profile error matrix`
@@ -266,9 +343,22 @@ pub(crate) fn profile_validation_error(
 Approach: `profile_source` formats
 `provisioning profile '<path>'` or
 `provisioning profile for bundle '<id>' at '<path>'`.
-`read_profile_file` is `std::fs::read(path).map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("failed to read {source}: {e}"))))` where
-`source = profile_source(path, bundle_id)`.
-`profile_validation_error` matches:
+`read_profile_file` derives its source label from BOTH parameters, then wraps
+the read:
+
+```rust
+pub(crate) fn read_profile_file(path: &Path, bundle_id: Option<&str>) -> Result<Vec<u8>, Error> {
+    let source = profile_source(path, bundle_id);
+    std::fs::read(path).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read {source}: {e}"),
+        ))
+    })
+}
+```
+
+`profile_validation_error` computes the same `source` and matches:
 
 ```rust
 match e {
@@ -291,9 +381,9 @@ ticket IDs. Match the file's existing import block and `///` style.
 - [ ] **Step 2: Rewire `builder.rs::load_entitlements_from_profile`**
 
 Replace the hand-rolled read wrap (:658-666) with
-`let profile_data = crate::builder::read_profile_file(profile_path, None)?;`
-(plain `read_profile_file(profile_path, None)?` — same module) and wrap the
-`extract_entitlements_checked(…)` error arm with
+`let profile_data = read_profile_file(profile_path, None)?;` (no module
+prefix — the helper lives in this file) and wrap the
+`extract_entitlements_checked(…)` error with
 `profile_validation_error(e, profile_path, None)`.
 
 - [ ] **Step 3: Rewire `ipa/mod.rs::load_profile`**
@@ -373,28 +463,36 @@ summary.
 
 Run:
 ```
-git status --porcelain
-git log --oneline main..HEAD
+git diff --name-only "$(git merge-base main HEAD)"..HEAD
 ```
-Expected: only the three commits (docs, test, fix) plus any plan/spec
-follow-ups; no `crypto/*`, `p12_err`, `verify.rs`, README, `scripts/`,
-`.github/` changes.
+Expected: the file list contains ONLY
+`docs/superpowers/specs/2026-09-28-profile-error-unification-design.md`,
+`docs/superpowers/plans/2026-09-28-profile-error-unification.md`,
+`crates/zsign/src/builder.rs`, `crates/zsign/src/ipa/mod.rs`, and
+`crates/zsign-wasm/src/lib.rs` — explicitly NO
+`crates/zsign-core/src/crypto/*`, no wasm `p12_err` region edits, no
+`verify.rs`, no `README.md`, no `scripts/`, no `.github/`. (`git status
+--porcelain` alone proves nothing here: committed edits never appear in it.)
 
 ---
 
 ## Self-Review
 
 1. **Spec coverage:** spec §2 decision → Task 2 Steps 1-4; §7 test matrix
-   N1-N7/R1-R4 → Task 1 Steps 1-7 (N1 facade/CLI pin exists; N3=Step 3,
-   N2=Step 5, N4=Step 4, N5 existing, N6=Steps 1-2, N7=Step 6, wasm=Step 7,
-   R-pins = Step 8 run list); §4 site list → Task 2 Steps 2-4 (bytes arm
-   deliberately untouched); §5 contract → no wasm/CLI/README edits anywhere
-   in the plan; §6 invariants → Global Constraints + Task 3 gates.
+   N1-N7/R1-R4 → Task 1 (N1=Step 6 facade pin + existing CLI pin, N2=Step 5,
+   N3=Step 3, N4=Step 4, N5 existing, N6=Steps 1-2, N7=Step 7, wasm=Step 8,
+   map-key Config=Step 9, R-pins = Step 10 run list incl. `-p zsign-core`);
+   §4 site list → Task 2 Steps 2-4 (bytes arm deliberately untouched); §5
+   contract → no wasm/CLI/README edits anywhere in the plan, supersession
+   linked in the header; §6 invariants → Global Constraints + Task 3 gates.
 2. **Step scan:** every step names one test/one rewiring/one command with an
    expected result; no TBDs or "handle edges".
 3. **Type consistency:** helper signatures in Task 1's mental model match
-   Task 2's Interfaces block verbatim; `bundle_id: Option<&str>` everywhere.
-4. **Review Focus:** all five lines have owning pins (Task 1 Steps 1, 3, 6
-   + existing untouched pins named in Steps 4/8).
+   Task 2's Interfaces block verbatim; `bundle_id: Option<&str>` everywhere;
+   Task 2's Step 1 recipe shows the two-parameter `read_profile_file` body
+   that Steps 2-4 call.
+4. **Review Focus:** all five lines have owning pins (Task 1 Steps 1, 3, 9
+   + Step 8 for wasm + the existing untouched bytes-arm pins named in
+   Step 10).
 5. **Proportion:** plan is test-and-signal sized; the only code bodies are
    the three helpers whose exact output format is the contract.
