@@ -669,9 +669,9 @@ impl SigningCredentials {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::InvalidPassword`] if the password is incorrect.
     /// Returns [`Error::Certificate`] if:
     /// - The PKCS#12 data is malformed
-    /// - The password is incorrect
     /// - No certificate is found in the container
     /// - No private key is found in the container
     /// - The private key is neither RSA nor ECDSA P-256

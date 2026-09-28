@@ -1418,4 +1418,30 @@ mod tests {
             "{err}"
         );
     }
+
+    #[test]
+    fn p12_load_error_maps_password_classes_and_keeps_container_classes() {
+        // Parity with the loaders: passphrase failures surface as
+        // InvalidPassword, everything else keeps the certificate class.
+        let mac = p12_load_error(P12Error::Mac);
+        assert!(
+            matches!(mac, Error::InvalidPassword),
+            "a MAC mismatch is a password failure, got {mac:?}"
+        );
+        let decrypt = p12_load_error(P12Error::Decrypt("AES-CBC".into()));
+        assert!(
+            matches!(decrypt, Error::InvalidPassword),
+            "a password-derived decryption failure is a password failure, got {decrypt:?}"
+        );
+        let der = p12_load_error(P12Error::Der("truncated".into()));
+        assert!(
+            matches!(&der, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
+            "a malformed container must keep its certificate class, got {der:?}"
+        );
+        let unsupported = p12_load_error(P12Error::Unsupported("AES-GCM".into()));
+        assert!(
+            matches!(&unsupported, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
+            "an unsupported container must keep its certificate class, got {unsupported:?}"
+        );
+    }
 }
