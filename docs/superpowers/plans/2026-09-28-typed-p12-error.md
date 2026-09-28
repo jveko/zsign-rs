@@ -84,8 +84,9 @@ assert!(
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core wrong_password_is_invalid_password test_from_p12_invalid_data`
-Expected: exactly the two new `*_is_invalid_password` tests FAIL (red set — wrong password is `Certificate` today). `test_from_p12_invalid_data`'s upgraded assertion PASSES already (a corrupt container is `Certificate` today; it is an invariant pin that must not regress, not red). Record actual output.
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core wrong_password_is_invalid_password`
+(`cargo test` accepts one TESTNAME filter; both new tests share the `wrong_password_is_invalid_password` suffix, so one filter selects both.)
+Expected: exactly the two new `*_is_invalid_password` tests FAIL (red set — wrong password is `Certificate` today). The upgraded `test_from_p12_invalid_data` is not selected by this filter; it passes as-is (a corrupt container is `Certificate` today — it is an invariant pin that must not regress, not red) and is exercised in Step 5. Record actual output.
 
 - [ ] **Step 3: Implement `p12_load_error` in `pkcs12.rs`**
 
@@ -247,7 +248,7 @@ assert!(
 - [ ] **Step 3: Run CLI tests to verify red**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-cli`
-Expected: FAIL — `missing_password_on_non_tty_degrades_to_clear_error` fails on the hint assertions (sniffer no longer fires: current code still sniffs the old markers), `argv_password_beats_env_password` fails on the adapted substring. Record actual output.
+Expected: FAIL — both adapted tests go red **solely on their real-cause substring assertion**: at this step the old sniffer is still present and the empty-password trial still yields `Certificate("Failed to parse PKCS#12: invalid PKCS#12 password (MAC mismatch)")` (via `cert.rs:709-710`), whose text contains neither `Invalid password for private key or PKCS#12`. The `--password`/`ZSIGN_PASSWORD` hint assertions still PASS at this step (the sniffer still fires) — they become the at-risk guard only after Step 4 rewires the classifier, which is why Step 5 re-runs the whole suite. Record actual output.
 
 - [ ] **Step 4: Rewrite `resolve_p12_password`**
 

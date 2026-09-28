@@ -1,6 +1,7 @@
 # Design: Typed PKCS#12 Password Signal End-to-End (ZSN-230)
 
-Status: final (cold-reviewed before implementation)
+Status: final (cold review: round 1 NOT-READY → fixes → round 2
+READY-WITH-FIXES; all prescribed fixes applied)
 Base: main @ 899170c (ZSN-96 Apple-root anchoring, ZSN-98 key↔cert guard,
 ZSN-143 profile-error unification all landed)
 
@@ -76,7 +77,7 @@ Fail-closed posture: wrong password still fails on every route; only the
   450, 460, 632-633`); non-block-aligned ciphertext, short IV and bad
   PKCS#7 padding all surface as `Decrypt` (`cbc_decrypt` `:642-644,
   :645-647, :663-665`, the padding check delegating to `unpad_pkcs7`
-  whose invalid-padding returns are `:671-679` → `:488`/`:633`) —
+  whose invalid-padding returns are `:672-680` → `:488`/`:633`) —
   crypto-11's claim confirmed against source.
   These were also sniffer-matched before; parity holds.
 - A wrong password can degenerate into `Der` only on no-MAC files with a
