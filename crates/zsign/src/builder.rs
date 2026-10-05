@@ -1070,16 +1070,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_macho_adhoc_rejects_fat() {
+    fn test_sign_macho_adhoc_signs_fat() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_two_arch_fat_fixture(dir.path());
         let output = dir.path().join("universal_signed");
 
-        let err = ZSign::new()
+        ZSign::new()
             .adhoc(true)
             .sign_macho(&input, &output)
-            .expect_err("adhoc direct-sign must fail closed on FAT (documented limitation)");
-        assert!(err.to_string().contains("sign_any_macho"), "{err}");
+            .expect("adhoc direct-sign must cover FAT containers");
+
+        let signed = std::fs::read(&output).unwrap();
+        assert_eq!(&signed[0..4], &[0xca, 0xfe, 0xba, 0xbe]);
+        let m = crate::macho::MachOFile::parse(signed).unwrap();
+        assert!(m.is_fat() && m.slices().len() == 2);
+        assert!(
+            m.slices().iter().all(|s| s.code_sig_offset.is_some()),
+            "both slices must be signed"
+        );
     }
     /// Minimal `Info.plist` for the IPA fixture (has no name/version keys, so a
     /// rewrite of either key is observable in the signed output).

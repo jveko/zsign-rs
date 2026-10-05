@@ -278,10 +278,12 @@ pub fn sign_macho(
     Ok(signed.signed_data)
 }
 
-/// Signs a single-architecture Mach-O with no identity (ad-hoc).
+/// Signs a Mach-O with no identity (ad-hoc).
 ///
 /// The superblob carries an empty CMS wrapper and the code directories are
 /// flagged `CS_ADHOC`. No certificate or private key is required.
+/// Every slice of a FAT/Universal binary is signed ad-hoc and the container
+/// is reassembled; a thin binary is signed in place.
 pub fn sign_macho_adhoc(
     macho: &MachOFile,
     identifier: &str,
@@ -291,10 +293,18 @@ pub fn sign_macho_adhoc(
     allow_encrypted: bool,
 ) -> Result<Vec<u8>> {
     if macho.is_fat() {
-        return Err(crate::Error::MachO(
-            "sign_macho_adhoc signs thin Mach-O only; use sign_any_macho for FAT/Universal binaries"
-                .into(),
-        ));
+        reject_encrypted(macho, identifier, allow_encrypted)?;
+        let signed = sign_all_slices_impl(
+            macho,
+            identifier,
+            entitlements,
+            None,
+            info_plist,
+            code_resources,
+            allow_encrypted,
+            false,
+        )?;
+        return super::writer::embed_signature_fat(macho.data(), &signed);
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
@@ -332,7 +342,7 @@ pub fn sign_macho_sha256_only(
             macho,
             identifier,
             entitlements,
-            credentials,
+            Some(credentials),
             info_plist,
             code_resources,
             allow_encrypted,
@@ -379,7 +389,7 @@ pub fn sign_macho_all_slices(
         macho,
         identifier,
         entitlements,
-        credentials,
+        Some(credentials),
         info_plist,
         code_resources,
         allow_encrypted,
@@ -387,20 +397,21 @@ pub fn sign_macho_all_slices(
     )
 }
 
-/// Shared per-slice signing engine behind [`sign_macho_all_slices`] and
-/// [`sign_macho_sha256_only`].
+/// Shared per-slice signing engine behind [`sign_macho_all_slices`],
+/// [`sign_macho_sha256_only`], and [`sign_macho_adhoc`].
 ///
-/// `sha256_only` selects whether each slice gets a SHA-256-only code
-/// directory (no SHA-1 slot) or the default SHA-1 + SHA-256 set.
+/// `credentials` of `None` signs ad-hoc (`CS_ADHOC` code directories, empty
+/// CMS wrapper). `sha256_only` selects whether each slice gets a SHA-256-only
+/// code directory (no SHA-1 slot) or the default SHA-1 + SHA-256 set.
 // Mirrors the frozen 7-argument public sibling plus the sha256_only mode
-// flag; a wrapper struct for a private two-caller helper would add
-// indirection without shrinking the public surface.
+// flag; a wrapper struct for a private helper would add indirection without
+// shrinking the public surface.
 #[allow(clippy::too_many_arguments)]
 fn sign_all_slices_impl(
     macho: &MachOFile,
     identifier: &str,
     entitlements: Option<&[u8]>,
-    credentials: &SigningCredentials,
+    credentials: Option<&SigningCredentials>,
     info_plist: Option<&[u8]>,
     code_resources: Option<&[u8]>,
     allow_encrypted: bool,
@@ -414,7 +425,7 @@ fn sign_all_slices_impl(
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let ctx = SigningContext::new(
         identifier,
-        Some(credentials),
+        credentials,
         entitlements,
         is_executable,
         info_plist,
@@ -435,7 +446,7 @@ fn sign_all_slices_impl(
                 slice,
                 identifier,
                 &ctx,
-                Some(credentials),
+                credentials,
                 sha256_only,
             )?;
 
@@ -1262,7 +1273,10 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_only_signers_reject_fat_containers() {
+    fn test_sign_macho_rejects_fat_containers() {
+        // sign_macho is still thin-only (it needs credentials); the ad-hoc
+        // sibling now signs containers itself — see
+        // test_sign_macho_adhoc_signs_fat_container.
         let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
         let macho = MachOFile::parse(fat).unwrap();
         let creds = crate::macho::fixtures::test_root_credentials();
@@ -1272,12 +1286,59 @@ mod tests {
             err.to_string().contains("sign_any_macho"),
             "error must point at the FAT-capable entry: {err}"
         );
-        let err = sign_macho_adhoc(&macho, "com.zsign.no", None, None, None, false)
-            .expect_err("adhoc thin-only signer must reject a container");
-        assert!(
-            err.to_string().contains("sign_any_macho"),
-            "error must point at the FAT-capable entry: {err}"
+    }
+
+    #[test]
+    fn test_sign_macho_adhoc_signs_fat_container() {
+        use crate::codesign::verify::PageCheck;
+
+        let fat = make_fat_macho(
+            &[
+                crate::macho::fixtures::make_minimal_macho_32(),
+                make_minimal_macho(),
+            ],
+            &[12, 12],
         );
+        let macho = MachOFile::parse(fat).unwrap();
+        let input_archs: Vec<u32> = macho.slices().iter().map(|s| s.cpu_type).collect();
+        assert_eq!(input_archs.len(), 2);
+
+        let signed = sign_macho_adhoc(&macho, "com.zsign.adhocfat", None, None, None, false)
+            .expect("adhoc signing must cover FAT containers");
+
+        let out = MachOFile::parse(signed.clone()).unwrap();
+        assert!(out.is_fat(), "output must remain a FAT container");
+        let output_archs: Vec<u32> = out.slices().iter().map(|s| s.cpu_type).collect();
+        assert_eq!(
+            output_archs, input_archs,
+            "slice count and architectures must be preserved"
+        );
+        for (i, slice) in out.slices().iter().enumerate() {
+            assert!(
+                slice.code_sig_offset.is_some(),
+                "slice {i} must carry an embedded signature"
+            );
+        }
+
+        let report =
+            crate::macho::verify_macho(&signed, &crate::codesign::verify::SignatureInputs::none())
+                .expect("signed output must verify structurally");
+        assert!(report.fat);
+        assert_eq!(report.slices.len(), 2, "both slices must report");
+        for (i, slice) in report.slices.iter().enumerate() {
+            assert!(slice.signed, "slice {i} must be signed");
+            assert!(
+                slice.adhoc,
+                "slice {i} must carry a CS_ADHOC code directory"
+            );
+            assert_eq!(
+                slice.pages,
+                PageCheck::Matched,
+                "slice {i}: {:?}",
+                slice.errors
+            );
+            assert!(slice.is_valid(), "slice {i}: {:?}", slice.errors);
+        }
     }
 
     #[test]

@@ -104,7 +104,10 @@ pub fn sign_macho_all_slices(
     )?)
 }
 
-/// Signs a single-architecture Mach-O with no identity (ad-hoc).
+/// Signs a Mach-O with no identity (ad-hoc).
+///
+/// Every slice of a FAT/Universal binary is signed ad-hoc and the container
+/// is reassembled; a thin binary is signed in place.
 pub fn sign_macho_adhoc(
     macho: &MachOFile,
     identifier: &str,
