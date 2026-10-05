@@ -1085,7 +1085,7 @@ mod tests {
         };
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let credentials = crate::macho::fixtures::test_root_credentials();
+        let credentials = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_macho_sha256_only(
             &macho,
             "com.zsign.sha256only",
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(macho.is_fat(), "fixture must parse as a FAT container");
         assert_eq!(macho.slices().len(), 2, "fixture must hold two slices");
 
-        let creds = crate::macho::fixtures::test_root_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         // This is exactly the call the default IpaSigner (sha256_only=true) makes.
         let signed =
             sign_macho_sha256_only(&macho, "com.zsign.fatsha", None, &creds, None, None, false)
@@ -1223,7 +1223,7 @@ mod tests {
         let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
         let macho = MachOFile::parse(fat).unwrap();
         assert!(macho.is_fat() && macho.slices().len() == 1);
-        let creds = crate::macho::fixtures::test_root_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_any_macho(&macho, "com.zsign.onefat", None, &creds, None, None, false)
             .expect("one-arch FAT must sign through the FAT-capable path");
         assert_eq!(
@@ -1252,7 +1252,7 @@ mod tests {
         b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64-headed
         let fat = make_fat_macho(&[a, b], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
-        let creds = crate::macho::fixtures::test_root_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_any_macho(&macho, "com.zsign.tail", None, &creds, None, None, false)
             .expect("FAT signing must succeed");
         let m = MachOFile::parse(signed.clone()).expect("signed output reparses");
@@ -1428,7 +1428,7 @@ mod tests {
         );
 
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let creds = crate::macho::fixtures::test_root_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let first = sign_macho(
             &macho,
             "com.zsign.bigents",
@@ -1460,7 +1460,7 @@ mod tests {
 
         let identifier = "com.zsign.roundtrip";
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
-        let credentials = crate::macho::fixtures::test_root_credentials();
+        let credentials = crate::macho::fixtures::test_signing_credentials();
 
         let signed = sign_macho(
             &macho,
@@ -1629,7 +1629,7 @@ mod tests {
             "second slice must be encrypted"
         );
 
-        let credentials = crate::macho::fixtures::test_root_credentials();
+        let credentials = crate::macho::fixtures::test_signing_credentials();
         let err = sign_any_macho(
             &macho,
             "com.zsign.fat",
@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn test_sign_allow_encrypted_override() {
         let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
-        let credentials = crate::macho::fixtures::test_root_credentials();
+        let credentials = crate::macho::fixtures::test_signing_credentials();
         let signed = sign_macho(
             &macho,
             "com.zsign.encrypted",
@@ -1813,7 +1813,7 @@ mod tests {
         b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
         let fat = make_fat_macho(&[make_minimal_macho(), b], &[12, 12]);
         let macho = MachOFile::parse(fat).unwrap();
-        let creds = crate::macho::fixtures::test_root_credentials();
+        let creds = crate::macho::fixtures::test_signing_credentials();
         let signed =
             sign_any_macho(&macho, "com.zsign.execseg", None, &creds, None, None, false).unwrap();
         let m = MachOFile::parse(signed.clone()).unwrap();

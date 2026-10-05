@@ -118,17 +118,25 @@ fn test_credentials() -> SigningCredentials {
     let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
     let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
-    let cert = CertificateBuilder::new(
-        Profile::Root,
+    let mut builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: subject.clone(),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
         serial,
         validity,
         subject,
         pub_key,
         &signing_key,
     )
-    .unwrap()
-    .build::<rsa::pkcs1v15::Signature>()
     .unwrap();
+    builder
+        .add_extension(&x509_cert::ext::pkix::ExtendedKeyUsage(vec![
+            const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+        ]))
+        .unwrap();
+    let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
     SigningCredentials {
         certificate: cert,

@@ -727,6 +727,7 @@ mod tests {
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::time::Validity;
@@ -741,17 +742,23 @@ mod tests {
         let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &signing_key,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
         let credentials = SigningCredentials {
             certificate: cert,
@@ -844,6 +851,7 @@ mod tests {
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::time::Validity;
@@ -857,17 +865,23 @@ mod tests {
         let pub_key_der = verifying_key.to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
 
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &ecdsa_key,
         )
-        .unwrap()
-        .build::<p256::ecdsa::DerSignature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<p256::ecdsa::DerSignature>().unwrap();
 
         let credentials = SigningCredentials {
             certificate: cert,
@@ -949,6 +963,7 @@ mod tests {
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::time::Validity;
@@ -961,17 +976,23 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_key_der = rsa_key.to_public_key().to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &signing_key,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
         SigningCredentials {
             certificate: cert,
@@ -990,6 +1011,7 @@ mod tests {
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::time::Validity;
@@ -1038,17 +1060,23 @@ mod tests {
         let leaf_subject = Name::from_str("CN=Test Leaf,OU=TESTTEAM").unwrap();
         let leaf_pub_der = leaf_key.to_public_key().to_public_key_der().unwrap();
         let leaf_pub = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_ref()).unwrap();
-        let leaf_cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: leaf_subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             SerialNumber::from(3u32),
             Validity::from_now(Duration::from_secs(3600)).unwrap(),
             leaf_subject,
             leaf_pub,
             &leaf_signing_key,
         )
-        .unwrap()
-        .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let leaf_cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
 
         let credentials = SigningCredentials {
             certificate: leaf_cert,
@@ -1083,6 +1111,7 @@ mod tests {
         use std::str::FromStr;
         use std::time::Duration;
         use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
         use x509_cert::name::Name;
         use x509_cert::serial_number::SerialNumber;
         use x509_cert::time::Validity;
@@ -1094,17 +1123,23 @@ mod tests {
         let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let pub_key_der = verifying_key.to_public_key_der().unwrap();
         let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_key_der.as_ref()).unwrap();
-        let cert = CertificateBuilder::new(
-            Profile::Root,
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
             serial,
             validity,
             subject,
             pub_key,
             &ecdsa_key,
         )
-        .unwrap()
-        .build::<p256::ecdsa::DerSignature>()
         .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<p256::ecdsa::DerSignature>().unwrap();
 
         SigningCredentials {
             certificate: cert,
