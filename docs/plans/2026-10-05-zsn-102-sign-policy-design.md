@@ -13,7 +13,8 @@ were verified against current source:
   and `finish_p12` (`cert.rs:822`, behind the PKCS#12 entry points).
 - `sign_code_directory` (`crates/zsign-core/src/crypto/cms.rs:291`) never
   calls it; its only pre-sign check is `verify_key_matches_cert`
-  (`cms.rs:297`, the ZSN-98 gate).
+  (`cms.rs:297`, the ZSN-98 gate; that helper is `pub(crate)` at
+  `cert.rs:882`, visible in current source).
 - `SigningCredentials` (`cert.rs:107-128`) is `#[derive(Clone)]` with four
   `pub` fields and no invariant enforcement, so a struct literal skips every
   load-time check.
@@ -23,17 +24,19 @@ CA=true`, whose `keyUsage` lacks `digitalSignature`, or whose validity window
 does not contain the signing instant — including "loaded while valid, signed
 after expiry" — signs successfully today. The two production signing paths
 (`macho/signer.rs:569` and `macho/signer.rs:684`) both funnel through
-`sign_code_directory`, and the `#[cfg(test)]`-only helpers at `cms.rs:111/132`
-are not production paths.
+`sign_code_directory`, and the `#[cfg(test)]`-only helpers at
+`cms.rs:111/132/155/241` are not production paths.
 
 ## Chosen design
 
 Call the existing policy function at the top of `sign_code_directory`,
-mirroring the ZSN-98 landed pattern exactly:
+following the landed ZSN-98 pattern (`verify_key_matches_cert`: `pub(crate)`
+bump in `cert.rs`, one-line import in `cms.rs:38`, first-statement call):
 
 1. Bump `code_signing_policy_violation` and `time_now` in `cert.rs` from
-   private to `pub(crate)` (same bump ZSN-98 gave `verify_key_matches_cert`).
-2. Import both in `cms.rs` alongside the existing `crate::` imports.
+   private to `pub(crate)`.
+2. Import both in `cms.rs` alongside the existing `crate::` import block
+   (starts at `cms.rs:38`).
 3. First statement of `sign_code_directory`:
 
    ```rust
@@ -46,11 +49,13 @@ mirroring the ZSN-98 landed pattern exactly:
 4. Extend the function's `# Errors` doc to name the policy rejection via
    `Error::Certificate`.
 
-The policy check runs **before** `verify_key_matches_cert`: certificate
-purpose and validity are the more fundamental rejection and match the load
-paths' check order; both map to `Error::Certificate`, so the error contract
-is unchanged. The ZSN-98 mismatched-key test is unaffected (its cert is
-policy-clean, so the key check still fires).
+The policy check runs **before** `verify_key_matches_cert`. This is a
+deliberate choice, not load-path mimicry: `load_pem` runs the key match
+(`cert.rs:638`) before the policy check (`cert.rs:640`). At sign time the
+certificate's purpose and validity are treated as the more fundamental
+rejection; both checks map to `Error::Certificate`, so the error contract is
+unchanged either way. The ZSN-98 mismatched-key test is unaffected (its cert
+is policy-clean, so the key check still fires).
 
 ## Alternatives considered
 
@@ -81,41 +86,63 @@ policy-clean, so the key check still fires).
 
 ## Test strategy
 
-Required contract tests live in the `cms_verify.rs` test module (the file's
-existing `fresh_rsa_credentials` / `build_subca` / `replace_extension`
-helpers):
+Required contract tests live in the `cms_verify.rs` test module (helpers:
+`fresh_rsa_credentials` at `cms_verify.rs:1758`, `replace_extension` at
+`cms_verify.rs:2606`, `fixed_validity_chain` at `cms_verify.rs:3310`):
 
 - **(a) CA=true leaf** — a struct-literal `SigningCredentials` carrying a
-  leaf with codeSigning EKU **and** `basicConstraints CA=true` (flip via the
-  existing `replace_extension` pattern, `cms_verify.rs:2606`, precedent at
-  `cms_verify.rs:2741-2748`) is rejected: `Err(Error::Certificate(m))` with
+  leaf with codeSigning EKU **and** `basicConstraints CA=true` (flip via
+  `replace_extension`; same composition as `leaf_asserting_ca_fails`,
+  `cms_verify.rs:2735`) is rejected: `Err(Error::Certificate(m))` with
   `m.contains("CA=true")`. The EKU must be present so the named violation is
-  the CA check, not the mandatory-EKU check.
-- **(b) expired / not-yet-valid leaf** — leaf credentials composed directly
-  (struct literal) with a validity window entirely in the past, and one
-  entirely in the future, are rejected with `m.contains("expired")` and
-  `m.contains("not yet valid")` respectively. Windows are computed relative
-  to the current time (mirroring the load-time tests at `cert.rs:1707/1726`)
-  so the tests do not rot.
+  the CA check, not the mandatory-EKU check (policy checks EKU first).
+- **(b) expired / not-yet-valid leaf** — leaves built by
+  `fixed_validity_chain(not_before_unix, not_after_unix, eku)`
+  (`cms_verify.rs:3310`) with `eku = Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING]))`
+  and windows computed from the current time (`±86_400`/`±172_800` seconds
+  around `SystemTime::now()`, converted through `Time::try_from`, the idiom
+  at `cms_verify.rs:3316-3318`), composed into `SigningCredentials` struct
+  literals directly, are rejected with `m.contains("expired")` and
+  `m.contains("not yet valid")`. Relative windows are deliberate: the
+  load-time tests at `cert.rs:1707/1726` use fixed windows, which we do not
+  mirror because they rot as wall time crosses their bounds. With
+  `Profile::Leaf` the builder emits `basicConstraints ca:false` and
+  `keyUsage DigitalSignature|NonRepudiation` (x509-cert 0.2.5
+  `builder.rs:177,199`), so with the EKU supplied the named violation is
+  the validity one.
 - **(c) regression** — a normal end-entity credential still signs; proven by
-  the existing success tests (e.g. `cms_verify.rs:1816`, `cms_verify.rs:1858`,
+  the existing success tests (`cms_verify.rs:1816`, `cms_verify.rs:1858`,
   `cms.rs:1244` determinism test) staying green. No duplicate test added.
 
-Existing tests that sign with a `Profile::Root` (CA=true, no EKU,
-no digitalSignature) signer cert are pinning the wrong behavior once the
-gate lands; their **signer** fixtures are adjusted to a valid end-entity
-cert (chain/anchor roles keep the root): five `cms.rs` tests
-(`cms.rs:719/836/911/927/985`), the `macho/fixtures.rs:702` signer usage in
-`macho/signer.rs` tests, and `benches/signing.rs:100`. Each adjustment is
-recorded in the final report.
+Existing tests that sign with a `Profile::Root` (ca:true, KeyUsage
+KeyCertSign|CRLSign, no EKU — x509-cert 0.2.5 `builder.rs:164,190`) signer
+cert are pinning the wrong behavior once the gate lands; their **signer**
+fixtures move to a valid end-entity cert (chain/anchor roles keep the root).
+Each adjustment is recorded in the final report:
+
+- five `cms.rs` tests: `cms.rs:719`, `cms.rs:836`, `cms.rs:905`,
+  `cms.rs:925`, `cms.rs:985` — inline builder and helpers
+  `build_test_rsa_credentials(bits: usize)` (`cms.rs:944`,
+  `Profile::Root` hard-coded) and `build_test_ecdsa_credentials`
+  (`cms.rs:1077`); each becomes `Profile::Leaf` +
+  `builder.add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))` before
+  `.build()`, the idiom at `cms_verify.rs:1786-1788`.
+- `macho/signer.rs` tests that sign with `test_root_credentials()`
+  (`macho/fixtures.rs:702`) swap signer-role usage to the existing
+  `test_signing_credentials()` (`macho/fixtures.rs:686`, `Profile::Leaf` +
+  codeSigning EKU + `team_id = Some("TESTTEAM")`); tests that fail before
+  signing (e.g. `signer.rs:1283`, FAT-container rejection) need no change.
+- `benches/signing.rs:99` `test_credentials()` → `Profile::Leaf` + codeSigning
+  EKU.
 
 ## Design-decisions
 
 | # | Decision | Rationale | Cost if wrong |
 |---|----------|-----------|---------------|
-| 1 | Gate at top of `sign_code_directory` | Ticket's primary option; single choke point mirrors ZSN-98; future callers inherit it | None material — alternative was two drifting sites |
-| 2 | Reuse `code_signing_policy_violation` + `Error::Certificate` as-is | Same messages/order as load paths; no new variants | Callers matching on messages see identical text |
+| 1 | Gate at top of `sign_code_directory` | Ticket's primary option; single choke point follows the ZSN-98 pattern; future callers inherit it | None material — alternative was two drifting sites |
+| 2 | Reuse `code_signing_policy_violation` + `Error::Certificate` as-is | Same messages as load paths; no new variants | Callers matching on messages see identical text |
 | 3 | `cert::time_now` (bumped `pub(crate)`), not `cms_verify::time_now` | Policy fn and its clock live in one module; sign path stays out of the verify module | Trivial; both helpers are equivalent cfg-gated mirrors |
-| 4 | Policy check before key-match check | Purpose/validity is the fundamental rejection; ZSN-98 test unaffected | None; both are `Error::Certificate` |
+| 4 | Policy check before key-match check (deliberate divergence from `load_pem`'s key-then-policy order) | Purpose/validity is the fundamental rejection; both are `Error::Certificate`, so the contract is identical | None; ZSN-98 test fires on its policy-clean cert |
 | 5 | No new test for (c) | Existing success tests already pin it; a duplicate would be a wiring test | Reviewer must accept existing tests as the regression evidence |
-| 6 | Adjust wrong-pinning fixtures to end-entity, keep root for chain roles | Root-as-signer was a lazy fixture, never the assertion subject | Some tests may pin signer identity details; fix those assertions minimally |
+| 6 | Adjust wrong-pinning fixtures to end-entity, keep root for chain roles | Root-as-signer was a lazy fixture, never the assertion subject; `test_signing_credentials()` already exists for this | Some tests may pin signer identity details; fix those assertions minimally |
+| 7 | Validity windows computed relative to `SystemTime::now()` | Load tests' fixed windows (`cert.rs:1707/1726`) rot as wall time crosses them | None; relative windows never expire |
