@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, x509-cert 0.2.5, `time`, thiserror; `cargo test -p zsign-core`, `cargo clippy -p zsign-core --all-targets -- -D warnings`.
 
-**Spec:** `docs/plans/2026-10-05-zsn-102-sign-policy-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-05-zsn-102-sign-policy-design.md`
 
 ## Global Constraints
 
