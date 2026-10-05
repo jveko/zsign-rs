@@ -460,7 +460,7 @@ fn ext_value(cert: &Certificate, id: ObjectIdentifier) -> Option<&[u8]> {
 
 /// Current time; wasm32 has no wall clock, so builds there check against a
 /// fixed reference (mirrors `cms_verify::time_now`).
-fn time_now() -> time::OffsetDateTime {
+pub(crate) fn time_now() -> time::OffsetDateTime {
     #[cfg(target_arch = "wasm32")]
     {
         time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
@@ -477,7 +477,10 @@ fn time_now() -> time::OffsetDateTime {
 /// basicConstraints, when present, must assert CA=false; then the validity
 /// window must contain `now`. Returns the violation naming the subject and
 /// the failing property.
-fn code_signing_policy_violation(cert: &Certificate, now: time::OffsetDateTime) -> Option<String> {
+pub(crate) fn code_signing_policy_violation(
+    cert: &Certificate,
+    now: time::OffsetDateTime,
+) -> Option<String> {
     use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
 
     let subject = cert.tbs_certificate.subject.to_string();

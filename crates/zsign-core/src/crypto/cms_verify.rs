@@ -1867,6 +1867,99 @@ mod tests {
         assert!(report.valid, "errors: {:?}", report.errors);
         assert!(report.signature_ok);
     }
+
+    #[test]
+    fn sign_rejects_ca_true_leaf() {
+        let (identity, _key) = fresh_rsa_credentials();
+        let SigningCredentials {
+            mut certificate,
+            signing_key,
+            cert_chain,
+            team_id,
+        } = identity;
+        // `replace_extension` is only for the CA flip; validity is an X.509
+        // field, not an extension.
+        replace_extension(
+            &mut certificate,
+            OID_BASIC_CONSTRAINTS,
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            },
+        );
+        let creds = SigningCredentials {
+            certificate,
+            signing_key,
+            cert_chain,
+            team_id,
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let res = sign_code_directory(content, &creds, None, &cd_sha256);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("CA=true")),
+            "a leaf asserting basicConstraints CA=true must be rejected at sign time, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn sign_rejects_expired_leaf() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (_root, leaf, leaf_key, _anchors) = fixed_validity_chain(
+            now - 172_800,
+            now - 86_400,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let creds = SigningCredentials {
+            certificate: leaf,
+            signing_key: SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<Sha256>::new(leaf_key)),
+            cert_chain: vec![],
+            team_id: None,
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let res = sign_code_directory(content, &creds, None, &cd_sha256);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("expired")),
+            "an expired leaf must be rejected at sign time, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn sign_rejects_not_yet_valid_leaf() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (_root, leaf, leaf_key, _anchors) = fixed_validity_chain(
+            now + 86_400,
+            now + 172_800,
+            Some(ExtendedKeyUsage(vec![OID_CODE_SIGNING])),
+        );
+        let creds = SigningCredentials {
+            certificate: leaf,
+            signing_key: SigningKeyType::Rsa(rsa::pkcs1v15::SigningKey::<Sha256>::new(leaf_key)),
+            cert_chain: vec![],
+            team_id: None,
+        };
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+
+        let res = sign_code_directory(content, &creds, None, &cd_sha256);
+        assert!(
+            matches!(&res, Err(Error::Certificate(m)) if m.contains("not yet valid")),
+            "a not-yet-valid leaf must be rejected at sign time, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
     /// A signing certificate repeated in `cert_chain` must be carried once.
     #[test]
     fn sign_code_directory_dedupes_repeated_signing_certificate() {
