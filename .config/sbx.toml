@@ -1,0 +1,5 @@
+image = "docker.io/rianillham28/stack-base:sbx"
+cpus = 4
+memory_mib = 8192
+forward = ["OMP_AXON_API_KEY", "OMP_NEWAPI_API_KEY", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+check = "hk check --all"
