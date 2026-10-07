@@ -174,7 +174,7 @@ Expected: PASS — the fixture invariant (same `digest_algorithm` into `SignerIn
 ### Task 2: Require each accepted SignerInfo digest in the SET
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` — SignerInfo loop, immediately after the mode-gated `let signer_digest = match mode { ... };` (`:950-977`); tests module.
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` — SignerInfo loop, immediately after the mode-gated `let signer_digest = match mode { ... };` (`:950-976`); tests module.
 
 **Interfaces:**
 - Consumes: `digest_alg_oids` (Task 1), `dig_oid` (`:942-949`), `global_errors` (`:705`), `seal()` (`:609-613`), `replace_digest_algs` (Task 1).
@@ -261,6 +261,6 @@ Stage `crates/zsign-core/src/crypto/cms_verify.rs`, `docs/superpowers/specs/2026
 
 ## Self-review
 
-- Spec coverage: structural decode → Task 1; membership check → Task 2; failure-channel alignment → Global Constraints; the three regression criteria → Task 1 Step 4 (well-formed stays green, untouched), Task 1 test (malformed → `Error::Verification`), Task 2 test (mismatch → report failure).
-- Type consistency: `digest_alg_oids: Vec<ObjectIdentifier>` defined in Task 1, read in Task 2; `dig_oid` name matches `:949`.
+- Spec coverage: structural decode → Task 1; membership check → Task 2; failure-channel alignment → Global Constraints; the three regression criteria → Task 1 Step 5 (well-formed stays green, untouched suite), Task 1 test (malformed → `Error::Verification`), Task 2 test (mismatch → report failure).
+- Type consistency: `digest_alg_oids: Vec<ObjectIdentifier>` defined in Task 1, read in Task 2; `dig_oid` binding starts at `:945` (`dig_oid` extraction block `:945-949`).
 - Proportion: the plan names exact insertion points and messages; bodies the signature+tests already fix are not transcribed.

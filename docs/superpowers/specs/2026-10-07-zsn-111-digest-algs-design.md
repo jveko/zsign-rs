@@ -25,7 +25,7 @@ Codebase (line numbers verified against `cbb53a0`):
   early `Ok(seal(...))`, `:953-956` and `:970-973`).
 - Failure-mode conventions already in the module:
   - Malformed DER / structural violations → hard `Err(Error::Verification)`
-    (e.g. `:745-746`, `encapContentInfo is not a SEQUENCE` `:765-768`).
+    (e.g. `:745-746`, `encapContentInfo is not a SEQUENCE` `:751-755`).
   - SignedData-level semantic mismatches → `global_errors` (declared `:705`);
     the precedent is the `eContentType` mismatch `:760-762`. `seal()`
     (`:609-613`) merges them into `report.errors` on every `Ok` exit, and
@@ -108,7 +108,11 @@ Implement A:
    does not include the SignerInfo digest algorithm {dig_oid}"))` when
    `dig_oid` is absent. No early return — like the `eContentType` precedent,
    the remaining checks still run and `seal()` guarantees the entry lands in
-   `report.errors` with `report.valid == false`.
+   `report.errors` with `report.valid == false`. The check applies to every
+   SignerInfo the module inspects: the loop returns on the first fully-valid
+   signer (`:1120-1127`), exactly like every existing per-signer check
+   (`:950-976`), so "each SignerInfo" means each one reached at the module's
+   existing per-signer semantics; repo fixtures are single-SignerInfo.
 3. Empty SET: valid DER (RFC 5652 §5.1 allows zero elements), so it parses;
    membership then fails for every SignerInfo → report failure.
 
