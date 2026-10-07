@@ -117,7 +117,7 @@ Implement A:
    membership then fails for every SignerInfo → report failure.
 
 Failure-mode alignment rationale (cited): structural → `Error::Verification`
-matches `:745-746` and `:765-768`; semantic mismatch → `global_errors` matches
+matches `:745-746` and `:751-755`; semantic mismatch → `global_errors` matches
 the `eContentType` precedent `:760-762` merged by `seal()` `:609-613`; Apple
 and OpenSSL both treat a missing SET member as a verification failure, and
 RFC 5652 §5.1/§5.3 license the rejection ("MAY fail to validate").
