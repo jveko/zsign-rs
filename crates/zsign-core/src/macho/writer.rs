@@ -106,6 +106,7 @@ pub fn calculate_signature_space(code_length: usize) -> usize {
 /// - The binary is big-endian 32-bit (not supported)
 /// - No `__LINKEDIT` segment exists
 /// - No space for `LC_CODE_SIGNATURE` in load commands area
+/// - The `__LINKEDIT` vmsize extension overflows `usize`
 pub fn realloc_code_sign_space(data: &[u8], code_length: usize) -> Result<Vec<u8>> {
     let mach =
         Mach::parse(data).map_err(|e| Error::MachO(format!("Failed to parse Mach-O: {}", e)))?;
@@ -203,7 +204,12 @@ fn realloc_code_sign_space_single(
     if let Some((offset, linkedit_fileoff, old_vmsize, _old_filesize)) = linkedit_cmd {
         let linkedit_fileoff = linkedit_fileoff as usize;
         let size_increase = required - data.len();
-        let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;
+        let new_vmsize = usize::try_from(old_vmsize)
+            .ok()
+            .and_then(|v| v.checked_add(size_increase))
+            .and_then(|v| align_to_checked(v, PAGE_SIZE))
+            .ok_or_else(|| Error::MachO("__LINKEDIT vmsize extension overflows".into()))?
+            as u64;
         let new_filesize = required
             .checked_sub(linkedit_fileoff)
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
@@ -1113,6 +1119,15 @@ pub fn align_to(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
+/// [`align_to`] with overflow checking: `None` when the rounding step
+/// `value + alignment - 1` would overflow `usize`. `alignment` must be a
+/// power of two, as [`align_to`] requires.
+fn align_to_checked(value: usize, alignment: usize) -> Option<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+}
+
 /// Converts a `usize` to `u32`, returning an error if the value exceeds `u32::MAX`.
 ///
 /// Used for Mach-O fields that are defined as u32 (e.g., `LC_CODE_SIGNATURE` offsets).
@@ -1298,6 +1313,7 @@ use super::parser::MachOMetadata;
 /// - No `__LINKEDIT` segment exists
 /// - No space for `LC_CODE_SIGNATURE` in load commands area
 /// - The signature reserve end overflows `usize`
+/// - The `__LINKEDIT` vmsize extension overflows `usize`
 pub fn realloc_code_sign_space_with_metadata(
     data: &[u8],
     metadata: &MachOMetadata,
@@ -1341,7 +1357,12 @@ pub fn realloc_code_sign_space_with_metadata(
     if let Some((offset, fileoff, vmsize, _filesize)) = metadata.linkedit_cmd {
         let linkedit_fileoff = fileoff as usize;
         let size_increase = required - data.len();
-        let new_vmsize = align_to(vmsize as usize + size_increase, PAGE_SIZE) as u64;
+        let new_vmsize = usize::try_from(vmsize)
+            .ok()
+            .and_then(|v| v.checked_add(size_increase))
+            .and_then(|v| align_to_checked(v, PAGE_SIZE))
+            .ok_or_else(|| Error::MachO("__LINKEDIT vmsize extension overflows".into()))?
+            as u64;
         let new_filesize = required
             .checked_sub(linkedit_fileoff)
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
@@ -2955,6 +2976,80 @@ mod tests {
             matches!(&res, Err(crate::Error::MachO(_))),
             "a 32-bit file extent beyond u32::MAX must fail closed, got {:?}",
             res.map(|v| v.len())
+        );
+    }
+
+    #[test]
+    fn test_realloc_rejects_hostile_linkedit_vmsize() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        // __LINKEDIT LC at 184; segment_command_64.vmsize field at +32.
+        data[216..224].copy_from_slice(&u64::MAX.to_le_bytes());
+        let result = std::panic::catch_unwind(|| realloc_code_sign_space(&data, data.len()));
+        match result {
+            Ok(inner) => {
+                let err =
+                    inner.expect_err("hostile __LINKEDIT vmsize must be rejected, not accepted");
+                assert!(err.to_string().contains("__LINKEDIT vmsize"), "{err}");
+            }
+            Err(_) => {
+                panic!("realloc must not panic on a hostile __LINKEDIT vmsize (u64 add overflow)")
+            }
+        }
+    }
+
+    #[test]
+    fn test_realloc_metadata_rejects_hostile_linkedit_vmsize() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data[216..224].copy_from_slice(&u64::MAX.to_le_bytes());
+        let macho =
+            crate::macho::MachOFile::parse(data.clone()).expect("patched fixture must parse");
+        let meta = macho.slices()[0].metadata.clone();
+        let result = std::panic::catch_unwind(|| {
+            realloc_code_sign_space_with_metadata(&data, &meta, data.len(), 0x1000)
+        });
+        match result {
+            Ok(inner) => match inner {
+                Err(err) => assert!(err.to_string().contains("__LINKEDIT vmsize"), "{err}"),
+                Ok(_) => panic!("hostile __LINKEDIT vmsize must be rejected, not accepted"),
+            },
+            Err(_) => panic!(
+                "metadata realloc must not panic on a hostile __LINKEDIT vmsize (u64 add overflow)"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_sign_rejects_hostile_linkedit_vmsize() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data[216..224].copy_from_slice(&u64::MAX.to_le_bytes());
+        let result = std::panic::catch_unwind(|| {
+            let macho =
+                crate::macho::MachOFile::parse(data.clone()).expect("patched fixture must parse");
+            crate::macho::sign_macho_adhoc(&macho, "com.example.linkedit", None, None, None, false)
+        });
+        match result {
+            Ok(inner) => {
+                let err =
+                    inner.expect_err("hostile __LINKEDIT vmsize must be rejected, not accepted");
+                assert!(err.to_string().contains("__LINKEDIT vmsize"), "{err}");
+            }
+            Err(_) => {
+                panic!("signing must not panic on a hostile __LINKEDIT vmsize (u64 add overflow)")
+            }
+        }
+    }
+
+    #[test]
+    fn test_realloc_keeps_large_nonoverflowing_linkedit_vmsize() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        const HUGE: u64 = 1 << 63;
+        data[216..224].copy_from_slice(&HUGE.to_le_bytes());
+        let out = realloc_code_sign_space(&data, data.len())
+            .expect("large-but-non-overflowing vmsize must still be accepted");
+        let written = u64::from_le_bytes(out[216..224].try_into().unwrap());
+        assert!(
+            written >= HUGE,
+            "vmsize passthrough must not clamp: got {written:#x}"
         );
     }
 }
