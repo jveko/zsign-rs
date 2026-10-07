@@ -9,19 +9,21 @@ unchecked arithmetic from an attacker-controlled `u64`:
   (`crates/zsign-core/src/macho/writer.rs:206`):
   `let new_vmsize = align_to(old_vmsize as usize + size_increase, PAGE_SIZE) as u64;`
 - `realloc_code_sign_space_with_metadata`
-  (`crates/zsign-core/src/macho/writer.rs:1334`, expression at `:1344`):
+  (`crates/zsign-core/src/macho/writer.rs:1301`, expression at `:1344`):
   same shape from `metadata.linkedit_cmd`'s `vmsize`.
 
 `old_vmsize`/`vmsize` is `segment_command_64.vmsize` (`u64`, captured at
-`writer.rs:166`/`:170-174` from parser metadata `parser.rs:290-292`,
+`writer.rs:166`/`:169-174` from parser metadata `parser.rs:290-292`,
 `:304-310`); the parser validates only `fileoff + filesize`
 (`parser.rs:342-353`), never `vmsize`. Consequences:
 
 - On 64-bit, `vmsize as usize + size_increase` overflows for
-  `vmsize >= usize::MAX - size_increase + 1`: a panic in debug AND
-  release builds. There is no `catch_unwind` anywhere in the workspace, so
-  the panic reaches CLI (`zsign-cli`), wasm, and facade callers instead of
-  an `Error`.
+  `vmsize >= usize::MAX - size_increase + 1`: a panic in debug builds and
+  silent wraparound in release builds (no `overflow-checks` override is
+  set in any manifest), i.e. a fabricated vmsize written into the image.
+  There is no `catch_unwind` in non-test production code (the only
+  workspace occurrence is inside `mod tests` at `writer.rs:2751`), so in
+  production the failure surfaces as an abort instead of an `Error`.
 - `align_to` itself (`writer.rs:1112-1114`,
   `(value + alignment - 1) & !(alignment - 1)`) is a second overflow
   point for `value > usize::MAX - (PAGE_SIZE - 1)`.
@@ -30,7 +32,7 @@ unchecked arithmetic from an attacker-controlled `u64`:
 - When the arithmetic does not overflow, the value is written verbatim
   into the signed image by `write_linkedit_sizes` (`writer.rs:1037`;
   `u64` at `lc_offset + 32` for 64-bit images) and propagated into the
-  returned metadata (`writer.rs:1361`).
+  returned metadata (`writer.rs:1359`).
 
 The surrounding code is already fully checked: `signature space overflow`
 (`:189-191`), `__LINKEDIT fileoff exceeds required length` (`:207-210`),

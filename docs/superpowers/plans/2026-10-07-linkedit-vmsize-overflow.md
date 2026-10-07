@@ -74,11 +74,10 @@ fn test_realloc_metadata_rejects_hostile_linkedit_vmsize() {
         realloc_code_sign_space_with_metadata(&data, &meta, data.len(), 0x1000)
     });
     match result {
-        Ok(inner) => {
-            let err = inner
-                .expect_err("hostile __LINKEDIT vmsize must be rejected, not accepted");
-            assert!(err.to_string().contains("__LINKEDIT vmsize"), "{err}");
-        }
+        Ok(inner) => match inner {
+            Err(err) => assert!(err.to_string().contains("__LINKEDIT vmsize"), "{err}"),
+            Ok(_) => panic!("hostile __LINKEDIT vmsize must be rejected, not accepted"),
+        },
         Err(_) => panic!(
             "metadata realloc must not panic on a hostile __LINKEDIT vmsize (u64 add overflow)"
         ),
