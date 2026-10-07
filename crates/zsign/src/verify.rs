@@ -433,6 +433,7 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
     // _CodeSignature) and nested bundle directories.
     let mut direct_binaries = Vec::new();
     let mut nested_dirs = Vec::new();
+    let mut found_main_executable = false;
     for entry in WalkDir::new(dir).min_depth(1) {
         let entry = entry.map_err(|e| {
             crate::Error::Io(std::io::Error::other(format!(
@@ -461,8 +462,24 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
             continue;
         }
         if is_macho_file(p)? {
+            if let Some(exe) = &main_executable {
+                if rel_dir.to_string_lossy().replace('\\', "/") == *exe {
+                    found_main_executable = true;
+                }
+            }
             direct_binaries.push((p.to_path_buf(), rel_str));
         }
+    }
+    if let Some(exe) = &main_executable {
+        if !found_main_executable {
+            out.errors.push(format!(
+                "declared main executable \"{exe}\" not found in the bundle"
+            ));
+        }
+    }
+    if direct_binaries.is_empty() {
+        out.errors
+            .push("bundle contains no Mach-O binaries".to_string());
     }
 
     // Verify each direct binary, binding this bundle's Info.plist and
@@ -812,6 +829,9 @@ fn check_code_resources(
     }
     if let Some(files) = files {
         sealed_set.extend(files.keys().cloned());
+    }
+    if sealed_set.is_empty() {
+        errors.push("CodeResources seals no files".to_string());
     }
 
     // Sealed → disk: every entry must exist and match its recorded seal.
@@ -1616,5 +1636,137 @@ mod tests {
                 "unsigned slice must not report as signed"
             );
         }
+    }
+
+    #[test]
+    fn deleted_main_executable_is_invalid() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (app, _) = build_signed_bundle(td.path());
+        // Dual-pin at the bundle layer: report.valid() is anchor-gated for test
+        // credentials, so it cannot express the precondition.
+        let before = verify_bundle(&app).unwrap();
+        let bb = before.bundle.as_ref().unwrap();
+        assert!(
+            bb.errors.is_empty(),
+            "precondition: bundle errors: {:?}",
+            bb.errors
+        );
+        assert!(
+            !bb.binaries.is_empty(),
+            "precondition: signed bundle has binaries"
+        );
+        assert!(
+            bb.code_resources.as_ref().is_some_and(|c| c.valid()),
+            "precondition: code resources: {:?}",
+            bb.code_resources
+        );
+        fs::remove_file(app.join("Test")).unwrap();
+        let report = verify_bundle(&app).unwrap();
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle
+                .errors
+                .iter()
+                .any(|e| e.contains("declared main executable") && e.contains("\"Test\"")),
+            "missing-executable error expected, got {:?}",
+            bundle.errors
+        );
+    }
+
+    #[test]
+    fn zero_macho_empty_seal_bundle_is_invalid() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = td.path().join("Hand.app");
+        fs::create_dir_all(app.join("_CodeSignature")).unwrap();
+        fs::write(
+            app.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.zsign.hand</string>
+</dict></plist>
+#"#,
+        )
+        .unwrap();
+        let mut info_omit = plist::Dictionary::new();
+        info_omit.insert("omit".to_string(), plist::Value::Boolean(true));
+        info_omit.insert("weight".to_string(), plist::Value::Real(20.0));
+        let mut rules2 = plist::Dictionary::new();
+        rules2.insert("^.*".to_string(), plist::Value::Boolean(true));
+        rules2.insert(
+            "^Info\\.plist$".to_string(),
+            plist::Value::Dictionary(info_omit),
+        );
+        let mut rules = plist::Dictionary::new();
+        rules.insert("^.*".to_string(), plist::Value::Boolean(true));
+        let mut cr = plist::Dictionary::new();
+        cr.insert(
+            "files".to_string(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+        cr.insert(
+            "files2".to_string(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+        cr.insert("rules".to_string(), plist::Value::Dictionary(rules));
+        cr.insert("rules2".to_string(), plist::Value::Dictionary(rules2));
+        let mut buf = Vec::new();
+        plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(cr)).unwrap();
+        fs::write(app.join("_CodeSignature").join("CodeResources"), buf).unwrap();
+
+        let report = verify_bundle(&app).unwrap();
+        assert!(
+            !report.valid(),
+            "zero-Mach-O empty-seal bundle must be invalid, got {:?}",
+            report.bundle
+        );
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle
+                .errors
+                .iter()
+                .any(|e| e.contains("no Mach-O binaries")),
+            "empty-binaries error expected, got {:?}",
+            bundle.errors
+        );
+        assert!(
+            bundle.errors.iter().any(|e| e.contains("seals no files")),
+            "empty-seal error expected, got {:?}",
+            bundle.errors
+        );
+    }
+
+    #[test]
+    fn minimal_signed_bundle_verifies() {
+        let td = tempfile::TempDir::new().unwrap();
+        let app = td.path().join("Min.app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("Info.plist"), app_info_plist()).unwrap();
+        fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
+        let (creds, _rsa_key) = crate::test_util::test_credentials_with_key();
+        ZSign::new()
+            .credentials(creds)
+            .sign_bundle(&app, None)
+            .unwrap();
+        // Dual-pin: report.valid() is anchor-gated for test credentials.
+        let report = verify_bundle(&app).unwrap();
+        let bundle = report.bundle.as_ref().unwrap();
+        assert!(
+            bundle.errors.is_empty(),
+            "minimal signed bundle must stay free of structural errors: {:?}",
+            bundle.errors
+        );
+        assert!(
+            !bundle.binaries.is_empty(),
+            "the executable must be verified"
+        );
+        let cr = bundle.code_resources.as_ref().expect("CodeResources check");
+        assert!(
+            cr.valid(),
+            "mismatched={:?} missing={:?} unsealed={:?}",
+            cr.mismatched,
+            cr.missing,
+            cr.unsealed
+        );
     }
 }
