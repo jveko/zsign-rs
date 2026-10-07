@@ -110,8 +110,12 @@ const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.84
 const OID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
 /// keyUsage extension: `2.5.29.15`
 const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+/// subjectAltName extension: `2.5.29.17`
+const OID_SUBJECT_ALT_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
 /// basicConstraints extension: `2.5.29.19`
 const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+/// nameConstraints extension: `2.5.29.30`
+const OID_NAME_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.30");
 /// extended key usage extension: `2.5.29.37`
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`
@@ -1353,6 +1357,27 @@ fn sha1_warning(child: &x509_cert::Certificate) -> Option<String> {
         )
     })
 }
+/// First critical extension this verifier does not process, if any.
+///
+/// Certificates carrying an unprocessed critical extension must be rejected;
+/// the caller reports the returned OID.
+fn unrecognized_critical(cert: &x509_cert::Certificate) -> Option<ObjectIdentifier> {
+    let exts = cert.tbs_certificate.extensions.as_ref()?;
+    exts.iter()
+        .find(|e| {
+            e.critical
+                && ![
+                    OID_SUBJECT_KEY_IDENTIFIER,
+                    OID_KEY_USAGE,
+                    OID_SUBJECT_ALT_NAME,
+                    OID_BASIC_CONSTRAINTS,
+                    OID_NAME_CONSTRAINTS,
+                    OID_EXT_KEY_USAGE,
+                ]
+                .contains(&e.extn_id)
+        })
+        .map(|e| e.extn_id)
+}
 
 /// Walks the embedded certificate set from `leaf` toward a trust anchor,
 /// enforcing leaf and issuer purpose constraints, then verifying each
@@ -1369,6 +1394,17 @@ pub(crate) fn verify_chain(
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
+    if let Some(oid) = unrecognized_critical(leaf) {
+        return ChainOutcome {
+            ok: false,
+            anchored: false,
+            subjects: names,
+            reason: Some(format!(
+                "certificate has unrecognized critical extension {oid}"
+            )),
+            warnings,
+        };
+    }
 
     let purpose_reason = match purpose {
         SignerPurpose::CodeSigning => leaf_purpose_reason(leaf),
@@ -1428,6 +1464,17 @@ pub(crate) fn verify_chain(
                         anchored: false,
                         subjects: names,
                         reason: Some(reason),
+                        warnings,
+                    };
+                }
+                if let Some(oid) = unrecognized_critical(p) {
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(format!(
+                            "certificate has unrecognized critical extension {oid}"
+                        )),
                         warnings,
                     };
                 }
@@ -2712,6 +2759,295 @@ mod tests {
         .build::<rsa::pkcs1v15::Signature>()
         .unwrap();
         (cert, signing_key)
+    }
+
+    struct UnknownCritical;
+    struct UnknownNonCritical;
+
+    impl const_oid::AssociatedOid for UnknownCritical {
+        const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57264.99999.1");
+    }
+
+    impl const_oid::AssociatedOid for UnknownNonCritical {
+        const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57264.99999.2");
+    }
+
+    impl der::Encode for UnknownCritical {
+        fn encoded_len(&self) -> der::Result<der::Length> {
+            Ok(der::Length::ZERO)
+        }
+
+        fn encode(&self, _encoder: &mut impl der::Writer) -> der::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl der::Encode for UnknownNonCritical {
+        fn encoded_len(&self) -> der::Result<der::Length> {
+            Ok(der::Length::ZERO)
+        }
+
+        fn encode(&self, _encoder: &mut impl der::Writer) -> der::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl x509_cert::ext::AsExtension for UnknownCritical {
+        fn critical(
+            &self,
+            _subject: &x509_cert::name::Name,
+            _extensions: &[x509_cert::ext::Extension],
+        ) -> bool {
+            true
+        }
+    }
+
+    impl x509_cert::ext::AsExtension for UnknownNonCritical {
+        fn critical(
+            &self,
+            _subject: &x509_cert::name::Name,
+            _extensions: &[x509_cert::ext::Extension],
+        ) -> bool {
+            false
+        }
+    }
+
+    /// `Profile::Root` with an extension hook running before the build.
+    fn build_root_signed(
+        cn: &str,
+        extend: impl FnOnce(&mut CertificateBuilder<'_, rsa::pkcs1v15::SigningKey<Sha256>>),
+    ) -> (
+        rsa::RsaPrivateKey,
+        x509_cert::Certificate,
+        rsa::pkcs1v15::SigningKey<Sha256>,
+    ) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str(cn).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(9u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap();
+        extend(&mut b);
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (key, cert, signing_key)
+    }
+
+    /// `Profile::Leaf` signed by `issuer_signing`, with a codeSigning EKU
+    /// default and an extension hook running before the build.
+    fn build_leaf_signed(
+        cn: &str,
+        issuer: &x509_cert::name::Name,
+        issuer_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+        extend: impl FnOnce(&mut CertificateBuilder<'_, rsa::pkcs1v15::SigningKey<Sha256>>),
+    ) -> (rsa::RsaPrivateKey, x509_cert::Certificate) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: issuer.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(3u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str(cn).unwrap(),
+            pub_key,
+            issuer_signing,
+        )
+        .unwrap();
+        b.add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        extend(&mut b);
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (key, cert)
+    }
+
+    /// `Profile::SubCA` issued by `issuer`, with a codeSigning EKU default
+    /// and an extension hook running before the build.
+    fn build_subca_issued_by_signed(
+        cn: &str,
+        issuer: &x509_cert::name::Name,
+        issuer_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+        extend: impl FnOnce(&mut CertificateBuilder<'_, rsa::pkcs1v15::SigningKey<Sha256>>),
+    ) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: issuer.clone(),
+                path_len_constraint: None,
+            },
+            SerialNumber::from(12u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str(cn).unwrap(),
+            pub_key,
+            issuer_signing,
+        )
+        .unwrap();
+        b.add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        extend(&mut b);
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (cert, signing_key)
+    }
+
+    #[test]
+    fn unknown_critical_extension_rejects_the_leaf() {
+        let (_root_key, root, root_signing) = build_rsa_root("CN=zsign seed root");
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&UnknownCritical).unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            matches!(&out.reason, Some(r) if r.contains("unrecognized critical extension 1.3.6.1.4.1.57264.99999.1")),
+            "expected critical-extension rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn unknown_non_critical_extension_still_verifies() {
+        let (_root_key, root, root_signing) = build_rsa_root("CN=zsign seed root");
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&UnknownNonCritical).unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            out.ok,
+            "non-critical unknown extension must not break the chain: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.anchored,
+            "non-critical unknown extension must stay anchored: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn unknown_critical_extension_rejects_an_intermediate() {
+        let (_root_key, root, root_signing) = build_rsa_root("CN=zsign seed root");
+        let (subca, subca_signing) = build_subca_issued_by_signed(
+            "CN=zsign unknown ext subca",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&UnknownCritical).unwrap();
+            },
+        );
+        let (_leaf_key, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &subca.tbs_certificate.subject,
+            &subca_signing,
+            |_| {},
+        );
+        let out = verify_chain(
+            &[leaf.clone(), subca.clone(), root.clone()],
+            &leaf,
+            &TrustAnchors::from_certificates(vec![root.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(
+            matches!(&out.reason, Some(r) if r.contains("unrecognized critical extension 1.3.6.1.4.1.57264.99999.1")),
+            "expected critical-extension rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn self_signed_root_with_unknown_critical_rejects_the_chain() {
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign seed root", |b| {
+            b.add_extension(&UnknownCritical).unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            matches!(&out.reason, Some(r) if r.contains("unrecognized critical extension 1.3.6.1.4.1.57264.99999.1")),
+            "expected critical-extension rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn out_of_chain_anchor_extensions_are_ignored() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign anchor root", |b| {
+            b.add_extension(&UnknownCritical).unwrap();
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DirectoryName(
+                        Name::from_str("CN=zsign anchor leaf").unwrap(),
+                    ),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign anchor leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = verify_chain(
+            std::slice::from_ref(&leaf),
+            &leaf,
+            &TrustAnchors::from_certificates(vec![root.clone()]),
+            time_now(),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(
+            out.ok,
+            "out-of-chain anchor extensions must be ignored: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.anchored,
+            "out-of-chain anchor chain must stay anchored: reason={:?}",
+            out.reason
+        );
     }
 
     /// Replaces (or appends) extension `id` on `cert` with `value`'s DER.
