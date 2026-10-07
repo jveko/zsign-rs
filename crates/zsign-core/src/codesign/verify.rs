@@ -299,10 +299,12 @@ fn evaluate_expr(expr: &Expr, ctx: &RequirementContext<'_>) -> Tri {
             Some(_) => Tri::False,
             None => Tri::Unknown,
         },
+        // Apple's interpreter is boolean: no certificate chain (ad-hoc or
+        // unsigned code) evaluates anchor checks to false, never unknown.
         Expr::AppleAnchor | Expr::AppleGenericAnchor => match ctx.anchored {
             Some(true) => Tri::True,
             Some(false) => Tri::False,
-            None => Tri::Unknown,
+            None => Tri::False,
         },
         Expr::Not(inner) => match evaluate_expr(inner, ctx) {
             Tri::True => Tri::False,
@@ -1390,6 +1392,54 @@ mod tests {
             }),
             RequirementVerdict::Satisfied
         );
+    }
+
+    #[test]
+    fn anchor_requirement_fails_without_a_known_anchor() {
+        // opAnchorApple (3), no operands.
+        let blob = req_blob_with_dr(&3u32.to_be_bytes());
+        let set = parse_requirements(&blob).unwrap();
+        let dr = set.designated().expect("dr present");
+        let ctx = |anchored: Option<bool>| RequirementContext {
+            identifier: Some("com.example"),
+            cdhashes: &[],
+            anchored,
+        };
+        assert_eq!(
+            dr.evaluate(&ctx(None)),
+            RequirementVerdict::Violated,
+            "ad-hoc/unsigned code must not satisfy anchor apple, got {:?}",
+            dr.evaluate(&ctx(None))
+        );
+        assert_eq!(dr.evaluate(&ctx(Some(false))), RequirementVerdict::Violated);
+        assert_eq!(dr.evaluate(&ctx(Some(true))), RequirementVerdict::Satisfied);
+
+        let generic_blob = req_blob_with_dr(&15u32.to_be_bytes());
+        let generic_set = parse_requirements(&generic_blob).unwrap();
+        let generic_dr = generic_set.designated().expect("dr present");
+        assert_eq!(
+            generic_dr.evaluate(&ctx(None)),
+            RequirementVerdict::Violated,
+            "anchor apple generic must fail without a known anchor, got {:?}",
+            generic_dr.evaluate(&ctx(None))
+        );
+
+        // Not(anchor apple) with no known anchor is satisfied (boolean complement).
+        let mut not_expr = 9u32.to_be_bytes().to_vec(); // opNot
+        not_expr.extend_from_slice(&3u32.to_be_bytes()); // opAnchorApple
+        let not_blob = req_blob_with_dr(&not_expr);
+        let not_set = parse_requirements(&not_blob).unwrap();
+        let not_dr = not_set.designated().expect("dr present");
+        assert_eq!(not_dr.evaluate(&ctx(None)), RequirementVerdict::Satisfied);
+
+        // And(identifier matches, anchor unknown) fails closed, not Unsupported.
+        let mut and_expr = 6u32.to_be_bytes().to_vec(); // opAnd
+        and_expr.extend_from_slice(&ident_expr("com.example"));
+        and_expr.extend_from_slice(&3u32.to_be_bytes()); // opAnchorApple
+        let and_blob = req_blob_with_dr(&and_expr);
+        let and_set = parse_requirements(&and_blob).unwrap();
+        let and_dr = and_set.designated().expect("dr present");
+        assert_eq!(and_dr.evaluate(&ctx(None)), RequirementVerdict::Violated);
     }
 
     #[test]

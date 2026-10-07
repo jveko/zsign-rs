@@ -626,6 +626,25 @@ mod tests {
         b
     }
 
+    /// Requirements SuperBlob whose designated requirement is bare
+    /// `anchor apple` (opAnchorApple = 3, no operands).
+    fn anchor_dr_blob() -> Vec<u8> {
+        let expr = 3u32.to_be_bytes().to_vec();
+        let child_len = 12 + expr.len();
+        let total = 0x14 + child_len;
+        let mut b = Vec::with_capacity(total);
+        b.extend_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&3u32.to_be_bytes()); // CSREQ_DESIGNATED
+        b.extend_from_slice(&0x14u32.to_be_bytes());
+        b.extend_from_slice(&CSMAGIC_REQUIREMENT.to_be_bytes());
+        b.extend_from_slice(&(child_len as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // exprForm
+        b.extend_from_slice(&expr);
+        b
+    }
+
     /// Replace the requirements child of `signed`'s SuperBlob with `new_child`
     /// (shifting later children, fixing declared length + index offsets), then
     /// rebind stored special slot -2 in BOTH CDs to the new child.
@@ -706,6 +725,31 @@ mod tests {
                 .any(|e| e.contains("designated requirement not satisfied")),
             "errors: {:?}",
             report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn anchor_designated_requirement_fails_on_adhoc_slice() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.anchor", None, None, None, false).unwrap();
+        replace_requirements_child(&mut signed, &anchor_dr_blob());
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("designated requirement not satisfied")),
+            "ad-hoc slice must fail an anchor-apple DR, got errors: {:?}",
+            report.slices[0].errors
+        );
+        assert!(
+            report.slices[0]
+                .warnings
+                .iter()
+                .all(|w| !w.contains("designated requirement not fully evaluated")),
+            "anchor failure must not degrade to a warning, got warnings: {:?}",
+            report.slices[0].warnings
         );
     }
 
