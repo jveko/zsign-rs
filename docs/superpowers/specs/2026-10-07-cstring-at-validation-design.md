@@ -10,9 +10,11 @@ plausible-looking values. Two defects, both in `crates/zsign-core/src/codesign/v
 
 1. `cstring_at` silently accepts an unterminated string (falls back to the whole
    remaining buffer), so a missing NUL terminator is never noticed.
-2. `identOffset`/`teamOffset` are only checked `< data.len()`; nothing constrains them
-   to the CodeDirectory's header/string region, so a malformed directory produces a
-   fabricated identifier/team through the `pub` accessors instead of a rejected parse.
+2. `identOffset`/`teamOffset` are only checked `< data.len()` ad hoc, with no terminator
+   requirement, so a malformed directory produces a fabricated identifier/team through the
+   `pub` accessors instead of a rejected parse. The fix applies Apple's own rules —
+   offset in-blob plus a NUL-terminated string in-blob; Apple declines structural
+   overlap checks (see D4), and so do we.
 
 Files in scope — nothing else may be touched:
 
@@ -90,11 +92,13 @@ Pinned sources: XNU `f6217f89` (2025-10-04), Apple Security `db15acbe`,
 5. **Lenient readers are the anti-pattern:** upstream `zhlynn/zsign` prints
    `pSlotBase + LE(cdHeader.identOffset)` straight into `%s` (an unbounded read on
    malformed input); `ldid` does the same. Neither is a model to copy.
-6. **Known kernel gap (deliberate):** the kernel does *not* check that the offset lies
-   outside the header/hash regions — Security's own comment skips it ("flagged as
-   nonsense later"). Our design closes that gap (see D4 tradeoff); this parser is
-   already deliberately stricter than the kernel (scatter, pre-encrypt, runtime flag,
-   page-size rejections).
+6. **Known kernel gap (deliberate — and now honoured):** the kernel does *not* check
+   that the offset lies outside the header/hash regions — Security's own comment skips it
+   ("flagged as nonsense later"). The final design does NOT close that gap either (see
+   D4): structural overlap checks were first shipped, then removed per supervisor steer
+   for full Apple parity. This parser remains stricter than the kernel elsewhere
+   (scatter, pre-encrypt, runtime flag, page-size rejections), but not on string
+   references.
 
 ## Design decisions
 
@@ -103,32 +107,35 @@ Pinned sources: XNU `f6217f89` (2025-10-04), Apple Security `db15acbe`,
 Two layers, each independently testable, each reusing an existing in-repo convention:
 
 **Layer 1 — parse (rejected parse, sibling convention).** In `CodeDirectory::parse`,
-the ident/team bounds block (`verify.rs:692-705`) is replaced by region-aware checks
-that run after the two existing hash-region checks (`expected_tail` :706-717,
-`n_special` :718-721). The string region is `[header_size, hash_offset)`;
-`hash_offset <= data.len()` follows from `expected_tail <= data.len()` (and the
-`n_special` check), so every slice built from it is in bounds on any width. Rules, per
-string that exists (identifier always; team only when `team_offset` is `Some`, i.e. the
-kernel's own gate):
+the ident/team bounds block (`verify.rs:692-705`) is replaced by terminator checks that
+run after the two existing hash-region checks (`expected_tail` :706-717,
+`n_special` :718-721). The rule mirrors Apple's validator exactly: an offset must lie
+inside the blob (`< data.len()`, the pre-existing bound, now enforced by the same helper
+that scans) and a NUL must exist in `[offset, data.len())` — no structural region is
+imposed, because Apple explicitly declines overlap checks (Security
+`codedirectory.cpp:153-164` comment; XNU bounds its `memchr` only by the blob length,
+`length - identOffset`). Rules, per string that exists (identifier always; team only when
+`team_offset` is `Some`, i.e. the kernel's own gate):
 
-- offset must satisfy `header_size <= offset < hash_offset`, else
-  `Error::Verification("CodeDirectory {identifier|team ID} offset outside the string
-  region")`;
-- a NUL must exist in `data[offset..hash_offset]`, else
+- offset must satisfy `offset < data.len()`, else
+  `Error::Verification("CodeDirectory {identifier|team ID} offset out of bounds")`;
+- a NUL must exist in `data[offset..]`, else
   `Error::Verification("CodeDirectory {identifier|team ID} is not NUL-terminated")`.
 
-The upper bound deliberately stops at `hash_offset` rather than the canonical
-`hash_offset - nSpecialSlots * hashSize` (see D6): code slots and trailing bytes stay
-excluded — the ticket's "rather than anywhere in data" — while a special-slot window
-that overlaps the header remains tolerated, as this repo's own
-`n_special <= hash_offset / hash_size` check and Apple's kernel both intend.
+`identOffset == 0` is accepted at parse (a NUL always exists in the blob), while
+`identifier()` special-cases `ident_offset == 0` to return `None` — deterministically
+mirroring `csblob_get_identity`, where the validator accepts 0 but identity retrieval
+returns NULL (the CD magic bytes would fail UTF-8 anyway; the explicit arm states the
+contract instead of depending on it). Pinned by test.
 
 `Error::Verification(String)` is the sole convention for malformed-CD parse failures
 in this file (:545, :553, :560, :578, :604, :611, :644, :650, :669, :693, :701, :715,
-:719 — `crates/zsign-core/src/error.rs:40-41`), so no new variant is introduced. The
-two old messages ("...offset out of bounds") are subsumed by the region message
-(`hash_offset <= data.len()`, so any offset that failed the old check fails the new
-one); no test or consumer matches those payloads (wasm maps the variant, not the
+:719 — `crates/zsign-core/src/error.rs:40-41`), so no new variant is introduced.
+The two old ad-hoc bounds checks (`identifier offset out of bounds` at :693, `team
+offset out of bounds` at :701) are folded into `check_string`'s single labelled bounds
+rule — same condition, same "out of bounds" wording, now also applied before the NUL
+scan so the slice cannot panic; no test or consumer matches those payloads (wasm maps
+the variant, not the
 string).
 
 **Layer 2 — helper (strict scan).** `cstring_at` (`verify.rs:827-831`) drops the
@@ -152,10 +159,12 @@ agrees: the *identical* offset checks already error at parse today.
 ### Invariants after the change
 
 - `CodeDirectory::parse` returns `Ok` ⟹ for the struct it produced:
-  `header_size <= ident_offset < hash_offset <= data.len()`; the same holds for
-  `team_offset` when `Some`; a NUL exists within `[offset, hash_offset)` for both.
-- `identifier()` returns `Some(s)` ⟺ `s` is the NUL-terminated, in-region identifier
-  reinterpreted as UTF-8; `team_id()` additionally returns `None` for absent teams
+  `ident_offset < data.len()`; the same holds for `team_offset` when `Some`; a NUL exists
+  within `[offset, data.len())` for both. No structural (header/hash) constraint is
+  implied — overlap with header or special-slot bytes is tolerated, as Apple does.
+- `identifier()` returns `None` when `ident_offset == 0` (kernel identity mirror) or when
+  the identifier bytes are not valid UTF-8; otherwise `Some(s)` with `s` the NUL-terminated
+  in-blob identifier. `team_id()` additionally returns `None` for absent teams
   (`teamOffset == 0` or version < 0x20200 — unchanged).
 - No public signature or type changes: both accessors stay `Option<&'a str>`; fuzz
   targets, `macho/verify.rs`, the facade crates, and the CLI compile untouched.
@@ -172,27 +181,26 @@ agrees: the *identical* offset checks already error at parse today.
   single validation site and O(1) access are real, but it restructures the struct,
   duplicates state (offsets + strings), and buys nothing observable on a low-priority
   ticket — YAGNI.
-- **D4 — without the header-region lower bound** (only require `offset < hash_offset`
-  + NUL): would still let `identOffset` point into the fixed header — exactly the
-  "anywhere in data" class the ticket calls out, since an offset below `header_size`
-  can only ever fabricate magic/version bytes as an "identifier". Tradeoff accepted: we reject some nonsense kernels would tolerate — consistent with
-  this parser's existing stricter-than-kernel checks (evidence §6).
+- **D4 — structural string-region bounds in any form (header-size floor + canonical or
+  `hash_offset` ceiling) — the design as first shipped, superseded twice**: the original
+  bound was the canonical `hash_offset - nSpecialSlots * hashSize`; the full-suite gate
+  proved it breaks a deferred fixture —
+  `macho::verify::tests::bound_launch_constraint_without_blob_is_rejected`
+  (`macho/verify.rs:1350`) grows `nSpecialSlots` 7→8 (`macho/verify.rs:1365`) so the
+  special-slot window overlaps the header, which this repo's own
+  `n_special <= hash_offset / hash_size` check and Apple's kernel both tolerate — so the
+  ceiling moved up to `hash_offset` (header floor kept, per the ticket's literal
+  "header/string region" wording). A supervisor steer then removed both bounds entirely:
+  Apple explicitly declines overlap checks (Security `codedirectory.cpp:153-164`
+  comment; XNU bounds `memchr` only by the blob length), and `csblob_get_identity`
+  accepts `identOffset == 0` at validation while returning NULL at identity retrieval —
+  the behaviour we pin by test. Cost if wrong: an in-blob offset into header/hash bytes
+  whose run to the first NUL is valid UTF-8 parses and yields a garbage identifier —
+  exactly the class Apple defers to "flagged as nonsense later"; the unterminated-string
+  gap and all out-of-blob offsets stay closed.
 - **D5 — exact equality `ident_offset == header_size`**: what every builder emits, but
   a lower bound accepts non-canonical-yet-unambiguous layouts with zero extra risk;
   equality only adds false-rejection surface.
-- **D6 — canonical `string_end = hash_offset - nSpecialSlots * hashSize` (the design's
-  original upper bound, superseded during implementation)**: the exact Apple layout,
-  tightest possible region — but the full-suite gate proved it breaks a deferred
-  fixture: `macho::verify::tests::bound_launch_constraint_without_blob_is_rejected`
-  (`macho/verify.rs:1350`) grows `nSpecialSlots` 7→8 (`macho/verify.rs:1365`) so the
-  special-slot window overlaps the header, which this repo's own
-  `n_special <= hash_offset / hash_size` check and Apple's kernel both tolerate (the
-  kernel performs no region check at all). `macho/**` is out of this lane's scope, so
-  the bound moved up to `hash_offset`; every ticket constraint — header lower bound,
-  exclusion of code slots and trailing bytes, terminator requirement — survives, and
-  the only conceded class (an offset inside the header-overlapping special window that
-  happens to be NUL-terminated UTF-8) is nonsense input no reader fabricated a
-  value from before anyway.
 
 ## Test strategy
 
@@ -203,29 +211,38 @@ for `Result`, `assert_eq!` for `Option`):
 1. **Helper contract (direct calls):** unterminated input → `None` (red before the
    fix: returns the whole tail); offset past end → `None`; non-UTF-8 before NUL →
    `None`; terminated positive control → `Some`.
-2. **Parse rejections (five, all red against pre-fix code):**
-   `identOffset < header_size`; `identOffset` at/after `hash_offset` (via
-   `synth_cd_with_slot8` extended by 100 trailing bytes with the declared length
-   updated, patching bytes 20..24 to 400 ≥ `hash_offset` 359); identifier with its
-   terminator byte overwritten; `teamOffset < header_size`; team string with no NUL
-   before `hash_offset` (extend a `synth_cd` blob by two non-zero bytes, updating the
-   declared length and `hashOffset`).
-3. **Positive guards (must stay green):** all seven `synth_cd` versions parse
+2. **Parse rejections (three, red at the appropriate stage):** identifier with its
+   terminator byte overwritten; team string with no NUL before the blob end (extend a
+   `synth_cd` blob by two non-zero bytes, updating the declared length and `hashOffset`);
+   `identOffset` at 400 inside a `synth_cd_with_slot8` blob extended by 100 `0x5A`
+   trailing bytes (declared 459) — in-blob, but the fill carries no terminator, so the
+   bounded scan rejects it with the NUL diagnostic (red while the structural ceiling
+   still produced the "string region" message).
+3. **Kernel-parity pins (red while the structural bounds existed, green after):**
+   `string_region_overlap_is_tolerated_like_the_kernel` — header-region identifier and
+   team offsets whose bytes contain a NUL must keep parsing (Security declines overlap
+   checks; XNU's `memchr` is bounded by blob length alone);
+   `ident_offset_zero_parses_and_reads_none_like_the_kernel` — `identOffset == 0`
+   parses, `identifier()` is `None` (magic bytes are never valid UTF-8), mirroring
+   `csblob_get_identity` (validator accepts 0, identity retrieval returns NULL).
+4. **Positive guards (must stay green):** all seven `synth_cd` versions parse
    (`version_header_sizes_are_correct`, :1710); `linkage_fields_are_bounds_checked`
    ok-arm (:1939, `t2`); builder round trip `identifier() == Some("com.example.test")`
-   (:1525); plus one new builder round trip with a team asserting
-   `team_id() == Some(...)` so the region checks are proven not to false-reject the
+   (:1525); plus one builder round trip with a team asserting
+   `team_id() == Some(...)` so the terminator checks are proven not to false-reject the
    team path.
-4. **Whole-scope gate:** `cargo fmt --all -- --check`,
+5. **Whole-scope gate:** `cargo fmt --all -- --check`,
    `cargo clippy -p zsign-core --all-targets -- -D warnings`,
    `cargo test -p zsign-core`, then `cargo test --workspace` before reporting.
 
 ## Acceptance criteria
 
 1. `cstring_at` returns `None` for unterminated input (pinned by a direct helper test).
-2. `CodeDirectory::parse` rejects: out-of-region identifier offset, out-of-region
-   team offset, unterminated identifier, unterminated team — each with
-   `Error::Verification` naming the region/terminator problem (five tests).
+2. `CodeDirectory::parse` rejects an unterminated identifier, an unterminated team ID,
+   and an in-blob offset whose bytes carry no terminator — each with
+   `Error::Verification` naming the bounds/terminator problem (three tests) — while
+   accepting header-overlap and `identOffset == 0` exactly as the kernel does (two
+   parity pins).
 3. No fixture relying on pre-change behavior regresses; the scoped gates are green
    with verbatim output in the final report.
 4. Exactly one production file changes (`verify.rs`); no public API change; no

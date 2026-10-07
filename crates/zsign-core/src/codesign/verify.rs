@@ -689,9 +689,10 @@ impl<'a> CodeDirectory<'a> {
             )));
         }
 
-        // Bounds: special slots, then code slots; the identifier/team strings
-        // live between the fixed header and the code hashes, in
-        // [header_size, hash_offset).
+        // Bounds: special slots, then code slots. Apple performs no overlap
+        // checks on the identifier/team offsets (XNU only bounds its memchr by
+        // the blob length), so each string must simply be found inside the blob
+        // and carry its terminator there.
         let n_special = n_special_slots as usize;
         let n_code = n_code_slots as usize;
         let expected_tail = n_code
@@ -710,16 +711,12 @@ impl<'a> CodeDirectory<'a> {
         }
         let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
         let check_string = |label: &str, off: usize| -> Result<()> {
-            if off < header_size || off >= hash_offset {
+            if off >= data.len() {
                 return Err(crate::Error::Verification(format!(
-                    "CodeDirectory {label} offset outside the string region"
+                    "CodeDirectory {label} offset out of bounds"
                 )));
             }
-            if data[off..hash_offset]
-                .iter()
-                .position(|&b| b == 0)
-                .is_none()
-            {
+            if data[off..].iter().position(|&b| b == 0).is_none() {
                 return Err(crate::Error::Verification(format!(
                     "CodeDirectory {label} is not NUL-terminated"
                 )));
@@ -754,9 +751,13 @@ impl<'a> CodeDirectory<'a> {
 
     /// The bundle identifier recorded in the CodeDirectory.
     ///
-    /// [`CodeDirectory::parse`] validates the offset's region and terminator;
-    /// [`None`] here means the identifier bytes are not valid UTF-8.
+    /// [`CodeDirectory::parse`] validates the offset's bounds and terminator;
+    /// [`None`] here also means `identOffset` is 0 (the kernel exposes no
+    /// identity in that case) or the bytes are not valid UTF-8.
     pub fn identifier(&self) -> Option<&'a str> {
+        if self.ident_offset == 0 {
+            return None;
+        }
         cstring_at(self.data, self.ident_offset)
     }
 
@@ -1780,36 +1781,40 @@ mod tests {
     }
 
     #[test]
-    fn identifier_offset_inside_header_is_rejected() {
-        let mut cd = synth_cd(0x20400, &[0u8; 44]);
-        cd[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
-        let err = CodeDirectory::parse(&cd).unwrap_err();
+    fn string_region_overlap_is_tolerated_like_the_kernel() {
+        // Apple declines overlap checks (Security's codedirectory comment; XNU
+        // only bounds its memchr by the blob length), so header-region offsets
+        // whose bytes carry a terminator inside the blob must keep parsing.
+        let mut ident = synth_cd(0x20400, &[0u8; 44]);
+        ident[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
         assert!(
-            matches!(&err, crate::Error::Verification(m)
-                if m.contains("identifier") && m.contains("string region")),
-            "got {err:?}"
+            CodeDirectory::parse(&ident).is_ok(),
+            "ident offset in header"
         );
+
+        let mut team = synth_cd(0x20400, &[0u8; 44]);
+        team[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+        assert!(CodeDirectory::parse(&team).is_ok(), "team offset in header");
+    }
+
+    #[test]
+    fn ident_offset_zero_parses_and_reads_none_like_the_kernel() {
+        // Per csblob_get_identity: the kernel validator accepts identOffset 0
+        // (a NUL exists in the blob), while identity retrieval returns NULL —
+        // so parse must succeed and identifier() must be None, not an error.
+        let mut cd = synth_cd(0x20400, &[0u8; 44]);
+        cd[20..24].copy_from_slice(&0u32.to_be_bytes());
+        let parsed = CodeDirectory::parse(&cd).expect("offset 0 must parse");
+        assert_eq!(parsed.identifier(), None, "magic bytes are not UTF-8");
     }
 
     #[test]
     fn identifier_offset_inside_hash_region_is_rejected() {
         let mut cd = synth_cd_with_slot8(b"x");
-        // string region is [88, 359); offset 400 lands in the code-hash/trailing area.
+        // offset 400 lands in the code-hash/trailing area; the 0x5A fill carries no NUL before the blob end, so the bounded scan rejects it (kernel parity).
         cd.extend_from_slice(&[0x5au8; 100]);
         cd[4..8].copy_from_slice(&459u32.to_be_bytes());
         cd[20..24].copy_from_slice(&400u32.to_be_bytes());
-        let err = CodeDirectory::parse(&cd).unwrap_err();
-        assert!(
-            matches!(&err, crate::Error::Verification(m)
-                if m.contains("identifier") && m.contains("string region")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn unterminated_identifier_is_rejected() {
-        let mut cd = synth_cd(0x20400, &[0u8; 44]);
-        cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator before string_end
         let err = CodeDirectory::parse(&cd).unwrap_err();
         assert!(
             matches!(&err, crate::Error::Verification(m)
@@ -1819,13 +1824,13 @@ mod tests {
     }
 
     #[test]
-    fn team_offset_inside_header_is_rejected() {
+    fn unterminated_identifier_is_rejected() {
         let mut cd = synth_cd(0x20400, &[0u8; 44]);
-        cd[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+        cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator in the blob
         let err = CodeDirectory::parse(&cd).unwrap_err();
         assert!(
             matches!(&err, crate::Error::Verification(m)
-                if m.contains("team ID") && m.contains("string region")),
+                if m.contains("identifier") && m.contains("NUL-terminated")),
             "got {err:?}"
         );
     }
@@ -1836,7 +1841,7 @@ mod tests {
         cd[48..52].copy_from_slice(&90u32.to_be_bytes()); // teamOffset = 90
         cd.extend_from_slice(b"yz"); // team bytes with no terminator
         cd[4..8].copy_from_slice(&92u32.to_be_bytes()); // declared length
-        cd[16..20].copy_from_slice(&92u32.to_be_bytes()); // hashOffset -> string_end = 92
+        cd[16..20].copy_from_slice(&92u32.to_be_bytes()); // hashOffset grows with the declared blob
         let err = CodeDirectory::parse(&cd).unwrap_err();
         assert!(
             matches!(&err, crate::Error::Verification(m)

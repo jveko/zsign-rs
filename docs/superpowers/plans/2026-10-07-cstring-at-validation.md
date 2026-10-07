@@ -4,14 +4,17 @@
 
 **Goal:** Make malformed CodeDirectory string references fail loudly: `cstring_at` stops
 accepting unterminated strings, and `CodeDirectory::parse` rejects identifier/team offsets
-outside the header/string region or missing their NUL terminators.
+outside the blob or missing their NUL terminators — Apple's validator rules exactly
+(`identifier()` additionally mirrors `csblob_get_identity` by returning `None` for
+`identOffset == 0`).
 
 **Architecture:** Two layered fixes, both inside `crates/zsign-core/src/codesign/verify.rs`:
 (1) the private helper's NUL scan becomes strict (`?` instead of `unwrap_or(rest.len())`);
-(2) the parse-time bounds block gains region + terminator checks that return
-`Error::Verification`, with the string region defined as `[header_size, hash_offset)` —
-code slots and trailing bytes excluded, special-window/header overlap tolerated per the
-repo's existing `n_special` check. No public
+(2) the parse-time bounds block gains terminator checks that return
+`Error::Verification`, mirroring Apple's validator: offset `< data.len()` (the
+pre-existing bound, folded into one labelled helper) plus a NUL in `[offset, data.len())`
+— no structural region, since Apple declines overlap checks (Security
+`codedirectory.cpp:153-164`; XNU bounds `memchr` only by blob length). No public
 signature changes; accessors stay `Option<&'a str>`.
 
 **Tech Stack:** Rust 2021 / cargo / thiserror; gates via `cargo fmt`, `cargo clippy`,
@@ -41,23 +44,23 @@ argues from the spec; executors read both.
 ## Review Focus
 
 1. **Layer split must not create a gap:** a missing NUL must be caught by BOTH the direct
-   helper test (Task 1) and the parse rejection test (Task 2) — neither layer may assume
+   helper test (Task 1) and the parse rejection tests (Task 2) — neither layer may assume
    the other's tests cover it.
-2. **Absent ≠ malformed:** `teamOffset == 0` (and version < 0x20200) must keep parsing and
-   yield `team_id() == None` — pinned by the sixth Task 2 test; all seven `synth_cd`
-   versions (`verify.rs:1710-1735`) must keep parsing, proving `identOffset == header_size`
-   passes the new lower bound.
+2. **Absent and offset-zero ≠ malformed:** `teamOffset == 0` (and version < 0x20200) must
+   keep parsing and yield `team_id() == None` — pinned by the positive guard; `identOffset == 0`
+   must parse and yield `identifier() == None` (never a parse error) — pinned by the
+   `csblob_get_identity` parity test; all seven `synth_cd` versions (`verify.rs:1710-1735`)
+   must keep parsing.
 3. **False rejection of valid output:** builder round trips (with and without a team) must
    still parse — the positive guard in Task 2 plus the existing `verify.rs:1525` assertion;
-   `synth_cd_with_slot8`'s `hash_offset = 359` boundary (identifier probe at 400) is where
-   an off-by-one would show.
-4. **Check ordering:** the region checks must run AFTER `expected_tail`/`n_special`
-   (so `hash_offset <= data.len()` is proven before any slice is built from it)
-   yet preserve the existing diagnostics
+   header-region offsets with an in-blob NUL must keep parsing — pinned by the overlap
+   tolerance test (an off-by-one or a resurrected floor fails exactly there).
+4. **Check ordering:** the terminator checks run AFTER `expected_tail`/`n_special`
+   (the block's existing layout) yet preserve the existing diagnostics
    (`"hash region … overruns blob"`, `"special-slot region overruns hash offset"`,
    pinned by `verify.rs:2044-2057`).
-5. **Slice safety inside the new closure:** `data[off..hash_offset]` is only reached after
-   `header_size <= off < hash_offset <= data.len()` is proven — the bounds check must be the
+5. **Slice safety inside the new closure:** `data[off..]` is only reached after
+   `off < data.len()` is proven — the bounds check must be the
    first statement of `check_string`.
 
 These map to Task 1 steps 1/3 and Task 2 steps 1/3/4 below.
@@ -159,7 +162,7 @@ Expected: clean worktree for this file; one commit, never pushed.
 
 ---
 
-## Task 2: Reject out-of-region and unterminated strings at parse
+## Task 2: Reject unterminated CodeDirectory strings at parse (kernel parity)
 
 **Files:**
 - Modify: `crates/zsign-core/src/codesign/verify.rs` — bounds block `:692-721`; accessor
@@ -168,47 +171,38 @@ Expected: clean worktree for this file; one commit, never pushed.
 
 **Interfaces:**
 - Consumes: Task 1's strict `cstring_at` (unchanged signature).
-- Produces: `CodeDirectory::parse` guarantee — on `Ok`, `header_size <= ident_offset <
-  hash_offset` and (when present) `header_size <= team_offset < hash_offset`, with
-  `hash_offset <= data.len()` and a NUL inside `[offset, hash_offset)` for each.
-  Accessor docs state it; no type changes.
+- Produces: `CodeDirectory::parse` guarantee — on `Ok`, `ident_offset < data.len()`
+  and (when present) `team_offset < data.len()`, with a NUL inside
+  `[offset, data.len())` for each; no structural (header/hash) constraint. Accessor
+  docs state it; no type changes.
 
 - [ ] **Step 1: Write the failing parse tests (Tester)**
 
-Add to the inline test module:
+Add to the inline test module (this set supersedes the earlier region-bound tests:
+the two `*_inside_header_is_rejected` tests are deleted as part of this change):
 
 ```rust
 #[test]
-fn identifier_offset_inside_header_is_rejected() {
-    let mut cd = synth_cd(0x20400, &[0u8; 44]);
-    cd[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
-    let err = CodeDirectory::parse(&cd).unwrap_err();
-    assert!(
-        matches!(&err, crate::Error::Verification(m)
-            if m.contains("identifier") && m.contains("string region")),
-        "got {err:?}"
-    );
+fn string_region_overlap_is_tolerated_like_the_kernel() {
+    // Apple declines overlap checks (Security's codedirectory comment; XNU
+    // only bounds its memchr by the blob length), so header-region offsets
+    // whose bytes carry a terminator inside the blob must keep parsing.
+    let mut ident = synth_cd(0x20400, &[0u8; 44]);
+    ident[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+    assert!(CodeDirectory::parse(&ident).is_ok(), "ident offset in header");
+
+    let mut team = synth_cd(0x20400, &[0u8; 44]);
+    team[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+    assert!(CodeDirectory::parse(&team).is_ok(), "team offset in header");
 }
 
 #[test]
 fn identifier_offset_inside_hash_region_is_rejected() {
     let mut cd = synth_cd_with_slot8(b"x");
-    // string region is [88, 359); offset 400 lands in the code-hash/trailing area.
+    // offset 400 lands in the code-hash/trailing area; the 0x5A fill carries no NUL before the blob end, so the bounded scan rejects it (kernel parity).
     cd.extend_from_slice(&[0x5au8; 100]);
     cd[4..8].copy_from_slice(&459u32.to_be_bytes());
     cd[20..24].copy_from_slice(&400u32.to_be_bytes());
-    let err = CodeDirectory::parse(&cd).unwrap_err();
-    assert!(
-        matches!(&err, crate::Error::Verification(m)
-            if m.contains("identifier") && m.contains("string region")),
-        "got {err:?}"
-    );
-}
-
-#[test]
-fn unterminated_identifier_is_rejected() {
-    let mut cd = synth_cd(0x20400, &[0u8; 44]);
-    cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator before string_end
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
         matches!(&err, crate::Error::Verification(m)
@@ -218,13 +212,13 @@ fn unterminated_identifier_is_rejected() {
 }
 
 #[test]
-fn team_offset_inside_header_is_rejected() {
+fn unterminated_identifier_is_rejected() {
     let mut cd = synth_cd(0x20400, &[0u8; 44]);
-    cd[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+    cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator in the blob
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
         matches!(&err, crate::Error::Verification(m)
-            if m.contains("team ID") && m.contains("string region")),
+            if m.contains("identifier") && m.contains("NUL-terminated")),
         "got {err:?}"
     );
 }
@@ -235,13 +229,24 @@ fn unterminated_team_id_is_rejected() {
     cd[48..52].copy_from_slice(&90u32.to_be_bytes()); // teamOffset = 90
     cd.extend_from_slice(b"yz"); // team bytes with no terminator
     cd[4..8].copy_from_slice(&92u32.to_be_bytes()); // declared length
-    cd[16..20].copy_from_slice(&92u32.to_be_bytes()); // hashOffset -> string_end = 92
+    cd[16..20].copy_from_slice(&92u32.to_be_bytes()); // hashOffset grows with the declared blob
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
         matches!(&err, crate::Error::Verification(m)
             if m.contains("team ID") && m.contains("NUL-terminated")),
         "got {err:?}"
     );
+}
+
+#[test]
+fn ident_offset_zero_parses_and_reads_none_like_the_kernel() {
+    // Per csblob_get_identity: the kernel validator accepts identOffset 0
+    // (a NUL exists in the blob), while identity retrieval returns NULL —
+    // so parse must succeed and identifier() must be None, not an error.
+    let mut cd = synth_cd(0x20400, &[0u8; 44]);
+    cd[20..24].copy_from_slice(&0u32.to_be_bytes());
+    let parsed = CodeDirectory::parse(&cd).expect("offset 0 must parse");
+    assert_eq!(parsed.identifier(), None, "magic bytes are not UTF-8");
 }
 
 #[test]
@@ -263,14 +268,19 @@ fn valid_strings_survive_region_checks() {
 }
 ```
 
-- [ ] **Step 2: Run, confirm five red / one green for the right reasons**
+- [ ] **Step 2: Run, confirm three red / three green for the right reasons**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core codesign::verify::tests::`
-Expected: the five rejection tests FAIL because `CodeDirectory::parse` currently returns
-`Ok` (each `unwrap_err` panics with the actual `Ok(..)`); `valid_strings_survive_region_checks`
-PASSES today and must keep passing after the change. Record the failure list.
+Expected: THREE tests FAIL because the structural bounds are still in the code —
+`string_region_overlap_is_tolerated_like_the_kernel` and
+`ident_offset_zero_parses_and_reads_none_like_the_kernel` (parse returns `Err`
+"string region" where `Ok` is required) and
+`identifier_offset_inside_hash_region_is_rejected` (parse fails, but with the
+"string region" message where "NUL-terminated" is asserted). The two unterminated
+tests and `valid_strings_survive_region_checks` PASS already and must keep passing
+after the change. Record the failure list.
 
-- [ ] **Step 3: Implement the region/terminator checks**
+- [ ] **Step 3: Implement the blob-bounded terminator checks**
 
 In `CodeDirectory::parse`, replace the span from the comment
 `// Bounds: identifier/team strings, then special slots, then code slots.`
@@ -279,9 +289,10 @@ check (`verify.rs:721`) — the two existing hash checks keep their exact code, 
 above the string checks — with:
 
 ```rust
-        // Bounds: special slots, then code slots; the identifier/team strings
-        // live between the fixed header and the code hashes, in
-        // [header_size, hash_offset).
+        // Bounds: special slots, then code slots. Apple performs no overlap
+        // checks on the identifier/team offsets (XNU only bounds its memchr by
+        // the blob length), so each string must simply be found inside the blob
+        // and carry its terminator there.
         let n_special = n_special_slots as usize;
         let n_code = n_code_slots as usize;
         let expected_tail = n_code
@@ -300,12 +311,12 @@ above the string checks — with:
         }
         let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
         let check_string = |label: &str, off: usize| -> Result<()> {
-            if off < header_size || off >= hash_offset {
+            if off >= data.len() {
                 return Err(crate::Error::Verification(format!(
-                    "CodeDirectory {label} offset outside the string region"
+                    "CodeDirectory {label} offset out of bounds"
                 )));
             }
-            if data[off..hash_offset].iter().position(|&b| b == 0).is_none() {
+            if data[off..].iter().position(|&b| b == 0).is_none() {
                 return Err(crate::Error::Verification(format!(
                     "CodeDirectory {label} is not NUL-terminated"
                 )));
@@ -321,14 +332,21 @@ above the string checks — with:
 Notes for the implementer: `team_offset`'s definition moves into this block (it is only
 consumed by the struct literal after it); `hash_size` is validated to 20 or 32 before this
 point, so the division is safe; `Result` is already imported (`verify.rs:29`); no import
-changes. Then replace both accessor doc comments in full with these contiguous blocks:
+changes. Then replace the `identifier()` doc comment AND body with the first block below,
+and the `team_id()` doc comment with the second (its body stays unchanged):
 
 ```rust
     /// The bundle identifier recorded in the CodeDirectory.
     ///
-    /// [`CodeDirectory::parse`] validates the offset's region and terminator;
-    /// [`None`] here means the identifier bytes are not valid UTF-8.
+    /// [`CodeDirectory::parse`] validates the offset's bounds and terminator;
+    /// [`None`] here also means `identOffset` is 0 (the kernel exposes no
+    /// identity in that case) or the bytes are not valid UTF-8.
     pub fn identifier(&self) -> Option<&'a str> {
+        if self.ident_offset == 0 {
+            return None;
+        }
+        cstring_at(self.data, self.ident_offset)
+    }
 ```
 
 ```rust
@@ -339,8 +357,6 @@ changes. Then replace both accessor doc comments in full with these contiguous b
     /// [`CodeDirectory::parse`].
     pub fn team_id(&self) -> Option<&'a str> {
 ```
-
-(The function bodies stay unchanged.)
 
 - [ ] **Step 4: Run the six tests, confirm green**
 
