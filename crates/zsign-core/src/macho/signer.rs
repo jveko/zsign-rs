@@ -525,7 +525,7 @@ fn sign_slice_complete(
     )?;
 
     // Step 4: Hash code pages ONCE with both SHA-1 and SHA-256
-    // buf now contains exactly the code bytes (code_length) with updated load commands
+    // buf now contains the code bytes plus the zero alignment pad, i.e. sig_offset == LC_CODE_SIGNATURE.dataoff bytes — the hashed region that codeLimit must equal
     let dual_hashes = hash_code_pages_dual(&buf);
 
     // Step 5: Build code directories from pre-computed hashes

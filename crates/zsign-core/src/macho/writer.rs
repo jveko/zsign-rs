@@ -1130,7 +1130,9 @@ pub(crate) fn checked_u32(value: usize, field_name: &str) -> Result<u32> {
 ///
 /// # Returns
 ///
-/// Returns `(prepared_code, signature_offset, code_length)`.
+/// Returns `(prepared_code, signature_offset, code_length)`. `prepared_code` is
+/// `signature_offset` bytes long (code bytes plus zero alignment pad) — the region
+/// to hash, equal to the `LC_CODE_SIGNATURE.dataoff` written by this call.
 ///
 /// # Errors
 ///
@@ -1157,7 +1159,9 @@ pub fn prepare_code_for_signing(
 ///
 /// # Returns
 ///
-/// Returns `(prepared_code, signature_offset, code_length)`.
+/// Returns `(prepared_code, signature_offset, code_length)`. `prepared_code` is
+/// `signature_offset` bytes long (code bytes plus zero alignment pad) — the region
+/// to hash, equal to the `LC_CODE_SIGNATURE.dataoff` written by this call.
 ///
 /// # Errors
 ///
@@ -1175,6 +1179,11 @@ pub fn prepare_code_for_signing_slice(
     }
 }
 
+/// Prepares code bytes for signing a single Mach-O image.
+///
+/// Returns `(prepared_code, signature_offset, code_length)`. `prepared_code` is
+/// `sig_offset` bytes long (code bytes plus zero alignment pad) — the region to
+/// hash, equal to the `LC_CODE_SIGNATURE.dataoff` written by this call.
 fn prepare_code_single(
     data: &[u8],
     macho: &MachO,
@@ -1235,6 +1244,7 @@ fn prepare_code_single(
     let sig_size = checked_u32(estimated_signature_size, "estimated_signature_size")?;
 
     let mut prepared = data[..code_length].to_vec();
+    prepared.resize(sig_offset, 0);
 
     if let Some((offset, _)) = code_sig_cmd {
         update_linkedit_data_command(
@@ -1429,7 +1439,9 @@ pub fn realloc_code_sign_space_with_metadata(
 ///
 /// # Returns
 ///
-/// Returns `(prepared_code, signature_offset, code_length)`.
+/// Returns `(prepared_code, signature_offset, code_length)`. `prepared_code` is
+/// `sig_offset` bytes long (code bytes plus zero alignment pad) — the region to
+/// hash, equal to the `LC_CODE_SIGNATURE.dataoff` written by this call.
 ///
 /// # Errors
 ///
@@ -1465,6 +1477,7 @@ pub fn prepare_code_with_metadata(
     }
 
     let mut prepared = data[..code_length].to_vec();
+    prepared.resize(sig_offset, 0);
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
         update_linkedit_data_command(
@@ -1544,8 +1557,10 @@ fn add_code_signature_command_with_metadata(
 
 /// Prepares code for signing in-place, avoiding extra allocations.
 ///
-/// Truncates `buf` to `code_length`, updates load commands, and returns
-/// `(sig_offset, code_length)`.
+/// Truncates `buf` to `code_length`, then zero-extends it to `sig_offset` bytes
+/// (code bytes plus zero alignment pad), updates load commands, and returns
+/// `(sig_offset, code_length)`. The returned buffer is `sig_offset` bytes long —
+/// the hash region, equal to the `LC_CODE_SIGNATURE.dataoff` written by this call.
 ///
 /// # Errors
 ///
@@ -1571,6 +1586,7 @@ pub fn prepare_code_in_place(
     }
 
     buf.truncate(code_length);
+    buf.resize(sig_offset, 0);
 
     if let Some((offset, _dataoff, _datasize)) = metadata.code_sig_cmd {
         update_linkedit_data_command(
@@ -2378,6 +2394,74 @@ mod tests {
         assert!(
             (dataoff as usize) + slice.code_sig_size.expect("size") as usize <= resigned.len(),
             "declared range must fit the output"
+        );
+    }
+
+    #[test]
+    fn test_code_limit_equals_dataoff_for_odd_length() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data.resize(0x2001, 0); // unsigned image whose length is not 16-aligned
+        let macho = crate::macho::MachOFile::parse(data).expect("fixture must parse");
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.oddlen", None, None, None, false)
+                .expect("signing an odd-length unsigned binary must succeed");
+        let reparsed =
+            crate::macho::MachOFile::parse(signed.clone()).expect("signed output must reparse");
+        let slice = &reparsed.slices()[0];
+        let dataoff = slice
+            .code_sig_offset
+            .expect("signed output carries LC_CODE_SIGNATURE") as usize;
+        let size = slice.code_sig_size.expect("signed size") as usize;
+        assert_eq!(dataoff, 0x2010, "sig offset is align_to(0x2001, 16)");
+        let superblob = crate::codesign::verify::parse_superblob(&signed[dataoff..dataoff + size])
+            .expect("embedded superblob parses");
+        let cd = superblob
+            .code_directory
+            .as_ref()
+            .expect("code directory present");
+        let code_limit = u32::from_be_bytes(cd.raw()[32..36].try_into().unwrap()) as usize;
+        assert_eq!(
+            code_limit, dataoff,
+            "codeLimit must equal LC_CODE_SIGNATURE.dataoff: no file byte may sit between the hashed region and the signature"
+        );
+        assert!(
+            signed[0x2001..0x2010].iter().all(|&b| b == 0),
+            "the pad between code_length 0x2001 and dataoff 0x2010 must be zero-filled"
+        );
+        assert!(
+            matches!(
+                crate::codesign::verify::check_code_pages(cd, &signed[..dataoff]),
+                crate::codesign::verify::PageCheck::Matched
+            ),
+            "every byte below dataoff, pad included, must verify against the code slots"
+        );
+    }
+
+    #[test]
+    fn test_code_limit_equals_dataoff_after_odd_resign() {
+        let signed = crate::macho::fixtures::make_signed_minimal_macho_at(0x2001, 0x400);
+        let macho = crate::macho::MachOFile::parse(signed).expect("odd input must parse");
+        let resigned =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.odd", None, None, None, false)
+                .expect("re-sign must succeed");
+        let reparsed =
+            crate::macho::MachOFile::parse(resigned.clone()).expect("resigned output must reparse");
+        let slice = &reparsed.slices()[0];
+        let dataoff = slice
+            .code_sig_offset
+            .expect("signed output carries LC_CODE_SIGNATURE") as usize;
+        let size = slice.code_sig_size.expect("signed size") as usize;
+        let superblob =
+            crate::codesign::verify::parse_superblob(&resigned[dataoff..dataoff + size])
+                .expect("embedded superblob parses");
+        let cd = superblob
+            .code_directory
+            .as_ref()
+            .expect("code directory present");
+        let code_limit = u32::from_be_bytes(cd.raw()[32..36].try_into().unwrap()) as usize;
+        assert_eq!(
+            code_limit, dataoff,
+            "re-signing an odd-dataoff image must still yield codeLimit == dataoff"
         );
     }
 
