@@ -10,6 +10,7 @@ readme = "../../README.md"
 homepage = "https://github.com/jveko/zsign-rs"
 repository = "https://github.com/jveko/zsign-rs"
 license = "MIT"
+license-file = "../../LICENSE"
 keywords = ["ios", "codesign", "macho", "ipa", "signing"]
 categories = ["command-line-utilities", "cryptography", "development-tools"]
 

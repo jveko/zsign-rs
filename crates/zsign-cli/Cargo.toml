@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Cross-platform iOS code signing CLI - Rust port of zsign"
 license = "MIT"
+license-file = "../../LICENSE"
 repository = "https://github.com/jveko/zsign-rs"
 
 [dependencies]

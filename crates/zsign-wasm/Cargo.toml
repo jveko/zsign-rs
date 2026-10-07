@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors = ["jveko"]
 description = "WASM bindings for zsign iOS code signing"
 license = "MIT"
+license-file = "../../LICENSE"
 repository = "https://github.com/jveko/zsign-rs"
 keywords = ["ios", "codesign", "wasm", "mach-o", "ipa"]
 
