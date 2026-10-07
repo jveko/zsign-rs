@@ -78,11 +78,18 @@ Append to `crates/zsign/src/verify.rs` `mod tests`:
 fn deleted_main_executable_is_invalid() {
     let td = tempfile::TempDir::new().unwrap();
     let (app, _) = build_signed_bundle(td.path());
+    // Dual-pin at the bundle layer: report.valid() is anchor-gated for test
+    // credentials, so it cannot express the precondition.
     let before = verify_bundle(&app).unwrap();
-    assert!(before.valid(), "precondition: signed bundle verifies: {:?}", before.bundle);
+    let bb = before.bundle.as_ref().unwrap();
+    assert!(bb.errors.is_empty(), "precondition: bundle errors: {:?}", bb.errors);
+    assert!(!bb.binaries.is_empty(), "precondition: signed bundle has binaries");
+    assert!(
+        bb.code_resources.as_ref().is_some_and(|c| c.valid()),
+        "precondition: code resources: {:?}", bb.code_resources
+    );
     fs::remove_file(app.join("Test")).unwrap();
     let report = verify_bundle(&app).unwrap();
-    assert!(!report.valid(), "deleted main executable must invalidate the bundle, got {:?}", report.bundle);
     let bundle = report.bundle.as_ref().unwrap();
     assert!(
         bundle.errors.iter().any(|e| e.contains("declared main executable") && e.contains("\"Test\"")),
@@ -144,18 +151,24 @@ fn minimal_signed_bundle_verifies() {
     fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
     let (creds, _rsa_key) = crate::test_util::test_credentials_with_key();
     ZSign::new().credentials(creds).sign_bundle(&app, None).unwrap();
+    // Dual-pin: report.valid() is anchor-gated for test credentials.
     let report = verify_bundle(&app).unwrap();
-    assert!(report.valid(), "minimal signed bundle must stay valid: {:?}", report.bundle);
+    let bundle = report.bundle.as_ref().unwrap();
+    assert!(bundle.errors.is_empty(), "minimal signed bundle must stay free of structural errors: {:?}", bundle.errors);
+    assert!(!bundle.binaries.is_empty(), "the executable must be verified");
+    let cr = bundle.code_resources.as_ref().expect("CodeResources check");
+    assert!(cr.valid(), "mismatched={:?} missing={:?} unsealed={:?}", cr.mismatched, cr.missing, cr.unsealed);
 }
 ```
 
 - [ ] **Step 2: Run the tests to confirm fail-before/pass-before split**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-rs verify::tests`
-Expected: `deleted_main_executable_is_invalid` FAIL
-("deleted main executable must invalidate the bundle"),
+Expected: `deleted_main_executable_is_invalid` FAIL ("missing-executable
+error expected" — no error is pushed yet),
 `zero_macho_empty_seal_bundle_is_invalid` FAIL ("must be invalid"),
-`minimal_signed_bundle_verifies` PASS, all pre-existing tests PASS. If any
+`minimal_signed_bundle_verifies` PASS under its bundle-layer pins, all
+pre-existing tests PASS. If any
 pre-existing test fails at this step, stop and report — the fixture assumption
 is wrong.
 
@@ -177,7 +190,9 @@ is wrong.
 
 - [ ] **Step 1: Track the declared executable during the walk**
 
-In `verify_bundle_dir`, before the `for entry in WalkDir…` loop, add:
+In `verify_bundle_dir`, before its collection walk — the `for entry in
+WalkDir…` loop that pushes onto `direct_binaries` (verify.rs ~436-466), **not**
+the `check_code_resources` disk walk — add:
 
 ```rust
 let mut found_main_executable = false;

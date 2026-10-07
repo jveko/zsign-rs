@@ -31,25 +31,26 @@ structural gaps:
   `:428-430` (`plist_executable`, `:552-559`), used only by `is_rule_omitted`
   (`:316-326`, consumed in the disk pass inside `check_code_resources`); the
   walk collects `direct_binaries` at `:433-465`; recursion at `:531-537`.
-  `verify_bundle` (`:374-382`) and `verify_ipa` (`:390-403`) are thin wrappers
+  `verify_bundle` (`:374-382`) and `verify_ipa` (`:390-402`) are thin wrappers
   over `verify_bundle_dir`, so one implementation covers both entry points.
 - `check_code_resources` — `verify.rs:745-925`: `files2` key required
-  (`:787-790`, else an error is pushed), legacy `files` optional (`:797-805`),
-  `sealed_set = files2 ∪ files` (`:814-820`); emptiness is never checked. All
+  (`:787-790`, else an error is pushed), legacy `files` optional (`:798-807`),
+  `sealed_set = files2 ∪ files` (`:809-815`); emptiness is never checked. All
   counts come from loops over the sealed dicts, so an empty set yields zeros.
 - The only structural error precedent today is
   `out.errors.push("missing _CodeSignature/CodeResources")` at `verify.rs:424-426`.
-- Signer asymmetry — `ipa/mod.rs:1678-1730`: `get_main_executable` requires
+- Signer asymmetry — `ipa/mod.rs:1678-1742`: `get_main_executable` requires
   `Info.plist`, a string `CFBundleExecutable`, a relative path, and an existing
   regular file at `bundle/CFBundleExecutable` (file-stem fallback when the key
-  is absent); called from `sign_single_bundle` (`:1464`). The signed main
+  is absent); called from `sign_single_bundle` (`:1463`). The signed main
   executable is then parsed as Mach-O (`sign_binary`), so every zsign-signed
   bundle level has at least one direct Mach-O at exactly `bundle/<exe>`.
 - Builder emission — `zsign-core/src/bundle/code_resources.rs`
-  `build()`: legacy `files` is written from every scanned entry with no rule
-  filtering (`:591-609`); `files2` skips entries whose `rules2` action is omit
-  (`:611-630`), and `standard_rules2` declares `^Info\.plist$`/`^PkgInfo$`
-  omit. The facade scanner always seals `Info.plist` (facade
+  `build()`: legacy `files` (`:591-609`) skips symlinks and entries whose
+  *v1-rules* action is `Omit` (marking `Optional` ones with a flag); `files2`
+  (`:611-630`) skips entries whose `rules2` action is `Omit`, and
+  `standard_rules2` declares `^Info\.plist$`/`^PkgInfo$` omit there — while the
+  v1 rules have no such omit, so `Info.plist` survives in `files`. The facade scanner always seals `Info.plist` (facade
   `bundle/code_resources.rs` test asserts `file_paths.contains("Info.plist")`)
   and always excludes the main executable (`should_exclude`, core `:420-436`).
   Consequence: every zsign-signed bundle has `files` ≥ {`Info.plist`}, so the
@@ -139,18 +140,21 @@ with no signature or consumer edits.
 ## Testing
 
 - `deleted_main_executable_is_invalid` — sign the standard fixture, assert the
-  precondition valid, `fs::remove_file(app/"Test")`, then assert
-  `!report.valid()` and that `bundle.errors` names the missing executable.
-  Fails before the change (report stays valid).
+  precondition at the bundle layer (report-level `valid()` is anchor-gated for
+  test credentials — the repo's dual-pin pattern: `bundle.errors` empty,
+  binaries non-empty, `cr.valid()`), `fs::remove_file(app/"Test")`, then assert
+  `bundle.errors` is non-empty and names the missing executable. Fails before
+  the change (no error is pushed).
 - `zero_macho_empty_seal_bundle_is_invalid` — hand-build the never-signed
   bundle (`Info.plist` without `CFBundleExecutable`, `_CodeSignature/CodeResources`
   with empty `files`/`files2` and standard rules whose `^Info\.plist$` omit
   keeps the disk pass clean). Assert invalid and that both structural errors are
   present. Fails before the change (no errors at all).
 - `minimal_signed_bundle_verifies` — sign a bundle containing only
-  `Info.plist` + executable; assert it stays valid. Guards the union-based
-  empty-seal check against over-strictness (`files2` is legitimately empty
-  here). Passes before and after.
+  `Info.plist` + executable; assert `bundle.errors` is empty, binaries
+  non-empty, and `cr.valid()` (dual-pin — `report.valid()` is anchor-gated).
+  Guards the union-based empty-seal check against over-strictness (`files2` is
+  legitimately empty here). Passes before and after.
 - Existing suites (`signed_bundle_verifies`, IPA end-to-end, CLI sign/verify
   round-trips) are the regression net for false rejections.
 
@@ -159,7 +163,9 @@ with no signature or consumer edits.
 - Deleted declared main executable ⇒ report invalid, error names the
   executable, `-V` exits 1, `problem_count > 0`.
 - Zero-Mach-O never-signed bundle ⇒ report invalid with both structural errors.
-- Minimal signed bundle and every existing fixture stay valid.
+- Minimal signed bundle and every existing fixture stay free of new structural
+  errors (`bundle.errors` empty, `cr.valid()`), so nothing valid today is
+  rejected.
 - Zero-warning gate green: `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `TMPDIR=$PWD/target/tmp cargo test --workspace`.
