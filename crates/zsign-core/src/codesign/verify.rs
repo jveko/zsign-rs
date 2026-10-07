@@ -824,9 +824,13 @@ impl<'a> CodeDirectory<'a> {
 }
 
 /// Reads a NUL-terminated string from `data` at `offset`.
+///
+/// Returns [`None`] when `offset` is past the end of `data`, when no
+/// terminator follows it, or when the bytes before the terminator are not
+/// valid UTF-8.
 fn cstring_at(data: &[u8], offset: usize) -> Option<&str> {
     let rest = data.get(offset..)?;
-    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let end = rest.iter().position(|&b| b == 0)?;
     std::str::from_utf8(&rest[..end]).ok()
 }
 
@@ -1637,6 +1641,30 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_superblob(&[0u8; 64]).is_err());
         assert!(CodeDirectory::parse(&[0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn cstring_at_requires_a_nul_terminator() {
+        assert_eq!(
+            cstring_at(b"com.example.test\0trailing", 0),
+            Some("com.example.test"),
+            "control: terminated string is returned without its tail"
+        );
+        assert_eq!(
+            cstring_at(b"com.example.test", 0),
+            None,
+            "a missing NUL must not be read as end-of-string"
+        );
+        assert_eq!(
+            cstring_at(b"com.example.test", usize::MAX),
+            None,
+            "an offset past the buffer must be None"
+        );
+        assert_eq!(
+            cstring_at(b"com.\xff.example\0", 0),
+            None,
+            "bytes up to the terminator must be valid UTF-8"
+        );
     }
 
     fn synth_cd_with_slot8(child: &[u8]) -> Vec<u8> {
