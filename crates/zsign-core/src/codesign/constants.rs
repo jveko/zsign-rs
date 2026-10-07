@@ -66,9 +66,6 @@ pub const CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: u32 = 0xfade7172;
 /// CMS signature wrapper blob
 pub const CSMAGIC_BLOBWRAPPER: u32 = 0xfade0b01;
 
-/// Detached signature magic
-pub const CSMAGIC_DETACHED_SIGNATURE: u32 = 0xfade0cc1;
-
 // =============================================================================
 // Slot Types (for SuperBlob index)
 // =============================================================================
@@ -76,23 +73,11 @@ pub const CSMAGIC_DETACHED_SIGNATURE: u32 = 0xfade0cc1;
 /// Main code directory slot (SHA-1)
 pub const CSSLOT_CODEDIRECTORY: u32 = 0x0000;
 
-/// Info.plist slot
-pub const CSSLOT_INFOSLOT: u32 = 0x0001;
-
 /// Code requirements slot
 pub const CSSLOT_REQUIREMENTS: u32 = 0x0002;
 
-/// Resource directory (CodeResources) slot
-pub const CSSLOT_RESOURCEDIR: u32 = 0x0003;
-
-/// Application-specific slot
-pub const CSSLOT_APPLICATION: u32 = 0x0004;
-
 /// Entitlements slot (XML format)
 pub const CSSLOT_ENTITLEMENTS: u32 = 0x0005;
-
-/// Rep-specific slot
-pub const CSSLOT_REP_SPECIFIC: u32 = 0x0006;
 
 /// DER entitlements slot
 pub const CSSLOT_DER_ENTITLEMENTS: u32 = 0x0007;
@@ -139,14 +124,8 @@ pub const CSSLOT_SPECIAL_REQUIREMENTS: i32 = -2;
 /// CodeResources special slot index
 pub const CSSLOT_SPECIAL_RESOURCEDIR: i32 = -3;
 
-/// Application special slot index
-pub const CSSLOT_SPECIAL_APPLICATION: i32 = -4;
-
 /// Entitlements special slot index
 pub const CSSLOT_SPECIAL_ENTITLEMENTS: i32 = -5;
-
-/// Rep-specific special slot index
-pub const CSSLOT_SPECIAL_REP_SPECIFIC: i32 = -6;
 
 /// DER entitlements special slot index
 pub const CSSLOT_SPECIAL_DER_ENTITLEMENTS: i32 = -7;
@@ -167,23 +146,11 @@ pub const CSSLOT_SPECIAL_LIBRARY_CONSTRAINT: i32 = -11;
 // Hash Types
 // =============================================================================
 
-/// No hash (placeholder)
-pub const CS_HASHTYPE_NOHASH: u8 = 0;
-
 /// SHA-1 hash (160-bit / 20 bytes)
 pub const CS_HASHTYPE_SHA1: u8 = 1;
 
 /// SHA-256 hash (256-bit / 32 bytes)
 pub const CS_HASHTYPE_SHA256: u8 = 2;
-
-/// SHA-256 truncated to 20 bytes (legacy compatibility)
-pub const CS_HASHTYPE_SHA256_TRUNCATED: u8 = 3;
-
-/// SHA-384 hash (384-bit / 48 bytes)
-pub const CS_HASHTYPE_SHA384: u8 = 4;
-
-/// SHA-512 hash (512-bit / 64 bytes)
-pub const CS_HASHTYPE_SHA512: u8 = 5;
 
 // =============================================================================
 // Hash Sizes
@@ -201,45 +168,15 @@ pub const CS_SHA384_LEN: usize = 48;
 /// SHA-512 hash size in bytes
 pub const CS_SHA512_LEN: usize = 64;
 
-/// Maximum hash size we support
-pub const CS_MAX_HASH_LEN: usize = 64;
-
 // =============================================================================
 // Code Signature Flags
 // =============================================================================
 
-/// Code is valid (verified)
-pub const CS_VALID: u32 = 0x00000001;
-
 /// Ad-hoc signed (no identity)
 pub const CS_ADHOC: u32 = 0x00000002;
 
-/// Force hard page validation
-pub const CS_HARD: u32 = 0x00000100;
-
-/// Force kill on page validation failure
-pub const CS_KILL: u32 = 0x00000200;
-
-/// Restrict memory protections
-pub const CS_RESTRICT: u32 = 0x00000800;
-
-/// Allow amfi to check if dyld is loaded
-pub const CS_ENFORCEMENT: u32 = 0x00001000;
-
-/// Require library validation
-pub const CS_REQUIRE_LV: u32 = 0x00002000;
-
-/// Entitlements were validated
-pub const CS_ENTITLEMENTS_VALIDATED: u32 = 0x00004000;
-
-/// Never modify code
-pub const CS_NVRAM_UNRESTRICTED: u32 = 0x00008000;
-
 /// Code runs with amfi in test mode
 pub const CS_RUNTIME: u32 = 0x00010000;
-
-/// Linked for encryption
-pub const CS_LINKER_SIGNED: u32 = 0x00020000;
 
 // =============================================================================
 // Exec Segment Flags
@@ -259,12 +196,6 @@ pub const CS_EXECSEG_JIT: u64 = 0x0040;
 
 /// Skip library validation
 pub const CS_EXECSEG_SKIP_LV: u64 = 0x0080;
-
-/// Can load any library
-pub const CS_EXECSEG_CAN_LOAD_CDHASH: u64 = 0x0100;
-
-/// Can execute with dyld simulator
-pub const CS_EXECSEG_CAN_EXEC_CDHASH: u64 = 0x0200;
 
 // =============================================================================
 // CodeDirectory Version
@@ -308,148 +239,11 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_LOG2: u8 = 12;
 
 // =============================================================================
-// Requirements Opcodes
-// =============================================================================
-
-/// Requirement expression: always false
-pub const OP_FALSE: u32 = 0;
-
-/// Requirement expression: always true
-pub const OP_TRUE: u32 = 1;
-
-/// Requirement expression: check identifier
-pub const OP_IDENT: u32 = 2;
-
-/// Requirement expression: Apple anchor
-pub const OP_APPLE_ANCHOR: u32 = 3;
-
-/// Requirement expression: anchor hash
-pub const OP_ANCHOR_HASH: u32 = 4;
-
-/// Requirement expression: info key value
-pub const OP_INFO_KEY_VALUE: u32 = 5;
-
-/// Requirement expression: logical AND
-pub const OP_AND: u32 = 6;
-
-/// Requirement expression: logical OR
-pub const OP_OR: u32 = 7;
-
-/// Requirement expression: CDHash
-pub const OP_CDHASH: u32 = 8;
-
-/// Requirement expression: logical NOT
-pub const OP_NOT: u32 = 9;
-
-/// Requirement expression: info key field
-pub const OP_INFO_KEY_FIELD: u32 = 10;
-
-/// Requirement expression: certificate field
-pub const OP_CERT_FIELD: u32 = 11;
-
-/// Requirement expression: trusted certificate
-pub const OP_TRUSTED_CERT: u32 = 12;
-
-/// Requirement expression: trusted certificates
-pub const OP_TRUSTED_CERTS: u32 = 13;
-
-/// Requirement expression: certificate generic
-pub const OP_CERT_GENERIC: u32 = 14;
-
-/// Requirement expression: Apple generic anchor
-pub const OP_APPLE_GENERIC_ANCHOR: u32 = 15;
-
-/// Requirement expression: entitlement field
-pub const OP_ENTITLEMENT_FIELD: u32 = 16;
-
-/// Requirement expression: certificate policy
-pub const OP_CERT_POLICY: u32 = 17;
-
-/// Requirement expression: named anchor
-pub const OP_NAMED_ANCHOR: u32 = 18;
-
-/// Requirement expression: named code
-pub const OP_NAMED_CODE: u32 = 19;
-
-/// Requirement expression: platform
-pub const OP_PLATFORM: u32 = 20;
-
-/// Requirement expression: notarized
-pub const OP_NOTARIZED: u32 = 21;
-
-/// Requirement expression: certificate field (date)
-pub const OP_CERT_FIELD_DATE: u32 = 22;
-
-/// Requirement expression: legacy development ID
-pub const OP_LEGACY_DEV_ID: u32 = 23;
-
-// =============================================================================
 // Requirements Types
 // =============================================================================
 
-/// Requirement type: host requirement
-pub const CSREQ_HOST: u32 = 0x0001;
-
-/// Requirement type: guest requirement
-pub const CSREQ_GUEST: u32 = 0x0002;
-
 /// Requirement type: designated requirement
 pub const CSREQ_DESIGNATED: u32 = 0x0003;
-
-/// Requirement type: library requirement
-pub const CSREQ_LIBRARY: u32 = 0x0004;
-
-/// Requirement type: plugin requirement
-pub const CSREQ_PLUGIN: u32 = 0x0005;
-
-// =============================================================================
-// Match Operations (for requirements expressions)
-// =============================================================================
-
-/// Match: exists
-pub const MATCH_EXISTS: u32 = 0;
-
-/// Match: equal
-pub const MATCH_EQUAL: u32 = 1;
-
-/// Match: contains
-pub const MATCH_CONTAINS: u32 = 2;
-
-/// Match: begins with
-pub const MATCH_BEGINS_WITH: u32 = 3;
-
-/// Match: ends with
-pub const MATCH_ENDS_WITH: u32 = 4;
-
-/// Match: less than
-pub const MATCH_LESS_THAN: u32 = 5;
-
-/// Match: greater than
-pub const MATCH_GREATER_THAN: u32 = 6;
-
-/// Match: less than or equal
-pub const MATCH_LESS_THAN_OR_EQUAL: u32 = 7;
-
-/// Match: greater than or equal
-pub const MATCH_GREATER_THAN_OR_EQUAL: u32 = 8;
-
-/// Match: on (for dates)
-pub const MATCH_ON: u32 = 9;
-
-/// Match: before (for dates)
-pub const MATCH_BEFORE: u32 = 10;
-
-/// Match: after (for dates)
-pub const MATCH_AFTER: u32 = 11;
-
-/// Match: on or before (for dates)
-pub const MATCH_ON_OR_BEFORE: u32 = 12;
-
-/// Match: on or after (for dates)
-pub const MATCH_ON_OR_AFTER: u32 = 13;
-
-/// Match: absent
-pub const MATCH_ABSENT: u32 = 14;
 
 #[cfg(test)]
 mod tests {
