@@ -248,7 +248,8 @@ fn valid_strings_survive_region_checks() {
     assert_eq!(cd.identifier(), Some("com.example.team"));
     assert_eq!(cd.team_id(), Some("ABCDE12345"));
 
-    let no_team = CodeDirectory::parse(&synth_cd(0x20400, &vec![0u8; 44])).expect("parse");
+    let raw = synth_cd(0x20400, &vec![0u8; 44]);
+    let no_team = CodeDirectory::parse(&raw).expect("parse");
     assert_eq!(no_team.team_id(), None, "teamOffset 0 is absent, not malformed");
 }
 ```
