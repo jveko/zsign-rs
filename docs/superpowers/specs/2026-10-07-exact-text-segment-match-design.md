@@ -14,7 +14,7 @@ executable segment with a prefix test in both width arms:
 - 32-bit arm: `crates/zsign-core/src/macho/parser.rs:294`, same prefix
   test, same three captures widened `as u64`.
 
-The load-command loop (`parser.rs:268`) is last-match-wins, so any segment
+The load-command loop (`parser.rs:264`) is last-match-wins, so any segment
 whose 16-byte name merely begins with `__TEXT` overwrites the captured
 values. `__TEXT_EXEC` is a real ld64 output (emitted for `-text_exec` and
 forced for arm64 kext bundles) and is ordered after `__TEXT`, so it
@@ -29,6 +29,10 @@ defect: the emitted `execSegBase`/`execSegLimit` come from the wrong
 segment.
 
 ## Verified external contract
+
+The citations in this section are externally verified against upstream
+sources (Apple/ld64/zsign), not files in this worktree — line numbers
+refer to those upstream repositories at the reviewed commits:
 
 - Apple resolves the segment by exact comparison: `MachOBase::findSegment`
   returns the first segment where

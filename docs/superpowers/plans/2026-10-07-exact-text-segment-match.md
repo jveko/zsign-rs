@@ -211,7 +211,7 @@ Expected: FAIL — the three new tests fail on assertion (prefix capture yields 
 
 - [ ] **Step 1: Add the constant and switch both arms**
 
-In `crates/zsign-core/src/macho/parser.rs`, immediately above `fn parse_single`, add:
+In `crates/zsign-core/src/macho/parser.rs`, at true module level (above the `impl MachOFile` block that contains `parse_single`, NOT inside the impl — the bare `TEXT_SEGMENT_NAME` references below require module scope), add:
 
 ```rust
 /// `__TEXT` as it appears in a 16-byte segment-name field: 6 name
