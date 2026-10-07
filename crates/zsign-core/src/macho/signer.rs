@@ -1644,6 +1644,41 @@ mod tests {
     }
 
     #[test]
+    fn test_sign_macho_adhoc_refuses_fat_with_encrypted_slice() {
+        let fat = make_fat_macho(
+            &[
+                make_minimal_macho(),
+                make_minimal_macho_encrypted(1, 0x1000),
+            ],
+            &[12, 12],
+        );
+        let macho = MachOFile::parse(fat).expect("FAT binary must parse");
+        assert!(
+            macho.slices()[1].is_encrypted(),
+            "second slice must be encrypted"
+        );
+
+        let err = sign_macho_adhoc(&macho, "com.zsign.adhocenc", None, None, None, false)
+            .expect_err("ad-hoc FAT signing must refuse an encrypted slice");
+        match err {
+            crate::Error::EncryptedBinary(msg) => {
+                assert!(
+                    msg.contains("slice 1"),
+                    "message must name the encrypted slice: {msg}"
+                );
+            }
+            other => panic!("expected EncryptedBinary, got {other:?}"),
+        }
+
+        let signed = sign_macho_adhoc(&macho, "com.zsign.adhocenc", None, None, None, true)
+            .expect("allow_encrypted=true must sign the FAT binary");
+        assert!(
+            signed.len() > macho.data().len(),
+            "signed FAT must include the embedded signature"
+        );
+    }
+
+    #[test]
     fn test_sign_allow_encrypted_override() {
         let macho = MachOFile::parse(make_minimal_macho_encrypted(1, 0x1000)).unwrap();
         let credentials = crate::macho::fixtures::test_signing_credentials();
