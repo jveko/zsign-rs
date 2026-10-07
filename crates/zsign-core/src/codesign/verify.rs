@@ -689,20 +689,9 @@ impl<'a> CodeDirectory<'a> {
             )));
         }
 
-        // Bounds: identifier/team strings, then special slots, then code slots.
-        if ident_offset >= data.len() {
-            return Err(crate::Error::Verification(
-                "CodeDirectory identifier offset out of bounds".into(),
-            ));
-        }
-        let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
-        if let Some(off) = team_offset {
-            if off >= data.len() {
-                return Err(crate::Error::Verification(
-                    "CodeDirectory team offset out of bounds".into(),
-                ));
-            }
-        }
+        // Bounds: special slots, then code slots; the identifier/team strings
+        // live between the fixed header and the code hashes, in
+        // [header_size, hash_offset).
         let n_special = n_special_slots as usize;
         let n_code = n_code_slots as usize;
         let expected_tail = n_code
@@ -718,6 +707,28 @@ impl<'a> CodeDirectory<'a> {
             return Err(crate::Error::Verification(
                 "CodeDirectory special-slot region overruns hash offset".into(),
             ));
+        }
+        let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
+        let check_string = |label: &str, off: usize| -> Result<()> {
+            if off < header_size || off >= hash_offset {
+                return Err(crate::Error::Verification(format!(
+                    "CodeDirectory {label} offset outside the string region"
+                )));
+            }
+            if data[off..hash_offset]
+                .iter()
+                .position(|&b| b == 0)
+                .is_none()
+            {
+                return Err(crate::Error::Verification(format!(
+                    "CodeDirectory {label} is not NUL-terminated"
+                )));
+            }
+            Ok(())
+        };
+        check_string("identifier", ident_offset)?;
+        if let Some(off) = team_offset {
+            check_string("team ID", off)?;
         }
 
         Ok(CodeDirectory {
@@ -742,11 +753,18 @@ impl<'a> CodeDirectory<'a> {
     }
 
     /// The bundle identifier recorded in the CodeDirectory.
+    ///
+    /// [`CodeDirectory::parse`] validates the offset's region and terminator;
+    /// [`None`] here means the identifier bytes are not valid UTF-8.
     pub fn identifier(&self) -> Option<&'a str> {
         cstring_at(self.data, self.ident_offset)
     }
 
     /// The team ID recorded in the CodeDirectory, if any.
+    ///
+    /// [`None`] also means the directory records no team ID (offset 0, or
+    /// versions before 0x20200); offsets and terminators are validated by
+    /// [`CodeDirectory::parse`].
     pub fn team_id(&self) -> Option<&'a str> {
         self.team_offset.and_then(|off| cstring_at(self.data, off))
     }
@@ -1758,6 +1776,90 @@ mod tests {
             err.to_string()
                 .contains("unsupported CodeDirectory version"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn identifier_offset_inside_header_is_rejected() {
+        let mut cd = synth_cd(0x20400, &[0u8; 44]);
+        cd[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("identifier") && m.contains("string region")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn identifier_offset_inside_hash_region_is_rejected() {
+        let mut cd = synth_cd_with_slot8(b"x");
+        // string region is [88, 359); offset 400 lands in the code-hash/trailing area.
+        cd.extend_from_slice(&[0x5au8; 100]);
+        cd[4..8].copy_from_slice(&459u32.to_be_bytes());
+        cd[20..24].copy_from_slice(&400u32.to_be_bytes());
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("identifier") && m.contains("string region")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_identifier_is_rejected() {
+        let mut cd = synth_cd(0x20400, &[0u8; 44]);
+        cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator before string_end
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("identifier") && m.contains("NUL-terminated")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn team_offset_inside_header_is_rejected() {
+        let mut cd = synth_cd(0x20400, &[0u8; 44]);
+        cd[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("team ID") && m.contains("string region")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_team_id_is_rejected() {
+        let mut cd = synth_cd(0x20400, &[0u8; 44]); // len 90; ident "x\0" at 88..90
+        cd[48..52].copy_from_slice(&90u32.to_be_bytes()); // teamOffset = 90
+        cd.extend_from_slice(b"yz"); // team bytes with no terminator
+        cd[4..8].copy_from_slice(&92u32.to_be_bytes()); // declared length
+        cd[16..20].copy_from_slice(&92u32.to_be_bytes()); // hashOffset -> string_end = 92
+        let err = CodeDirectory::parse(&cd).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Verification(m)
+                if m.contains("team ID") && m.contains("NUL-terminated")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn valid_strings_survive_region_checks() {
+        let bytes = CodeDirectoryBuilder::new("com.example.team", TEST_CODE)
+            .team_id("ABCDE12345")
+            .build_sha256();
+        let cd = CodeDirectory::parse(&bytes).expect("builder output must parse");
+        assert_eq!(cd.identifier(), Some("com.example.team"));
+        assert_eq!(cd.team_id(), Some("ABCDE12345"));
+
+        let raw = synth_cd(0x20400, &[0u8; 44]);
+        let no_team = CodeDirectory::parse(&raw).expect("parse");
+        assert_eq!(
+            no_team.team_id(),
+            None,
+            "teamOffset 0 is absent, not malformed"
         );
     }
 

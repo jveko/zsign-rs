@@ -104,25 +104,30 @@ Two layers, each independently testable, each reusing an existing in-repo conven
 
 **Layer 1 — parse (rejected parse, sibling convention).** In `CodeDirectory::parse`,
 the ident/team bounds block (`verify.rs:692-705`) is replaced by region-aware checks
-that run *after* the two existing hash-region checks (`expected_tail` :706-717,
-`n_special` :718-721). The relocation is load-bearing: once `n_special <=
-hash_offset / hash_size` holds, `string_end = hash_offset - n_special * hash_size`
-cannot underflow on any width (the product is ≤ `hash_offset`, and `hash_size` was
-already validated to 20 or 32 at :681-689), and `string_end <= data.len()` follows
-from `expected_tail <= data.len()`. Rules, per string that exists (identifier always;
-team only when `team_offset` is `Some`, i.e. the kernel's own gate):
+that run after the two existing hash-region checks (`expected_tail` :706-717,
+`n_special` :718-721). The string region is `[header_size, hash_offset)`;
+`hash_offset <= data.len()` follows from `expected_tail <= data.len()` (and the
+`n_special` check), so every slice built from it is in bounds on any width. Rules, per
+string that exists (identifier always; team only when `team_offset` is `Some`, i.e. the
+kernel's own gate):
 
-- offset must satisfy `header_size <= offset < string_end`, else
+- offset must satisfy `header_size <= offset < hash_offset`, else
   `Error::Verification("CodeDirectory {identifier|team ID} offset outside the string
   region")`;
-- a NUL must exist in `data[offset..string_end]`, else
+- a NUL must exist in `data[offset..hash_offset]`, else
   `Error::Verification("CodeDirectory {identifier|team ID} is not NUL-terminated")`.
+
+The upper bound deliberately stops at `hash_offset` rather than the canonical
+`hash_offset - nSpecialSlots * hashSize` (see D6): code slots and trailing bytes stay
+excluded — the ticket's "rather than anywhere in data" — while a special-slot window
+that overlaps the header remains tolerated, as this repo's own
+`n_special <= hash_offset / hash_size` check and Apple's kernel both intend.
 
 `Error::Verification(String)` is the sole convention for malformed-CD parse failures
 in this file (:545, :553, :560, :578, :604, :611, :644, :650, :669, :693, :701, :715,
 :719 — `crates/zsign-core/src/error.rs:40-41`), so no new variant is introduced. The
 two old messages ("...offset out of bounds") are subsumed by the region message
-(`string_end <= data.len()`, so any offset that failed the old check fails the new
+(`hash_offset <= data.len()`, so any offset that failed the old check fails the new
 one); no test or consumer matches those payloads (wasm maps the variant, not the
 string).
 
@@ -147,8 +152,8 @@ agrees: the *identical* offset checks already error at parse today.
 ### Invariants after the change
 
 - `CodeDirectory::parse` returns `Ok` ⟹ for the struct it produced:
-  `header_size <= ident_offset < string_end <= data.len()`; the same holds for
-  `team_offset` when `Some`; a NUL exists within `[offset, string_end)` for both.
+  `header_size <= ident_offset < hash_offset <= data.len()`; the same holds for
+  `team_offset` when `Some`; a NUL exists within `[offset, hash_offset)` for both.
 - `identifier()` returns `Some(s)` ⟺ `s` is the NUL-terminated, in-region identifier
   reinterpreted as UTF-8; `team_id()` additionally returns `None` for absent teams
   (`teamOffset == 0` or version < 0x20200 — unchanged).
@@ -167,15 +172,27 @@ agrees: the *identical* offset checks already error at parse today.
   single validation site and O(1) access are real, but it restructures the struct,
   duplicates state (offsets + strings), and buys nothing observable on a low-priority
   ticket — YAGNI.
-- **D4 — kernel-parity without the header-region lower bound** (only require
-  `offset < string_end` + NUL): strictly matches XNU, but the ticket explicitly asks
-  for offsets constrained to the header/string region, and an offset below
-  `header_size` can only ever fabricate magic/version bytes as an "identifier".
-  Tradeoff accepted: we reject some nonsense kernels would tolerate — consistent with
+- **D4 — without the header-region lower bound** (only require `offset < hash_offset`
+  + NUL): would still let `identOffset` point into the fixed header — exactly the
+  "anywhere in data" class the ticket calls out, since an offset below `header_size`
+  can only ever fabricate magic/version bytes as an "identifier". Tradeoff accepted: we reject some nonsense kernels would tolerate — consistent with
   this parser's existing stricter-than-kernel checks (evidence §6).
 - **D5 — exact equality `ident_offset == header_size`**: what every builder emits, but
   a lower bound accepts non-canonical-yet-unambiguous layouts with zero extra risk;
   equality only adds false-rejection surface.
+- **D6 — canonical `string_end = hash_offset - nSpecialSlots * hashSize` (the design's
+  original upper bound, superseded during implementation)**: the exact Apple layout,
+  tightest possible region — but the full-suite gate proved it breaks a deferred
+  fixture: `macho::verify::tests::bound_launch_constraint_without_blob_is_rejected`
+  (`macho/verify.rs:1350`) grows `nSpecialSlots` 7→8 (`macho/verify.rs:1365`) so the
+  special-slot window overlaps the header, which this repo's own
+  `n_special <= hash_offset / hash_size` check and Apple's kernel both tolerate (the
+  kernel performs no region check at all). `macho/**` is out of this lane's scope, so
+  the bound moved up to `hash_offset`; every ticket constraint — header lower bound,
+  exclusion of code slots and trailing bytes, terminator requirement — survives, and
+  the only conceded class (an offset inside the header-overlapping special window that
+  happens to be NUL-terminated UTF-8) is nonsense input no reader fabricated a
+  value from before anyway.
 
 ## Test strategy
 
@@ -186,12 +203,13 @@ for `Result`, `assert_eq!` for `Option`):
 1. **Helper contract (direct calls):** unterminated input → `None` (red before the
    fix: returns the whole tail); offset past end → `None`; non-UTF-8 before NUL →
    `None`; terminated positive control → `Some`.
-2. **Parse rejections (five, all red today — each currently parses `Ok`):**
-   `identOffset < header_size`; `identOffset` inside the hash region
-   (via `synth_cd_with_slot8`, patching bytes 20..24 ≥ `string_end`); identifier with
-   its terminator byte overwritten; `teamOffset < header_size`; team string with no
-   NUL before `string_end` (extend a `synth_cd` blob by two non-zero bytes, updating
-   declared length, `hashOffset`, `teamOffset`).
+2. **Parse rejections (five, all red against pre-fix code):**
+   `identOffset < header_size`; `identOffset` at/after `hash_offset` (via
+   `synth_cd_with_slot8` extended by 100 trailing bytes with the declared length
+   updated, patching bytes 20..24 to 400 ≥ `hash_offset` 359); identifier with its
+   terminator byte overwritten; `teamOffset < header_size`; team string with no NUL
+   before `hash_offset` (extend a `synth_cd` blob by two non-zero bytes, updating the
+   declared length and `hashOffset`).
 3. **Positive guards (must stay green):** all seven `synth_cd` versions parse
    (`version_header_sizes_are_correct`, :1710); `linkage_fields_are_bounds_checked`
    ok-arm (:1939, `t2`); builder round trip `identifier() == Some("com.example.test")`

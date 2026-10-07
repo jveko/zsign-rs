@@ -9,8 +9,9 @@ outside the header/string region or missing their NUL terminators.
 **Architecture:** Two layered fixes, both inside `crates/zsign-core/src/codesign/verify.rs`:
 (1) the private helper's NUL scan becomes strict (`?` instead of `unwrap_or(rest.len())`);
 (2) the parse-time bounds block gains region + terminator checks that return
-`Error::Verification`, relocated after the existing hash-region checks so the
-`string_end = hash_offset - n_special * hash_size` subtraction is provably safe. No public
+`Error::Verification`, with the string region defined as `[header_size, hash_offset)` —
+code slots and trailing bytes excluded, special-window/header overlap tolerated per the
+repo's existing `n_special` check. No public
 signature changes; accessors stay `Option<&'a str>`.
 
 **Tech Stack:** Rust 2021 / cargo / thiserror; gates via `cargo fmt`, `cargo clippy`,
@@ -48,13 +49,15 @@ argues from the spec; executors read both.
    passes the new lower bound.
 3. **False rejection of valid output:** builder round trips (with and without a team) must
    still parse — the positive guard in Task 2 plus the existing `verify.rs:1525` assertion;
-   `synth_cd_with_slot8`'s `string_end = 103` boundary is where an off-by-one would show.
+   `synth_cd_with_slot8`'s `hash_offset = 359` boundary (identifier probe at 400) is where
+   an off-by-one would show.
 4. **Check ordering:** the region checks must run AFTER `expected_tail`/`n_special`
-   (load-bearing for subtraction safety on 32-bit) yet preserve the existing diagnostics
+   (so `hash_offset <= data.len()` is proven before any slice is built from it)
+   yet preserve the existing diagnostics
    (`"hash region … overruns blob"`, `"special-slot region overruns hash offset"`,
    pinned by `verify.rs:2044-2057`).
-5. **Slice safety inside the new closure:** `data[off..string_end]` is only reached after
-   `header_size <= off < string_end <= data.len()` is proven — the bounds check must be the
+5. **Slice safety inside the new closure:** `data[off..hash_offset]` is only reached after
+   `header_size <= off < hash_offset <= data.len()` is proven — the bounds check must be the
    first statement of `check_string`.
 
 These map to Task 1 steps 1/3 and Task 2 steps 1/3/4 below.
@@ -166,9 +169,9 @@ Expected: clean worktree for this file; one commit, never pushed.
 **Interfaces:**
 - Consumes: Task 1's strict `cstring_at` (unchanged signature).
 - Produces: `CodeDirectory::parse` guarantee — on `Ok`, `header_size <= ident_offset <
-  string_end` and (when present) `header_size <= team_offset < string_end`, where
-  `string_end = hash_offset - n_special * hash_size <= data.len()`, with a NUL inside
-  `[offset, string_end)` for each. Accessor docs state it; no type changes.
+  hash_offset` and (when present) `header_size <= team_offset < hash_offset`, with
+  `hash_offset <= data.len()` and a NUL inside `[offset, hash_offset)` for each.
+  Accessor docs state it; no type changes.
 
 - [ ] **Step 1: Write the failing parse tests (Tester)**
 
@@ -177,7 +180,7 @@ Add to the inline test module:
 ```rust
 #[test]
 fn identifier_offset_inside_header_is_rejected() {
-    let mut cd = synth_cd(0x20400, &vec![0u8; 44]);
+    let mut cd = synth_cd(0x20400, &[0u8; 44]);
     cd[20..24].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
@@ -190,8 +193,10 @@ fn identifier_offset_inside_header_is_rejected() {
 #[test]
 fn identifier_offset_inside_hash_region_is_rejected() {
     let mut cd = synth_cd_with_slot8(b"x");
-    // string region is [88, 103); bytes 103..359 are the 8 special-slot hashes.
-    cd[20..24].copy_from_slice(&110u32.to_be_bytes());
+    // string region is [88, 359); offset 400 lands in the code-hash/trailing area.
+    cd.extend_from_slice(&[0x5au8; 100]);
+    cd[4..8].copy_from_slice(&459u32.to_be_bytes());
+    cd[20..24].copy_from_slice(&400u32.to_be_bytes());
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
         matches!(&err, crate::Error::Verification(m)
@@ -202,7 +207,7 @@ fn identifier_offset_inside_hash_region_is_rejected() {
 
 #[test]
 fn unterminated_identifier_is_rejected() {
-    let mut cd = synth_cd(0x20400, &vec![0u8; 44]);
+    let mut cd = synth_cd(0x20400, &[0u8; 44]);
     cd[89] = b'y'; // was the NUL: identifier "x" becomes "xy" with no terminator before string_end
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
@@ -214,7 +219,7 @@ fn unterminated_identifier_is_rejected() {
 
 #[test]
 fn team_offset_inside_header_is_rejected() {
-    let mut cd = synth_cd(0x20400, &vec![0u8; 44]);
+    let mut cd = synth_cd(0x20400, &[0u8; 44]);
     cd[48..52].copy_from_slice(&40u32.to_be_bytes()); // inside the 88-byte header
     let err = CodeDirectory::parse(&cd).unwrap_err();
     assert!(
@@ -226,7 +231,7 @@ fn team_offset_inside_header_is_rejected() {
 
 #[test]
 fn unterminated_team_id_is_rejected() {
-    let mut cd = synth_cd(0x20400, &vec![0u8; 44]); // len 90; ident "x\0" at 88..90
+    let mut cd = synth_cd(0x20400, &[0u8; 44]); // len 90; ident "x\0" at 88..90
     cd[48..52].copy_from_slice(&90u32.to_be_bytes()); // teamOffset = 90
     cd.extend_from_slice(b"yz"); // team bytes with no terminator
     cd[4..8].copy_from_slice(&92u32.to_be_bytes()); // declared length
@@ -248,9 +253,13 @@ fn valid_strings_survive_region_checks() {
     assert_eq!(cd.identifier(), Some("com.example.team"));
     assert_eq!(cd.team_id(), Some("ABCDE12345"));
 
-    let raw = synth_cd(0x20400, &vec![0u8; 44]);
+    let raw = synth_cd(0x20400, &[0u8; 44]);
     let no_team = CodeDirectory::parse(&raw).expect("parse");
-    assert_eq!(no_team.team_id(), None, "teamOffset 0 is absent, not malformed");
+    assert_eq!(
+        no_team.team_id(),
+        None,
+        "teamOffset 0 is absent, not malformed"
+    );
 }
 ```
 
@@ -271,8 +280,8 @@ above the string checks — with:
 
 ```rust
         // Bounds: special slots, then code slots; the identifier/team strings
-        // live between the fixed header and the special-slot hashes, in
-        // [header_size, hash_offset - nSpecialSlots * hashSize).
+        // live between the fixed header and the code hashes, in
+        // [header_size, hash_offset).
         let n_special = n_special_slots as usize;
         let n_code = n_code_slots as usize;
         let expected_tail = n_code
@@ -289,17 +298,14 @@ above the string checks — with:
                 "CodeDirectory special-slot region overruns hash offset".into(),
             ));
         }
-        // The check above bounds n_special * hash_size by hash_offset, so this
-        // subtraction cannot underflow on any width.
-        let string_end = hash_offset - n_special * hash_size;
         let team_offset = (team_offset_raw != 0).then_some(team_offset_raw as usize);
         let check_string = |label: &str, off: usize| -> Result<()> {
-            if off < header_size || off >= string_end {
+            if off < header_size || off >= hash_offset {
                 return Err(crate::Error::Verification(format!(
                     "CodeDirectory {label} offset outside the string region"
                 )));
             }
-            if data[off..string_end].iter().position(|&b| b == 0).is_none() {
+            if data[off..hash_offset].iter().position(|&b| b == 0).is_none() {
                 return Err(crate::Error::Verification(format!(
                     "CodeDirectory {label} is not NUL-terminated"
                 )));
