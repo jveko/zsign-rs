@@ -33,6 +33,11 @@ fixtures), inline `#[cfg(test)]` modules.
 - Processed critical-OID set (final state): 2.5.29.14, 2.5.29.15,
   2.5.29.17, 2.5.29.19, 2.5.29.30, 2.5.29.37 — as module-local
   `const OID_*` consts in the file's existing style (`:109-118`).
+- Test sketches in this plan abbreviate `GeneralName` constructors:
+  `DnsName`/`Rfc822Name`/`UniformResourceIdentifier` payloads are
+  `der::asn1::Ia5String` (not `&str`) and `IpAddress` takes an
+  `OctetString` of raw bytes — build them with
+  `Ia5String::new("…").unwrap()` / `OctetString::new(vec![…]).unwrap()`.
 - `replace_extension` (test helper, hardcodes `critical: false`) invalidates
   the mutated certificate's signature — it may only be used for fixtures
   whose rejection fires before any signature verification of the mutated
@@ -91,7 +96,9 @@ fixtures), inline `#[cfg(test)]` modules.
 
 In the inline test module, two zero-sized authoring types for the builder:
 each carries its own OID (experimental arc `2.999.1` / `2.999.2`), encodes as
-an empty DER NULL, and reports `critical()` as `true` / `false` respectively.
+an empty DER NULL, and reports the trait's full method
+`fn critical(&self, subject: &x509_cert::name::Name, extensions:
+&[x509_cert::ext::Extension]) -> bool` as `true` / `false` respectively.
 They must implement `x509_cert::ext::AsExtension` + `AssociatedOid` + `Encode`
 — read the exact trait definition in the vendored source
 `~/.cargo/registry/src/index.crates.io-*/x509-cert-0.2.5/src/ext.rs` first
@@ -160,15 +167,20 @@ add ONE generic extension hook per builder, e.g.
 issuer_signing: &rsa::pkcs1v15::SigningKey<Sha256>, extend:
 impl FnOnce(&mut CertificateBuilder<rsa::pkcs1v15::SigningKey<Sha256>>))`
 (`build_subca_issued_by_signed` analogous), that delegates to the same
-construction but invokes `extend` before
-`build::<rsa::pkcs1v15::Signature>()`. Generic `impl FnOnce`, NOT
-`&dyn FnOnce` (a `FnOnce` cannot be called through `&dyn`, and the builder
-is generic over its signer type). Do not modify existing helpers; existing
+construction, **adds `ExtendedKeyUsage(vec![OID_CODE_SIGNING])` by default**
+(`leaf_purpose_reason` at `:1628-1632` rejects a leaf without the
+codeSigning EKU, so every positive control through these helpers needs it —
+the `extend` closure runs after that default and may add SANs or
+constraints), then invokes `extend` before
+`build::<rsa::pkcs1v15::Signature>()`. Call as `build_leaf_signed(…, |b| { … })`
+— generic `impl FnOnce`, NOT `&dyn FnOnce` and NOT `&|b|` (a `&F` where
+`F: FnOnce` does not implement `FnOnce`; the builder is generic over its
+signer type). Do not modify existing helpers; existing
 tests must compile unchanged.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
 Expected: the three rejection tests FAIL — leaf/intermediate/root fixtures
 currently verify (`ok=true, anchored=true`); the reason footers show the
 actual outcomes. `out_of_chain_anchor_extensions_are_ignored` PASSES already
@@ -192,7 +204,7 @@ the gate/evaluation to an out-of-chain anchor.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
 Expected: PASS — the four rejection/control tests green, and
 `out_of_chain_anchor_extensions_are_ignored` proves the anchor path never
 hits the gate.
@@ -213,8 +225,10 @@ critical BC/KU/EKU (all in the processed set), so nothing regresses.
 
 **Interfaces:**
 - Consumes: `OID_NAME_CONSTRAINTS` and the `verify_chain` hooks from
-  Task 1; `x509_cert::ext::pkix::constraints::NameConstraints` /
-  `GeneralSubtrees` / `GeneralSubtree`; test helpers
+  Task 1; `x509_cert::ext::pkix::constraints::NameConstraints` plus the
+  subtree types at `x509_cert::ext::pkix::constraints::name::{GeneralSubtrees,
+  GeneralSubtree}` (the `constraints` module re-exports only
+  `BasicConstraints`/`NameConstraints`/`PolicyConstraints`); test helpers
   `build_rsa_root`/`build_leaf`/`build_subca`/`chain_with`.
 - Produces (all private, exact names later tasks/reviewers rely on):
   - `enum NcScan { Absent, Malformed, Present(NameConstraints) }` and
@@ -314,7 +328,7 @@ first, fixtures currently verify with `ok=true`.
 
 - `scan_name_constraints` / `nc_shape_reason` per the Interfaces block
   (decode via `NameConstraints::from_der` on `ext_value(cert,
-  OID_CE_NAME_CONSTRAINTS)`).
+  OID_NAME_CONSTRAINTS)`).
 - `check_certificate_names`: skip when `!is_final && cert.tbs_certificate.subject
   == cert.tbs_certificate.issuer`; build the evaluated name list = subject DN
   (directoryName form) — Task 3 adds SAN/legacy-email names; evaluate

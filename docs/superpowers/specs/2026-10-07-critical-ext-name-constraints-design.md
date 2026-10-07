@@ -13,7 +13,7 @@ required by RFC 5280.
 
 ## Evidence (verified against current source)
 
-- `cms_verify.rs:1601-1606` — `ext_value(cert, id)` is a first-match
+- `cms_verify.rs:1600-1606` — `ext_value(cert, id)` is a first-match
   `.find(|e| e.extn_id == id)` returning raw `extn_value.as_bytes()`; the
   `critical` flag on `x509_cert::ext::Extension` (`critical: bool`, x509-cert
   0.2.5 `src/ext.rs:29-36`) is structurally unobservable through it, and
@@ -39,10 +39,10 @@ required by RFC 5280.
   root-with-constraints fixtures).
 - Failure plumbing: `verify_signed_data` copies `outcome.reason` into
   `report.chain_reason` (`:1108`) and pushes it into `report.errors`
-  (`:1130-1136`), forcing `valid = false`; `crypto/cert.rs:410-427`
+  (`:1130-1136`), forcing `valid = false`; `crypto/cert.rs:405-427`
   (`require_anchored_chain`, the only other caller) folds the same string
   into `Error::Certificate`. New failures therefore need **no struct change**.
-- `CmsVerifyReport` (`:262-299`) derives Debug/Clone/PartialEq/Eq/Default —
+- `CmsVerifyReport` (`:262-298`) derives Debug/Clone/PartialEq/Eq/Default —
   no serde; the CLI maps fields by hand. Adding strings to existing fields
   ripples nowhere; adding a struct field would hit the CLI DTO/README owned
   by other lanes — so this design adds none.
