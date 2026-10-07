@@ -9,10 +9,10 @@ from two independently computed values that disagree whenever
 - `codeLimit` comes from the length of the hashed buffer:
   `code_directory.rs:331` / `:423` compute
   `code_limit = u32_len(self.code.len())`, where `self.code` is the buffer
-  handed to `CodeDirectoryBuilder::new` by the signer
-  (`signer.rs:852` over `&buf` from `signer.rs:535`/`:648`). The signer's
+  `CodeDirectoryBuilder::new` by the signer
+  (`signer.rs:851` over `&buf` from `signer.rs:529`/`:648`). The signer's
   `buf` is truncated to `code_length` by `prepare_code_in_place`
-  (`writer.rs:1574`).
+  (`writer.rs:1573`).
 - `LC_CODE_SIGNATURE.dataoff` and the physical blob placement both come
   from `align_to(code_length, 16)`, at seven sites in `writer.rs`
   (`:185`, `:302`, `:601`, `:1234`, `:1306`, `:1455`, `:1561`; `align_to`
@@ -77,7 +77,7 @@ holds by construction, exactly like Apple's `signingExtent()` and zsign's
 Changes (all in `crates/zsign-core/src/macho/writer.rs`):
 
 - `prepare_code_in_place` (`:1553`): after the existing
-  `buf.truncate(code_length)` (`:1574`), zero-extend to `sig_offset`
+  `buf.truncate(code_length)` (`:1573`), zero-extend to `sig_offset`
   (`buf.resize(sig_offset, 0)`). Order matters: truncate first so stale
   old-signature bytes in `[code_length, sig_offset)` are discarded before
   the pad is (re)filled with zeros.
@@ -86,7 +86,7 @@ Changes (all in `crates/zsign-core/src/macho/writer.rs`):
   `data[..code_length].to_vec()` at `:1237`) is zero-extended to
   `sig_offset` before being returned as the hash-ready buffer.
 - `prepare_code_with_metadata` (`:1437`): same extension of `prepared`
-  (`:1470`).
+  (`:1467`).
 - Doc comments on the three functions and the signer's step comment
   (`signer.rs:528`) updated to describe the padded buffer.
 
@@ -105,8 +105,10 @@ source of truth.
 ## Alternatives considered
 
 - **Place the blob at `code_length`, drop 16-byte alignment**: rejected.
-  Four existing tests pin `dataoff % 16 == 0` (`writer.rs:2283-2337`,
-  `:2340-2358`) matching codesign/ld64 layout, and the whole write path
+  Four `dataoff % 16 == 0` asserts across three tests pin the convention —
+  `writer.rs:2283-2337` (asserts at `:2309`, `:2329`), `:2340-2358`
+  (assert at `:2353`), `:2361-2380` (assert at `:2374`), plus a
+  `sig_offset` pin at `writer.rs:2800` — matching codesign/ld64 layout, and the whole write path
   (`has_enough_signature_space`, reserve formula, embed) computes from
   `align_to(code_length, 16)`. Inverting seven sites for a format-legal
   but convention-breaking offset is strictly more blast radius for the

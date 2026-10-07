@@ -19,7 +19,7 @@
 - `align_to`, `calculate_signature_space`, `has_enough_signature_space`, the realloc delta computations (`size_increase` / `new_vmsize`), and `embed_signature*` placement logic are NOT touched.
 - `crates/zsign-core/src/codesign/code_directory.rs` is NOT touched — the buffer length remains the single source of truth for `codeLimit`.
 - 16-byte alignment of `dataoff` must be preserved (existing tests pin `dataoff % 16 == 0`).
-- `nCodeSlots` must remain `ceil(code_length / 4096)` — unchanged by the zero-width-or-smaller pad.
+- `nCodeSlots` must remain `ceil(code_length / 4096)` — unchanged by the zero-to-15-byte pad.
 - Already-aligned inputs must produce byte-identical results (zero-width pad).
 - Conventional commits: imperative, lowercase, no trailing period, no ticket IDs.
 
