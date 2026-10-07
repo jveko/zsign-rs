@@ -456,7 +456,10 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         }
         let rel_path = p.strip_prefix(root).unwrap_or(p);
         let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-        if rel_str.contains("_CodeSignature/") {
+        if rel_path
+            .components()
+            .any(|c| c.as_os_str() == "_CodeSignature")
+        {
             continue;
         }
         if has_nested_bundle_component(dir, rel_dir, false) {
@@ -850,65 +853,25 @@ fn check_code_resources(
             if files2.is_some_and(|files2| files2.contains_key(rel)) {
                 continue;
             }
-            if let Some(sealed_hash) = entry.as_data() {
-                if !is_safe_bundle_key(rel.as_str()) {
-                    errors.push(format!(
-                        "CodeResources entry path escapes the bundle: {rel}"
-                    ));
-                    continue;
+            let synthesized;
+            let entry_value = match entry.as_data() {
+                Some(sealed_hash) => {
+                    let mut legacy = plist::Dictionary::new();
+                    legacy.insert("hash".to_string(), plist::Value::Data(sealed_hash.to_vec()));
+                    synthesized = plist::Value::Dictionary(legacy);
+                    &synthesized
                 }
-                let file_path = bundle.join(rel.as_str());
-                let parent = file_path.parent().ok_or_else(|| {
-                    crate::Error::Io(std::io::Error::other("invalid resource path"))
-                })?;
-                match std::fs::canonicalize(parent) {
-                    Ok(resolved) if resolved.starts_with(&bundle_real) => {}
-                    Ok(_) => {
-                        errors.push(format!(
-                            "CodeResources entry path escapes the bundle: {rel}"
-                        ));
-                        continue;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        if !matches!(
-                            rule_action(&rules, rel),
-                            Some(RuleAction::Optional) | Some(RuleAction::Omit)
-                        ) {
-                            out.missing.push(rel.clone());
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(crate::Error::Io(e)),
-                }
-                let data = match std::fs::read(&file_path) {
-                    Ok(data) => data,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        if !matches!(
-                            rule_action(&rules, rel),
-                            Some(RuleAction::Optional) | Some(RuleAction::Omit)
-                        ) {
-                            out.missing.push(rel.clone());
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(crate::Error::Io(e)),
-                };
-                if sealed_hash == Sha1::digest(&data).as_slice() {
-                    out.matched += 1;
-                } else {
-                    out.mismatched.push(rel.clone());
-                }
-            } else {
-                verify_code_resource_entry(
-                    bundle,
-                    &bundle_real,
-                    rel,
-                    entry,
-                    &mut out,
-                    &rules,
-                    errors,
-                )?;
-            }
+                None => entry,
+            };
+            verify_code_resource_entry(
+                bundle,
+                &bundle_real,
+                rel,
+                entry_value,
+                &mut out,
+                &rules,
+                errors,
+            )?;
         }
     }
 
@@ -1569,6 +1532,81 @@ mod tests {
                 .any(|e| e.contains("escapes the bundle") && e.contains("Escape/secret.txt")),
             "symlink-parent key must be rejected before any read; got {:?}",
             bundle.errors
+        );
+    }
+    #[test]
+    fn macho_under_x_codesign_directory_is_verified() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (app, _) = build_signed_bundle_with(td.path(), |app| {
+            fs::create_dir_all(app.join("X_CodeSignature")).unwrap();
+            fs::write(
+                app.join("X_CodeSignature").join("App"),
+                fixtures::make_minimal_macho(),
+            )
+            .unwrap();
+        });
+        let report = verify_bundle(&app).unwrap();
+        let bundle = report.bundle.as_ref().unwrap();
+        let planted = bundle
+            .binaries
+            .iter()
+            .find(|b| b.path.starts_with("X_CodeSignature/"));
+        let planted = planted.unwrap_or_else(|| {
+            panic!(
+                "lookalike signature dir must not hide binaries; binaries: {:?}",
+                bundle
+                    .binaries
+                    .iter()
+                    .map(|b| b.path.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            planted.report.is_some(),
+            "planted Mach-O must be slice-verified, got {:?}",
+            planted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_files_symlink_is_mismatched() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        let outside = td.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"outside content").unwrap();
+        // The builder seals symlinks only in files2 (legacy format has no
+        // symlink shape), so this signs cleanly.
+        let (app, _) = build_signed_bundle_with(td.path(), |app| {
+            symlink(outside.join("secret.txt"), app.join("Leak")).unwrap();
+        });
+        // Attacker rewrites the seal: raw SHA-1 in legacy `files` (the inline
+        // arm), key absent from files2 so the legacy arm processes it.
+        rewrite_code_resources(&app, |dict| {
+            let files2 = dict.get_mut("files2").unwrap().as_dictionary_mut().unwrap();
+            let _ = files2.remove("Leak");
+            let files = dict.get_mut("files").unwrap().as_dictionary_mut().unwrap();
+            files.insert(
+                "Leak".to_string(),
+                plist::Value::Data(Sha1::digest(b"outside content").to_vec()),
+            );
+        });
+        let report = verify_bundle(&app).unwrap();
+        let cr = report
+            .bundle
+            .as_ref()
+            .unwrap()
+            .code_resources
+            .as_ref()
+            .unwrap();
+        assert!(
+            cr.mismatched.iter().any(|m| m == "Leak"),
+            "legacy symlink must be mismatched, never hashed through; \
+             mismatched={:?} missing={:?} matched={}",
+            cr.mismatched,
+            cr.missing,
+            cr.matched
         );
     }
 
