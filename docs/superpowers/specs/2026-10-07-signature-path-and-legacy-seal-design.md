@@ -29,7 +29,9 @@ Two verification holes in `crates/zsign/src/verify.rs`:
 ## Verified evidence (current source)
 
 - Walk skip: `verify.rs:459`; variables in scope — `rel_path` (root-relative
-  `&Path`, `:457`), `rel_str` (`:458`), `rel_dir` (bundle-dir-relative,
+  `&Path` — `strip_prefix(root)`, `:457`), `rel_str` (`:458`), `rel_dir`
+  (`dir`-relative — `strip_prefix(dir)` where `dir` is the bundle currently
+  under verification, hence nested-bundle-relative at recursion levels,
   `:448`); skip order: signature skip `:459` → nested-bundle skip `:462` →
   `is_macho_file` `:465` → direct-binary push `:471`.
 - Recursion threads `root` unchanged (`verify.rs:554`-region), so a nested
@@ -114,11 +116,12 @@ Two verification holes in `crates/zsign/src/verify.rs`:
 
 ## Decisions and rejected alternatives
 
-- **`rel_path` (root-relative), not `rel_dir` (bundle-relative).** The brief
+- **`rel_path` (root-relative), not `rel_dir` (`dir`-relative).** The brief
   suggested `rel_dir`; source says otherwise: because `root` is threaded
   unchanged through recursion, component-exact on `rel_path` reproduces
   today's nested-signature skipping byte-for-byte (only the `X_CodeSignature`
-  false positive disappears), whereas `rel_dir` would leave nested skipping
+  false positive disappears), whereas `rel_dir` — `dir`-relative, so
+  nested-bundle-relative at recursion levels — would leave nested skipping
   entirely to `has_nested_bundle_component` — a second, unevidenced behavior
   change. `rel_path` is already the `&Path` in scope (`String` cannot be
   component-iterated anyway).
@@ -145,8 +148,12 @@ Two verification holes in `crates/zsign/src/verify.rs`:
   drops it from `direct_binaries`).
 - `legacy_files_symlink_is_mismatched` (`#[cfg(unix)]`, mirroring
   `symlink_parent_traversal_is_rejected`) — outside file with known bytes;
-  setup symlinks `app/Leak` to it (the builder seals symlinks only in
-  `files2`); `rewrite_code_resources` removes `Leak` from `files2` and
+  setup symlinks `app/Leak` to it (the builder omits symlinks from legacy
+  `files` — `zsign-core/src/bundle/code_resources.rs` skips
+  `symlink_target` entries before the legacy emission — and seals them only
+  in `files2`, so pre-rewrite signing is clean; both dicts are always
+  emitted, so the rewrite's `files` mutation cannot hit a missing key);
+  `rewrite_code_resources` removes `Leak` from `files2` and
   inserts `files["Leak"] = Data(SHA-1 of the outside bytes)`; assert
   `cr.mismatched` contains `Leak` (with the mismatched/missing/unsealed
   footer). Fails before the change (the inline arm follows the link, the

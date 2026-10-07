@@ -118,8 +118,10 @@ fn legacy_files_symlink_is_mismatched() {
     let outside = td.path().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("secret.txt"), b"outside content").unwrap();
-    // The builder seals symlinks only in files2 (legacy format has no
-    // symlink shape), so this signs cleanly.
+    // The builder omits symlinks from legacy `files` (no symlink shape in
+    // that format) and seals them only in files2, so pre-rewrite signing
+    // is clean; both dicts are always emitted, so the files dict the
+    // rewrite mutates exists.
     let (app, _) = build_signed_bundle_with(td.path(), |app| {
         symlink(outside.join("secret.txt"), app.join("Leak")).unwrap();
     });
@@ -152,6 +154,13 @@ fn legacy_files_symlink_is_mismatched() {
     );
 }
 ```
+
+Imports availability (verified): the tests module sees `sha1::Sha1` and
+`sha2::Digest` through `super::*` (crate-level imports at `verify.rs:29-30`)
+plus `fs`/`PathBuf` from the module's std imports — do NOT add module-level
+duplicate `use` lines (clippy churn); a function-local import is unnecessary
+too. `plist::Dictionary::remove(&str)` returns `Option`, which the
+`let _ =` binding suppresses (`unused_must_use`).
 
 - [ ] **Step 2: Run the tests to confirm both fail for their own reasons**
 
@@ -193,8 +202,9 @@ if rel_path.components().any(|c| c.as_os_str() == "_CodeSignature") {
 }
 ```
 
-(`rel_path` is the root-relative `&Path` computed two lines above; `rel_str`
-keeps its other uses — do not reorder them.)
+(`rel_path` is the root-relative `&Path` computed two lines above
+(`strip_prefix(root)`, `verify.rs:457`); `rel_str` keeps its other uses — it
+feeds the `direct_binaries` push at `verify.rs:471` — do not reorder them.)
 
 - [ ] **Step 2: Delegate raw-Data legacy entries; delete the inline arm**
 
