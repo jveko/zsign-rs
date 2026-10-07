@@ -749,34 +749,6 @@ pub(crate) struct SpecialSlotHashes {
     pub(crate) resources: Option<DualHash>,
 }
 
-#[allow(dead_code)]
-fn embed_signature_into_prepared(
-    prepared_code: &[u8],
-    signature: &[u8],
-    sig_offset: usize,
-    original_binary_size: Option<usize>,
-) -> Vec<u8> {
-    let min_size = sig_offset + signature.len();
-    let final_size = original_binary_size
-        .map(|orig| orig.max(min_size))
-        .unwrap_or(min_size);
-    let mut output = Vec::with_capacity(final_size);
-
-    output.extend_from_slice(prepared_code);
-
-    while output.len() < sig_offset {
-        output.push(0);
-    }
-
-    output.extend_from_slice(signature);
-
-    if output.len() < final_size {
-        output.resize(final_size, 0);
-    }
-
-    output
-}
-
 fn embed_signature_in_place(
     buf: &mut Vec<u8>,
     signature: &[u8],

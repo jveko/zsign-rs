@@ -8,7 +8,7 @@
 //!
 //! # Key Functions
 //!
-//! - [`write_signed_macho`] - Write signed binary to a new file
+//! - `write_signed_macho` - Write signed binary to a new file
 //! - [`embed_signature`] - Embed signature into single-arch binary
 //! - [`embed_signature_fat`] - Embed signatures into FAT binary
 //! - [`prepare_code_for_signing`] - Prepare binary for hash computation
