@@ -89,5 +89,5 @@ Lines 12–14 and 28 stay bracketed links — they are alive and touching them i
 - Deletion must leave **zero new warnings**: `cargo clippy -p zsign-core --all-targets -- -D warnings`
   and `cargo test -p zsign-core` must stay green.
 - Only the two named files may change; no drive-by fixes to nearby warnings.
-- `cargo doc -p zsign-core --no-deps` must emit **no** `unresolved link` warning after (a).
+- After (a), `cargo doc -p zsign-core --no-deps` must emit no `unresolved link to \`write_signed_macho\`` warning. Baseline measured on clean HEAD during implementation: 10 warnings / 7 unresolved-link — 1 ours (`write_signed_macho`) plus 6 pre-existing in out-of-scope/deferred files (`superblob`, `code_directory` at codesign/verify.rs:3, `Error::Verification` ×3, `Error::MachO`), plus 3 private-item link warnings. Acceptance is therefore the delta: unresolved-link 7 → 6, total 10 → 9, zero new. The 6 pre-existing warnings are findings for other lanes/out-of-scope files — reported, not fixed.
 - No ticket ID in code comments; docs/commit subject may carry ZSN-66.

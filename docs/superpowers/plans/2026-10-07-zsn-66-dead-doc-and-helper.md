@@ -23,7 +23,7 @@
 
 - Live links at `writer.rs:12–14` and `:28` (`` embed_signature ``, `` embed_signature_fat ``, `` prepare_code_for_signing ``) must remain bracketed links — de-linking them is over-reach.
 - `embed_signature_in_place` (`signer.rs:780–801`) and its call sites (`:722`, `:733`) must survive untouched; the deletion boundary is `signer.rs:752–778` only.
-- Post-fix `cargo doc -p zsign-core --no-deps` must show **no** `unresolved link` warning (pre-fix it shows exactly one, to `write_signed_macho`).
+- Post-fix `cargo doc -p zsign-core --no-deps` must show **no** `unresolved link to \`write_signed_macho\`` warning. Pre-fix baseline measured on clean HEAD during implementation: 10 warnings / 7 unresolved-link — exactly 1 in-scope (`write_signed_macho`) plus 6 pre-existing in out-of-scope/deferred files — so the gate is a delta: unresolved-link 7 → 6, total 10 → 9, zero new warnings. (Ruling: the original "shows exactly one / expect 0" wording was contradicted by observed baseline; corrected before implementation.)
 - Post-deletion `grep -rn embed_signature_into_prepared crates/ fuzz/` must return **zero** hits, and the full `-p zsign-core` suite must stay green — a dangling reference would surface as a compile error here.
 - For a pure doc/dead-code removal the "failing test" is an observable check, not a new unit test: Task 1's red state is the `cargo doc` warning; Task 2's red state is the grep proving the dead, unreferenced function exists. Adding unit tests for either would pin implementation details; none are warranted, and the brief allows an existing-suite/`cargo doc` check to serve — stated here explicitly.
 
@@ -67,7 +67,11 @@ Run:
 ```
 cargo doc -p zsign-core --no-deps 2>&1 | grep -cE "unresolved link"
 ```
-Expected: `0`. Also confirm the doc run exits 0 and the three alive links still render (`grep -c "unresolved link"` over the full output is the gate).
+Expected: `6` — the 7-line pre-fix baseline minus the fixed `write_signed_macho` line (the 6 remaining are pre-existing out-of-scope warnings and must not grow). Then run the scoped check:
+```
+cargo doc -p zsign-core --no-deps 2>&1 | grep -c "unresolved link to \`write_signed_macho\`"
+```
+Expected: `0`. The doc run must exit 0 and the three alive links must still render as links.
 
 ---
 
@@ -109,8 +113,9 @@ cargo fmt --all -- --check
 cargo clippy -p zsign-core --all-targets -- -D warnings
 mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core
 cargo doc -p zsign-core --no-deps 2>&1 | grep -cE "unresolved link"
+cargo doc -p zsign-core --no-deps 2>&1 | grep -c "unresolved link to \`write_signed_macho\`"
 ```
-Expected: fmt clean (exit 0, no diff); clippy zero warnings (exit 0); tests all pass; the final grep prints `0`. Zero new warnings is the hard acceptance criterion for the deletion.
+Expected: fmt clean (exit 0, no diff); clippy zero warnings (exit 0); tests all pass; the unresolved-link count prints `6` (pre-fix baseline 7 minus the fixed link; 6 pre-existing out-of-scope warnings stay untouched); the scoped count prints `0`. Zero new warnings is the hard acceptance criterion for the deletion.
 
 - [ ] **Step 5: Commit**
 
