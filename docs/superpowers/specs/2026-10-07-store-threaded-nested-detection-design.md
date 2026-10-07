@@ -121,9 +121,11 @@ One landing, four coordinated changes:
    per level.
 3. **Align prune polarity** (gap 3): `walk_children` skips on
    `!prune(&path, kind)` (false = skip), matching `store.rs:76-78`,
-   `FsStore`, and caller intent; correct the inner doc (`mem_store.rs:212-213`)
-   and the struct doc's false no-deadlock claim (`mem_store.rs:68-70`); invert
-  the two existing test predicates (asserted outputs unchanged).
+   `FsStore`, and caller intent; correct the `PruneFn` alias doc
+   (`mem_store.rs:15-16`, "`true` skips the entry"), the inner doc
+   (`mem_store.rs:212-213`), and the struct doc's false no-deadlock claim
+   (`mem_store.rs:68-70`); invert the two existing test predicates (asserted
+   outputs unchanged).
 4. **Doc truth**: the "no filesystem access" contract at `ipa/mod.rs:666-667`
    becomes true for detection as well; the two public doc links to
    `is_nested_bundle_dir` (`verify.rs:14`, `verify.rs:83`) become plain code

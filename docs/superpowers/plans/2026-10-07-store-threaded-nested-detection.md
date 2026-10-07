@@ -185,6 +185,9 @@ recursion, no `out` mutation happens while any guard is alive.
 Docs and tests in the same file:
 - `walk_inner` doc: "`prune` returning `true` skips" → "`prune` returning
   `false` skips the whole subtree — never yielded, never descended into."
+- `PruneFn` alias doc (`:15-16`): "`true` skips the entry: never yielded,
+  never descended into." → "`false` skips the entry: never yielded, never
+  descended into."
 - struct doc (`:68-70`): replace the "no guard is ever returned or nested, so
   no deadlock is possible" sentence with the true invariant — walks
   materialize each level's children under the guard and release it before
