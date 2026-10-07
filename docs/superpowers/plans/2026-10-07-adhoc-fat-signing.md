@@ -30,14 +30,14 @@ Input classes the spec implies but a careless change would break — each line i
 2. **Output must stay a FAT container with both architectures preserved:** Task 1 (`test_sign_macho_adhoc_signs_fat_container`).
 3. **Every slice must be ad-hoc and verify:** `CS_ADHOC` flag, `PageCheck::Matched`, `is_valid()` per slice — Task 1 (same test).
 4. **The credential-gated thin entry must still refuse containers** with an error naming the FAT-capable entry — Task 1 (`test_sign_macho_rejects_fat_containers`).
-5. **Facade parity, deferred crate:** the existing facade test must keep passing without any edit there — Task 3 (`cargo test -p zsign-rs adhoc`).
+5. **Facade parity, deferred crate:** the existing facade test must keep passing without any edit there — Task 3 (`cargo test -p zsign-rs test_sign_macho_adhoc_signs_fat`).
 
 ---
 
 ### Task 1: Ad-hoc FAT routing contract (core, already on branch — verify)
 
 **Files:**
-- Verify: `crates/zsign-core/src/macho/signer.rs:287-322` (routing body), `signer.rs:1247-1315` (the two contract tests)
+- Verify: `crates/zsign-core/src/macho/signer.rs:287-322` (routing body), `signer.rs:1247-1314` (the two contract tests)
 
 **Interfaces:**
 - Consumes: `sign_all_slices_impl(macho, identifier, entitlements, credentials: Option<&SigningCredentials>, info_plist, code_resources, allow_encrypted, sha256_only) -> Result<Vec<SignedSlice>>` (`signer.rs:410-459`); `super::writer::embed_signature_fat(data, slices) -> Result<Vec<u8>>`.
@@ -45,8 +45,9 @@ Input classes the spec implies but a careless change would break — each line i
 
 - [ ] **Step 1: Run the two contract tests**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core test_sign_macho_adhoc_signs_fat_container test_sign_macho_rejects_fat_containers`
-Expected: `test result: ok` with both tests passing (they exist at `signer.rs:1264` and `signer.rs:1248`).
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core test_sign_macho_adhoc_signs_fat_container`
+Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core test_sign_macho_rejects_fat_containers`
+Expected: `test result: ok` from both commands (the tests exist at `signer.rs:1264` and `signer.rs:1248`).
 
 - [ ] **Step 2: If red or missing, implement the FAT branch**
 
@@ -54,7 +55,7 @@ Only if Step 1 fails: in `sign_macho_adhoc` replace the hard-error `if macho.is_
 
 - [ ] **Step 3: Re-run Step 1**
 
-Run: same command as Step 1.
+Run: the same two commands as Step 1.
 Expected: `test result: ok`, both tests pass.
 
 ---
@@ -65,7 +66,7 @@ Expected: `test result: ok`, both tests pass.
 - Test: `crates/zsign-core/src/macho/signer.rs` — add one test to the existing `#[cfg(test)] mod tests`, next to `test_sign_refuses_fat_with_encrypted_slice` (`signer.rs:1584`).
 
 **Interfaces:**
-- Consumes: `sign_macho_adhoc(...)` (Task 1), fixtures `make_fat_macho(&[Vec<u8>], &[u32])`, `make_minimal_macho()`, `make_minimal_macho_encrypted(cryptid, cryptoff)` from the tests module imports (`signer.rs:908-910`).
+- Consumes: `sign_macho_adhoc(...)` (Task 1), fixtures `make_fat_macho(&[Vec<u8>], &[u32])`, `make_minimal_macho()`, `make_minimal_macho_encrypted(cryptid: u32, cryptsize: u32)` (cryptoff is fixed at `0x1000` inside the fixture, `fixtures.rs:468`) from the tests module imports (`signer.rs:908-910`).
 - Produces: no production code. If and only if the test comes back red, the fix is the `reject_encrypted(macho, identifier, allow_encrypted)?;` line as the first statement of `sign_macho_adhoc`'s `if macho.is_fat()` branch (`signer.rs:296`).
 
 - [ ] **Step 1: Write the failing test**
@@ -136,7 +137,7 @@ Expected: `Finished` with zero warnings; no workspace-wide cold run.
 
 - [ ] **Step 3: Scoped tests (core + the deferred facade call path, read-only)**
 
-Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core signer` then `TMPDIR=$PWD/target/tmp cargo test -p zsign-rs adhoc_signs_fat`
+Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core signer` then `TMPDIR=$PWD/target/tmp cargo test -p zsign-rs test_sign_macho_adhoc_signs_fat`
 Expected: `test result: ok` in both; the facade test passes without touching `crates/zsign/**`.
 
 - [ ] **Step 4: Commit**

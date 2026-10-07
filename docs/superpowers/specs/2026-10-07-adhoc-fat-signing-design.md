@@ -33,12 +33,13 @@ verifies.
     `None` yields `CS_ADHOC` code directories and an empty CMS wrapper
     (`signer.rs:403-405`, `signer.rs:581`, `signer.rs:853`);
   - the contract test `test_sign_macho_adhoc_signs_fat_container`
-    (`signer.rs:1264-1315`): a 2-arch (32-bit + 64-bit) container signs, keeps
+    (`signer.rs:1264-1314`): a 2-arch (32-bit + 64-bit) container signs, keeps
     both arches, and every slice reports `CS_ADHOC`, `PageCheck::Matched`, and
     `is_valid()`;
   - `test_sign_macho_rejects_fat_containers` (`signer.rs:1247-1262`), which
     keeps `sign_macho` (credential-gated, thin-only) refusing containers;
-  - facade caller migration and facade test flip
+  - a facade test flip and a reworded facade doc comment — the production
+    facade call path already called `sign_macho_adhoc` and is unchanged
     (`crates/zsign/src/builder.rs:1073`, `crates/zsign/src/macho/mod.rs:107-111`).
 - Remaining stale claim found during research:
   `crates/zsign/src/builder.rs:393-396` still says "Adhoc mode rejects
@@ -77,8 +78,11 @@ Why this shape:
   shape — `reject_encrypted` → `sign_all_slices_impl` →
   `embed_signature_fat` — so a reader can diff the three and see only the
   parameter changes.
-- **Frozen public API.** Every `pub` signature keeps its exact shape; no
-  caller (facade, wasm, CLI) changes.
+- **Frozen public API.** Every `pub` signature keeps its exact shape, and the
+  production facade/wasm/CLI call paths are untouched; the only non-core
+  edits were the facade's test flip and a reworded facade doc comment, plus
+  the two internal `Some(credentials)` wraps at the sibling engine call
+  sites in the same file.
 
 ## Alternatives considered (rejected)
 
