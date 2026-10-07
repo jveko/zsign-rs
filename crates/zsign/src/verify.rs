@@ -11,7 +11,7 @@
 //!   every sealed file must hash to its recorded value, and every on-disk file
 //!   must be sealed (or belong to the rules' omission set).
 //! - Nested-code bundles recognized by
-//!   [`crate::bundle::is_nested_bundle_dir`] are verified recursively,
+//!   `crate::bundle::is_nested_bundle_dir` are verified recursively,
 //!   mirroring the signer's depth-first walk.
 //!
 //! # Examples
@@ -24,6 +24,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use crate::store::FsStore;
 use crate::Result;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -80,7 +81,7 @@ pub struct BundleVerification {
     pub binaries: Vec<BinaryVerification>,
     /// CodeResources check (present when the bundle has a `_CodeSignature`).
     pub code_resources: Option<CodeResourcesVerification>,
-    /// Nested-code bundles recognized by [`crate::bundle::is_nested_bundle_dir`].
+    /// Nested-code bundles recognized by `crate::bundle::is_nested_bundle_dir`.
     pub nested: Vec<BundleVerification>,
     /// Bundle-level errors (e.g. missing Info.plist for an app bundle).
     pub errors: Vec<String>,
@@ -152,7 +153,7 @@ fn has_nested_bundle_component(dir: &Path, rel: &Path, ignore_last: bool) -> boo
     let mut prefix = dir.to_path_buf();
     components.iter().any(|c| {
         prefix.push(c);
-        crate::bundle::is_nested_bundle_dir(&prefix)
+        crate::bundle::is_nested_bundle_dir(&FsStore, &prefix)
     })
 }
 
@@ -446,7 +447,7 @@ fn verify_bundle_dir(root: &Path, dir: &Path, rel: &str) -> Result<BundleVerific
         }
         let rel_dir = p.strip_prefix(dir).unwrap_or(p);
         if entry.file_type().is_dir() {
-            if crate::bundle::is_nested_bundle_dir(p)
+            if crate::bundle::is_nested_bundle_dir(&FsStore, p)
                 && !has_nested_bundle_component(dir, rel_dir, true)
             {
                 nested_dirs.push(p.to_path_buf());

@@ -12,8 +12,8 @@ use std::sync::{Mutex, MutexGuard};
 /// directory modes replay on output.
 const DEFAULT_DIR_MODE: u32 = 0o40755;
 
-/// Predicate deciding whether a visited entry prunes its whole subtree.
-/// `true` skips the entry: never yielded, never descended into.
+/// Predicate deciding whether a visited entry is kept. `false` skips the
+/// entry's whole subtree — never yielded, never descended into.
 type PruneFn<'a> = &'a dyn Fn(&Path, StoreKind) -> bool;
 
 /// [`PruneFn`] when traversal is unconditional, `None` otherwise.
@@ -66,8 +66,10 @@ impl Node {
 /// The map lives behind a `Mutex` so `MemStore: Sync` — required because the
 /// generic sign stage compiles its rayon arm on non-wasm targets (the
 /// native round-trip tests run this store there). Every method locks and
-/// unlocks internally; no guard is ever returned or nested, so no deadlock
-/// is possible and the uncontended lock costs nanoseconds next to signing.
+/// unlocks internally; walks materialize each level's children under the
+/// guard and release it before running any caller closure, so no callback
+/// ever executes while the lock is held, and the uncontended lock costs
+/// nanoseconds next to signing.
 pub(crate) struct MemStore {
     nodes: Mutex<BTreeMap<PathBuf, Node>>,
 }
@@ -209,7 +211,7 @@ impl MemStore {
     }
 
     /// Shared pre-order traversal. `include_root` mirrors `WalkDir` with and
-    /// without `min_depth(1)`; `prune` returning `true` skips the whole
+    /// without `min_depth(1)`; `prune` returning `false` skips the whole
     /// subtree — never yielded, never descended into.
     fn walk_inner(
         &self,
@@ -218,35 +220,40 @@ impl MemStore {
         prune: MaybePruneFn<'_>,
     ) -> Result<Vec<Result<(PathBuf, StoreKind)>>> {
         let key = Self::normalize(root)?;
-        let nodes = self.lock();
-        let mut out = Vec::new();
-        let Some(root_node) = nodes.get(&key) else {
-            out.push(Err(not_found(root)));
-            return Ok(out);
+        let root_kind = {
+            let nodes = self.lock();
+            match nodes.get(&key) {
+                Some(node) => node.kind(),
+                None => return Ok(vec![Err(not_found(root))]),
+            }
         };
-        let root_kind = root_node.kind();
+        let mut out = Vec::new();
         if include_root {
             out.push(Ok((key.clone(), root_kind)));
         }
-        Self::walk_children(&nodes, &key, prune, &mut out);
+        self.walk_children(&key, prune, &mut out);
         Ok(out)
     }
 
     fn walk_children(
-        nodes: &BTreeMap<PathBuf, Node>,
+        &self,
         dir: &Path,
         prune: MaybePruneFn<'_>,
         out: &mut Vec<Result<(PathBuf, StoreKind)>>,
     ) {
-        for (path, _, kind) in Self::children(nodes, dir) {
+        let children = {
+            let nodes = self.lock();
+            Self::children(&nodes, dir)
+        };
+        for (path, _, kind) in children {
             if let Some(prune) = prune {
-                if prune(&path, kind) {
+                if !prune(&path, kind) {
                     continue;
                 }
             }
             out.push(Ok((path.clone(), kind)));
             if kind == StoreKind::Dir {
-                Self::walk_children(nodes, &path, prune, out);
+                self.walk_children(&path, prune, out);
             }
         }
     }
@@ -427,7 +434,8 @@ impl Store for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::bundle::is_nested_bundle_dir;
+    use crate::store::{FsStore, Store};
     fn store() -> MemStore {
         MemStore::new()
     }
@@ -567,7 +575,7 @@ mod tests {
         s.write(Path::new("Payload/top.txt"), b"t").unwrap();
 
         let entries: Vec<(PathBuf, StoreKind)> = s
-            .walk_pruned(Path::new("Payload"), &|p, _| p.ends_with("secret"))
+            .walk_pruned(Path::new("Payload"), &|p, _| !p.ends_with("secret"))
             .unwrap()
             .into_iter()
             .map(|e| e.unwrap())
@@ -594,12 +602,42 @@ mod tests {
         s.write(Path::new("a/b/keep.txt"), b"k").unwrap();
         s.write(Path::new("a/b/skip.txt"), b"s").unwrap();
         let paths: Vec<String> = s
-            .walk_pruned(Path::new("a"), &|_, kind| kind == StoreKind::File)
+            .walk_pruned(Path::new("a"), &|_, kind| kind == StoreKind::Dir)
             .unwrap()
             .into_iter()
             .map(|e| e.unwrap().0.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, vec!["a/b".to_string()]);
+    }
+
+    #[test]
+    fn walk_pruned_allows_a_store_consulting_predicate() {
+        let s = store();
+        s.create_dir_all(Path::new("Payload/App.app/Frameworks"))
+            .unwrap();
+        s.write(Path::new("Payload/App.app/Info.plist"), b"<plist/>")
+            .unwrap();
+        s.write(Path::new("Payload/App.app/icon.png"), b"i")
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // The predicate may consult the same store: the walk must not hold
+            // its lock while the closure runs.
+            let outcome = s.walk_pruned(Path::new("Payload"), &|p, _| {
+                let _ = s.metadata(p);
+                true
+            });
+            tx.send(outcome.map(|entries| entries.len())).ok();
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(n)) => assert!(n > 0, "walk should yield entries, got {n}"),
+            Ok(Err(e)) => panic!("walk_pruned failed: {e}"),
+            Err(_) => panic!(
+                "walk_pruned deadlocked: a store-consulting prune predicate did not return within 10s"
+            ),
+        }
+        worker.join().unwrap();
     }
 
     #[test]
@@ -719,6 +757,90 @@ mod tests {
         assert_eq!(
             s.metadata(Path::new("d/other")).unwrap().unix_mode,
             Some(0o100600)
+        );
+    }
+
+    #[test]
+    fn mem_and_native_walk_pruned_match_for_extension_less_nested_bundle() {
+        const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.test.legacy</string><key>CFBundleExecutable</key><string>Legacy</string></dict></plist>"#;
+
+        // Same logical tree both sides: an extension-less nested bundle
+        // under Frameworks/ plus a top-level file.
+        let temp = tempfile::TempDir::new().unwrap();
+        let native_root = temp.path();
+        let native_legacy = native_root.join("Frameworks").join("Legacy");
+        std::fs::create_dir_all(&native_legacy).unwrap();
+        std::fs::write(native_legacy.join("Info.plist"), PLIST).unwrap();
+        std::fs::write(native_legacy.join("inner.bin"), b"inner").unwrap();
+        std::fs::write(native_root.join("top.bin"), b"top").unwrap();
+
+        let mem = store();
+        mem.create_dir_all(Path::new("Frameworks/Legacy")).unwrap();
+        mem.write(Path::new("Frameworks/Legacy/Info.plist"), PLIST.as_bytes())
+            .unwrap();
+        mem.write(Path::new("Frameworks/Legacy/inner.bin"), b"inner")
+            .unwrap();
+        mem.write(Path::new("top.bin"), b"top").unwrap();
+
+        // 1. Detection parity.
+        assert!(is_nested_bundle_dir(&FsStore, &native_legacy));
+        assert!(is_nested_bundle_dir(&mem, Path::new("Frameworks/Legacy")));
+
+        // 2+3. `find_immediate`-shaped prune per side (false = skip), then
+        // compare the surviving entry sets, sorted: native WalkDir order is
+        // readdir-dependent while MemStore is BTreeMap-sorted.
+        let native_entries = FsStore
+            .walk_pruned(native_root, &|path, kind| {
+                if path != native_root
+                    && kind == StoreKind::Dir
+                    && is_nested_bundle_dir(&FsStore, path)
+                {
+                    return false;
+                }
+                true
+            })
+            .unwrap();
+        let mut native_paths: Vec<String> = native_entries
+            .into_iter()
+            .map(|e| e.unwrap().0)
+            .map(|p| {
+                p.strip_prefix(native_root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        let mem_root = Path::new("");
+        let mem_entries = mem
+            .walk_pruned(mem_root, &|path, kind| {
+                if path != mem_root && kind == StoreKind::Dir && is_nested_bundle_dir(&mem, path) {
+                    return false;
+                }
+                true
+            })
+            .unwrap();
+        let mut mem_paths: Vec<String> = mem_entries
+            .into_iter()
+            .map(|e| e.unwrap().0.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        native_paths.sort();
+        mem_paths.sort();
+        let expected = vec!["Frameworks".to_string(), "top.bin".to_string()];
+        assert_eq!(
+            native_paths, expected,
+            "native walk_pruned set mismatch: {native_paths:?}"
+        );
+        assert_eq!(
+            mem_paths, expected,
+            "mem walk_pruned set mismatch: {mem_paths:?}"
+        );
+        assert_eq!(
+            native_paths, mem_paths,
+            "cross-store walk_pruned parity mismatch: native {native_paths:?} vs mem {mem_paths:?}"
         );
     }
 }

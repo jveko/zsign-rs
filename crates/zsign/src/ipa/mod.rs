@@ -1162,8 +1162,8 @@ impl<'a> IpaSigner<'a> {
                 continue;
             }
 
-            if kind == StoreKind::Dir && crate::bundle::is_nested_bundle_dir(&path) {
-                let depth = self.calculate_bundle_depth(&path, bundle_path);
+            if kind == StoreKind::Dir && crate::bundle::is_nested_bundle_dir(store, &path) {
+                let depth = self.calculate_bundle_depth(store, &path, bundle_path);
                 bundles.push((path, depth));
             }
         }
@@ -1312,7 +1312,12 @@ impl<'a> IpaSigner<'a> {
     /// Calculate the nesting depth of a bundle relative to the root bundle.
     ///
     /// Depth is based on how many bundle directories are in the path.
-    fn calculate_bundle_depth(&self, bundle_path: &Path, root_bundle: &Path) -> usize {
+    fn calculate_bundle_depth(
+        &self,
+        store: &dyn Store,
+        bundle_path: &Path,
+        root_bundle: &Path,
+    ) -> usize {
         let Ok(relative) = bundle_path.strip_prefix(root_bundle) else {
             return 0;
         };
@@ -1321,7 +1326,7 @@ impl<'a> IpaSigner<'a> {
         let mut prefix = root_bundle.to_path_buf();
         for component in relative.components() {
             prefix.push(component);
-            if crate::bundle::is_nested_bundle_dir(&prefix) {
+            if crate::bundle::is_nested_bundle_dir(store, &prefix) {
                 depth += 1;
             }
         }
@@ -1561,7 +1566,7 @@ impl<'a> IpaSigner<'a> {
         let prune = |path: &Path, kind: StoreKind| {
             if path != bundle_path
                 && kind == StoreKind::Dir
-                && crate::bundle::is_nested_bundle_dir(path)
+                && crate::bundle::is_nested_bundle_dir(store, path)
             {
                 return false;
             }
