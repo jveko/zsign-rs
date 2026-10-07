@@ -294,10 +294,13 @@ fn realloc_code_sign_space_single(
 
 /// Returns whether the binary has space for the signature without reallocation.
 ///
+/// The signature is placed at the 16-byte-aligned offset `align_to(code_length, 16)`,
+/// so the padding up to that alignment is not available.
+///
 /// Check this before calling [`embed_signature`] to avoid unnecessary reallocation.
 pub fn has_enough_signature_space(data: &[u8], code_length: usize, signature_size: usize) -> bool {
-    let available_space = data.len().saturating_sub(code_length);
-    available_space >= signature_size
+    let sig_offset = align_to(code_length, 16);
+    data.len().saturating_sub(sig_offset) >= signature_size
 }
 
 /// Embeds a code signature into a Mach-O binary.
@@ -1797,9 +1800,11 @@ mod tests {
 
     #[test]
     fn test_has_enough_signature_space() {
-        // Data has 1000 bytes after code_length
+        // Data has 1000 bytes after code_length, but the signature starts at the
+        // 16-byte-aligned offset 1008, leaving only 992 usable bytes.
         assert!(has_enough_signature_space(&[0u8; 2000], 1000, 500));
-        assert!(has_enough_signature_space(&[0u8; 2000], 1000, 1000));
+        assert!(has_enough_signature_space(&[0u8; 2000], 1000, 992));
+        assert!(!has_enough_signature_space(&[0u8; 2000], 1000, 1000));
         assert!(!has_enough_signature_space(&[0u8; 2000], 1000, 1001));
         assert!(!has_enough_signature_space(&[0u8; 2000], 1000, 2000));
 
