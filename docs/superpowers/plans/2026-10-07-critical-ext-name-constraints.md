@@ -116,7 +116,7 @@ fn unknown_critical_extension_rejects_the_leaf() {
         "CN=zsign leaf",
         &root.tbs_certificate.subject,
         &root_signing,
-        &|b| { b.add_extension(&UnknownCritical).unwrap(); },
+        |b| { b.add_extension(&UnknownCritical).unwrap(); },
     );
     let out = chain_with(&root, &leaf);
     assert!(
@@ -307,7 +307,8 @@ fn non_critical_name_constraints_are_enforced() {
 #[test]
 fn self_issued_certificate_skips_constraints_unless_final() {
     // unit-level: let (subca, _) = build_subca("CN=self issued", None);
-    // let nc = NameConstraints { permitted: Some([base "CN=other"]), .. };
+    // let nc = NameConstraints { permitted_subtrees: Some(...base "CN=other"
+    // in a GeneralSubtree...), .. };
     // assert check_certificate_names(&subca, false, &[nc.clone()], &mut b)
     //     == None  (subject == issuer, not final -> skipped)
     // assert check_certificate_names(&subca, true, &[nc], &mut b)
