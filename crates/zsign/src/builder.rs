@@ -399,8 +399,8 @@ impl ZSign {
     ///
     /// Returns an error if:
     /// - [`Error::MissingCredentials`] - Credentials not set
-    /// - [`Error::MachO`] - Input file is not a valid Mach-O binary
-    /// - [`Error::Signing`] - Signature generation failed
+    /// - [`Error::Core`] - Input file is not a valid Mach-O binary (`zsign_core::Error::MachO`)
+    /// - [`Error::Core`] - Signature generation failed (`zsign_core::Error::Signing`)
     /// - [`Error::Io`] - File read/write failed
     ///
     /// # Examples
@@ -496,8 +496,8 @@ impl ZSign {
     /// Returns an error if:
     /// - [`Error::MissingCredentials`] - Credentials not set
     /// - [`Error::Zip`] - IPA extraction or creation failed
-    /// - [`Error::Signing`] - Bundle signing failed
-    /// - [`Error::ProvisioningProfile`] - Invalid provisioning profile
+    /// - [`Error::Core`] - Bundle signing failed (`zsign_core::Error::Signing`)
+    /// - [`Error::Core`] - Invalid provisioning profile (`zsign_core::Error::ProvisioningProfile`)
     ///
     /// # Examples
     ///

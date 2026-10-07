@@ -37,6 +37,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (workspace, deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rustdoc (zsign-rs, deny broken intra-doc links)
+        run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc -p zsign-rs --no-deps
 
   test:
     name: Test (workspace)

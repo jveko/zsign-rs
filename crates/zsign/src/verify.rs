@@ -329,7 +329,7 @@ fn is_rule_omitted(rel: &str, main_executable: Option<&str>) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the file cannot be read.
+/// Returns [`crate::Error::Io`] when the file cannot be read.
 pub fn verify_macho_file(path: impl AsRef<Path>) -> Result<VerifyReport> {
     let path = path.as_ref();
     let data = std::fs::read(path)?;
@@ -370,7 +370,7 @@ pub fn verify_macho_file(path: impl AsRef<Path>) -> Result<VerifyReport> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the bundle cannot be read.
+/// Returns [`crate::Error::Io`] when the bundle cannot be read.
 pub fn verify_bundle(path: impl AsRef<Path>) -> Result<VerifyReport> {
     let path = path.as_ref();
     let bundle = verify_bundle_dir(path, path, "")?;
@@ -385,8 +385,8 @@ pub fn verify_bundle(path: impl AsRef<Path>) -> Result<VerifyReport> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`]/[`Error::Zip`] when the archive cannot be read and
-/// [`Error::Verify`]-style errors when extraction fails.
+/// Returns [`crate::Error::Io`]/[`crate::Error::Zip`] when the archive cannot
+/// be read or extracted.
 pub fn verify_ipa(path: impl AsRef<Path>) -> Result<VerifyReport> {
     let path = path.as_ref();
     let tmp = tempfile::TempDir::new()?;

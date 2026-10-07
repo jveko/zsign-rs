@@ -635,7 +635,7 @@ impl<'a> IpaSigner<'a> {
     ///
     /// Returns [`Error::Io`] if files cannot be read or written.
     /// Returns [`Error::Zip`] if the IPA archive is invalid.
-    /// Returns [`Error::Signing`] if code signing fails.
+    /// Returns [`Error::Core`] (`zsign_core::Error::Signing`) if code signing fails.
     pub fn sign(&self, input_ipa: impl AsRef<Path>, output_ipa: impl AsRef<Path>) -> Result<()> {
         let input_ipa = input_ipa.as_ref();
         let output_ipa = output_ipa.as_ref();
