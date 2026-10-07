@@ -1378,6 +1378,183 @@ fn unrecognized_critical(cert: &x509_cert::Certificate) -> Option<ObjectIdentifi
         })
         .map(|e| e.extn_id)
 }
+/// Name-constraints state of one path certificate.
+enum NcScan {
+    Absent,
+    Malformed,
+    Present(x509_cert::ext::pkix::constraints::NameConstraints),
+}
+
+/// Decodes the nameConstraints extension (OID 2.5.29.30) of `cert`, if any.
+fn scan_name_constraints(cert: &x509_cert::Certificate) -> NcScan {
+    use der::Decode;
+    use x509_cert::ext::pkix::constraints::NameConstraints;
+    let Some(bytes) = ext_value(cert, OID_NAME_CONSTRAINTS) else {
+        return NcScan::Absent;
+    };
+    match NameConstraints::from_der(bytes) {
+        Ok(nc) => NcScan::Present(nc),
+        Err(_) => NcScan::Malformed,
+    }
+}
+
+/// Structural rejection for decoded name constraints: an empty extension and
+/// non-default subtree bounds cannot be processed, so the chain must fail.
+fn nc_shape_reason(nc: &x509_cert::ext::pkix::constraints::NameConstraints) -> Option<String> {
+    let permitted_empty = nc.permitted_subtrees.as_ref().is_none_or(Vec::is_empty);
+    let excluded_empty = nc.excluded_subtrees.as_ref().is_none_or(Vec::is_empty);
+    if permitted_empty && excluded_empty {
+        return Some(
+            "name constraints extension has neither permitted nor excluded subtrees".into(),
+        );
+    }
+    let bounded = nc
+        .permitted_subtrees
+        .iter()
+        .flatten()
+        .chain(nc.excluded_subtrees.iter().flatten())
+        .any(|s| s.minimum != 0 || s.maximum.is_some());
+    if bounded {
+        return Some("name constraints subtree specifies minimum or maximum".into());
+    }
+    None
+}
+
+/// Cap on total (name x subtree) comparisons; constraint lists are
+/// attacker-shaped input, so unbounded matching would be a DoS vector.
+const MAX_NAME_COMPARISONS: usize = 4096;
+
+/// Evaluates `constraints` (one entry per CA above `cert`) against `cert`.
+///
+/// Only the directoryName form is evaluated here; the remaining name forms
+/// follow later, with the per-form structure below left open for them.
+/// Returns the first rejection reason, if any.
+fn check_certificate_names(
+    cert: &x509_cert::Certificate,
+    is_final: bool,
+    constraints: &[x509_cert::ext::pkix::constraints::NameConstraints],
+    budget: &mut usize,
+) -> Option<String> {
+    if !is_final && cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+        return None;
+    }
+    // Evaluated names in directoryName form; later forms (subjectAltName,
+    // legacy-email) extend this list.
+    let mut names = Vec::new();
+    if !cert.tbs_certificate.subject.0.is_empty() {
+        names.push(&cert.tbs_certificate.subject);
+    }
+    for name in names {
+        // Excluded beats permitted unconditionally, across every CA.
+        for nc in constraints {
+            for base in nc.excluded_subtrees.iter().flatten().filter_map(dir_base) {
+                *budget += 1;
+                if *budget > MAX_NAME_COMPARISONS {
+                    return Some("name constraints comparison budget exceeded".into());
+                }
+                if directory_name_matches(base, name) {
+                    return Some(
+                        "subject or alternative name within excluded name constraints".into(),
+                    );
+                }
+            }
+        }
+        // Permitted is an intersection: every CA that restricts this form
+        // must admit the name.
+        for nc in constraints {
+            let permitted: Vec<_> = nc
+                .permitted_subtrees
+                .iter()
+                .flatten()
+                .filter_map(dir_base)
+                .collect();
+            if permitted.is_empty() {
+                continue;
+            }
+            let mut matched = false;
+            for base in permitted {
+                *budget += 1;
+                if *budget > MAX_NAME_COMPARISONS {
+                    return Some("name constraints comparison budget exceeded".into());
+                }
+                if directory_name_matches(base, name) {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Some(
+                    "subject or alternative name outside permitted name constraints".into(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// The directoryName base of a subtree, if it constrains that form.
+fn dir_base(
+    subtree: &x509_cert::ext::pkix::constraints::name::GeneralSubtree,
+) -> Option<&x509_cert::name::Name> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    match &subtree.base {
+        GeneralName::DirectoryName(base) => Some(base),
+        _ => None,
+    }
+}
+
+/// A directoryName constraint matches when its RDN sequence is a prefix of
+/// the target DN (compared from the root), each RDN matching as a set of
+/// type-and-value pairs.
+fn directory_name_matches(base: &x509_cert::name::Name, name: &x509_cert::name::Name) -> bool {
+    if base.0.len() > name.0.len() {
+        return false;
+    }
+    base.0
+        .iter()
+        .zip(name.0.iter())
+        .all(|(constraint, actual)| rdn_equal(constraint, actual))
+}
+
+fn rdn_equal(
+    a: &x509_cert::name::RelativeDistinguishedName,
+    b: &x509_cert::name::RelativeDistinguishedName,
+) -> bool {
+    a.0.len() == b.0.len()
+        && a.0.iter().all(|atv| {
+            b.0.iter()
+                .any(|other| other.oid == atv.oid && attr_value_equal(&atv.value, &other.value))
+        })
+}
+
+/// Compares attribute values under `caseIgnoreMatch` with insignificant-space
+/// handling: trim, collapse internal whitespace runs, Unicode lowercase.
+/// Values that are not character strings fall back to exact comparison.
+fn attr_value_equal(a: &der::asn1::Any, b: &der::asn1::Any) -> bool {
+    match (attr_str(a), attr_str(b)) {
+        (Some(x), Some(y)) => normalize_dn_value(x) == normalize_dn_value(y),
+        _ => a.tag() == b.tag() && a.value() == b.value(),
+    }
+}
+
+fn attr_str(value: &der::asn1::Any) -> Option<&str> {
+    use der::asn1::{Ia5StringRef, PrintableStringRef, TeletexStringRef, Utf8StringRef};
+    use der::Tag;
+    match value.tag() {
+        Tag::Utf8String => Utf8StringRef::try_from(value).ok().map(|s| s.as_str()),
+        Tag::PrintableString => PrintableStringRef::try_from(value).ok().map(|s| s.as_str()),
+        Tag::Ia5String => Ia5StringRef::try_from(value).ok().map(|s| s.as_str()),
+        Tag::TeletexString => TeletexStringRef::try_from(value).ok().map(|s| s.as_str()),
+        _ => None,
+    }
+}
+
+fn normalize_dn_value(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
 
 /// Walks the embedded certificate set from `leaf` toward a trust anchor,
 /// enforcing leaf and issuer purpose constraints, then verifying each
@@ -1394,6 +1571,8 @@ pub(crate) fn verify_chain(
     let mut names = vec![leaf.tbs_certificate.subject.to_string()];
     let mut warnings: Vec<String> = Vec::new();
     let mut current = leaf;
+    let mut path: Vec<&x509_cert::Certificate> = vec![leaf];
+    let mut budget = 0usize;
     if let Some(oid) = unrecognized_critical(leaf) {
         return ChainOutcome {
             ok: false,
@@ -1477,6 +1656,48 @@ pub(crate) fn verify_chain(
                         )),
                         warnings,
                     };
+                }
+                match scan_name_constraints(p) {
+                    NcScan::Malformed => {
+                        return ChainOutcome {
+                            ok: false,
+                            anchored: false,
+                            subjects: names,
+                            reason: Some("malformed name constraints extension".into()),
+                            warnings,
+                        };
+                    }
+                    NcScan::Present(nc) => {
+                        if let Some(reason) = nc_shape_reason(&nc) {
+                            return ChainOutcome {
+                                ok: false,
+                                anchored: false,
+                                subjects: names,
+                                reason: Some(reason),
+                                warnings,
+                            };
+                        }
+                        for (idx, entry) in path.iter().enumerate() {
+                            if let Some(reason) = check_certificate_names(
+                                entry,
+                                idx == 0,
+                                std::slice::from_ref(&nc),
+                                &mut budget,
+                            ) {
+                                return ChainOutcome {
+                                    ok: false,
+                                    anchored: false,
+                                    subjects: names,
+                                    reason: Some(reason),
+                                    warnings,
+                                };
+                            }
+                        }
+                        path.push(p);
+                    }
+                    NcScan::Absent => {
+                        path.push(p);
+                    }
                 }
                 if let Some(w) = sha1_warning(current) {
                     warnings.push(w);
@@ -3047,6 +3268,338 @@ mod tests {
             out.anchored,
             "out-of-chain anchor chain must stay anchored: reason={:?}",
             out.reason
+        );
+    }
+
+    /// Non-critical authoring wrapper for `NameConstraints` (OID 2.5.29.30).
+    ///
+    /// The real `NameConstraints` type's `impl_extension!` marks it critical,
+    /// which is what conforming CAs emit; this wrapper follows the
+    /// `UnknownNonCritical` pattern so a test can author the same value as
+    /// non-critical. `Encode` delegates to the inner value's DER.
+    struct NonCriticalNameConstraints(x509_cert::ext::pkix::constraints::name::NameConstraints);
+
+    impl const_oid::AssociatedOid for NonCriticalNameConstraints {
+        const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.30");
+    }
+
+    impl der::Encode for NonCriticalNameConstraints {
+        fn encoded_len(&self) -> der::Result<der::Length> {
+            self.0.encoded_len()
+        }
+
+        fn encode(&self, _encoder: &mut impl der::Writer) -> der::Result<()> {
+            self.0.encode(_encoder)
+        }
+    }
+
+    impl x509_cert::ext::AsExtension for NonCriticalNameConstraints {
+        fn critical(
+            &self,
+            _subject: &x509_cert::name::Name,
+            _extensions: &[x509_cert::ext::Extension],
+        ) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn permitted_directory_name_subtree_accepts_the_leaf() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let leaf_cn = "CN=zsign nc permitted leaf";
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign nc permitted root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::DirectoryName(Name::from_str(leaf_cn).unwrap()),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            leaf_cn,
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            out.ok,
+            "permitted directoryName subtree matching the leaf must stay valid: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.anchored,
+            "permitted directoryName subtree matching the leaf must stay anchored: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn permitted_directory_name_mismatch_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign nc mismatch root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DirectoryName(
+                        Name::from_str("CN=unrelated subtree").unwrap(),
+                    ),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign nc mismatch leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "leaf outside the permitted directoryName subtree must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn excluded_subtree_beats_permitted() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let leaf_cn = "CN=zsign nc excluded leaf";
+        let leaf_dn = || GeneralName::DirectoryName(Name::from_str(leaf_cn).unwrap());
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign nc excluded root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: leaf_dn(),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: Some(vec![GeneralSubtree {
+                    base: leaf_dn(),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            leaf_cn,
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "excluded directoryName subtree must beat the matching permitted entry: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("within excluded name constraints"),
+            "expected excluded-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn empty_name_constraints_reject() {
+        use x509_cert::ext::pkix::constraints::name::NameConstraints;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign nc empty root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign nc empty leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "empty nameConstraints (neither permitted nor excluded) must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("neither permitted nor excluded"),
+            "expected empty-constraints rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn non_default_subtree_maximum_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign nc maximum root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DnsName(der::asn1::Ia5String::new("example.com").unwrap()),
+                    minimum: 0,
+                    maximum: Some(5),
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign nc maximum leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "non-default subtree maximum must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("specifies minimum or maximum"),
+            "expected minimum/maximum rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn non_default_subtree_minimum_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign nc minimum root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DnsName(der::asn1::Ia5String::new("example.com").unwrap()),
+                    minimum: 1,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign nc minimum leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "non-default subtree minimum must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("specifies minimum or maximum"),
+            "expected minimum/maximum rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn non_critical_name_constraints_are_enforced() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let leaf_cn = "CN=zsign nc noncritical leaf";
+        let nc = NameConstraints {
+            permitted_subtrees: None,
+            excluded_subtrees: Some(vec![GeneralSubtree {
+                base: GeneralName::DirectoryName(Name::from_str(leaf_cn).unwrap()),
+                minimum: 0,
+                maximum: None,
+            }]),
+        };
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign nc noncritical root", |b| {
+                b.add_extension(&NonCriticalNameConstraints(nc.clone()))
+                    .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            leaf_cn,
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "recognized non-critical nameConstraints must still be enforced: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("within excluded name constraints"),
+            "expected excluded-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn self_issued_certificate_skips_constraints_unless_final() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (subca, _) = build_subca("CN=self issued", None);
+        let nc = NameConstraints {
+            permitted_subtrees: Some(vec![GeneralSubtree {
+                base: GeneralName::DirectoryName(Name::from_str("CN=other").unwrap()),
+                minimum: 0,
+                maximum: None,
+            }]),
+            excluded_subtrees: None,
+        };
+        let mut budget = 0usize;
+        assert!(
+            check_certificate_names(&subca, false, std::slice::from_ref(&nc), &mut budget)
+                .is_none(),
+            "self-issued non-final certificate must skip name constraints"
+        );
+        let reason = check_certificate_names(&subca, true, &[nc], &mut budget);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "self-issued final certificate must be evaluated, got {:?}",
+            reason
         );
     }
 
