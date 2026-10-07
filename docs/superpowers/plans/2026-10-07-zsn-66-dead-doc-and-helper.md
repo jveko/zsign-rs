@@ -22,7 +22,7 @@
 ## Review Focus
 
 - Live links at `writer.rs:12–14` and `:28` (`` embed_signature ``, `` embed_signature_fat ``, `` prepare_code_for_signing ``) must remain bracketed links — de-linking them is over-reach.
-- `embed_signature_in_place` (`signer.rs:780–801`) and its call sites (`:722`, `:733`) must survive untouched; the deletion boundary is `signer.rs:752–778` only.
+- `embed_signature_in_place` (`signer.rs:780–801` pre-edit) and its call sites (`:722`, `:733`) must survive untouched; the deletion boundary is `signer.rs:752–779` only (the `#[allow(dead_code)]` line, the function through `:778`, and the trailing blank at `:779` — removing the blank too leaves exactly one blank line after `SpecialSlotHashes`'s closing brace at `:750`, which removing `:752–778` alone would not).
 - Post-fix `cargo doc -p zsign-core --no-deps` must show **no** `unresolved link to \`write_signed_macho\`` warning. Pre-fix baseline measured on clean HEAD during implementation: 10 warnings / 7 unresolved-link — exactly 1 in-scope (`write_signed_macho`) plus 6 pre-existing in out-of-scope/deferred files — so the gate is a delta: unresolved-link 7 → 6, total 10 → 9, zero new warnings. (Ruling: the original "shows exactly one / expect 0" wording was contradicted by observed baseline; corrected before implementation.)
 - Post-deletion `grep -rn embed_signature_into_prepared crates/ fuzz/` must return **zero** hits, and the full `-p zsign-core` suite must stay green — a dangling reference would surface as a compile error here.
 - For a pure doc/dead-code removal the "failing test" is an observable check, not a new unit test: Task 1's red state is the `cargo doc` warning; Task 2's red state is the grep proving the dead, unreferenced function exists. Adding unit tests for either would pin implementation details; none are warranted, and the brief allows an existing-suite/`cargo doc` check to serve — stated here explicitly.
@@ -83,7 +83,7 @@ Expected: `0`. The doc run must exit 0 and the three alive links must still rend
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `signer.rs` no longer contains `embed_signature_into_prepared`; `embed_signature_in_place` (`:780–801`, calls at `:722`/`:733`) untouched; exactly one blank line remains between `SpecialSlotHashes` (closes `:751`) and `fn embed_signature_in_place`.
+- Produces: `signer.rs` no longer contains `embed_signature_into_prepared`; `embed_signature_in_place` (pre-edit `:780–801`, calls at `:722`/`:733`) untouched; exactly one blank line remains between `SpecialSlotHashes` (closes `:750`) and `fn embed_signature_in_place` (now at `:752`).
 
 - [ ] **Step 1: Capture the red state (deadness proof)**
 
@@ -93,9 +93,9 @@ grep -rn "embed_signature_into_prepared" crates/ fuzz/
 ```
 Expected FAIL state: exactly one hit — the `fn` definition at `crates/zsign-core/src/macho/signer.rs:753` (the `#[allow(dead_code)]` attribute at `:752` does not contain the identifier and does not match). Zero hits anywhere else proves no caller and no test exists. Save the output as before-evidence.
 
-- [ ] **Step 2: Delete lines 752–778**
+- [ ] **Step 2: Delete lines 752–779**
 
-Remove the entire `#[allow(dead_code)]` attribute line and the whole `fn embed_signature_into_prepared(...) -> Vec<u8> { … }` body (definition `signer.rs:753`, closing brace `:778`), so the file reads `}` (struct close, line 751), blank line, `fn embed_signature_in_place(`. Delete nothing else.
+Remove the entire `#[allow(dead_code)]` attribute line (752) and the whole `fn embed_signature_into_prepared(...) -> Vec<u8> { … }` (definition `signer.rs:753`, closing brace `:778`) together with the blank line at `:779`, so the file reads `}` (struct close, line 750), one blank line, `fn embed_signature_in_place(`. Delete nothing else.
 
 - [ ] **Step 3: Verify deletion is complete and self-consistent**
 
