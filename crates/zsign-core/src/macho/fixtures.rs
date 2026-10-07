@@ -106,6 +106,38 @@ pub fn make_minimal_dylib() -> Vec<u8> {
     data[12..16].copy_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
     data
 }
+/// [`make_minimal_macho`] with an extra `LC_SEGMENT_64 "__TEXT_EXEC"`
+/// command inserted after `__TEXT`, mirroring ld64's `-text_exec`
+/// ordering. Its vmaddr/fileoff/filesize deliberately differ from
+/// `__TEXT`'s, so a prefix-based capture of the executable segment is
+/// observable in tests.
+pub fn make_minimal_macho_text_exec() -> Vec<u8> {
+    let mut b = make_minimal_macho();
+    // mach_header_64: ncmds at 16..20, sizeofcmds at 20..24.
+    let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
+    b[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+    let sizeofcmds = u32::from_le_bytes(b[20..24].try_into().unwrap());
+    b[20..24].copy_from_slice(&(sizeofcmds + 72).to_le_bytes());
+
+    let mut cmd = Vec::new();
+    cmd.extend_from_slice(&0x19u32.to_le_bytes()); // LC_SEGMENT_64
+    cmd.extend_from_slice(&72u32.to_le_bytes()); // cmdsize
+    let mut segname = [0u8; 16];
+    segname[..11].copy_from_slice(b"__TEXT_EXEC");
+    cmd.extend_from_slice(&segname);
+    cmd.extend_from_slice(&0x1_0000_1000u64.to_le_bytes()); // vmaddr
+    cmd.extend_from_slice(&0x400u64.to_le_bytes()); // vmsize
+    cmd.extend_from_slice(&0x1400u64.to_le_bytes()); // fileoff
+    cmd.extend_from_slice(&0x400u64.to_le_bytes()); // filesize
+    cmd.extend_from_slice(&5u32.to_le_bytes()); // maxprot (r-x)
+    cmd.extend_from_slice(&5u32.to_le_bytes()); // initprot (r-x)
+    cmd.extend_from_slice(&0u32.to_le_bytes()); // nsects
+    cmd.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+    // After __TEXT: 32-byte header + 152-byte __TEXT command.
+    b.splice(32 + 152..32 + 152, cmd);
+    b
+}
 
 /// Minimal thin-armv7 (little-endian 32-bit) Mach-O bytes: `mach_header`
 /// (28 B), `LC_SEGMENT` (56 B + one 68 B section), 32-bit `__LINKEDIT`.
@@ -184,6 +216,37 @@ pub fn make_minimal_macho_32() -> Vec<u8> {
     b.resize(0x1000, 0);
     b.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
     b.resize(0x2000, 0);
+    b
+}
+/// [`make_minimal_macho_32`] with an extra `LC_SEGMENT "__TEXT_EXEC"`
+/// command inserted after `__TEXT`, mirroring ld64's `-text_exec`
+/// ordering. Its vmaddr/fileoff/filesize differ from `__TEXT`'s so a
+/// prefix-based capture of the executable segment is observable.
+pub fn make_minimal_macho_32_text_exec() -> Vec<u8> {
+    let mut b = make_minimal_macho_32();
+    // mach_header: ncmds at 16..20, sizeofcmds at 20..24.
+    let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
+    b[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+    let sizeofcmds = u32::from_le_bytes(b[20..24].try_into().unwrap());
+    b[20..24].copy_from_slice(&(sizeofcmds + 56).to_le_bytes());
+
+    let mut cmd = Vec::new();
+    cmd.extend_from_slice(&0x01u32.to_le_bytes()); // LC_SEGMENT
+    cmd.extend_from_slice(&56u32.to_le_bytes()); // cmdsize
+    let mut segname = [0u8; 16];
+    segname[..11].copy_from_slice(b"__TEXT_EXEC");
+    cmd.extend_from_slice(&segname);
+    cmd.extend_from_slice(&0x3000u32.to_le_bytes()); // vmaddr
+    cmd.extend_from_slice(&0x400u32.to_le_bytes()); // vmsize
+    cmd.extend_from_slice(&0x1400u32.to_le_bytes()); // fileoff
+    cmd.extend_from_slice(&0x400u32.to_le_bytes()); // filesize
+    cmd.extend_from_slice(&5u32.to_le_bytes()); // maxprot (r-x)
+    cmd.extend_from_slice(&5u32.to_le_bytes()); // initprot (r-x)
+    cmd.extend_from_slice(&0u32.to_le_bytes()); // nsects
+    cmd.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+    // After __TEXT: 28-byte header + 124-byte __TEXT command.
+    b.splice(28 + 124..28 + 124, cmd);
     b
 }
 

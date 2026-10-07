@@ -161,6 +161,11 @@ impl ArchSlice {
     }
 }
 
+/// `__TEXT` as it appears in a 16-byte segment-name field: 6 name
+/// bytes followed by 10 NULs. Compared for exact equality, matching
+/// Apple's `findSegment("__TEXT")`.
+const TEXT_SEGMENT_NAME: [u8; 16] = *b"__TEXT\0\0\0\0\0\0\0\0\0\0";
+
 impl MachOFile {
     /// Parses a Mach-O binary from in-memory data.
     ///
@@ -274,7 +279,7 @@ impl MachOFile {
                     meta_code_sig_cmd = Some((lc.offset, cs.dataoff, cs.datasize));
                 }
                 CommandVariant::Segment64(ref seg) => {
-                    if seg.segname.starts_with(b"__TEXT") {
+                    if seg.segname == TEXT_SEGMENT_NAME {
                         text_segment_size = seg.filesize;
                         text_segment_base = seg.vmaddr;
                         text_segment_fileoff = seg.fileoff;
@@ -291,7 +296,7 @@ impl MachOFile {
                     }
                 }
                 CommandVariant::Segment32(ref seg) => {
-                    if seg.segname.starts_with(b"__TEXT") {
+                    if seg.segname == TEXT_SEGMENT_NAME {
                         text_segment_size = seg.filesize as u64;
                         text_segment_base = seg.vmaddr as u64;
                         text_segment_fileoff = seg.fileoff as u64;
@@ -643,6 +648,75 @@ mod tests {
         assert_eq!(
             slice.text_segment_size, 0x1000,
             "file-backed size (the filesize rider field)"
+        );
+    }
+
+    #[test]
+    fn test_text_segment_selection_ignores_text_exec() {
+        let data = crate::macho::fixtures::make_minimal_macho_text_exec();
+        let macho = MachOFile::parse(data).expect("fixture must parse");
+        let slice = &macho.slices()[0];
+        assert_eq!(
+            slice.text_segment_fileoff, 0x1000,
+            "execSegBase input must come from the exact __TEXT segment, not a __TEXT* prefix match"
+        );
+        assert_eq!(
+            slice.text_segment_size, 0x1000,
+            "execSegLimit input must come from the exact __TEXT segment, not a __TEXT* prefix match"
+        );
+        assert_eq!(
+            slice.text_segment_base, 0x1_0000_0000,
+            "vmaddr must come from the exact __TEXT segment, not a __TEXT* prefix match"
+        );
+    }
+
+    #[test]
+    fn test_text_segment_selection_ignores_text_exec_32() {
+        let data = crate::macho::fixtures::make_minimal_macho_32_text_exec();
+        let macho = MachOFile::parse(data).expect("fixture must parse");
+        let slice = &macho.slices()[0];
+        assert!(!slice.is_64, "armv7 fixture must be 32-bit");
+        assert_eq!(
+            slice.text_segment_fileoff, 0x1000,
+            "32-bit execSegBase input must come from the exact __TEXT segment"
+        );
+        assert_eq!(
+            slice.text_segment_size, 0x1000,
+            "32-bit execSegLimit input must come from the exact __TEXT segment"
+        );
+        assert_eq!(
+            slice.text_segment_base, 0x1000,
+            "32-bit vmaddr must come from the exact __TEXT segment"
+        );
+    }
+
+    #[test]
+    fn test_exec_seg_fields_ignore_text_exec() {
+        let data = crate::macho::fixtures::make_minimal_macho_text_exec();
+        let macho = MachOFile::parse(data).expect("fixture must parse");
+        let signed =
+            crate::macho::sign_macho_adhoc(&macho, "com.example.textexec", None, None, None, false)
+                .expect("sign must succeed");
+        let reparsed = MachOFile::parse(signed.clone()).expect("signed output parses");
+        let slice = &reparsed.slices()[0];
+        let off = slice.code_sig_offset.expect("signed") as usize;
+        let size = slice.code_sig_size.expect("signed") as usize;
+        let superblob = crate::codesign::verify::parse_superblob(&signed[off..off + size])
+            .expect("embedded superblob parses");
+        let cd = superblob
+            .code_directory
+            .as_ref()
+            .expect("code directory present");
+        let raw = cd.raw();
+        let exec_seg_base = u64::from_be_bytes(raw[64..72].try_into().unwrap());
+        let exec_seg_limit = u64::from_be_bytes(raw[72..80].try_into().unwrap());
+        assert_eq!(
+            exec_seg_base, 0x1000,
+            "execSegBase must be __TEXT.fileoff, not __TEXT_EXEC's"
+        );
+        assert_eq!(
+            exec_seg_limit, 0x1000,
+            "execSegLimit must be __TEXT.filesize, not __TEXT_EXEC's"
         );
     }
 }
