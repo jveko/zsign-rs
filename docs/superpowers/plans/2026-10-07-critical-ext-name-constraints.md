@@ -320,7 +320,7 @@ fn self_issued_certificate_skips_constraints_unless_final() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core name_constraint`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- permitted_directory_name excluded_ empty_name_constraints non_default_subtree non_critical_name_constraints self_issued_certificate`
 Expected: FAIL — helpers don't exist yet (compile error), or if written
 first, fixtures currently verify with `ok=true`.
 
@@ -344,7 +344,7 @@ first, fixtures currently verify with `ok=true`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core name_constraint`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- permitted_directory_name excluded_ empty_name_constraints non_default_subtree non_critical_name_constraints self_issued_certificate`
 Expected: PASS (all eight).
 
 - [ ] **Step 5: Scoped regression run**
@@ -491,7 +491,7 @@ in the `extend` closure.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- dns_constraint uri email_constraint legacy_email unsupported_ip comparison_budget constraint_form`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- dns_subtree dns_constraint uri email_constraint legacy_email unsupported_ip comparison_budget constraint_form`
 Expected: FAIL — SAN names are not evaluated yet (Task 2's helper only
 handles directoryName): the DNS/URI/email/IP cases verify or fail with the
 wrong reason; compile-time if helpers are absent.
@@ -505,7 +505,7 @@ comparisons only.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- dns_constraint uri email_constraint legacy_email unsupported_ip comparison_budget constraint_form`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- dns_subtree dns_constraint uri email_constraint legacy_email unsupported_ip comparison_budget constraint_form`
 Expected: PASS (all nine).
 
 - [ ] **Step 5: Full scoped gate**
