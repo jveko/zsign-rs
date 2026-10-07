@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Files in scope ONLY: `crates/zsign-core/src/codesign/der.rs` and `crates/zsign-core/src/codesign/constants.rs` (plus their inline `#[cfg(test)]` modules). Nothing else — no `macho/`, no `crypto/`, no `superblob.rs` comment edits, no drive-by refactors.
-- Do NOT remove the `Error::DerEncoding(String)` variant (error.rs:37-38) — only the `"Empty DER output"` construction site.
+- Do NOT remove the `Error::DerEncoding(String)` variant (`crates/zsign-core/src/error.rs:37-38`) — only the `"Empty DER output"` construction site.
 - Keep every constant with any workspace reference (56 of 122); delete exactly the 66 definition-only ones listed in Task 2.
 - Zero new warnings: `cargo clippy -p zsign-core --all-targets -- -D warnings` must stay clean.
 - No `TODO`/stubs/placeholders; no commits by subagents (controller commits); ticket ID never in code comments.
@@ -34,7 +34,7 @@ These map to Task 1 steps 2/3 and Task 2 steps 1/3/4 below.
 ## Task 1: Remove unreachable empty-DER branch in `plist_to_der`
 
 **Files:**
-- Modify: `crates/zsign-core/src/codesign/der.rs` (function tail at :375-379; `# Errors` bullet at :327)
+- Modify: `crates/zsign-core/src/codesign/der.rs` (function tail at :375-379; `# Errors` bullet at :324)
 - Test: none created — this is pure dead-code removal; the EXISTING suite is the regression proof (stated explicitly per brief). The `Err` arm was unexercisable, so no test can fail-then-pass on its removal; `test_plist_to_der_empty` (der.rs:451-466) already pins the observable output.
 
 **Interfaces:**
@@ -178,8 +178,8 @@ After deletion, the Opcodes group (all 24 `OP_*`) and the Match group (all 15 `M
 
 - [ ] **Step 4: Verify zero survivors and zero references**
 
-Run: `grep -rn -E "\b(CSMAGIC_DETACHED_SIGNATURE|OP_AND|MATCH_EQUAL|CS_VALID|CSREQ_HOST)\b" crates/ fuzz/` (spot check; repeat per-identifier as needed)
-Expected: no output — and for the full list, no identifier from Step 1 appears anywhere outside git history.
+Run, looping the full 66-identifier list from Step 1 (e.g. `while read -r id; do grep -rn "\b$id\b" crates/ fuzz/; done < dead-ids.txt`):
+Expected: the ONLY hits are (a) each remaining constants.rs definition+doc match from the pre-delete state — i.e. after deletion, no hits at all inside `constants.rs` — plus (b) the pre-existing comment-only mentions in `crates/zsign-core/src/codesign/superblob.rs:368,369,376,377,378,379,385,397` for `OP_*`/`MATCH_*` names (out of scope, comments only, no code hits). Any code hit anywhere else means the deletion must not proceed for that identifier — keep it and report instead.
 Run: `cargo test -p zsign-core` (doctests included → catches broken intra-doc links in constants.rs:1-34)
 Expected: PASS, identical suite to the pre-edit run of the same command (deletion must not remove or skip any test).
 
