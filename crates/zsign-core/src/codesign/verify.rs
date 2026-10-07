@@ -299,8 +299,9 @@ fn evaluate_expr(expr: &Expr, ctx: &RequirementContext<'_>) -> Tri {
             Some(_) => Tri::False,
             None => Tri::Unknown,
         },
-        // Apple's interpreter is boolean: no certificate chain (ad-hoc or
-        // unsigned code) evaluates anchor checks to false, never unknown.
+        // Apple's interpreter is boolean: with no usable chain signal
+        // (ad-hoc or unsigned code, or no CMS report) anchor checks
+        // evaluate to false, never unknown.
         Expr::AppleAnchor | Expr::AppleGenericAnchor => match ctx.anchored {
             Some(true) => Tri::True,
             Some(false) => Tri::False,
