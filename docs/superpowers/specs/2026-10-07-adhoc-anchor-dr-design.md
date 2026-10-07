@@ -19,8 +19,8 @@ instead of passing with a warning.
   `Expr::AppleAnchor | Expr::AppleGenericAnchor` maps `anchored: None` to `Tri::Unknown`.
 - `crates/zsign-core/src/codesign/verify.rs:278-280` —
   `Tri::Unknown` becomes `RequirementVerdict::Unsupported("boolean context unevaluable")`,
-  which `macho/verify.rs:447-450` turns into a **warning**; `SliceVerifyReport::is_valid()`
-  (`macho/verify.rs:61-63`) only inspects `errors`, so the slice still verifies.
+  which `macho/verify.rs:449-451` turns into a **warning**; `SliceVerifyReport::is_valid()`
+  (`macho/verify.rs:62-64`) only inspects `errors`, so the slice still verifies.
 
 Net effect: a DR demanding an Apple anchor is silently satisfied by an
 ad-hoc or unsigned binary.
@@ -63,9 +63,12 @@ One match arm: `Expr::AppleAnchor | Expr::AppleGenericAnchor` with
 - Matches Apple's interpreter exactly (boolean; absent chain ⇒ false).
 - Composes correctly: `Not(anchor apple)` on `None` ⇒ `True`; `And(ident-ok,
   anchor)` ⇒ `False` ⇒ `Violated` ⇒ existing error
-  `"designated requirement not satisfied"`; a `False` arm short-circuits ahead
-  of `Unsupported` in `And`, so real Apple DRs that pair `anchor apple` with
-  unsupported cert-chain opcodes still fail closed.
+  `"designated requirement not satisfied"`; within the supported-opcode
+  subset the `False` arm short-circuits ahead of `Unsupported` in `And`, so a
+  `False` anchor never degrades to a warning there. Caveat: DRs containing
+  unsupported cert-chain opcodes are collapsed to `Expr::Unsupported` at
+  parse time (`codesign/verify.rs:385-406`) and never reach evaluation —
+  that warning-only path is a separate, out-of-scope gap.
 - Identifier/cdhash DRs on ad-hoc slices are untouched (`anchored` unused).
 - Blast radius is tiny: `Tri` is private, `Requirement::evaluate` has a single
   production caller (`macho/verify.rs:445`); no facade/CLI code touches

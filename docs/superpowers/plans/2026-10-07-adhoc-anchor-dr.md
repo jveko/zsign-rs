@@ -85,6 +85,18 @@ fn anchor_requirement_fails_without_a_known_anchor() {
     assert_eq!(dr.evaluate(&ctx(Some(false))), RequirementVerdict::Violated);
     assert_eq!(dr.evaluate(&ctx(Some(true))), RequirementVerdict::Satisfied);
 
+    // opAnchorAppleGeneric (15) shares the arm: absent anchor must fail too.
+    let generic_dr = parse_requirements(&req_blob_with_dr(&15u32.to_be_bytes()))
+        .unwrap()
+        .designated()
+        .expect("dr present");
+    assert_eq!(
+        generic_dr.evaluate(&ctx(None)),
+        RequirementVerdict::Violated,
+        "anchor apple generic must fail without a known anchor, got {:?}",
+        generic_dr.evaluate(&ctx(None))
+    );
+
     // Not(anchor apple) with no known anchor is satisfied (boolean complement).
     let mut not_expr = 9u32.to_be_bytes().to_vec(); // opNot
     not_expr.extend_from_slice(&3u32.to_be_bytes()); // opAnchorApple
