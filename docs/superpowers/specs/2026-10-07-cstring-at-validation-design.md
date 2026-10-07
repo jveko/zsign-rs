@@ -49,8 +49,8 @@ Files in scope — nothing else may be touched:
   region end is never stored on the struct (`verify.rs:492-527`).
 - Consumers of a fabricated value: `macho/verify.rs:183` (`report.identifier`, JSON
   `null`-able field surfaced by the CLI) and `macho/verify.rs:441` → `RequirementContext`
-  → `Expr::Ident` maps `None` to `Tri::Unknown` (`macho/verify.rs:296-301`), which
-  surfaces as an `Unsupported` **warning**, never an error.
+  → `Expr::Ident` maps `None` to `Tri::Unknown` (`codesign/verify.rs:293-301`), which
+  surfaces as an `Unsupported` **warning** (`macho/verify.rs:449-451`), never an error.
 - No existing test relies on the lenient behavior. Every fixture places the identifier
   canonically: `synth_cd` writes `identOffset = 44 + tail.len() == header_size` with
   `b"x\0"` (`verify.rs:1692-1708`), exercised for all seven header sizes
@@ -108,7 +108,7 @@ that run *after* the two existing hash-region checks (`expected_tail` :706-717,
 `n_special` :718-721). The relocation is load-bearing: once `n_special <=
 hash_offset / hash_size` holds, `string_end = hash_offset - n_special * hash_size`
 cannot underflow on any width (the product is ≤ `hash_offset`, and `hash_size` was
-already validated to 20 or 32 at :683-689), and `string_end <= data.len()` follows
+already validated to 20 or 32 at :681-689), and `string_end <= data.len()` follows
 from `expected_tail <= data.len()`. Rules, per string that exists (identifier always;
 team only when `team_offset` is `Some`, i.e. the kernel's own gate):
 
@@ -120,7 +120,7 @@ team only when `team_offset` is `Some`, i.e. the kernel's own gate):
 
 `Error::Verification(String)` is the sole convention for malformed-CD parse failures
 in this file (:545, :553, :560, :578, :604, :611, :644, :650, :669, :693, :701, :715,
-:719 — `crates/zsign-core/src/error.rs:37-38`), so no new variant is introduced. The
+:719 — `crates/zsign-core/src/error.rs:40-41`), so no new variant is introduced. The
 two old messages ("...offset out of bounds") are subsumed by the region message
 (`string_end <= data.len()`, so any offset that failed the old check fails the new
 one); no test or consumer matches those payloads (wasm maps the variant, not the

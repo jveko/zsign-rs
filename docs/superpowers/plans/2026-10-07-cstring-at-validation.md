@@ -25,8 +25,8 @@ argues from the spec; executors read both.
   bounds block, accessor doc comments, inline `#[cfg(test)]` module). Nothing else — no
   `macho/`, no `code_directory.rs` (builder), no `error.rs`, no other tickets' findings.
 - No public API change: `identifier()`/`team_id()` keep `Option<&'a str>`; no new error
-  variants (`Error::Verification(String)` only, `crates/zsign-core/src/error.rs:37-38`);
-  no new imports (the `use` block at `verify.rs:26-29` stays as-is).
+  variants (`Error::Verification(String)` only, `crates/zsign-core/src/error.rs:40-41`);
+  no new imports (the `use` block at `verify.rs:28-31` stays as-is).
 - No `TODO`/stubs/placeholders; ticket ID never appears in code comments; subagents do not
   commit (the controller commits after each green task).
 - Error assertions follow the file's dominant pattern:
@@ -65,7 +65,7 @@ These map to Task 1 steps 1/3 and Task 2 steps 1/3/4 below.
 
 **Files:**
 - Modify: `crates/zsign-core/src/codesign/verify.rs` — helper at `:826-831`
-- Test: same file, inline `#[cfg(test)] mod tests` (module at `:1247`)
+- Test: same file, inline `#[cfg(test)] mod tests` (module at `:1247-1248`)
 
 **Interfaces:**
 - Consumes: nothing new (private free function, in-module only).
@@ -313,12 +313,27 @@ above the string checks — with:
 
 Notes for the implementer: `team_offset`'s definition moves into this block (it is only
 consumed by the struct literal after it); `hash_size` is validated to 20 or 32 before this
-point, so the division is safe; `Result` is already imported (`verify.rs:27`); no import
-changes. Then update the accessor docs:
+point, so the division is safe; `Result` is already imported (`verify.rs:29`); no import
+changes. Then replace both accessor doc comments in full with these contiguous blocks:
 
-- `:744` → `/// The bundle identifier recorded in the CodeDirectory.` plus a blank doc
-  line and: `/// Offsets and terminators are validated by [`CodeDirectory::parse`]; [`None`]\n/// here means the identifier bytes are not valid UTF-8.`
-- `:749` → keep the first line, add: `/// [`None`] also means the directory records no\n/// team ID (offset 0, or versions before 0x20200); offsets and terminators are validated\n/// by [`CodeDirectory::parse`.`
+```rust
+    /// The bundle identifier recorded in the CodeDirectory.
+    ///
+    /// [`CodeDirectory::parse`] validates the offset's region and terminator;
+    /// [`None`] here means the identifier bytes are not valid UTF-8.
+    pub fn identifier(&self) -> Option<&'a str> {
+```
+
+```rust
+    /// The team ID recorded in the CodeDirectory, if any.
+    ///
+    /// [`None`] also means the directory records no team ID (offset 0, or
+    /// versions before 0x20200); offsets and terminators are validated by
+    /// [`CodeDirectory::parse`].
+    pub fn team_id(&self) -> Option<&'a str> {
+```
+
+(The function bodies stay unchanged.)
 
 - [ ] **Step 4: Run the six tests, confirm green**
 
