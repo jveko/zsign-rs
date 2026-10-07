@@ -201,7 +201,7 @@ variant is a hard compile error in a wave-6 file plus a new stable JS code (its 
 
 | Condition | Error | JS code |
 |---|---|---|
-| password given, plaintext undecryptable: PKCS#7 padding invalid, **or** padding valid but the DER/SPKI pairing check fails (the 1-in-256 case) | `Error::InvalidPassword` (`error.rs:19-20`, Display already says "private key or PKCS#12"; constructed nowhere today — this ticket makes it real) | `ZSIGN_INVALID_PASSWORD` |
+| password given, plaintext undecryptable: PKCS#7 padding invalid, **or** padding valid but the DER/SPKI pairing check fails (the 1-in-256 case) | `Error::InvalidPassword` (`error.rs:19-20`, Display already says "private key or PKCS#12"; now constructed by the wrong-password paths in `cert.rs`, `encrypted_pem.rs`, `pkcs12.rs`) | `ZSIGN_INVALID_PASSWORD` |
 | encryption we will not perform: unknown/weak `DEK-Info` cipher, PBES2 scheme or PRF outside the in-tree matrix, scrypt KDF, PBES1 (`pkcs-5 v1.5`) | `Error::Certificate("unsupported key encryption: <name or OID>")` | `ZSIGN_INVALID_CERTIFICATE` |
 | encrypted key, no password supplied | `Error::Certificate("encrypted private key requires a password (-p or ZSIGN_PASSWORD)")` | `ZSIGN_INVALID_CERTIFICATE` |
 | malformed container before any decryption attempt | `Error::Certificate("failed to parse encrypted private key: …")` | `ZSIGN_INVALID_CERTIFICATE` |
