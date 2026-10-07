@@ -993,6 +993,11 @@ fn verify_signed_data(
                 }
             },
         };
+        if !digest_alg_oids.contains(&dig_oid) {
+            global_errors.push(format!(
+                "digestAlgorithms does not include the SignerInfo digest algorithm {dig_oid}"
+            ));
+        }
 
         // signedAttrs [0] — capture raw bytes (the signed message).
         let attrs_start = usize::try_from(si_r.position()).unwrap_or(0);
@@ -3166,6 +3171,46 @@ mod tests {
             "non-SET digestAlgorithms must fail with Error::Verification, got {:?}",
             res.as_ref().err()
         );
+    }
+
+    #[test]
+    fn digest_algorithms_missing_signer_digest_fails_verification() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let sha1 = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+
+        // Structurally valid SETs that do not list the SHA-256 SignerInfo digest:
+        // (a) SHA-1 only, (b) empty (RFC 5652 §5.1 allows zero elements).
+        let sha1_only = der_tlv(0x31, &der_tlv(0x30, &sha1.to_der().unwrap()));
+        let empty = der_tlv(0x31, &[]);
+        for (label, new_set) in [
+            ("sha1-only", sha1_only.as_slice()),
+            ("empty", empty.as_slice()),
+        ] {
+            let bad = replace_digest_algs(&cms, new_set);
+            let report = verify_code_signature_with_anchors(
+                &wrap(&bad),
+                content,
+                None,
+                &cd_sha256,
+                &anchors_for(&creds),
+            )
+            .unwrap_or_else(|e| panic!("{label}: mismatch must stay report-based, got {e:?}"));
+            assert!(
+                !report.valid,
+                "{label}: mismatch must fail verification, report: {report:?}"
+            );
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("digestAlgorithms") && e.contains("2.16.840.1.101.3.4.2.1")),
+                "{label}: errors: {:?}",
+                report.errors
+            );
+        }
     }
 
     #[test]
