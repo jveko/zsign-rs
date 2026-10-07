@@ -25,7 +25,7 @@ fixtures), inline `#[cfg(test)]` modules.
   CLI, wasm, other crypto modules untouched.
 - Failure reasons are lowercase prose, returned via
   `ChainOutcome { ok: false, anchored: false, reason: Some(..) }` — the
-  existing convention (cf. `issuer_ca_reason` at `:1667-1692`).
+  existing convention (cf. `issuer_ca_reason` at `:1667-1694`).
 - No ticket IDs anywhere (code, comments, docs, commit messages).
 - Zero-warning gate: `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`.
 - Tests run with `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test …`.
@@ -42,15 +42,24 @@ fixtures), inline `#[cfg(test)]` modules.
 ## Review Focus
 
 - Leaf, every in-walk parent, and the embedded self-signed root each get the
-  critical-gate exactly once; the out-of-chain trust anchor resolved by
-  `anchors.find_by_subject` gets neither gate nor constraints (§6.2).
+  critical-gate exactly once — pinned by
+  `self_signed_root_with_unknown_critical_rejects` and
+  `unknown_critical_extension_rejects_an_intermediate` (Task 1); the
+  out-of-chain trust anchor resolved by `anchors.find_by_subject` gets
+  neither gate nor constraints (§6.2) — pinned by
+  `out_of_chain_anchor_extensions_are_ignored` (Task 1).
 - Positive control: an unknown **non-critical** extension still verifies —
   pinned by Task 1.
 - Excluded beats permitted unconditionally; permitted is at-least-one-match —
   pinned by Task 2.
 - Empty nameConstraints and non-default `minimum`/`maximum` reject — pinned
-  by Task 2.
+  by Task 2 (`…maximum_rejects`, `…minimum_rejects`).
 - A constraint with no instance of its name form is inert — pinned by Task 3.
+- Email host-form constraints are exact-domain (subdomains need the
+  leading-period form); URI plain form is host-only — pinned by Task 3.
+- The legacy DN-email rule fires only when the certificate has no
+  subjectAltName extension, and the fixture proves it carries the matched
+  OID — pinned by Task 3.
 - Comparison budget caps attacker-shaped constraint lists — pinned by Task 3.
 
 ---
@@ -65,12 +74,17 @@ fixtures), inline `#[cfg(test)]` modules.
 
 **Interfaces:**
 - Consumes: `x509_cert::ext::Extension { extn_id, critical, .. }`,
-  `ObjectIdentifier` (imported at `:45`), `ChainOutcome` (`:1322-1334`),
+  `ObjectIdentifier` (imported at `:45`), `ChainOutcome` (`:1322-1333`),
   `verify_chain` (`:1362`), test helpers `build_rsa_root` (`:2405`),
   `build_leaf` (`:2444`), `chain_with` (`:2433`).
 - Produces:
   - `fn unrecognized_critical(cert: &x509_cert::Certificate) -> Option<ObjectIdentifier>` (private)
-  - `const OID_CE_SUBJECT_KEY_IDENTIFIER / OID_CE_KEY_USAGE / OID_CE_SUBJECT_ALT_NAME / OID_CE_BASIC_CONSTRAINTS / OID_CE_NAME_CONSTRAINTS / OID_CE_EXT_KEY_USAGE` — the last four exist already as `OID_*` for 14/15/19/37; reuse those and add only the missing ones (`2.5.29.17`, `2.5.29.30`) in the same style. Task 2 consumes `OID_CE_NAME_CONSTRAINTS`.
+  - OID consts: REUSE the existing `OID_SUBJECT_KEY_IDENTIFIER` (`:110`),
+    `OID_KEY_USAGE` (`:112`), `OID_BASIC_CONSTRAINTS` (`:114`),
+    `OID_EXT_KEY_USAGE` (`:116`); ADD only `OID_SUBJECT_ALT_NAME` (`2.5.29.17`)
+    and `OID_NAME_CONSTRAINTS` (`2.5.29.30`) in the same
+    `const OID_*: ObjectIdentifier = ObjectIdentifier::new_unwrap("…")` style
+    with one-line `///` docs. Task 2 consumes `OID_NAME_CONSTRAINTS`.
   - Reason string format: `certificate has unrecognized critical extension {oid}` (lowercase, `{oid}` = dotted form).
 
 - [ ] **Step 1: Test-only extension authoring types**
@@ -118,25 +132,53 @@ fn unknown_critical_extension_rejects_an_intermediate() {
     // root -> subca(with UnknownCritical via signed builder) -> leaf
     // assert reason names 2.999.1, !out.ok
 }
+
+#[test]
+fn self_signed_root_with_unknown_critical_rejects_the_chain() {
+    // root built Profile::Root with UnknownCritical (signed builder);
+    // leaf issued by that root. The root is first accepted as the leaf's
+    // parent (Hook B) before the walk reaches the self-signed terminal.
+    // assert !out.ok and reason names 2.999.1.
+}
+
+#[test]
+fn out_of_chain_anchor_extensions_are_ignored() {
+    // root built Profile::Root carrying UnknownCritical AND an excluded
+    // nameConstraints subtree matching the leaf subject (signed builder).
+    // Chain: verify_chain(&[leaf], leaf, &TrustAnchors::from_certificates(
+    // vec![root]), time_now(), SignerPurpose::CodeSigning) — the issuer is
+    // resolved via anchors.find_by_subject, which is §6.2 anchor territory:
+    // assert out.ok && out.anchored (footer prints out.reason) — neither the
+    // unknown critical extension nor the constraints of an out-of-chain
+    // trust anchor gate or fail the path.
+}
 ```
 
 Note: `build_leaf`/`build_subca_issued_by` currently take fixed arguments —
-add ONE new helper `fn build_leaf_signed(cn, issuer, issuer_signing, extend:
-&dyn FnOnce(&mut CertificateBuilder<…>))`… (or the equivalent generic form)
-that delegates to the same construction but runs `extend` before
-`build::<rsa::pkcs1v15::Signature>()`, and the analogous
-`build_subca_issued_by_signed`. Do not modify existing helpers; existing
+add ONE generic extension hook per builder, e.g.
+`fn build_leaf_signed(cn: &str, issuer: &x509_cert::name::Name,
+issuer_signing: &rsa::pkcs1v15::SigningKey<Sha256>, extend:
+impl FnOnce(&mut CertificateBuilder<rsa::pkcs1v15::SigningKey<Sha256>>))`
+(`build_subca_issued_by_signed` analogous), that delegates to the same
+construction but invokes `extend` before
+`build::<rsa::pkcs1v15::Signature>()`. Generic `impl FnOnce`, NOT
+`&dyn FnOnce` (a `FnOnce` cannot be called through `&dyn`, and the builder
+is generic over its signer type). Do not modify existing helpers; existing
 tests must compile unchanged.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_`
-Expected: FAIL — leaf/intermediate fixtures currently verify
-(`ok=true, anchored=true`); the reason footer shows the actual outcome.
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
+Expected: the three rejection tests FAIL — leaf/intermediate/root fixtures
+currently verify (`ok=true, anchored=true`); the reason footers show the
+actual outcomes. `out_of_chain_anchor_extensions_are_ignored` PASSES already
+and is a standing guard: it fails only if a future change wrongly applies
+the gate/evaluation to an out-of-chain anchor.
 
 - [ ] **Step 4: Implement the gate**
 
-- Add the two missing OID consts (`2.5.29.17`, `2.5.29.30`) in the existing
+- Reuse the existing four OID consts and add the two missing ones
+  (`OID_SUBJECT_ALT_NAME`, `OID_NAME_CONSTRAINTS`) in the existing
   `const OID_*` style with one-line `///` docs.
 - `fn unrecognized_critical(cert) -> Option<ObjectIdentifier>` iterating
   `cert.tbs_certificate.extensions`, returning the first `e.critical` entry
@@ -144,12 +186,16 @@ Expected: FAIL — leaf/intermediate fixtures currently verify
 - Hook A — `verify_chain` entry, before the purpose gate:
   `if let Some(oid) = unrecognized_critical(leaf) { return ChainOutcome { ok: false, anchored: false, subjects: names, reason: Some(format!("certificate has unrecognized critical extension {oid}")), warnings }; }`
 - Hook B — parent branch, directly after the `issuer_ca_reason(p, …)` block,
-  same construction with `p`.
+  same construction with `p`. (This also covers the embedded self-signed
+  root: it passes through the parent branch as `p` while `current` is still
+  its child; the `!ptr::eq` guard only rejects the later self-match.)
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_`
-Expected: PASS (all three).
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core unknown_ self_signed_root_with_unknown_critical out_of_chain_anchor`
+Expected: PASS — the four rejection/control tests green, and
+`out_of_chain_anchor_extensions_are_ignored` proves the anchor path never
+hits the gate.
 
 - [ ] **Step 6: Scoped regression run**
 
@@ -166,7 +212,7 @@ critical BC/KU/EKU (all in the processed set), so nothing regresses.
   helpers, `verify_chain` hook, inline tests.
 
 **Interfaces:**
-- Consumes: `OID_CE_NAME_CONSTRAINTS` and the `verify_chain` hooks from
+- Consumes: `OID_NAME_CONSTRAINTS` and the `verify_chain` hooks from
   Task 1; `x509_cert::ext::pkix::constraints::NameConstraints` /
   `GeneralSubtrees` / `GeneralSubtree`; test helpers
   `build_rsa_root`/`build_leaf`/`build_subca`/`chain_with`.
@@ -234,6 +280,12 @@ fn non_default_subtree_maximum_rejects() {
     // "specifies minimum or maximum"
 }
 #[test]
+fn non_default_subtree_minimum_rejects() {
+    // GeneralSubtree { base: DnsName("example.com"), minimum: 1,
+    // maximum: None } permitted -> same "specifies minimum or maximum"
+    // reason (the RFC's floor is minimum == 0 AND maximum absent)
+}
+#[test]
 fn non_critical_name_constraints_are_enforced() {
     // excluded subtree via the non-critical authoring wrapper, matching the
     // leaf subject -> !ok with the excluded reason (recognized => processed)
@@ -279,7 +331,7 @@ first, fixtures currently verify with `ok=true`.
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core name_constraint`
-Expected: PASS (all seven).
+Expected: PASS (all eight).
 
 - [ ] **Step 5: Scoped regression run**
 
@@ -303,17 +355,30 @@ hook is inert on them.
   and `uri name constraint cannot be applied to a uri without a host`;
   `budget` semantics (increment per same-form (name, subtree) comparison).
 
-Name matching rules (from the spec; each returns match / no-match):
-- **dNSName:** strip an optional leading `.` from the constraint, then
-  case-insensitive equality or `name.ends_with(".{constraint}")`.
-- **rfc822Name:** a constraint containing `@` matches the full address
-  (case-insensitive); otherwise it matches the address's domain subtree with
-  the dNSName rule.
-- **URI:** apply the dNSName rule to the URI's host
+Name matching rules (RFC 5280 §4.2.1.10 verbatim semantics; each returns
+match / no-match):
+- **dNSName:** "Any DNS name that can be constructed by simply adding zero
+  or more labels to the left-hand side of the name satisfies the name
+  constraint" — case-insensitive equality with the constraint, or
+  `name.ends_with(".{constraint}")`. A leading `.` on a dNSName constraint
+  (undefined by the RFC) uses the period form below: strict subdomain match
+  against the remainder, equality excluded.
+- **rfc822Name:** three forms — a constraint containing `@` matches the
+  full address exactly (case-insensitive; emailAddress attribute values are
+  not case-sensitive per §4.1.2.2); a constraint beginning with `.` matches
+  address domains that are strict subdomains of the remainder (".example.com"
+  matches `a.example.com`, NOT `example.com`); a plain host constraint
+  matches only when the address's domain EQUALS the constraint ("example.com"
+  is satisfied by any address at the host `example.com`, not its
+  subdomains).
+- **URI:** apply to the host only
   (`scheme://[userinfo@]host[:port]/…` — host is the span between `//` and
-  the next `/`, `?`, `#`, after stripping `userinfo@` and `:port`). A URI
-  instance whose authority has no host, under any URI constraint, rejects
-  with the fixed `uri name constraint…` reason.
+  the next `/`, `?`, `#`, after stripping `userinfo@` and `:port`). Plain
+  constraint ⇒ host equality; leading-period constraint ⇒ host is a strict
+  subdomain of the remainder. A URI instance whose authority has no host or
+  names an IP address, under any URI constraint, rejects with the fixed
+  `uri name constraint…` reason ("the application MUST reject the
+  certificate").
 - Forms without a matcher (iPAddress, otherName, ediPartyName,
   registeredId): if a constraint on that form exists and an instance of that
   form appears in the evaluated certificate ⇒ `unsupported name form under
@@ -322,10 +387,15 @@ Name matching rules (from the spec; each returns match / no-match):
 
 Evaluated name instances per certificate: subject DN (directoryName) +
 every `subjectAltName` entry (all forms; critical or not) + the legacy rule:
-when the certificate has **no subjectAltName extension at all**, each
-`emailAddress` attribute in the subject DN (OID
-`0.9.2342.19200300.100.1.1`) counts as an rfc822Name instance (§4.2.1.10
-legacy rule as cited in the spec). Per form: excluded match ⇒ excluded
+when the certificate does **not include a subject alternative name extension
+at all**, each `emailAddress` attribute in the subject DN counts as an
+rfc822Name instance — RFC 5280 §4.2.1.10: "When constraints are imposed on
+the rfc822Name name form, but the certificate does not include a subject
+alternative name, the rfc822Name constraint MUST be applied to the
+attribute of type emailAddress in the subject distinguished name." The
+matcher checks attribute OID `1.2.840.113549.1.9.1` (PKCS#9 emailAddress)
+and also accepts `0.9.2342.19200300.100.1.1` (rfc4519 UID) for robustness.
+Per form: excluded match ⇒ excluded
 reason (checked first);
 else if same-form permitted entries exist and none matches ⇒ permitted
 reason; cross-form entries never compare and never increment `budget`.
@@ -348,9 +418,12 @@ fn constraint_form_without_instance_is_inert() {
     // root permitted = [DnsName("example.com")]; leaf with NO SAN -> ok
 }
 #[test]
-fn uri_constraint_matches_host_subtree() {
+fn uri_constraint_matches_host_and_subdomain_forms() {
     // leaf SAN = [UniformResourceIdentifier("https://build.example.com/x")]
-    // permitted = [UniformResourceIdentifier("example.com")] -> ok
+    // permitted = [UniformResourceIdentifier(".example.com")] -> ok
+    // (period form = subdomains); sibling assert: plain constraint
+    // "build.example.com" also ok (host equality), and plain "example.com"
+    // against the same leaf -> permitted-rejection (plain form is host-only).
 }
 #[test]
 fn uri_without_host_under_constraint_rejects() {
@@ -360,21 +433,28 @@ fn uri_without_host_under_constraint_rejects() {
 }
 #[test]
 fn email_constraint_matches_san_address() {
-    // leaf SAN = [Rfc822Name("dev@example.com")], permitted =
-    // [Rfc822Name("example.com")] -> ok; sibling assert: address outside
-    // the domain -> permitted-reason rejection
+    // permitted = [Rfc822Name("example.com")] (host form): leaf SAN =
+    // [Rfc822Name("dev@example.com")] -> ok; [Rfc822Name("dev@other.org")]
+    // -> permitted rejection; [Rfc822Name("dev@mail.example.com")] -> ALSO
+    // rejected (host form is exact-domain only). Sibling fixture with
+    // permitted = [Rfc822Name(".example.com")] accepts
+    // dev@mail.example.com (period form = strict subdomains).
 }
 #[test]
 fn legacy_email_dn_attribute_is_constrained_when_san_absent() {
     // leaf subject carries emailAddress and NO subjectAltName extension;
     // permitted = [Rfc822Name("example.com")].
-    // Case A: emailAddress=dev@example.com -> ok && anchored.
+    // FIRST assert the fixture provably carries the matched OID:
+    //   assert the leaf's subject DN contains an AttributeTypeAndValue with
+    //   type 1.2.840.113549.1.9.1 (or 0.9.2342.19200300.100.1.1) — build it
+    //   with Name::from_str("CN=zsign leaf,emailAddress=dev@example.com")
+    //   if that parser emits the emailAddress OID; otherwise construct the
+    //   RDNSequence manually with AttributeTypeAndValue { type:
+    //   1.2.840.113549.1.9.1, value: IA5String }.
+    // Case A: emailAddress=dev@example.com -> ok && anchored (host-form
+    // constraint equals the address domain).
     // Case B: emailAddress=dev@other.org -> !ok, reason contains
     // "outside permitted name constraints".
-    // Build the DN with Name::from_str("CN=zsign leaf,emailAddress=…"); if
-    // that parser rejects the emailAddress short name, construct the
-    // RDNSequence manually with AttributeTypeAndValue { type:
-    // 0.9.2342.19200300.100.1.1, value: UTF8String }.
 }
 #[test]
 fn unsupported_ip_constraint_with_instance_rejects() {
@@ -437,23 +517,27 @@ and
 
 ## Self-review
 
-- Spec coverage: gate (design §1) → Task 1; NC structure/directoryName
-  (design §2, decisions on empty/min-max/malformed/self-issued skip) →
-  Task 2; remaining name forms, unsupported-form fail-closed, budget,
-  legacy email rule → Task 3; trust-anchor exclusion is implemented by hook
-  placement (only `certs`-resolved parents are evaluated) and asserted by
-  existing anchored-chain tests plus Task 1's controls.
+- Spec coverage: gate (design §1) → Task 1, including the self-signed-root
+  and out-of-chain-anchor owning tests the cold review required; NC
+  structure/directoryName (design §2, decisions on empty/min-max/malformed/
+  self-issued skip) → Task 2; remaining name forms with the RFC's host/period
+  semantics, unsupported-form fail-closed, budget, legacy email rule →
+  Task 3.
 - Step scan: each step is one action with a checkable result; test steps pin
   exact names/assertions/reason substrings; code steps pin signatures.
 - Type consistency: `unrecognized_critical`, `NcScan`, `nc_shape_reason`,
   `check_certificate_names`, `MAX_NAME_COMPARISONS`,
   `build_rsa_root_signed`, `build_subca_issued_by_signed` used identically
   across tasks.
-- Review Focus: all five lines have owning tests (Task 1 controls; Task 2
-  excluded/empty/min-max; Task 3 inert-form + budget). The legacy DN-email
-  rule is pinned by Task 3's `legacy_email_dn_attribute_is_constrained_when_san_absent`;
-  the trust-anchor exclusion is enforced by hook placement (only parents
-  resolved from `certs` are gated/evaluated) and exercised by the unchanged
-  `require_anchored_chain` tests.
+- Review Focus: every line has an owning test: Task 1 pins the parent/root
+  gate coverage (`unknown_critical_extension_rejects_an_intermediate`,
+  `self_signed_root_with_unknown_critical_rejects`), the non-critical
+  control, and the §6.2 anchor exclusion
+  (`out_of_chain_anchor_extensions_are_ignored`); Task 2 pins
+  excluded-beats-permitted, empty, minimum and maximum rejection plus the
+  self-issued skip (direct helper unit test); Task 3 pins inert forms, host
+  vs period email/URI semantics, the legacy DN-email rule
+  (`legacy_email_dn_attribute_is_constrained_when_san_absent`, with a
+  fixture assertion on the matched OID), and the comparison budget.
 - Proportion: plan size tracks three helper families and their fixtures;
   no step restates a body the signature and tests already determine.

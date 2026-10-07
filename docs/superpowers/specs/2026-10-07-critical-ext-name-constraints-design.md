@@ -23,15 +23,23 @@ required by RFC 5280.
   literals in test helpers (`cms_verify.rs:2734`, `cert.rs:1359`,
   `revocation.rs:2048`).
 - Path validation is the single function `verify_chain`
-  (`cms_verify.rs:1362-1536`): leaf checks at entry (purpose, validity), then
+  (`cms_verify.rs:1362-1537`): leaf checks at entry (purpose, validity), then
   a bottom-up walk resolving each `parent` by subject match
-  (`validity → issuer_ca_reason → sha1_warning → signature → names.push`),
-  with three success terminals (self-signed anchored, self-signed unanchored,
-  `anchors.find_by_subject` resolution) and failure returns of the form
+  (`validity :1411 → issuer_ca_reason :1425 → sha1_warning :1434 → signature
+  :1437 → names.push :1448`), with three success terminals (self-signed
+  anchored :1474-1482, self-signed unanchored :1484-1490,
+  `anchors.find_by_subject` :1494-1506) and failure returns of the form
   `ChainOutcome { ok: false, anchored: false, subjects, reason: Some(...), warnings }`.
+  A self-signed embedded root is processed as a **parent** in the iteration
+  where it is first accepted (`current` is still the child, so
+  `!ptr::eq(p, current)` holds at :1410); only the *next* iteration's
+  self-match routes to the terminal. Consequently hooks placed on the leaf
+  entry and in the parent branch cover every path certificate exactly once —
+  verified by the owning tests named in the plan (`self_signed_root_with_unknown_critical_rejects`,
+  root-with-constraints fixtures).
 - Failure plumbing: `verify_signed_data` copies `outcome.reason` into
   `report.chain_reason` (`:1108`) and pushes it into `report.errors`
-  (`:1133-1140`), forcing `valid = false`; `crypto/cert.rs:410-427`
+  (`:1130-1136`), forcing `valid = false`; `crypto/cert.rs:410-427`
   (`require_anchored_chain`, the only other caller) folds the same string
   into `Error::Certificate`. New failures therefore need **no struct change**.
 - `CmsVerifyReport` (`:262-299`) derives Debug/Clone/PartialEq/Eq/Default —
@@ -123,11 +131,15 @@ Everything else critical (certificatePolicies, AKID, AIA, …) fails with
 Hook points (every certificate that participates in the path, exactly once):
 - leaf — at `verify_chain` entry, before the purpose gate;
 - each `parent` in the walk, after `issuer_ca_reason`;
-- the self-signed embedded root is covered by the parent branch; a leaf that
-  is itself self-signed is covered at entry;
+- the embedded self-signed root **is** covered by the parent branch: it is
+  first seen as `p` while `current` is still its child (the `!ptr::eq(p,
+  current)` guard at `:1410` only rejects the *self*-match that occurs one
+  iteration later, after the root has already been processed);
+- a leaf that is itself self-signed is covered at entry;
 - a trust anchor resolved through `anchors.find_by_subject` is **not** a path
   certificate (§6.1 doesn't include the anchor; §6.2 gives explicit latitude)
-  — not gated, and its name constraints are not applied.
+  — not gated, and its name constraints are not applied. Pinned by the plan's
+  `out_of_chain_anchor_extensions_are_ignored` test.
 
 ### 2. nameConstraints evaluation
 
@@ -148,8 +160,14 @@ a name must satisfy every CA's permitted set and avoid every CA's excluded set.
 Per evaluated certificate, the names checked are:
 - its subject DN (when non-empty) — directoryName form;
 - every `subjectAltName` entry (critical or not);
-- when no rfc822Name is present in the SAN, any `emailAddress` attribute in
-  the subject DN counts as an rfc822Name instance (§4.2.1.10 legacy rule).
+- when the certificate does **not include a subject alternative name
+  extension at all**, any `emailAddress` attribute (OID
+  `1.2.840.113549.1.9.1`; the rfc4519 UID OID `0.9.2342.19200300.100.1.1` is
+  accepted too for robustness) in the subject DN counts as an rfc822Name
+  instance — RFC 5280 §4.2.1.10: "When constraints are imposed on the
+  rfc822Name name form, but the certificate does not include a subject
+  alternative name, the rfc822Name constraint MUST be applied to the
+  attribute of type emailAddress in the subject distinguished name."
 
 Skip rule: a certificate that is self-issued (subject == issuer) and is not
 the leaf is skipped (§6.1.3(b)/(c)).
@@ -159,13 +177,26 @@ Per name-form semantics:
   compared attribute-type-OID + value with `caseIgnoreMatch` normalization
   (trim, collapse internal whitespace, Unicode lowercase) — the §7.1 floor;
   full LDAP StringPrep is not implemented (documented deviation below).
-- **dNSName:** case-insensitive equality with the constraint, or a subdomain
-  of it (name ends with `.constraint`); an optional leading `.` on the
-  constraint is stripped.
-- **rfc822Name:** constraint containing `@` ⇒ full-address match; otherwise
-  domain-subtree match against the address's domain (case-insensitive).
-- **URI:** apply to the host component only (scheme://[userinfo]host[:port]/…);
-  a URI whose authority has no host, under a URI constraint, ⇒ reject.
+- **dNSName** (§4.2.1.10: "Any DNS name that can be constructed by simply
+  adding zero or more labels to the left-hand side of the name satisfies the
+  name constraint"): case-insensitive equality with the constraint, or
+  `name.ends_with(".{constraint}")`. A leading `.` (not defined for dNSName
+  by the RFC) is handled with the URI/email period semantics: strict
+  subdomain match against the remainder, equality excluded.
+- **rfc822Name** (§4.2.1.10, verbatim semantics): constraint containing `@`
+  ⇒ exact full-address match; constraint **with** leading period ⇒ address
+  domain is a strict subdomain of the remainder (".example.com" matches
+  `a.example.com`, not `example.com`); plain host constraint ⇒ the
+  address's domain equals the constraint exactly ("example.com" is satisfied
+  only by addresses at the host `example.com`). Case-insensitive throughout
+  (the emailAddress attribute is not case-sensitive per RFC 5280 §4.1.2.2).
+- **URI** (§4.2.1.10: "When the constraint does not begin with a period, it
+  specifies a host"): apply to the host component only
+  (scheme://[userinfo]host[:port]/…); plain constraint ⇒ host equality;
+  leading-period constraint ⇒ host is a strict subdomain of the remainder.
+  A URI instance whose authority has no host or names an IP address, under
+  any URI constraint, ⇒ reject ("the application MUST reject the
+  certificate").
 - **Any other form** (iPAddress, otherName, ediPartyName, registeredId): if
   an instance of that form is present in an evaluated certificate while a
   constraint on that form exists ⇒ reject with an explicit
