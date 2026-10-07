@@ -3,6 +3,9 @@
 debug/
 target/
 
+# wasm-pack generated npm package output
+/crates/zsign-wasm/pkg/
+
 # Cargo.lock is committed: this workspace ships a published CLI binary
 # (crates/zsign-cli) and a npm wasm artifact, so builds must be reproducible.
 
