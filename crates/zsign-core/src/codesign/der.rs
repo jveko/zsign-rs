@@ -321,7 +321,6 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
 ///
 /// Returns an error if:
 /// - The XML plist cannot be parsed
-/// - The resulting DER encoding is empty
 /// - An unsupported plist type is encountered (Real)
 /// - An integer value lies outside the i64 range
 /// - A date value lies outside the GeneralizedTime year range
@@ -372,11 +371,7 @@ pub fn plist_to_der(plist_xml: &[u8]) -> Result<Vec<u8>> {
     encode_length(&mut der, seq_content.len());
     der.extend_from_slice(&seq_content);
 
-    if der.is_empty() {
-        Err(Error::DerEncoding("Empty DER output".into()))
-    } else {
-        Ok(der)
-    }
+    Ok(der)
 }
 
 #[cfg(test)]
