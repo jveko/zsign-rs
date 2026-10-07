@@ -741,9 +741,28 @@ fn verify_signed_data(
     let _version = u32::decode(&mut sdr)
         .map_err(|e| Error::Verification(format!("malformed SignedData version: {e}")))?;
 
-    // digestAlgorithms SET
-    let _digest_algs = AnyRef::decode(&mut sdr)
+    // digestAlgorithms SET OF AlgorithmIdentifier — keep the OIDs so each
+    // accepted SignerInfo digest can be checked against the collection.
+    let dig_algs = AnyRef::decode(&mut sdr)
         .map_err(|e| Error::Verification(format!("malformed digestAlgorithms: {e}")))?;
+    if dig_algs.tag() != Tag::Set {
+        return Err(Error::Verification("digestAlgorithms is not a SET".into()));
+    }
+    let mut digest_alg_oids: Vec<ObjectIdentifier> = Vec::new();
+    let mut dar = reader(dig_algs.value(), "malformed digestAlgorithms body")?;
+    while !dar.is_finished() {
+        let alg = AnyRef::decode(&mut dar)
+            .map_err(|e| Error::Verification(format!("malformed digestAlgorithms entry: {e}")))?;
+        if alg.tag() != Tag::Sequence {
+            return Err(Error::Verification(
+                "digestAlgorithms entry is not a SEQUENCE".into(),
+            ));
+        }
+        let mut alg_r = reader(alg.value(), "malformed digestAlgorithms entry body")?;
+        let oid = ObjectIdentifier::decode(&mut alg_r)
+            .map_err(|e| Error::Verification(format!("malformed digestAlgorithms OID: {e}")))?;
+        digest_alg_oids.push(oid);
+    }
 
     // encapContentInfo SEQUENCE { eContentType, [0] eContent? }
     let encap = AnyRef::decode(&mut sdr)
@@ -3065,6 +3084,88 @@ mod tests {
         ci2.extend_from_slice(&ci_body[..oid_end]);
         ci2.extend_from_slice(&new_wrap);
         der_tlv(cms[0], &ci2)
+    }
+
+    /// Replaces the digestAlgorithms SET (SignedData field 2, RFC 5652 §5.1
+    /// order) with `new_set` (a complete TLV). Assumes the single-SignerInfo
+    /// output of `sign_code_directory`.
+    fn replace_digest_algs(cms: &[u8], new_set: &[u8]) -> Vec<u8> {
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap_any = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap_any.tag(), TAG_CTX0);
+        let wrap_tag = ci_body[oid_end]; // [0] wrapper tag byte
+        let sd_seq = AnyRef::from_der(wrap_any.value()).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_tag = wrap_any.value()[0];
+        let sd_body_src = sd_seq.value();
+
+        // Positional split: version, digestAlgorithms, encap, [certs], signerInfos.
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new();
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        assert!(fields.len() >= 3, "SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(fields[1]).unwrap().tag(),
+            Tag::Set,
+            "digestAlgorithms must be SignedData field 2"
+        );
+        fields[1] = new_set;
+
+        let new_sd = der_tlv(sd_tag, &fields.concat());
+        let new_wrap = der_tlv(wrap_tag, &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(&ci_body[..oid_end]);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms[0], &ci2)
+    }
+
+    #[test]
+    fn malformed_digest_algorithms_set_fails_verification() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let sha1 = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+
+        // (a) SET child is a bare OID, not an AlgorithmIdentifier SEQUENCE.
+        let bare_child = der_tlv(0x31, &sha1.to_der().unwrap());
+        let res = verify_code_signature_with_anchors(
+            &wrap(&replace_digest_algs(&cms, &bare_child)),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        );
+        assert!(
+            matches!(&res, Err(Error::Verification(m)) if m.contains("digestAlgorithms")),
+            "malformed digestAlgorithms child must fail with Error::Verification, got {:?}",
+            res.as_ref().err()
+        );
+
+        // (b) digestAlgorithms is not a SET at all (SEQUENCE-wrapped entries).
+        let not_a_set = der_tlv(0x30, &der_tlv(0x30, &sha1.to_der().unwrap()));
+        let res = verify_code_signature_with_anchors(
+            &wrap(&replace_digest_algs(&cms, &not_a_set)),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        );
+        assert!(
+            matches!(&res, Err(Error::Verification(m)) if m.contains("digestAlgorithms")),
+            "non-SET digestAlgorithms must fail with Error::Verification, got {:?}",
+            res.as_ref().err()
+        );
     }
 
     #[test]
