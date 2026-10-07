@@ -717,4 +717,82 @@ mod tests {
             vec![0x02, 0x08, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
     }
+
+    #[test]
+    fn test_encode_integer_zero() {
+        // Canonical DER INTEGER 0 is the minimal content octet 0x00 (X.690
+        // clause 8.3.2), not an empty content.
+        let value = Value::Integer(0.into());
+        let der = encode_value(&value).unwrap();
+        assert_eq!(der, vec![0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_date_pre_epoch() {
+        // Before the Unix epoch the GeneralizedTime still renders the civil
+        // UTC date from the euclidean day index: 1969-12-31 23:59:59 is
+        // seconds=-1, day=-1, so 86_399 seconds of day.
+        let whole = plist::Date::from_xml_format("1969-12-31T23:59:59Z").unwrap();
+        assert_eq!(
+            encode_value(&Value::Date(whole)).unwrap(),
+            vec![
+                0x18, 0x0f, b'1', b'9', b'6', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9',
+                b'5', b'9', b'Z',
+            ]
+        );
+
+        // A pre-epoch value with subsecond precision converts to a positive
+        // nanosecond fraction (the -secs-1 branch), keeping trailing zeros
+        // stripped (X.690 clause 11.7.3).
+        let frac = plist::Date::from_xml_format("1969-12-31T23:59:59.5Z").unwrap();
+        assert_eq!(
+            encode_value(&Value::Date(frac)).unwrap(),
+            vec![
+                0x18, 0x11, b'1', b'9', b'6', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9',
+                b'5', b'9', b'.', b'5', b'Z',
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encode_uid_unsupported() {
+        // UID is a plist type the writer does not support: it must fail with
+        // a typed error rather than emit bytes that only look like DER.
+        let res = encode_value(&Value::Uid(plist::Uid::new(42)));
+        assert!(
+            matches!(&res, Err(Error::DerEncoding(m)) if m.contains("Unknown plist value type")),
+            "expected unsupported-type error, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_plist_to_der_array_of_dict() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>k</key>
+            <true/>
+        </dict>
+    </array>
+</dict>
+</plist>"#;
+
+        let der = plist_to_der(xml).unwrap();
+        // A dictionary inside an array keeps its canonical [16] (0xb0)
+        // entries container inside the array's SEQUENCE:
+        // 70 1a | 02 01 01 | b0 15 | 30 13 0c 05 "items"
+        //       | 30 0a b0 08 30 06 0c 01 "k" 01 01 ff
+        assert_eq!(
+            der,
+            vec![
+                0x70, 0x1a, 0x02, 0x01, 0x01, 0xb0, 0x15, 0x30, 0x13, 0x0c, 0x05, b'i', b't', b'e',
+                b'm', b's', 0x30, 0x0a, 0xb0, 0x08, 0x30, 0x06, 0x0c, 0x01, b'k', 0x01, 0x01, 0xff,
+            ]
+        );
+    }
 }
