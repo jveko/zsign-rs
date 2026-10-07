@@ -29,7 +29,7 @@ during research and is forced into scope by the mandated parity test.
 3. **`MemStore` prune polarity is inverted** (discovered, not ticketed).
    The trait contract says `prune` returning `false` skips the subtree
    (`store.rs:76-78`), which is `WalkDir::filter_entry` semantics, which is
-   what `FsStore::walk_pruned` does (`store.rs:215-218`, closure passed
+   what `FsStore::walk_pruned` does (`store.rs:189-226`, closure passed
    straight to `filter_entry`, true = keep/descend) and what the only caller's
    intent and doc assume (`ipa/mod.rs:1544`, returns `false` for nested-bundle
    dirs). `MemStore::walk_children` does the opposite (`if prune(...) {
@@ -62,7 +62,7 @@ during research and is forced into scope by the mandated parity test.
   `pub(crate) fn with_store(store: &'a dyn Store, …)` (`bundle/code_resources.rs:97-103`).
 - Walk contracts: `Store::walk` / `Store::walk_pruned` (`store.rs:73-82`);
   `walk_pruned` doc pins `false` = skip (`store.rs:76-78`); `FsStore` passes
-  the closure to `WalkDir::filter_entry` (`store.rs:216`); `MemStore`
+  the closure to `WalkDir::filter_entry` (`store.rs:211`); `MemStore`
   inverts (`mem_store.rs:243-245`); `walk_inner` locks once at `:221`,
   invokes the closure at `:243` with the guard alive; `walk`/`walk_pruned`
   entry points at `:356-372`; `lock()` recovers poisoning at `:107-111`.

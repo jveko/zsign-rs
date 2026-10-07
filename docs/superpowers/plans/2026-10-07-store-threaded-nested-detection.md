@@ -218,6 +218,10 @@ already handled in Steps 1-3).
 
 - [ ] **Step 1: Write the parity test**
 
+In the tests module add `use crate::bundle::is_nested_bundle_dir;` and
+`use crate::store::{FsStore, Store};` (matching the file's import style; the
+native side stays fully-qualified `tempfile::TempDir`).
+
 Same logical tree both sides: `Frameworks/Legacy/` (extension-less) holding
 `Info.plist` with non-empty `CFBundleIdentifier` + `CFBundleExecutable`, plus
 `Frameworks/Legacy/inner.bin` and `top.bin` at the root. Native tree in a
@@ -225,9 +229,11 @@ Same logical tree both sides: `Frameworks/Legacy/` (extension-less) holding
 root-relative keys. Assertions, in order:
 1. `is_nested_bundle_dir(&FsStore, native) == true` and
    `is_nested_bundle_dir(&mem, rel) == true` (detection parity).
-2. `find_immediate`-shaped predicate per side — for each entry:
-   skip iff `path != <that side's root>` && `kind == Dir` && that side's
-   detector says nested (predicate returns false = skip).
+2. `find_immediate`-shaped predicate per side — the `FsStore` side compares
+   paths against `native_root` and consults `&FsStore`; the `MemStore` side
+   compares against `Path::new("")` (the mem walk root) and consults `&mem`.
+   For each entry, skip iff `path != <that side's root>` && `kind == Dir` &&
+   that side's detector says nested (predicate returns false = skip).
 3. Run `FsStore.walk_pruned(native_root, …)` and `mem.walk_pruned("", …)`;
    map native paths by `strip_prefix(native_root)` to `/`-separated strings,
    map mem paths via `to_string_lossy().replace('\\', "/")`; **sort both**;
