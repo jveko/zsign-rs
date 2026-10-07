@@ -21,9 +21,9 @@ Files in scope: `writer.rs`, `signer.rs` (plus a test in one of those two files 
 | 12 | `` [`embed_signature`] `` | `writer.rs:310` | alive |
 | 13 | `` [`embed_signature_fat`] `` | `writer.rs:364` | alive |
 | 14 | `` [`prepare_code_for_signing`] `` | `writer.rs:1136` | alive |
-| 30 | `` [`embed_signature_fat`] `` (in `SignedSlice` doc) | `writer.rs:364` | alive |
+| 28 | `` [`embed_signature_fat`] `` (in `SignedSlice` doc) | `writer.rs:364` | alive |
 
-Only line 11 carries the defect; lines 12–14 and 30 link in-crate items and must be left alone
+Only line 11 carries the defect; lines 12–14 and 28 link in-crate items and must be left alone
 ("fix each occurrence [of the defect] the same way" — there is exactly one occurrence).
 
 In-repo pattern: sibling zsign-core module docs use bracketed `` [`item`] `` links for **in-crate**
@@ -53,7 +53,8 @@ no code blocks, so no doctest depends on it. (The only doctest in the file is on
   `signer.rs:753–778`; superseding `fn embed_signature_in_place` at `signer.rs:780–801`
   with production call sites at `signer.rs:722` and `:733`.
 - Workspace-wide grep (crates/, fuzz/, docs/, tests) for `embed_signature_into_prepared`:
-  **exactly one hit — its own definition** (`signer.rs:753`, plus the `allow` at `:752`).
+  **exactly one hit — its own definition** at `signer.rs:753` (the `#[allow(dead_code)]`
+  attribute at `:752` does not contain the identifier and does not match).
   Zero calls, zero tests, zero doc references anywhere. No test in `signer.rs`'s
   `#[cfg(test)] mod tests` (starts line 933) touches it directly or indirectly.
 - Deadness proof complete → the brief's delete branch applies; there are **no tests to remove**
@@ -73,7 +74,7 @@ with no rustdoc behavior.
 | A2 | Reword the bullet to name the facade function in prose ("`write_signed_macho` in the `zsign` facade crate") | More context for readers but a larger copy change than the defect warrants | rejected (YAGNI, smallest correct change) |
 | A3 | Make it a real cross-crate link | Impossible: would require `zsign-core` → `zsign` dependency = circular; rustdoc cannot resolve non-dependency siblings (cited) | rejected (infeasible) |
 
-Lines 12–14 and 30 stay bracketed links — they are alive and touching them is scope creep.
+Lines 12–14 and 28 stay bracketed links — they are alive and touching them is scope creep.
 
 ### (b) Remove the dead helper
 

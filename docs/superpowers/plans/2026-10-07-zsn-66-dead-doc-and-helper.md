@@ -21,7 +21,7 @@
 
 ## Review Focus
 
-- Live links at `writer.rs:12–14` and `:30` (`` embed_signature ``, `` embed_signature_fat ``, `` prepare_code_for_signing ``) must remain bracketed links — de-linking them is over-reach.
+- Live links at `writer.rs:12–14` and `:28` (`` embed_signature ``, `` embed_signature_fat ``, `` prepare_code_for_signing ``) must remain bracketed links — de-linking them is over-reach.
 - `embed_signature_in_place` (`signer.rs:780–801`) and its call sites (`:722`, `:733`) must survive untouched; the deletion boundary is `signer.rs:752–778` only.
 - Post-fix `cargo doc -p zsign-core --no-deps` must show **no** `unresolved link` warning (pre-fix it shows exactly one, to `write_signed_macho`).
 - Post-deletion `grep -rn embed_signature_into_prepared crates/ fuzz/` must return **zero** hits, and the full `-p zsign-core` suite must stay green — a dangling reference would surface as a compile error here.
@@ -87,7 +87,7 @@ Run:
 ```
 grep -rn "embed_signature_into_prepared" crates/ fuzz/
 ```
-Expected FAIL state: exactly two hits, both in `crates/zsign-core/src/macho/signer.rs` — the `#[allow(dead_code)]` attribute (line 752) and the `fn` definition (line 753). Zero hits elsewhere proves no caller and no test exists. Save the output as before-evidence.
+Expected FAIL state: exactly one hit — the `fn` definition at `crates/zsign-core/src/macho/signer.rs:753` (the `#[allow(dead_code)]` attribute at `:752` does not contain the identifier and does not match). Zero hits anywhere else proves no caller and no test exists. Save the output as before-evidence.
 
 - [ ] **Step 2: Delete lines 752–778**
 
