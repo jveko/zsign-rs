@@ -147,8 +147,8 @@ three pinned `"vmsize extension overflows"` `Err` tests (writer.rs:3102,
 :3120, :3141) into successes-with-huge-vmsize — it changes the overflow
 ticket's pinned passthrough policy rather than composing with it; it also
 rewrites benign outputs (its `update_linkedit_segment` rule would turn the
-control example's delta-derived vmsize `0x6000` into
-`align_to(0x5000, 0x4000) = 0x8000`), churning behaviour beyond the defect.
+control example's delta-derived vmsize `0x7000` into
+`align_to(0x7000, 0x4000) = 0x8000`), churning behaviour beyond the defect.
 **C — disagreement guard only, leave delta.** Rejected: the wrong delta would
 make the guard fire on the existing passing case-(a) tests, converting green
 tests to `Err` — the delta is the bug, not the inputs.
