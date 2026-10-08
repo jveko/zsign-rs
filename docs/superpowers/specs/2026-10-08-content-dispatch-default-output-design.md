@@ -56,7 +56,7 @@ and top-level `report.errors` to 2 (`:385-388`). `-V` conflicts with `-o`
   `Payload/` itself — tests can build real IPA fixtures with no new
   dependencies. `zsign-cli` already depends on `zsign-rs` and on
   `zsign-core` with the `test-fixtures` feature
-  (`crates/zsign-cli/Cargo.toml`, dev-dependencies; feature line :22).
+  (`crates/zsign-cli/Cargo.toml`, dev-dependencies :20-21).
 - No existing test pins the `set_extension("signed")` default (zero `.signed`
   literals in the tests module), and every existing `-V` test preserves its
   exit code under content routing: valid → 0, unsigned Mach-O → 1, missing /
