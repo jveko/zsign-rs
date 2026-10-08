@@ -7,10 +7,10 @@ Scope: `crates/zsign-core/src/macho/signer.rs` (primary), plus minimal call wiri
 ## Problem
 
 `sign_macho_all_slices` (signer.rs:379-397) delegates to `sign_all_slices_impl`
-(signer.rs:410-458), which contains exactly three checks before the work:
-`reject_encrypted` (:426, per-slice encryption only), `SigningContext::new`
-(:427-434), and per-slice `sign_slice_complete` (:442) inside the rayon
-`par_iter` (:438-455). There is zero container-geometry validation — no
+(signer.rs:410-459), which contains exactly three checks before the work:
+`reject_encrypted` (:425, per-slice encryption only), `SigningContext::new`
+(:426-433), and per-slice `sign_slice_complete` (:444) inside the rayon
+`par_iter` (:437-456). There is zero container-geometry validation — no
 bounds, no overflow, no pairwise-disjoint check — and `validate_fat_arches`
 appears nowhere in signer.rs.
 
@@ -31,13 +31,32 @@ the gap: its fixture makes `sign_macho_all_slices(...).unwrap()` SUCCEED and
 the error surfaces only from `embed_signature_fat` — the trailing
 `// pre-fix: Ok` comment documents today's ordering.
 
+**One-liner (scoped — cold review finding 6):** after this fix, no `Ok` from
+`sign_macho_all_slices` for a container `embed_signature_fat` rejects on
+input-structure grounds: the empty-container rejection and every
+`validate_fat_arches` rejection (bounds, overflow, overlap) all fire pre-sign.
+Explicitly OUT of scope, with reasons:
+- the align-cap/offset-alignment rejections (the Item-1 guards) live in
+  `embed_fat_from_signed_slices` and remain post-sign by design — they were
+  already there before this item's brief and are this branch's earlier work;
+  pre-sign enforcement would require moving those guards out of the
+  reassembly path (a writer change beyond this item's "call wiring"), or
+  duplicating them in signer (a second convention the repo prohibits);
+- count/identity rejections are satisfied by construction pre-sign (signed
+  slices are produced one-per-parse from the same container);
+- output-side reassembly rejections (u32 offset bound on the recomputed
+  layout) depend on signature sizes that do not exist until signing has run,
+  so they are undecidable at validation time.
+
 Key narrowing (verified): `MachOFile::parse` already enforces the other two
 `validate_fat_arches` reasons — overflow (parser.rs:201-203) and out-of-file
 (parser.rs:204-210) — at parse time, so for a parsed `&MachOFile` only the
 pairwise-overlap check (writer.rs:433-441) is reachable as a silent `Ok`.
-The fix must still call the whole validator rather than only the overlap
-rule, so the one-liner — "no `Ok` from `sign_macho_all_slices` for a
-container `embed_signature_fat` would reject" — holds by construction.
+The fix still calls the whole validator rather than only the overlap rule,
+and additionally rejects the empty container (the one `validate_fat_arches`
+gap: `validate_fat_arches([])` is a vacuous `Ok`, while `embed_signature_fat`
+rejects `"Empty FAT binary"` at writer.rs:405-407 before validating), so the
+scoped one-liner above holds by construction.
 
 ## External contract (research-phase citations; [UNVERIFIED EXTERNAL] — not re-checkable in this worktree)
 
@@ -64,8 +83,10 @@ container `embed_signature_fat` would reject" — holds by construction.
    precedent; signer.rs already reaches writer via `super::writer::…`).
 2. At the TOP of `sign_all_slices_impl` (before `reject_encrypted`,
    `SigningContext::new`, and the `par_iter`), gate on `macho.is_fat()`:
-   parse `macho.data()` with the house `goblin` `Mach` idiom (same as
-   `embed_signature_fat`), collect `fat.iter_arches()` into `Vec<FatArch>`,
+   parse `macho.data()` with the house goblin `Mach` idiom (mirroring
+   `embed_signature_fat`'s import style and error strings), reject an empty
+   arch table with the same `"Empty FAT binary"` message `embed_signature_fat`
+   uses (writer.rs:405-407), collect `fat.iter_arches()` into `Vec<FatArch>`,
    and `super::writer::validate_fat_arches(&arches, macho.data())?`.
 - Same validator, same inputs as the downstream `embed_signature_fat` call ⇒
   the one-liner holds by construction; all four entry points inherit the fix
@@ -138,5 +159,7 @@ hostile FAT bytes). Errors asserted with the repo's `expect_err` +
 - `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `TMPDIR=$PWD/target/tmp cargo test --workspace` green.
 - Failing-before/passing-after test for the red test; migrated writer test green.
-- One-liner demonstrable: every container `embed_signature_fat` rejects is
-  rejected by `sign_macho_all_slices` before any slice is signed.
+- One-liner (scoped as defined in Gap) demonstrable: every container
+  `embed_signature_fat` rejects on input-structure grounds (empty, bounds,
+  overflow, overlap) is rejected by `sign_macho_all_slices` before any slice
+  is signed.

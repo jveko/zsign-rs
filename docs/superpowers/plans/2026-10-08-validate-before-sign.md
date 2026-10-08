@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development with dispatching-parallel-agents. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Make `sign_macho_all_slices` (and every sibling entry point via the shared impl) reject structurally invalid FAT containers before any per-slice signing work.
+**Goal:** Make `sign_macho_all_slices` (and every sibling entry point via the shared impl) reject structurally invalid FAT containers before any per-slice signing work — scoped to input-structure rejections (empty, bounds, overflow, overlap) per the spec's Gap section.
 
 **Architecture:** Widen `validate_fat_arches` to `pub(crate)` in writer.rs (call wiring only), then call it at the top of `sign_all_slices_impl` in signer.rs, gated on `macho.is_fat()`, with arches re-parsed from `macho.data()` via the same goblin `Mach`/`iter_arches` idiom `embed_signature_fat` uses. One migrated writer test + one new signer red test.
 
@@ -43,26 +43,30 @@
 - [ ] **Step 1: Write failing test + migrate the gap-pinning test**
   - New signer test `test_sign_macho_all_slices_rejects_overlapping_container`: reuse the hand-built hostile FAT bytes idiom from writer.rs (~:2757-2774 — copy the construction), `MachOFile::parse`, call `sign_macho_all_slices(&macho, ...)` with the same args existing signer tests use (read them first); `expect_err` + `contains("overlap")`.
   - Migrate writer's `test_embed_fat_rejects_overlapping_slices` so it no longer `.unwrap()`s a successful `sign_macho_all_slices`: keep its assertion that `embed_signature_fat` rejects the overlapping container. Preferred construction (spec §Chosen design details): hand-construct the two `SignedSlice`s matching the hostile arch identity fields (offset/original_size/cpu_type) with dummy `signed_data` — `embed_signature_fat` validates the container at writer.rs:408 before touching `signed_data`, so the overlap `Err` fires regardless. If hand-constructing `SignedSlice` proves awkward (private fields etc.), sign the slices from a VALID container layout and then present them against the hostile container ONLY if identity fields still match — document whichever route you take.
-- [ ] **Step 2: Run both tests, expect failure**
-  `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core rejects_overlapping` → new test FAILS (Ok returned — capture verbatim); migrated test FAILS or is red by construction until the fix lands (capture state; it asserts post-fix behavior of embed, which passes even pre-fix — record honestly which state applies).
+- [ ] **Step 2: Run tests, expect ONE failure**
+  `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core rejects_overlapping` → the NEW signer test FAILS (Ok returned — capture verbatim; this is the only red state). The migrated writer test PASSES both pre- and post-fix (its target, `embed_signature_fat`'s rejection, already works today) — it is a regression guard, not a red test; do not misdiagnose its green as a problem.
 - [ ] **Step 3: Implement the wiring + call**
   - writer.rs: `fn validate_fat_arches` → `pub(crate) fn validate_fat_arches`; extend its doc comment to mention the signer entry point (no ticket IDs).
-  - signer.rs: at the TOP of `sign_all_slices_impl`, before `reject_encrypted`:
+  - signer.rs: at the TOP of `sign_all_slices_impl`, before `reject_encrypted`. Mirror `embed_signature_fat`'s parse idiom EXACTLY (writer.rs ~:373-410 — read it first): bare `Mach` import style if signer needs one, and its error strings verbatim (`"Failed to parse Mach-O"`, `"Failed to read FAT arches"`). Note signer.rs spells errors `crate::Error::` (no `Error` import) — use that. Shape:
     ```rust
     if macho.is_fat() {
-        let arches = match goblin::mach::Mach::parse(macho.data())
-            .map_err(|e| Error::MachO(format!("Failed to parse FAT container: {e}")))?
+        let arches = match Mach::parse(macho.data())
+            .map_err(|e| crate::Error::MachO(format!("Failed to parse Mach-O: {}", e)))?
         {
-            goblin::mach::Mach::Fat(fat) => fat
-                .iter_arches()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::MachO(format!("Failed to read FAT arches: {}", e)))?,
-            _ => return Err(Error::MachO("FAT container did not parse as FAT".into())),
+            Mach::Fat(fat) => {
+                if fat.narch == 0 {
+                    return Err(crate::Error::MachO("Empty FAT binary".into()));
+                }
+                fat.iter_arches()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::MachO(format!("Failed to read FAT arches: {}", e)))?
+            }
+            _ => return Err(crate::Error::MachO("Expected a FAT container".into())),
         };
         super::writer::validate_fat_arches(&arches, macho.data())?;
     }
     ```
-    Match the exact parse/collect idiom already used in `embed_signature_fat` (writer.rs ~:373-410) — read it first and mirror its error wording if it differs. Import path: check how writer.rs spells `Mach` (goblin import style) and mirror.
+    Adjust `narch == 0` vs `arches.is_empty()` and the non-Fat arm wording to whatever `embed_signature_fat` actually uses (the empty check must reuse its `"Empty FAT binary"` string; the non-Fat arm is unreachable under the `is_fat()` gate — fail closed, never `unreachable!`).
 - [ ] **Step 4: Run scoped tests**
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core writer` and `... signer` → ALL green (new test passes; migrated test passes; FAT suite, sign_any/adhoc/sha256 tests, Items 1-2 tests unchanged).
 
