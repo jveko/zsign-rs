@@ -216,20 +216,28 @@ impl<'a> CodeResourcesBuilder<'a> {
             return Ok(None);
         }
 
-        let relative_path = path
-            .strip_prefix(bundle_path)
-            .map_err(|e| {
-                Error::Io(std::io::Error::other(format!(
-                    "Failed to strip prefix: {}",
-                    e
-                )))
-            })?
-            .to_string_lossy()
-            .to_string();
+        let relative_path = path.strip_prefix(bundle_path).map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "Failed to strip prefix: {}",
+                e
+            )))
+        })?;
 
-        if inner.should_exclude(&relative_path) {
+        if inner.should_exclude(&relative_path.to_string_lossy()) {
             return Ok(None);
         }
+
+        // A lossy key would collapse distinct invalid byte sequences onto
+        // U+FFFD, letting one entry overwrite another in the seal map.
+        let relative_path = relative_path
+            .to_str()
+            .ok_or_else(|| {
+                zsign_core::Error::Signing(format!(
+                    "File name is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?
+            .to_string();
 
         if is_symlink {
             let (sha1, sha256, target) = Self::hash_symlink_entry(store, path)?;
@@ -589,5 +597,90 @@ mod tests {
             Some(TARGET),
             "recorded symlink target must be byte-identical to the on-disk target"
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_rejects_colliding_non_utf8_file_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+
+        // Two distinct byte names whose lossy forms are identical, so before the
+        // guard the second insert silently overwrites the first.
+        fs::write(
+            bundle_path.join(std::ffi::OsStr::from_bytes(b"bad\xFF.dat")),
+            b"first",
+        )
+        .unwrap();
+        fs::write(
+            bundle_path.join(std::ffi::OsStr::from_bytes(b"bad\xFE.dat")),
+            b"second",
+        )
+        .unwrap();
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        let res = builder.scan();
+        assert!(
+            matches!(&res, Err(Error::Core(zsign_core::Error::Signing(m)))
+                if m.contains("File name is not valid UTF-8")),
+            "distinct non-UTF-8 names must not collapse onto one seal key, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_ignores_excluded_non_utf8_file_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+        let excluded_dir = bundle_path.join("Excluded");
+        fs::create_dir(&excluded_dir).unwrap();
+
+        fs::write(
+            excluded_dir.join(std::ffi::OsStr::from_bytes(b"junk\xFF.tmp")),
+            b"ignored",
+        )
+        .unwrap();
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        builder.exclude("Excluded/");
+        builder
+            .scan()
+            .expect("excluded entries are never sealed, so their names are never validated");
+    }
+
+    #[test]
+    fn test_scan_bundle_seals_exact_utf8_file_names() {
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+
+        const NAMES: [&str; 3] = ["r\u{00E9}.txt", "u\u{FFFD}n.txt", "\u{65E5}\u{672C}.txt"];
+        for name in NAMES {
+            fs::write(bundle_path.join(name), name.as_bytes()).unwrap();
+        }
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        builder.scan().unwrap();
+        let plist_data = builder.build().unwrap();
+
+        let value: plist::Value = plist::from_bytes(&plist_data).unwrap();
+        let files2 = value
+            .as_dictionary()
+            .and_then(|d| d.get("files2"))
+            .and_then(|v| v.as_dictionary())
+            .expect("files2 dictionary");
+        for name in NAMES {
+            assert!(
+                files2.get(name).is_some(),
+                "valid UTF-8 name must seal under its exact key {name}, got keys {:?}",
+                files2.keys().collect::<Vec<_>>()
+            );
+        }
     }
 }
