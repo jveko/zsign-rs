@@ -151,6 +151,7 @@ impl<'a> CodeResourcesBuilder<'a> {
     /// - A file cannot be read for hashing
     /// - Symlink targets cannot be resolved (on Unix)
     /// - A symlink target is not valid UTF-8 (the seal would otherwise differ from disk)
+    /// - An entry name is not valid UTF-8 (a lossy key could collide with another entry)
     ///
     /// # Examples
     ///
@@ -203,6 +204,8 @@ impl<'a> CodeResourcesBuilder<'a> {
 
     /// Hashes one walked bundle entry (or `None` when it is an excluded
     /// directory), shared verbatim by the parallel and sequential scan arms.
+    /// Fails when the entry name is not valid UTF-8; excluded entries are
+    /// exempt because they are never sealed.
     fn hash_entry(
         store: &dyn Store,
         bundle_path: &Path,

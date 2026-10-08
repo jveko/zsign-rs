@@ -483,6 +483,9 @@ impl CodeResourcesBuilder {
     /// Returns `true` if the file was added, `false` if it was excluded by
     /// the current exclusion rules.
     ///
+    /// Inserting a path that is already present replaces its entry (last write
+    /// wins).
+    ///
     /// # Examples
     ///
     /// ```
@@ -517,6 +520,9 @@ impl CodeResourcesBuilder {
     ///
     /// Returns `true` if the symlink was added, `false` if it was excluded by
     /// the current exclusion rules.
+    ///
+    /// Inserting a path that is already present replaces its entry (last write
+    /// wins).
     ///
     /// # Examples
     ///
