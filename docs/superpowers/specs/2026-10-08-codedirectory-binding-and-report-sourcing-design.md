@@ -35,7 +35,7 @@ mechanisms:
 - `CodeDirectory::parse` rejects `hashType ∉ {1,2}` and `hashSize ∉ {20,32}`
   (`codesign/verify.rs:672-681`), so every SHA-256 CD ties at 32: with two
   SHA-256 directories, `strongest` is deterministically the LAST-emitted one.
-- `cdhash_pair` (`macho/verify.rs:471-484`) uses `find` = FIRST of each type;
+- `cdhash_pair` (`macho/verify.rs:475-484`) uses `find` = FIRST of each type;
   `verify_code_signature(cms_blob, primary.raw(), cd_sha1, cd_sha256)` at
   `:381-393` therefore binds exactly: the slot-0 CD (messageDigest over
   `primary.raw()`), the first SHA-1 CD (v1 attribute), and the first SHA-256
@@ -140,7 +140,7 @@ let strongest = if cms_is_real {
 
 - The rule is **static**: the bound set depends only on the CMS blob's shape
   (which crypto will check), not on the check's outcome — so `strongest`
-  stays computable at `verify.rs:174`, before the CMS branch at `:363`.
+  stays computable at `verify.rs:174`, before the CMS branch at `:369`.
   `cms_is_real` replaces the later recomputation of `empty_wrapper` (one
   definition, reused).
 - Real CMS ⇒ bound = {primary (messageDigest), first SHA-1, first SHA-256} —
@@ -152,8 +152,9 @@ let strongest = if cms_is_real {
   cover every directory, so tampering with an alternate still fails
   verification — only the *field source* changes (recorded test rework below).
 - First-on-tie: the fold keeps the first strictly-greater element. After
-  direction (b)+(c) a size tie cannot occur (≤1 CD per type ⇒ sizes {20,32}),
-  but the brief mandates the tie rule and it future-proofs a wider type set.
+  direction (b)+(c) a size tie cannot occur for well-formed pairs (parse
+  admits hashSize {20,32} alongside the type check, so one directory per type
+  implies sizes {20,32}); the fold is tie-safe regardless.
 - Rejected A2 (bound = all CDs even without CMS): leaves the ad-hoc source
   gap and does not match the brief's expected test rework. Rejected A3
   (rank by Apple hash-priority): parse already restricts types to {1,2}, so
@@ -192,7 +193,7 @@ Why this single check IS directions (b) and (c):
   slot-range gap — are rejected outright.
 - Parse-time rejection propagates to `verify_slice` through the existing
   "embedded code signature is not a valid SuperBlob: {e}" push
-  (`macho/verify.rs:161-166`) — no new verify-slice wiring.
+  (`macho/verify.rs:160-162`) — no new verify-slice wiring.
 - Rejected: implementing (b) as a verify-slice loop over `cds` (redundant
   once parse rejects, and its error would double-report); rejected: touching
   `verify_code_signature`'s signature (deferred crypto).

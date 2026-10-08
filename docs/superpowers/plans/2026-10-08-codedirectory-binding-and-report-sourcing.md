@@ -75,8 +75,8 @@ signer, writer, parser, facade, and CLI are untouched.
 
 **Files:**
 - Modify: `crates/zsign-core/src/codesign/verify.rs` — `parse_superblob`
-  child-classification loop (~:187-214) + test module (`#[cfg(test)]` at
-  :1283).
+  child-classification loop (:197-216) + test module (`#[cfg(test)]` at
+  :1271).
 
 **Interfaces:**
 - Consumes: `CodeDirectory::parse` (returns `Err` on unsupported hashType —
@@ -141,8 +141,9 @@ fn duplicate_code_directory_hash_type_is_rejected() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core duplicate_code_directory_hash_type_is_rejected`
-Expected: FAIL — pre-fix both directories parse, `res` is `Ok`, the
-`matches!` assertion prints `got Ok(SuperBlob { .. })`.
+Expected: FAIL — pre-fix both directories parse, `res` is `Ok`, so
+`res.as_ref().err()` is `None` and the `matches!` assertion prints
+`got None`.
 
 - [ ] **Step 3: Add the duplicate-type checks to `parse_superblob`**
 
@@ -206,8 +207,8 @@ Stage exactly `crates/zsign-core/src/codesign/verify.rs` and commit
 
 **Files:**
 - Modify: `crates/zsign-core/src/macho/verify.rs` — `verify_slice`
-  (selection block :174-179, CMS branch ~:363-367, page loop :185-196) +
-  new private helper near `emitted_cds`/`cdhash_pair` (:460-484) + tests.
+  (selection block :174-179, CMS branch :367-372, page loop :185-196) +
+  new private helper near `emitted_cds`/`cdhash_pair` (:463-484) + tests.
 
 **Interfaces:**
 - Consumes: `emitted_cds(&superblob) -> Vec<&CodeDirectory>` (unchanged),
@@ -285,7 +286,7 @@ fn alternate_header_disagreement_is_rejected() {
 
 - [ ] **Step 2: Run both tests to verify they fail**
 
-Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core tampered_alternate_page_hash_is_rejected alternate_header_disagreement`
+Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- tampered_alternate_page_hash_is_rejected alternate_header_disagreement`
 Expected: both FAIL —
 - tampered: assertion `left: Mismatch { page_index: 0 }, right: Matched`
   (today's field source is the tampered unbound alternate);
@@ -415,7 +416,7 @@ requirements/DR block, and all error wording stay as-is.
 
 - [ ] **Step 5: Run both tests to verify they pass**
 
-Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core tampered_alternate_page_hash_is_rejected alternate_header_disagreement`
+Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- tampered_alternate_page_hash_is_rejected alternate_header_disagreement`
 Expected: both PASS.
 
 - [ ] **Step 6: Run the whole zsign-core crate (the canary run)**
