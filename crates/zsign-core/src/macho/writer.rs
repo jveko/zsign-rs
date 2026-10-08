@@ -203,7 +203,7 @@ fn realloc_code_sign_space_single(
 
     if let Some((offset, linkedit_fileoff, old_vmsize, _old_filesize)) = linkedit_cmd {
         let linkedit_fileoff = linkedit_fileoff as usize;
-        let size_increase = required - data.len();
+        let size_increase = required - code_length;
         let new_vmsize = usize::try_from(old_vmsize)
             .ok()
             .and_then(|v| v.checked_add(size_increase))
@@ -214,6 +214,11 @@ fn realloc_code_sign_space_single(
             .checked_sub(linkedit_fileoff)
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
             as u64;
+        if new_vmsize < new_filesize {
+            return Err(Error::MachO(format!(
+                "__LINKEDIT vmsize {new_vmsize:#x} does not cover filesize {new_filesize:#x}"
+            )));
+        }
 
         write_linkedit_sizes(
             &mut output,
@@ -1378,7 +1383,7 @@ pub fn realloc_code_sign_space_with_metadata(
 
     if let Some((offset, fileoff, vmsize, _filesize)) = metadata.linkedit_cmd {
         let linkedit_fileoff = fileoff as usize;
-        let size_increase = required - data.len();
+        let size_increase = required - code_length;
         let new_vmsize = usize::try_from(vmsize)
             .ok()
             .and_then(|v| v.checked_add(size_increase))
@@ -1389,6 +1394,11 @@ pub fn realloc_code_sign_space_with_metadata(
             .checked_sub(linkedit_fileoff)
             .ok_or_else(|| Error::MachO("__LINKEDIT fileoff exceeds required length".into()))?
             as u64;
+        if new_vmsize < new_filesize {
+            return Err(Error::MachO(format!(
+                "__LINKEDIT vmsize {new_vmsize:#x} does not cover filesize {new_filesize:#x}"
+            )));
+        }
 
         write_linkedit_sizes(
             &mut output,
@@ -3183,5 +3193,83 @@ mod tests {
             err.to_string().contains("No __LINKEDIT segment found"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_realloc_vmsize_covers_linkedit_filesize() {
+        let data = big_signed_buffer();
+        let out = realloc_code_sign_space(&data, 0x3000).expect("expansion must succeed");
+        let reparsed =
+            crate::macho::MachOFile::parse(out.clone()).expect("expanded output must reparse");
+        let (_, fileoff, vmsize, filesize) = reparsed.slices()[0]
+            .metadata
+            .linkedit_cmd
+            .expect("__LINKEDIT present");
+        assert_eq!(fileoff, 0x2000, "fixture __LINKEDIT fileoff");
+        assert!(
+            vmsize >= filesize,
+            "vmsize ({vmsize:#x}) must cover filesize ({filesize:#x})"
+        );
+        assert_eq!(
+            vmsize, 0x7000,
+            "vmsize must reflect actual growth, got {vmsize:#x}"
+        );
+    }
+
+    #[test]
+    fn test_realloc_metadata_vmsize_covers_linkedit_filesize() {
+        use crate::macho::parser::MachOMetadata;
+        let data = big_signed_buffer();
+        let metadata = MachOMetadata {
+            code_sig_cmd: Some((280, 0x3000, 0x6000)),
+            linkedit_cmd: Some((184, 0x2000, 0x1000, 0)),
+            max_load_cmd_end: 296,
+            first_segment_offset: 0x1000,
+            is_big_endian: false,
+            is_64: true,
+        };
+        let (out, updated_metadata) = realloc_code_sign_space_with_metadata(
+            &data,
+            &metadata,
+            0x3000,
+            calculate_signature_space(0x3000) - 0x3000,
+        )
+        .expect("expansion must succeed");
+        let reparsed =
+            crate::macho::MachOFile::parse(out.clone()).expect("expanded output must reparse");
+        let (_, _, vmsize, filesize) = reparsed.slices()[0]
+            .metadata
+            .linkedit_cmd
+            .expect("__LINKEDIT present");
+        assert!(
+            vmsize >= filesize,
+            "vmsize ({vmsize:#x}) must cover filesize ({filesize:#x})"
+        );
+        assert_eq!(
+            vmsize, 0x7000,
+            "vmsize must reflect actual growth, got {vmsize:#x}"
+        );
+        let (_, persisted_fileoff, persisted_vmsize, persisted_filesize) = updated_metadata
+            .linkedit_cmd
+            .expect("metadata persists the corrected pair");
+        assert_eq!(
+            (persisted_fileoff, persisted_vmsize, persisted_filesize),
+            (0x2000, 0x7000, 0x7000),
+            "persisted linkedit pair must carry the corrected sizes"
+        );
+    }
+
+    #[test]
+    fn test_realloc_rejects_vmsize_below_filesize() {
+        let mut data = crate::macho::fixtures::make_minimal_macho();
+        data.resize(0x5000, 0);
+        // __LINKEDIT LC at 184; segment_command_64.fileoff at +40, vmsize at +32.
+        data[224..232].copy_from_slice(&0x1000u64.to_le_bytes());
+        data[216..224].copy_from_slice(&0x1000u64.to_le_bytes());
+        let err = realloc_code_sign_space(&data, 0x5000)
+            .expect_err("vmsize that cannot cover filesize must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("vmsize"), "guard must name vmsize: {msg}");
+        assert!(msg.contains("filesize"), "guard must name filesize: {msg}");
     }
 }
