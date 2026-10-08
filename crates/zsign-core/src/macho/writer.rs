@@ -354,7 +354,7 @@ pub fn embed_signature(data: &[u8], signature: &[u8]) -> Result<Vec<u8>> {
                 signed_data: embed_signature_single(slice_data, &first_macho, signature)?,
             };
 
-            embed_fat_from_signed_slices(&fat, &[signed_slice])
+            embed_fat_from_signed_slices(&fat, &[signed_slice], data.len())
         }
     }
 }
@@ -401,7 +401,7 @@ pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result
                 return Err(Error::MachO("Empty FAT binary".into()));
             }
             validate_fat_arches(&arches, data)?;
-            embed_fat_from_signed_slices(&fat, signed_slices)
+            embed_fat_from_signed_slices(&fat, signed_slices, data.len())
         }
     }
 }
@@ -437,7 +437,11 @@ fn validate_fat_arches(arches: &[FatArch], data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) -> Result<Vec<u8>> {
+fn embed_fat_from_signed_slices(
+    fat: &MultiArch,
+    signed_slices: &[SignedSlice],
+    input_len: usize,
+) -> Result<Vec<u8>> {
     let arches: Vec<FatArch> = fat
         .iter_arches()
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -524,6 +528,16 @@ fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) 
     }
 
     let total_size = cursor;
+    let signed_total: usize = slice_data_vec.iter().map(|s| s.len()).sum();
+    let max_total = input_len
+        .checked_add(signed_total)
+        .and_then(|v| v.checked_add(arches.len().checked_mul(1 << 15)?))
+        .ok_or_else(|| Error::MachO("FAT output size bound overflows".into()))?;
+    if total_size > max_total {
+        return Err(Error::MachO(format!(
+            "FAT output size {total_size} exceeds bound {max_total} for input of {input_len} bytes"
+        )));
+    }
     let mut output = vec![0u8; total_size];
 
     output[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -1007,7 +1021,7 @@ pub fn inject_dylib_command(input: &[u8], dylib_name: &str, weak: bool) -> Resul
                 signed_data: injected,
             });
         }
-        return embed_fat_from_signed_slices(&fat, &signed_slices);
+        return embed_fat_from_signed_slices(&fat, &signed_slices, input.len());
     }
 
     inject_dylib_thin(input, dylib_name, weak)
@@ -2943,6 +2957,34 @@ mod tests {
         let err = embed_signature_fat(&bad, &full)
             .expect_err("input offset not aligned to 2^align must be rejected");
         assert!(err.to_string().contains("not aligned"), "{err}");
+    }
+    #[test]
+    fn test_embed_fat_output_bounded_by_input() {
+        let mut b = crate::macho::fixtures::make_minimal_macho();
+        b[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        let fat = make_fat_macho(&[make_minimal_macho(), b], &[15, 12]);
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.outputbound",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let signed_total: usize = full.iter().map(|s| s.signed_data.len()).sum();
+        let output = embed_signature_fat(&fat, &full).expect("well-formed reassembly must succeed");
+        let max_total = fat.len() + signed_total + full.len() * (1 << 15);
+        assert!(
+            output.len() <= max_total,
+            "output {} must stay within input {} + signed {signed_total} + {} * 32768 = {max_total}",
+            output.len(),
+            fat.len(),
+            full.len(),
+        );
     }
 
     /// The public single-path entry points accept little-endian 32-bit input:
