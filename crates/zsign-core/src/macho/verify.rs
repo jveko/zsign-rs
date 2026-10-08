@@ -1602,4 +1602,138 @@ mod tests {
             res.as_ref().err()
         );
     }
+
+    #[test]
+    fn planted_second_superblob_in_window_tail_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.window", None, None, None, false).unwrap();
+        let baseline = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(baseline.is_valid(), "{:?}", baseline.slices[0].errors);
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let declared =
+            u32::from_be_bytes(signed[sig_off + 4..sig_off + 8].try_into().unwrap()) as usize;
+        assert!(
+            sig_len >= 2 * declared,
+            "reserve must fit a full duplicate: sig_len={sig_len} declared={declared}"
+        );
+        signed.copy_within(sig_off..sig_off + declared, sig_off + declared);
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            !report.is_valid(),
+            "planted second signature must not verify clean: {:?}",
+            report.slices[0].errors
+        );
+        assert_eq!(report.error_count(), 1, "{:?}", report.slices[0].errors);
+        assert!(
+            report.slices[0].errors[0].contains("nonzero bytes past the declared SuperBlob length"),
+            "{:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn stray_nonzero_byte_in_window_tail_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.window", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let declared =
+            u32::from_be_bytes(signed[sig_off + 4..sig_off + 8].try_into().unwrap()) as usize;
+        signed[sig_off + declared] = 0xff;
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid(), "{:?}", report.slices[0].errors);
+        assert_eq!(report.error_count(), 1, "{:?}", report.slices[0].errors);
+        assert!(
+            report.slices[0].errors[0].contains("nonzero bytes past the declared SuperBlob length"),
+            "{:?}",
+            report.slices[0].errors
+        );
+    }
+
+    #[test]
+    fn zero_filled_window_tail_is_accepted() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let signed =
+            sign_macho_adhoc(&macho, "com.example.window", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let declared =
+            u32::from_be_bytes(signed[sig_off + 4..sig_off + 8].try_into().unwrap()) as usize;
+        assert!(
+            declared < sig_len,
+            "fixture must carry a reserved tail: declared={declared} sig_len={sig_len}"
+        );
+        assert!(
+            signed[sig_off + declared..sig_off + sig_len]
+                .iter()
+                .all(|&b| b == 0),
+            "fixture tail must be zero-filled"
+        );
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(report.is_valid(), "{:?}", report.slices[0].errors);
+        assert_eq!(report.error_count(), 0, "{:?}", report.slices[0].errors);
+    }
+
+    #[test]
+    fn exact_fit_window_tail_is_accepted() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.window", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let slice_off = sl.offset;
+        let (lc_off, _dataoff, datasize) = sl.metadata.code_sig_cmd.expect("fixture is signed");
+        let declared =
+            u32::from_be_bytes(signed[sig_off + 4..sig_off + 8].try_into().unwrap()) as usize;
+        assert!(
+            declared < datasize as usize,
+            "shrink must be real: declared={declared} datasize={datasize}"
+        );
+        // Shrink the window to exact fit (little-endian load-command field).
+        signed[lc_off + 12..lc_off + 16].copy_from_slice(&(declared as u32).to_le_bytes());
+        // The load-command area is inside the hashed code region, so rebind
+        // page 0 in BOTH CodeDirectories over the mutated bytes (fixture
+        // surgery of the same kind as bind_special_slot; the CDs themselves
+        // live past the code limit, so this does not recurse).
+        for slot in [CSSLOT_CODEDIRECTORY, CSSLOT_ALTERNATE_CODEDIRECTORIES] {
+            let cd = sig_off
+                + entry_offset(&signed[sig_off..sig_off + sig_len], slot)
+                    .unwrap_or_else(|| panic!("CD slot {slot:#x} must be present"));
+            let hash_offset =
+                u32::from_be_bytes(signed[cd + 16..cd + 20].try_into().unwrap()) as usize;
+            let n_special = u32::from_be_bytes(signed[cd + 24..cd + 28].try_into().unwrap());
+            let hash_size = signed[cd + 36] as usize;
+            let hash_type = signed[cd + 37];
+            let page_size = 1usize << signed[cd + 39];
+            assert!(
+                n_special >= 1,
+                "CD slot {slot:#x} must bind special slots: {n_special}"
+            );
+            assert_eq!(page_size, 4096, "CD slot {slot:#x} page size");
+            let expected_hash = if hash_type == 1 { 20 } else { 32 };
+            assert_eq!(
+                hash_size, expected_hash,
+                "CD slot {slot:#x} hash size for type {hash_type}"
+            );
+            let page = &signed[slice_off..slice_off + page_size];
+            let digest: Vec<u8> = match hash_type {
+                1 => Sha1::digest(page).to_vec(),
+                _ => Sha256::digest(page).to_vec(),
+            };
+            signed[cd + hash_offset..cd + hash_offset + hash_size].copy_from_slice(&digest);
+        }
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(report.is_valid(), "{:?}", report.slices[0].errors);
+        assert_eq!(report.error_count(), 0, "{:?}", report.slices[0].errors);
+    }
 }
