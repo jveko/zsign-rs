@@ -219,9 +219,11 @@ Commit: `feat(cli): validate dylib injection paths at parse time`
 
 Add to `crates/zsign/src/ipa/mod.rs` tests (reuse `create_folder_bundle`,
 `create_bundle_with_appex`, `create_test_ipa`, `fixtures::make_minimal_dylib`,
-`TempDir`; read load-command names through the same `MachOFile` accessor that
-`builder.rs`'s `test_sign_macho_applies_dylibs_and_bundle_id` at :1250-1279
-uses — read that test first and match it; parse signatures via
+`TempDir`; read load-command dylib names with `goblin::mach::Mach::parse`
+and its `libs` list exactly as `builder.rs`'s
+`test_sign_macho_applies_dylibs_and_bundle_id` at :1268-1276 does — goblin
+is a direct dependency of that crate (`crates/zsign/Cargo.toml:19`); parse
+signatures via
 `crate::macho::MachOFile::parse` + `.slices()[0].code_sig_offset` as at
 :2964-2967):
 
@@ -528,10 +530,10 @@ fn is_top_level_app_extension(relative: &Path) -> bool {
 
 ```rust
 for (path, _) in &bundles {
-    let Ok(relative) = path.strip_prefix(&bundle_path) else {
+    let Ok(relative) = path.strip_prefix(bundle_path) else {
         continue;
     };
-    let in_scope = path == &bundle_path
+    let in_scope = path == bundle_path
         || (self.inject_extensions && is_top_level_app_extension(relative));
     if !in_scope {
         continue;
@@ -544,7 +546,9 @@ for (path, _) in &bundles {
 }
 ```
 
-(root: `strip_prefix` yields `""`, zero components, `up` empty — identical to
+(the `path == bundle_path` / `strip_prefix(bundle_path)` forms are the
+identical comparisons already compiling in this function at :929/:954; root:
+`strip_prefix` yields `""`, zero components, `up` empty — identical to
 Task 2's root string.)
 
 `builder.rs`: field `inject_extensions: bool` (+ `false` in `new()`), setter
