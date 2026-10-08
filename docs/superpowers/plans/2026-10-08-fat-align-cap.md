@@ -25,8 +25,8 @@
 - Exponent boundary: align 15 must remain accepted, align 16 must be rejected — the cap is `> 15`, not `>= 15`.
 - Offset cross-check must run on the *input* arch offset (parsed container), not the recomputed cursor offsets (which are aligned by construction) — a test that patches the input offset proves which one is checked.
 - `total_size` guard must be evaluated BEFORE `vec![0u8; total_size]` (writer.rs:521) — no allocation on the failing path.
-- Existing behaviour tests (writer.rs:2611-2672 declared-exponent layout; :2504-2757 FAT suite) must stay green — guards must not reject well-formed containers.
-- The three call sites of `embed_fat_from_signed_slices` must all pass the correct `input_len` (same `data` they parsed) — migrating every caller, no default/0 passthrough.
+- Existing behaviour tests (writer.rs:2611-2672 declared-exponent layout; :2504-2869 FAT suite) must stay green — guards must not reject well-formed containers.
+- The three call sites of `embed_fat_from_signed_slices` must all pass the correct `input_len` (the container bytes they parsed — `data.len()` at :357/:404, `input.len()` at :1004) — migrating every caller, no default/0 passthrough.
 
 ---
 
@@ -65,7 +65,7 @@
 - [ ] **Step 1: Write the invariant-pin test**
   `test_embed_fat_output_bounded_by_input`: for a successful reassembly (align 15/12 fixture), assert `output.len() <= input_len + signed_total + arches * (1 << 15)` — pins the invariant the guard enforces. This is an **invariant-pin**: it passes before and after the guard (it constrains a successful output, which already satisfies the bound under guards 1+2 — no constructible input trips guard 3 once the cap and cross-check are in place, by design). The failing-before/passing-after coverage for this item is the cap and cross-check tests of Task 1.
 - [ ] **Step 2: Thread `input_len`**
-  Add `input_len: usize` parameter; update all three call sites with `data.len()` (`embed_signature` :357, `embed_signature_fat` :404, `inject_dylib_command` :1004). Grep for any other caller before finishing (`embed_fat_from_signed_slices` must have zero remaining 2-arg call sites).
+  Add `input_len: usize` parameter; update all three call sites with the container length in scope at each: `data.len()` at `embed_signature` :357 and `embed_signature_fat` :404, `input.len()` at `inject_dylib_command` :1004 (that fn's parameter is named `input`, not `data`). Grep for any other caller before finishing (`embed_fat_from_signed_slices` must have zero remaining 2-arg call sites).
 - [ ] **Step 3: Implement the guard**
   After the cursor loop (`let total_size = cursor;` :520) and BEFORE `vec![0u8; total_size]` (:521):
   compute `signed_total = slice_data_vec.iter().map(|s| s.len()).sum::<usize>()`;

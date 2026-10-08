@@ -62,8 +62,9 @@ Closes all three gap clauses:
 2. `arch.offset % (1 << arch.align) == 0` → `Error::MachO`, exactly lipo's
    interop check; validates the *input* container the reassembly came from.
 3. Pass the input container length into `embed_fat_from_signed_slices` from
-   its three call sites (embed_signature :357, embed_signature_fat :404,
-   inject_dylib_command :1004 — all already hold `data`) and, after the
+   its three call sites (embed_signature :357 and embed_signature_fat :404
+   pass `data.len()`; inject_dylib_command :1004 passes `input.len()` — that
+   fn's parameter is named `input`) and, after the
    cursor loop, require
    `total_size <= input_len + sum(signed slice len) + arches.len() * (1 << 15)`.
    Rationale: `header_size <= input_len` (the arch table lives in the input;
