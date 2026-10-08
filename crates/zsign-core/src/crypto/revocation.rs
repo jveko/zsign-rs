@@ -865,6 +865,23 @@ pub fn warn_revocation(leaf: &Certificate, chain: &[Certificate]) {
     }
 }
 
+/// Status-returning companion of [`warning_of`] for gate decisions.
+///
+/// Same issuer resolution, transport, and clock as [`warn_revocation`]
+/// (3s [`HttpTransport`] budget, `now` = wall clock), but returns the full
+/// [`RevocationStatus`] so callers can distinguish `Good` from
+/// `NotChecked` — the distinction a gate needs and `Option<String>` cannot
+/// carry. Native-only because it opens the socket.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn status_of(leaf: &Certificate, chain: &[Certificate]) -> RevocationStatus {
+    check(
+        leaf,
+        issuer_of(leaf, chain),
+        &HttpTransport::default(),
+        None,
+    )
+}
+
 /// The certificate in `chain` that issued `leaf`, matched on subject/issuer name.
 fn issuer_of<'a>(leaf: &Certificate, chain: &'a [Certificate]) -> Option<&'a Certificate> {
     let issuer_name = &leaf.tbs_certificate.issuer;
@@ -2155,6 +2172,69 @@ mod tests {
             );
             server.join().unwrap();
             assert!(matches!(status, RevocationStatus::Good), "got {status:?}");
+        }
+
+        #[test]
+        fn status_of_reports_revoked_against_a_loopback_responder() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = REVOKED_DER.to_vec();
+            let expected_request = {
+                let (leaf, issuer) = fixture_pair();
+                build_request(&leaf, &issuer).expect("request")
+            };
+            let server = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                // Read exactly the declared body: `read_to_end` would wait for
+                // the client to close, which it cannot do until we answer.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while find_subslice(&head, b"\r\n\r\n").is_none() {
+                    let n = sock.read(&mut byte).unwrap();
+                    assert!(n == 1, "client closed mid-header");
+                    head.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                let declared: usize = text
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .expect("Content-Length");
+                let mut body = vec![0u8; declared];
+                sock.read_exact(&mut body).unwrap();
+                assert!(text.starts_with("POST /ocsp HTTP/1.1"), "request: {text}");
+                assert!(
+                    text.to_ascii_lowercase()
+                        .contains("content-type: application/ocsp-request"),
+                    "request: {text}"
+                );
+                assert_eq!(body, expected_request, "posted body");
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                sock.write_all(header.as_bytes()).unwrap();
+                sock.write_all(&response).unwrap();
+                sock.flush().unwrap();
+            });
+            let (mut leaf, issuer) = fixture_pair();
+            rewrite_ocsp_uri(&mut leaf, &format!("http://127.0.0.1:{port}/ocsp"));
+            let chain = vec![issuer.clone()];
+            let status = status_of(&leaf, &chain);
+            server.join().unwrap();
+            assert_eq!(
+                status,
+                RevocationStatus::Revoked {
+                    revoked_at: time::OffsetDateTime::from_unix_timestamp(1_767_225_600).ok(),
+                    reason: None,
+                },
+                "got {status:?}"
+            );
         }
 
         #[test]
