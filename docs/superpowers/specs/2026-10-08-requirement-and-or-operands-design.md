@@ -15,7 +15,7 @@ while an unsupported opcode on its own stays a non-fatal warning (never
 turned into a hard error here; that enforcement is another ticket's
 ownership).
 
-## Defect — verified at HEAD (8e15ce8)
+## Defect — verified at 8e15ce8 (source unchanged at current HEAD 408f476)
 
 `parse_requirement_expr` is `verify.rs:376-421`. Four early-returns:
 
@@ -30,7 +30,7 @@ precedence but can only see the tree the parser builds:
 
 - `Expr::And` arm `:316-323`: `(False, _) | (_, False)` first, then
   `(True, True)`, then `Unsupported`, else `Unknown`.
-- `Expr::Or` arm `:324-332`: `(True, _) | (_, True)` first, then
+- `Expr::Or` arm `:324-331`: `(True, _) | (_, True)` first, then
   `(False, False)`, then `Unsupported`, else `Unknown`.
 - Both arms evaluate both children eagerly (a Rust tuple match — no
   evaluation skipping; precedence comes from arm order).
