@@ -1092,11 +1092,11 @@ fn der_integer(content: &[u8]) -> Result<plist::Value> {
         return Err(der_error("non-minimal or oversized DER INTEGER"));
     }
     let mut value = if negative {
-        -1i128 << (8 * content.len())
+        first as i128 - 256
     } else {
-        0
+        first as i128
     };
-    for &byte in content {
+    for &byte in prefix {
         value = (value << 8) | byte as i128;
     }
     let value = i64::try_from(value).map_err(|_| der_error("DER INTEGER does not fit i64"))?;
@@ -1679,6 +1679,26 @@ mod tests {
         let decoded = der_entitlements_to_plist(&der).unwrap();
         let expected = plist::from_bytes::<plist::Value>(xml.as_slice()).unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn der_integers_round_trip_signed_extremes() {
+        // Writer -> reader: each value is encoded by der::plist_to_der and must
+        // decode back unchanged. 0 is the control that already passed.
+        for value in [-1i64, -128, -129, -2_147_483_648, i64::MIN, i64::MAX, 0] {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>v</key><integer>{value}</integer></dict></plist>"#
+            );
+            let der = crate::codesign::der::plist_to_der(xml.as_bytes()).unwrap();
+            let decoded = der_entitlements_to_plist(&der).unwrap();
+            let got = decoded
+                .as_dictionary()
+                .and_then(|dict| dict.get("v"))
+                .and_then(|v| v.as_signed_integer());
+            assert_eq!(got, Some(value), "round trip of {value}");
+        }
     }
 
     #[test]
