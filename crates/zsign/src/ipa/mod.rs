@@ -329,7 +329,7 @@ pub struct IpaSigner<'a> {
     /// Emit only the SHA-256 code directory (no SHA-1 code directory)
     sha256_only: bool,
     /// Dylib load paths to inject into signed binaries
-    dylibs: Vec<String>,
+    dylibs: Vec<PathBuf>,
     /// Inject with LC_LOAD_WEAK_DYLIB instead of LC_LOAD_DYLIB
     weak_dylibs: bool,
     /// Override the FairPlay-encryption refusal (sign an encrypted binary anyway).
@@ -600,7 +600,7 @@ impl<'a> IpaSigner<'a> {
     /// Injects the given dylib load paths into every signed bundle binary.
     ///
     /// `weak` selects `LC_LOAD_WEAK_DYLIB`; otherwise `LC_LOAD_DYLIB` is used.
-    pub fn dylib_injection(mut self, dylibs: Vec<String>, weak: bool) -> Self {
+    pub fn dylib_injection(mut self, dylibs: Vec<PathBuf>, weak: bool) -> Self {
         self.dylibs = dylibs;
         self.weak_dylibs = weak;
         self
@@ -1824,7 +1824,7 @@ impl<'a> IpaSigner<'a> {
             for name in &self.dylibs {
                 binary_data = zsign_core::macho::writer::inject_dylib_command(
                     &binary_data,
-                    name,
+                    &name.to_string_lossy(),
                     self.weak_dylibs,
                 )?;
             }
@@ -2609,8 +2609,8 @@ mod tests {
 
         let credentials = crate::test_util::test_credentials();
         let before = std::fs::read(app.join("Enc")).unwrap();
-        let signer =
-            IpaSigner::new(&credentials).dylib_injection(vec!["lib.dylib".to_string()], false);
+        let signer = IpaSigner::new(&credentials)
+            .dylib_injection(vec![std::path::PathBuf::from("lib.dylib")], false);
         let err = signer
             .sign_folder_in_place(&app)
             .expect_err("encrypted main executable must refuse");

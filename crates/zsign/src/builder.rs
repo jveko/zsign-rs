@@ -82,7 +82,7 @@ pub struct ZSign {
     bundle_version: Option<String>,
     sha256_only: bool,
     adhoc: bool,
-    dylibs: Vec<String>,
+    dylibs: Vec<PathBuf>,
     weak_dylibs: bool,
     allow_encrypted: bool,
     /// Custom entitlements file: replaces profile-derived entitlements
@@ -342,7 +342,7 @@ impl ZSign {
     /// Injects dylib load paths into every signed executable.
     ///
     /// `weak` selects `LC_LOAD_WEAK_DYLIB`.
-    pub fn dylib_injection(mut self, dylibs: Vec<String>, weak: bool) -> Self {
+    pub fn dylib_injection(mut self, dylibs: Vec<PathBuf>, weak: bool) -> Self {
         self.dylibs = dylibs;
         self.weak_dylibs = weak;
         self
@@ -420,8 +420,11 @@ impl ZSign {
         self.validate()?;
         let mut bytes = std::fs::read(input.as_ref())?;
         for dylib in &self.dylibs {
-            bytes =
-                zsign_core::macho::writer::inject_dylib_command(&bytes, dylib, self.weak_dylibs)?;
+            bytes = zsign_core::macho::writer::inject_dylib_command(
+                &bytes,
+                &dylib.to_string_lossy(),
+                self.weak_dylibs,
+            )?;
         }
         let macho = MachOFile::parse(bytes)?;
 
@@ -1258,7 +1261,10 @@ mod tests {
 
         ZSign::new()
             .credentials(test_credentials())
-            .dylib_injection(vec!["/usr/lib/libzsn.dylib".to_string()], false)
+            .dylib_injection(
+                vec![std::path::PathBuf::from("/usr/lib/libzsn.dylib")],
+                false,
+            )
             .bundle_id("com.zsign.forwarded")
             .sign_macho(&input, &out)
             .expect("sign");

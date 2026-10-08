@@ -136,8 +136,8 @@ struct Cli {
     adhoc: bool,
 
     /// Dylib load path to inject (repeatable)
-    #[arg(short = 'l', long)]
-    dylibs: Vec<String>,
+    #[arg(short = 'l', long, value_parser = parse_dylib)]
+    dylibs: Vec<PathBuf>,
 
     /// Inject dylibs as LC_LOAD_WEAK_DYLIB
     #[arg(short = 'w', long)]
@@ -197,6 +197,22 @@ fn parse_profile_map(s: &str) -> std::result::Result<(String, PathBuf), String> 
         }
         _ => Err(format!("expected bundle-id=path, got '{s}'")),
     }
+}
+
+/// Parses one `-l` dylib argument: a non-empty path to an existing regular
+/// file that parses as Mach-O (mirrors upstream's pre-sign checks).
+fn parse_dylib(s: &str) -> std::result::Result<PathBuf, String> {
+    if s.is_empty() {
+        return Err("dylib path must not be empty".into());
+    }
+    let path = PathBuf::from(s);
+    if !path.is_file() {
+        return Err(format!("dylib not found or not a regular file: {s}"));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read dylib {s}: {e}"))?;
+    zsign_rs::macho::MachOFile::parse(bytes)
+        .map_err(|e| format!("not a valid Mach-O file {s}: {e}"))?;
+    Ok(path)
 }
 
 fn main() -> ExitCode {
@@ -1832,6 +1848,53 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["zsign", "-V", "in.ipa"]).is_ok());
         assert!(Cli::try_parse_from(["zsign", "-a", "--profile-map", "a=b", "in.ipa"]).is_ok());
+    }
+
+    #[test]
+    fn dylib_flag_rejects_empty_value() {
+        let err = parse_err(&["zsign", "-a", "-l", "", "in.ipa"]);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "empty -l must be a clap value error, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn dylib_flag_rejects_missing_file() {
+        let err = parse_err(&["zsign", "-a", "-l", "/no/such/lib.dylib", "in.ipa"]);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "a missing -l file must be a clap value error, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn dylib_flag_rejects_non_macho_file() {
+        let td = tempfile::TempDir::new().unwrap();
+        let junk = td.path().join("junk.bin");
+        std::fs::write(&junk, b"definitely not a macho").unwrap();
+        let err = parse_err(&["zsign", "-a", "-l", junk.to_str().unwrap(), "in.ipa"]);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "a non-Mach-O -l file must be a clap value error, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn dylib_flag_parses_existing_macho_path() {
+        let td = tempfile::TempDir::new().unwrap();
+        let file = td.path().join("lib.dylib");
+        std::fs::write(&file, zsign_core::macho::fixtures::make_minimal_macho()).unwrap();
+        let cli = Cli::try_parse_from(["zsign", "-a", "-l", file.to_str().unwrap(), "in.ipa"])
+            .expect("an existing Mach-O must parse");
+        let parsed: Vec<PathBuf> = cli.dylibs;
+        assert_eq!(parsed, vec![file]);
     }
 
     #[test]
