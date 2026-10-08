@@ -172,11 +172,30 @@ fn verify_slice(
     };
 
     let cds = emitted_cds(&superblob);
-    let strongest = cds
-        .iter()
-        .copied()
-        .max_by_key(|cd| cd.hash_size)
-        .unwrap_or(primary);
+    let first_sha1 = cds.iter().copied().find(|cd| cd.is_sha1());
+    let first_sha256 = cds.iter().copied().find(|cd| cd.is_sha256());
+    let cms_is_real = superblob
+        .cms
+        .is_some_and(|blob| !(blob.len() == 8 && blob[0..4] == CSMAGIC_BLOBWRAPPER.to_be_bytes()));
+    let mut bound: Vec<&CodeDirectory<'_>> = vec![primary];
+    if let Some(cd) = first_sha1.filter(|cd| !std::ptr::eq(*cd, primary)) {
+        bound.push(cd);
+    }
+    if let Some(cd) = first_sha256.filter(|cd| !std::ptr::eq(*cd, primary)) {
+        bound.push(cd);
+    }
+    let strongest = if cms_is_real {
+        bound
+            .iter()
+            .copied()
+            .fold(None::<&CodeDirectory<'_>>, |acc, cd| match acc {
+                Some(best) if best.hash_size >= cd.hash_size => Some(best),
+                _ => Some(cd),
+            })
+            .unwrap_or(primary)
+    } else {
+        primary
+    };
 
     report.signed = true;
     report.adhoc = primary.is_adhoc();
@@ -193,6 +212,13 @@ fn verify_slice(
             )
         };
         push_page_errors(&mut report, &label, &pages);
+        if !std::ptr::eq(*cd, primary) {
+            for field in cross_cd_disagreements(cd, primary) {
+                report.errors.push(format!(
+                    "{label}CodeDirectory disagrees with the primary: {field}"
+                ));
+            }
+        }
     }
 
     let mut pairs: Vec<(String, Vec<SpecialSlotCheck>)> = Vec::with_capacity(cds.len());
@@ -367,9 +393,7 @@ fn verify_slice(
     // CMS signature. An exact 8-byte CSMAGIC_BLOBWRAPPER header is what
     // codesign emits for ad-hoc output; the shortcut also requires CS_ADHOC.
     if let Some(cms_blob) = superblob.cms {
-        let empty_wrapper =
-            cms_blob.len() == 8 && cms_blob[0..4] == CSMAGIC_BLOBWRAPPER.to_be_bytes();
-        if empty_wrapper {
+        if !cms_is_real {
             if primary.is_adhoc() {
                 report.cms = Some(crate::crypto::cms_verify::adhoc_report());
             } else {
@@ -482,6 +506,44 @@ fn cdhash_pair(cds: &[&CodeDirectory<'_>]) -> (Option<[u8; 20]>, Option<[u8; 32]
         d
     });
     (sha1, sha256)
+}
+
+/// Header fields one signing session guarantees identical across every
+/// CodeDirectory of one file; a difference means the alternate describes a
+/// different binary than the primary the report anchors on.
+fn cross_cd_disagreements(
+    cd: &CodeDirectory<'_>,
+    primary: &CodeDirectory<'_>,
+) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cd.identifier() != primary.identifier() {
+        out.push("identifier");
+    }
+    if cd.team_id() != primary.team_id() {
+        out.push("team ID");
+    }
+    if cd.effective_code_limit() != primary.effective_code_limit() {
+        out.push("code limit");
+    }
+    if cd.n_code_slots != primary.n_code_slots {
+        out.push("code slot count");
+    }
+    if cd.page_size_log2 != primary.page_size_log2 {
+        out.push("page size");
+    }
+    if cd.flags != primary.flags {
+        out.push("flags");
+    }
+    if cd.exec_seg_base != primary.exec_seg_base {
+        out.push("exec segment base");
+    }
+    if cd.exec_seg_limit != primary.exec_seg_limit {
+        out.push("exec segment limit");
+    }
+    if cd.exec_seg_flags != primary.exec_seg_flags {
+        out.push("exec segment flags");
+    }
+    out
 }
 
 /// Page check variant that reads exactly the slice's byte range from the
@@ -1239,11 +1301,39 @@ mod tests {
             "errors: {:?}",
             report.slices[0].errors
         );
-        // Metadata = strongest CD (the tampered SHA-256 alternate), so the field
-        // itself now reflects the tamper:
-        assert_eq!(
-            report.slices[0].pages,
-            PageCheck::Mismatch { page_index: 0 }
+        // Metadata (pages) is sourced from the CMS-bound set; ad-hoc signing
+        // binds nothing beyond the primary, so the field reflects the
+        // unmodified primary while the tampered alternate is caught above.
+        assert_eq!(report.slices[0].pages, PageCheck::Matched);
+    }
+
+    #[test]
+    fn alternate_header_disagreement_is_rejected() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.agree", None, None, None, false).unwrap();
+        let m = MachOFile::parse(signed.clone()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let cd = sig_off
+            + entry_offset(
+                &signed[sig_off..sig_off + sig_len],
+                CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            )
+            .expect("alternate CD entry");
+        // identOffset sits at CD+20; flip the first identifier byte of the
+        // SHA-256 alternate so it describes a different identity than the primary.
+        let ident_off = u32::from_be_bytes(signed[cd + 20..cd + 24].try_into().unwrap()) as usize;
+        signed[cd + ident_off] = b'X';
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(!report.is_valid(), "disagreement must fail verification");
+        assert!(
+            report.slices[0].errors.iter().any(|e| e.contains(
+                "alternate SHA-256 CodeDirectory disagrees with the primary: identifier"
+            )),
+            "errors: {:?}",
+            report.slices[0].errors
         );
     }
 
@@ -1418,8 +1508,8 @@ mod tests {
         );
     }
 
-    /// Ad-hoc dual fixture with `__TEXT` vm exec-seg values; returns bytes with the
-    /// PRIMARY CD's exec-seg header already patched by `f(base, limit, flags)`.
+    /// Ad-hoc dual fixture with `__TEXT` vm exec-seg values; returns bytes with
+    /// both CDs' exec-seg headers already patched by `f(base, limit, flags)`.
     fn adhoc_with_patched_execseg(f: impl FnOnce(u64, u64, u64) -> (u64, u64, u64)) -> Vec<u8> {
         let macho = MachOFile::parse(make_minimal_macho()).unwrap();
         let mut signed =
@@ -1432,6 +1522,10 @@ mod tests {
         signed[cd + 64..cd + 72].copy_from_slice(&b.to_be_bytes());
         signed[cd + 72..cd + 80].copy_from_slice(&l.to_be_bytes());
         signed[cd + 80..cd + 88].copy_from_slice(&g.to_be_bytes());
+        let alt = child_off_in_signed(&signed, CSSLOT_ALTERNATE_CODEDIRECTORIES);
+        signed[alt + 64..alt + 72].copy_from_slice(&b.to_be_bytes());
+        signed[alt + 72..alt + 80].copy_from_slice(&l.to_be_bytes());
+        signed[alt + 80..alt + 88].copy_from_slice(&g.to_be_bytes());
         signed
     }
 
