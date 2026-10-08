@@ -26,7 +26,7 @@
 - Delta rebase: `size_increase = required - code_length` (NOT `required - data.len()`) at BOTH sites; the metadata twin must also persist corrected values (it already writes `new_vmsize`/`new_filesize` into `updated_metadata`).
 - The new vmsize guard must run AFTER `new_filesize` is computed and BEFORE `write_linkedit_sizes`, at BOTH sites.
 - Do not touch the early-return ordering (`required <= data.len()` / `code_length > data.len()` guards) that makes the plain `-` subtraction safe.
-- Hostile-vmsize `Err` tests (writer.rs:3101/:3119/:3142) and huge-passthrough test (:3161) must remain green — the fix must not add/remove overflow behavior.
+- Hostile-vmsize `Err` tests (writer.rs:3102/:3120/:3141) and huge-passthrough test (:3162) must remain green — the fix must not add/remove overflow behavior.
 
 ---
 
@@ -57,8 +57,9 @@
 - Produces: both realloc fns guarantee `new_vmsize >= new_filesize` or return `Err`.
 
 - [ ] **Step 1: Write failing tests**
-  - `test_realloc_vmsize_covers_linkedit_filesize`: `realloc_code_sign_space(&big_signed_buffer(), 0x3000)`; parse output, read `__LINKEDIT` vmsize (`lc+32` LE for 64-bit) and filesize (`lc+48`); assert `vmsize >= filesize` and `vmsize == 0x7000` (the corrected-delta value from the spec's concrete example). Mirror variant for `realloc_code_sign_space_with_metadata` if the existing metadata fixture setup makes it cheap; otherwise cover the metadata site by reusing the same readback helper on the metadata call path used by existing metadata tests.
-  - `test_realloc_rejects_vmsize_below_filesize`: construct input where `old_vmsize + fileoff < code_length` (e.g. `__LINKEDIT` fileoff `0x1000`, old vmsize `0x1000`, `code_length = 0x5000` per spec §Testing.3); `expect_err` + `contains` on the guard message naming vmsize/filesize.
+  - `test_realloc_vmsize_covers_linkedit_filesize`: `realloc_code_sign_space(&big_signed_buffer(), 0x3000)`; parse output, read `__LINKEDIT` vmsize (`lc+32` LE for 64-bit) and filesize (`lc+48`); assert `vmsize >= filesize` and `vmsize == 0x7000` (the corrected-delta value from the spec's concrete example).
+  - **Required metadata mirror** `test_realloc_metadata_vmsize_covers_linkedit_filesize`: same geometry through `realloc_code_sign_space_with_metadata` — build the hand-written `MachOMetadata` exactly as the existing metadata expansion test does (writer.rs:2170-2177 pattern), then assert the same vmsize/filesize readback on the returned buffer AND that the persisted `updated_metadata.linkedit_cmd` carries the corrected pair.
+  - `test_realloc_rejects_vmsize_below_filesize`: construct input where `old_vmsize + fileoff < code_length` — **the buffer must first be grown so `data.len() >= code_length`** or the `code_length exceeds buffer` guard (writer.rs:180-185) fires first and the new guard is never reached: take `make_minimal_macho`, resize the buffer to `>= 0x5000`, patch `__LINKEDIT` fileoff to `0x1000` and vmsize to `0x1000`, then call with `code_length = 0x5000`; `expect_err` + `contains` on the guard message naming vmsize/filesize.
 - [ ] **Step 2: Run, expect failure**
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core realloc_vmsize` and `... realloc_rejects_vmsize` → first FAILS with `vmsize (0x2000) < filesize (0x7000)`; second FAILS with Ok-returned panic value.
 - [ ] **Step 3: Rebase the delta at both sites**
@@ -68,7 +69,7 @@
   `if new_vmsize < new_filesize { return Err(Error::MachO(format!("__LINKEDIT vmsize {new_vmsize:#x} does not cover filesize {new_filesize:#x}"))); }`
   (Site B: place before `write_linkedit_sizes` and before persisting into `updated_metadata`.)
 - [ ] **Step 5: Run scoped tests**
-  `TMPDIR=$PWD/target/tmp cargo test -p zsign-core writer` → ALL green, especially :2143/:2169/:2339 (case-a realloc), :3101/:3119/:3142 (hostile Err), :3161 (huge passthrough), plus both new tests.
+  `TMPDIR=$PWD/target/tmp cargo test -p zsign-core writer` → ALL green, especially :2144/:2170/:2340 (case-a realloc), :3102/:3120/:3141 (hostile Err), :3162 (huge passthrough), plus all three new tests.
 
 ### Task 3: Full gate + commits (controller-owned)
 

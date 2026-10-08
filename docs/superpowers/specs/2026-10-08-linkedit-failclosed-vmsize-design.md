@@ -4,7 +4,7 @@ Date: 2026-10-08
 Lane: w2-macho-writer (branch w2-macho-writer)
 Scope: `crates/zsign-core/src/macho/writer.rs` only.
 
-## Problem 1 — fail-open missing __LINKEDIT (ZSN-49)
+## Problem 1 — fail-open missing __LINKEDIT
 
 `embed_signature_single` (writer.rs:575) writes the LC_CODE_SIGNATURE
 (update at :640-647 or insert at :648-661) and then consults `linkedit_cmd`
@@ -29,7 +29,7 @@ Five sibling write paths already fail closed on the identical condition with
 exported `embed_signature` (writer.rs:319-321, Mach::Binary arm) → facade
 `write_signed_macho`/`write_signed_macho_in_place` (crates/zsign/src/macho/mod.rs:43,54).
 
-### External contract (verified, cited in research log)
+### External contract (research-phase citations; [UNVERIFIED EXTERNAL] — not re-checkable in this worktree)
 - dyld rejects missing `__LINKEDIT` outright for non-preload images
   (MachOFile.cpp:2914-2917) and rejects a code signature extending beyond the
   LINKEDIT segment (MachOLayout.cpp:266-269; Image.cpp:479-481).
@@ -39,7 +39,7 @@ exported `embed_signature` (writer.rs:319-321, Mach::Binary arm) → facade
 - Conclusion: the current `Ok` output is an unloadable `malformed mach-o`,
   never a usable binary; `Err` is the only outcome consistent with all tooling.
 
-## Problem 2 — wrong realloc growth delta (ZSN-50)
+## Problem 2 — wrong realloc growth delta
 
 Both realloc variants compute the vmsize delta from the WRONG base:
 
@@ -48,11 +48,12 @@ Both realloc variants compute the vmsize delta from the WRONG base:
   `new_vmsize = align_to_checked(old_vmsize + size_increase, PAGE_SIZE)` chain (:207-212).
 - `realloc_code_sign_space_with_metadata` (writer.rs:1377-1385): byte-identical
   at :1379-1385, and it *persists* the value into
-  `updated_metadata.linkedit_cmd` (:1400), which the signer propagates
-  (signer.rs:475, :610).
+  `updated_metadata.linkedit_cmd` (:1400), returned to the signer's callers
+  (the `realloc_code_sign_space_with_metadata` call sites at signer.rs:475
+  and :610 receive the updated `MachOMetadata`).
 
 But the returned buffer is built as `data[..code_length].to_vec()`
-(:202 / :1373) and resized to `required` (:297 / :1472) — actual growth is
+(:202 / :1373) and resized to `required` (:296 / :1472) — actual growth is
 `required - code_length`. Whenever `data.len() > code_length` (the tail
 `[code_length, data.len())` is discarded) the declared vmsize is under-declared
 by exactly `D = data.len() - code_length` before page rounding.
@@ -64,7 +65,7 @@ Verified regimes:
 
 Concrete reproduction (arithmetic over source constants, fixture
 `make_minimal_macho` + `big_signed_buffer` writer.rs:2128, exercised by the
-existing `test_realloc_expands_to_cover_declared_reserve` writer.rs:2143):
+existing `test_realloc_expands_to_cover_declared_reserve` writer.rs:2144):
 `realloc_code_sign_space(&big_signed_buffer(), 0x3000)` writes
 `__LINKEDIT.vmsize = 0x2000` but `__LINKEDIT.filesize = 0x7000`
 (`new_filesize = required - fileoff = 0x9000 - 0x2000`) — `filesize > vmsize`,
@@ -74,11 +75,11 @@ The corrected delta (`required - code_length = 0x6000`) yields
 
 No test pins the delta today: the only vmsize read after a realloc is
 `written >= HUGE` (writer.rs:3168-3172, passthrough/floor policy); case-(a)
-tests (writer.rs:2143, :2339) assert only length/reparse/dataoff and pass with
+tests (writer.rs:2144, :2340) assert only length/reparse/dataoff and pass with
 the malformed output. `parser.rs:343-354` validates only
 `fileoff + filesize <= slice_len`, never vmsize, so the bad output reparses.
 
-### External contract (verified)
+### External contract (research-phase citations; [UNVERIFIED EXTERNAL] — not re-checkable in this worktree)
 - Load-time invariant: `filesize <= vmsize` is hard dyld-fatal
   (MachOFile.cpp:2821-2826/2846-2851); page-alignment of vmsize is NOT
   dyld-enforced (MachOFile.cpp:2052-2054) but is the ld64/codesign convention.
@@ -88,11 +89,16 @@ the malformed output. `parser.rs:343-354` validates only
 - Pinned repo policies the fix must not disturb: non-overflowing huge
   old vmsize passes through (writer.rs:3161 `written >= HUGE`); overflowing
   extension errors `"__LINKEDIT vmsize extension overflows"`
-  (tests writer.rs:3101, :3119, :3142).
+  (tests writer.rs:3102, :3120, :3141).
 
 ## Candidate designs
 
-### ZSN-49
+Note: the dyld / codesign_alloc / ld64 / upstream-zsign line citations in the
+two External contract sections were gathered during the research phase by
+fetching those projects' public sources; they are accurate to those fetches
+but cannot be re-verified against this worktree.
+
+### Problem 1 candidates
 **A — else arm with the siblings' exact error (CHOSEN).**
 Add `else { return Err(Error::MachO("No __LINKEDIT segment found".into())) }`
 to the terminal `if let` of `embed_signature_single`. Identical message to all
@@ -105,7 +111,7 @@ silent no-op contract violation.
 **C — synthesize a `__LINKEDIT` segment.** Rejected: invents load commands,
 far outside a defect fix.
 
-### ZSN-50
+### Problem 2 candidates
 **A — fix the delta base to `required - code_length` + fail-closed
 disagreement guard (CHOSEN).**
 1. `size_increase = required - code_length` at both sites — declared growth
@@ -119,33 +125,38 @@ disagreement guard (CHOSEN).**
 2. After `new_filesize` is computed, add a fail-closed guard at both sites:
    `new_vmsize < new_filesize` ⇒ `Err(Error::MachO(...))` (message names both
    values) — the dyld-fatal condition can never be written. Fix 1 alone leaves
-   a residual corner: `new_vmsize < new_filesize` iff
-   `old_vmsize + fileoff < code_length`, which hostile-but-reparse-clean
+   a residual corner (see Chosen design details) that hostile-but-reparse-clean
    inputs (tiny old vmsize, far-out code_length) can still reach.
    The guard is the unconditional closer for "vmsize and filesize disagree".
 - Note on the ticket's "no `max(original_vmsize, ..)` guard" observation: on a
   delta path the floor is vacuous — the delta is strictly positive (above), so
   `align(old + delta) >= old` always. A `max()` floor is only meaningful for a
   filesize-derived recompute (candidate B), which is why it is absent here.
+- Residual corner: `new_vmsize < new_filesize` requires
+  `old_vmsize + fileoff < code_length` (necessary; sufficient only modulo the
+  0..4095 page-pad absorbed by `align_to_checked`), which hostile-but-reparse-clean
+  inputs (tiny old vmsize, far-out code_length) can still reach.
+  The guard is the unconditional closer for "vmsize and filesize disagree".
 - Existing case-(a) tests stay green under fix 1 (delta correction turns their
   written vmsize from `0x2000` to `0x7000`, which is what they implicitly need);
   the guard never trips on them (verified arithmetic above).
 **B — recompute vmsize absolutely: `align(new_filesize).max(old_vmsize)` (the
 `update_linkedit_segment` pattern / Apple `codesign_alloc.cpp:308-319`).**
 Rejected: `max()` passes a hostile huge old vmsize through, converting the
-three pinned `"vmsize extension overflows"` `Err` tests (writer.rs:3101,
-:3119, :3142) into successes-with-huge-vmsize — it changes the overflow
+three pinned `"vmsize extension overflows"` `Err` tests (writer.rs:3102,
+:3120, :3141) into successes-with-huge-vmsize — it changes the overflow
 ticket's pinned passthrough policy rather than composing with it; it also
-rewrites benign outputs (control example: vmsize `0x6000` → `0x5000`),
-churning behaviour beyond the defect.
+rewrites benign outputs (its `update_linkedit_segment` rule would turn the
+control example's delta-derived vmsize `0x6000` into
+`align_to(0x5000, 0x4000) = 0x8000`), churning behaviour beyond the defect.
 **C — disagreement guard only, leave delta.** Rejected: the wrong delta would
 make the guard fire on the existing passing case-(a) tests, converting green
 tests to `Err` — the delta is the bug, not the inputs.
 
 ## Chosen design details
 
-- ZSN-49: else arm exactly as sibling Err strings (verbatim reuse).
-- ZSN-50: both realloc sites; `size_increase` rebased to `required - code_length`
+- Problem 1: else arm exactly as sibling Err strings (verbatim reuse).
+- Problem 2: both realloc sites; `size_increase` rebased to `required - code_length`
   (plain `-`, same style as today — underflow impossible by the ordering above);
   new guard after `new_filesize` in both fns, before `write_linkedit_sizes`.
   Site B keeps persisting both corrected values into `updated_metadata`.
@@ -160,26 +171,30 @@ Item-1 tests; NOT mid-suite). Idioms: `expect_err` + `contains` for errors,
 `matches!` + `res.as_ref().err()` footer where surrounding tests use it,
 `catch_unwind` for adversarial inputs, `MachOFile::parse` round-trip.
 
-1. **ZSN-49 red test** `test_embed_signature_rejects_missing_linkedit`:
+1. **Red test A (fail-closed)** `test_embed_signature_rejects_missing_linkedit`:
    feed `fixtures::make_minimal_macho_32_mixed_linkedit()` (fixtures.rs:256 —
    the constructible None-`linkedit_cmd` input) through `embed_signature`;
    failing-before: `Ok` returned; passing-after: `Err` containing
    `"No __LINKEDIT segment found"`.
-2. **ZSN-50 delta red test** `test_realloc_vmsize_covers_linkedit_filesize`:
+2. **Red test B (delta)** `test_realloc_vmsize_covers_linkedit_filesize`:
    run `realloc_code_sign_space(&big_signed_buffer(), 0x3000)` (the case-(a)
    geometry), read `__LINKEDIT.vmsize` and `.filesize` from the output;
    failing-before: `vmsize (0x2000) < filesize (0x7000)`; passing-after:
    `vmsize >= filesize` (and pin `vmsize == 0x7000` to the corrected delta).
-   Mirror for the metadata variant via `realloc_code_sign_space_with_metadata`.
-3. **ZSN-50 guard red test** `test_realloc_rejects_vmsize_below_filesize`:
-   construct input where `old_vmsize + fileoff < code_length` (e.g. `__LINKEDIT`
-   fileoff `0x1000`, old vmsize `0x1000`, call with `code_length = 0x5000`) so
-   the corrected delta still cannot cover `new_filesize`;
+   Required metadata mirror via `realloc_code_sign_space_with_metadata`
+   (hand-built `MachOMetadata`, asserting both the returned buffer and the
+   persisted `updated_metadata.linkedit_cmd` pair).
+3. **Red test C (guard)** `test_realloc_rejects_vmsize_below_filesize`:
+   grow the buffer first so `data.len() >= code_length` (else the
+   `code_length exceeds buffer` guard fires first), patch `__LINKEDIT` fileoff
+   to `0x1000` and old vmsize to `0x1000`, then call with
+   `code_length = 0x5000`, so the corrected delta still cannot cover
+   `new_filesize`;
    failing-before: `Ok` with `vmsize < filesize`; passing-after: `Err` naming
    vmsize/filesize.
 4. **Regression sweep**: entire writer test suite must stay green, especially
-   writer.rs:2143/:2169/:2339 (case (a) realloc), :3101/:3119/:3142 (hostile
-   `Err`), :3161 (huge passthrough), and the Item-1 FAT tests.
+   writer.rs:2144/:2170/:2340 (case (a) realloc), :3102/:3120/:3141 (hostile
+   `Err`), :3162 (huge passthrough), and the Item-1 FAT tests.
 
 ## Acceptance
 
