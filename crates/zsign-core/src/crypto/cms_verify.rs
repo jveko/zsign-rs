@@ -125,6 +125,9 @@ const OID_EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.84
 /// userId attribute (RFC 4519), accepted as an emailAddress equivalent: `0.9.2342.19200300.100.1.1`
 const OID_UID: ObjectIdentifier = ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.1");
 
+/// Minimum accepted RSA modulus size in bits.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
 /// Maximum accepted nesting depth for BER constructed TLVs. Matches the
 /// DER parser's depth cap; real CMS structures nest well under this.
 const MAX_BER_NEST_DEPTH: usize = 32;
@@ -1114,8 +1117,8 @@ fn verify_signed_data(
         }
 
         // 3. Signature over the raw signedAttrs bytes.
-        let sig_ok = verify_signer_signature(cert, sig_oid, signer_digest, attrs_raw, signature);
-        report.signature_ok = sig_ok;
+        let res = verify_signer_signature(cert, sig_oid, signer_digest, attrs_raw, signature);
+        report.signature_ok = res.is_ok();
 
         // 4. Chain structure and trust anchoring.
         let purpose = match mode {
@@ -1145,8 +1148,8 @@ fn verify_signed_data(
                 errors.push("Apple CDHash v2 attribute does not match the CodeDirectory".into());
             }
         }
-        if !sig_ok {
-            errors.push("signature does not verify over the signed attributes".into());
+        if let Err(reason) = res {
+            errors.push(reason);
         }
         if !outcome.ok {
             errors.push(
@@ -1242,6 +1245,23 @@ fn parse_ecdsa_signature(bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
         .ok()
 }
 
+/// Returns true when `cert` carries an RSA key below the 2048-bit minimum.
+/// Decode failures return false; the signature paths reject those as today.
+fn rsa_key_below_floor(cert: &x509_cert::Certificate) -> bool {
+    use rsa::traits::PublicKeyParts;
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    if spki.algorithm.oid != OID_RSA_ENCRYPTION {
+        return false;
+    }
+    let Ok(pk_der) = spki.to_der() else {
+        return false;
+    };
+    let Ok(pub_key) = rsa::RsaPublicKey::from_public_key_der(&pk_der) else {
+        return false;
+    };
+    pub_key.n().bits() < MIN_RSA_MODULUS_BITS
+}
+
 /// Verifies the signerInfo signature over the signed attributes with the
 /// signing certificate's public key.
 fn verify_signer_signature(
@@ -1250,7 +1270,8 @@ fn verify_signer_signature(
     digest: SignerDigest,
     signed_attrs_raw: &[u8],
     signature: &[u8],
-) -> bool {
+) -> std::result::Result<(), String> {
+    use rsa::traits::PublicKeyParts;
     use signature::Verifier;
 
     let spki = &cert.tbs_certificate.subject_public_key_info;
@@ -1285,7 +1306,7 @@ fn verify_signer_signature(
             || (sig_oid == OID_SHA1_WITH_RSA && digest == SignerDigest::Sha1);
         if !consistent {
             // signatureAlgorithm/digestAlgorithm mismatch — reject outright.
-            return false;
+            return Err("signature does not verify over the signed attributes".into());
         }
     }
     // The digest the RSA PKCS#1 v1.5 DigestInfo must carry: explicit
@@ -1302,13 +1323,16 @@ fn verify_signer_signature(
     for msg in candidates {
         let ok = if rsa_sig && alg == OID_RSA_ENCRYPTION {
             let Ok(pk_der) = spki.to_der() else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
             let Ok(pub_key) = rsa::RsaPublicKey::from_public_key_der(&pk_der) else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
+            if pub_key.n().bits() < MIN_RSA_MODULUS_BITS {
+                return Err("rsa public key is below the 2048-bit minimum".into());
+            }
             let Ok(sig) = rsa::pkcs1v15::Signature::try_from(signature) else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
             match effective_digest {
                 SignerDigest::Sha256 => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pub_key)
@@ -1320,23 +1344,23 @@ fn verify_signer_signature(
             }
         } else if ecdsa_sig && alg == OID_EC_PUBLIC_KEY {
             let Ok(pk_der) = spki.to_der() else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
             let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(&pk_der) else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
             let Some(sig) = parse_ecdsa_signature(signature) else {
-                return false;
+                return Err("signature does not verify over the signed attributes".into());
             };
             vk.verify(msg, &sig).is_ok()
         } else {
-            return false;
+            return Err("signature does not verify over the signed attributes".into());
         };
         if ok {
-            return true;
+            return Ok(());
         }
     }
-    false
+    Err("signature does not verify over the signed attributes".into())
 }
 
 /// The result of walking a certificate chain toward a trust anchor.
@@ -2085,6 +2109,17 @@ pub(crate) fn verify_chain(
                 if let Some(w) = sha1_warning(current) {
                     warnings.push(w);
                 }
+                if rsa_key_below_floor(p) {
+                    return ChainOutcome {
+                        ok: false,
+                        anchored: false,
+                        subjects: names,
+                        reason: Some(format!(
+                            "certificate at depth {depth} has an rsa key below the 2048-bit minimum"
+                        )),
+                        warnings,
+                    };
+                }
                 if !verify_cert_signature(current, p) {
                     return ChainOutcome {
                         ok: false,
@@ -2104,6 +2139,17 @@ pub(crate) fn verify_chain(
                 if self_signed {
                     if let Some(w) = sha1_warning(current) {
                         warnings.push(w);
+                    }
+                    if rsa_key_below_floor(current) {
+                        return ChainOutcome {
+                            ok: false,
+                            anchored: false,
+                            subjects: names,
+                            reason: Some(format!(
+                                "self-signed certificate at depth {depth} has an rsa key below the 2048-bit minimum"
+                            )),
+                            warnings,
+                        };
                     }
                     if !verify_cert_signature(current, current) {
                         return ChainOutcome {
@@ -2145,6 +2191,17 @@ pub(crate) fn verify_chain(
                 if let Some(anchor) = anchors.find_by_subject(&missing) {
                     if let Some(w) = sha1_warning(current) {
                         warnings.push(w);
+                    }
+                    if rsa_key_below_floor(anchor) {
+                        return ChainOutcome {
+                            ok: false,
+                            anchored: false,
+                            subjects: names,
+                            reason: Some(
+                                "trust anchor has an rsa key below the 2048-bit minimum".into(),
+                            ),
+                            warnings,
+                        };
                     }
                     if verify_cert_signature(current, anchor) {
                         names.push(anchor.tbs_certificate.subject.to_string());
@@ -2196,6 +2253,7 @@ pub(crate) fn verify_cert_signature(
     child: &x509_cert::Certificate,
     issuer: &x509_cert::Certificate,
 ) -> bool {
+    use rsa::traits::PublicKeyParts;
     use signature::Verifier;
     let Ok(tbs) = child.tbs_certificate.to_der() else {
         return false;
@@ -2212,6 +2270,9 @@ pub(crate) fn verify_cert_signature(
         let Ok(pub_key) = rsa::RsaPublicKey::from_public_key_der(&pk_der) else {
             return false;
         };
+        if pub_key.n().bits() < MIN_RSA_MODULUS_BITS {
+            return false;
+        }
         let Ok(sig) = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice()) else {
             return false;
         };
@@ -2437,6 +2498,42 @@ mod tests {
     fn build_rsa_test_credentials() -> (SigningCredentials, rsa::RsaPrivateKey) {
         let mut rng = rand::thread_rng();
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str("CN=zsign verify test").unwrap();
+        let serial = SerialNumber::from(42u32);
+        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let pub_der = key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(pub_der.as_ref()).unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            serial,
+            validity,
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (
+            SigningCredentials {
+                certificate: cert,
+                signing_key: SigningKeyType::Rsa(signing_key),
+                cert_chain: vec![],
+                team_id: None,
+            },
+            key,
+        )
+    }
+    fn rsa_credentials_with_bits(bits: usize) -> (SigningCredentials, rsa::RsaPrivateKey) {
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, bits).unwrap();
         let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
         let subject = Name::from_str("CN=zsign verify test").unwrap();
         let serial = SerialNumber::from(42u32);
@@ -3080,6 +3177,71 @@ mod tests {
         .unwrap();
         (key, cert, signing_key)
     }
+    fn rsa_root_with_bits(
+        cn: &str,
+        bits: usize,
+    ) -> (
+        rsa::RsaPrivateKey,
+        x509_cert::Certificate,
+        rsa::pkcs1v15::SigningKey<Sha256>,
+    ) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), bits).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str(cn).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(9u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+        (key, cert, signing_key)
+    }
+    /// Self-issued `Profile::Leaf` (subject == issuer, so self-signed) with a
+    /// codeSigning EKU, keyed at `bits`. The Leaf profile supplies the
+    /// purpose-gate extensions (digitalSignature KU, CA=false BC) so the
+    /// chain reaches the self-signed terminal.
+    fn rsa_self_signed_with_bits(
+        cn: &str,
+        bits: usize,
+    ) -> (
+        rsa::RsaPrivateKey,
+        x509_cert::Certificate,
+        rsa::pkcs1v15::SigningKey<Sha256>,
+    ) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), bits).unwrap();
+        let signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let subject = Name::from_str(cn).unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(9u32),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            subject,
+            pub_key,
+            &signing_key,
+        )
+        .unwrap();
+        b.add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        (key, cert, signing_key)
+    }
 
     fn chain_with(root: &x509_cert::Certificate, leaf: &x509_cert::Certificate) -> ChainOutcome {
         verify_chain(
@@ -3177,6 +3339,115 @@ mod tests {
             outcome.warnings.is_empty(),
             "SHA-256 chain must not warn: {:?}",
             outcome.warnings
+        );
+    }
+
+    #[test]
+    fn signer_rsa_key_below_minimum_is_rejected() {
+        let (creds, _key) = rsa_credentials_with_bits(1024);
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let report = verify_code_signature_with_anchors(
+            &wrap(&cms),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(
+            !report.valid && !report.signature_ok,
+            "expected signer-floor rejection, got valid={} signature_ok={} errors={:?}",
+            report.valid,
+            report.signature_ok,
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("rsa public key is below the 2048-bit minimum")),
+            "expected signer-floor error, got errors={:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn issuer_rsa_key_below_minimum_is_chain_rejected() {
+        let (_root_key, root, root_signing) = rsa_root_with_bits("CN=zsign small root", 1024);
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "expected issuer-floor chain rejection, got ok={} reason={:?}",
+            out.ok, out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("below the 2048-bit minimum"),
+            "expected issuer-floor reason, got reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn trust_anchor_rsa_key_below_minimum_is_rejected() {
+        let (_root_key, root, root_signing) = rsa_root_with_bits("CN=zsign small anchor", 1024);
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = verify_chain(
+            std::slice::from_ref(&leaf),
+            &leaf,
+            &TrustAnchors::from_certificates(vec![root]),
+            time_now(),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(
+            !out.ok,
+            "expected anchor-floor rejection, got ok={} reason={:?}",
+            out.ok, out.reason
+        );
+        assert_eq!(
+            out.reason.as_deref().unwrap_or_default(),
+            "trust anchor has an rsa key below the 2048-bit minimum",
+            "expected anchor-floor reason, got reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn self_signed_rsa_key_below_minimum_is_rejected() {
+        let (_k, self_signed, _s) = rsa_self_signed_with_bits("CN=zsign small self-signed", 1024);
+        let out = verify_chain(
+            std::slice::from_ref(&self_signed),
+            &self_signed,
+            &TrustAnchors::from_certificates(vec![]),
+            time_now(),
+            SignerPurpose::CodeSigning,
+        );
+        assert!(
+            !out.ok,
+            "expected self-signed-floor rejection, got ok={} reason={:?}",
+            out.ok, out.reason
+        );
+        assert!(
+            out.reason.as_deref().unwrap_or_default().contains(
+                "self-signed certificate at depth 0 has an rsa key below the 2048-bit minimum"
+            ),
+            "expected self-signed-floor reason, got reason={:?}",
+            out.reason
         );
     }
 
@@ -5980,59 +6251,136 @@ mod tests {
         let sig256: rsa::pkcs1v15::Signature = sha256_key.sign(msg);
         let sig256_bytes = sig256.to_vec();
 
-        assert!(verify_signer_signature(
-            &creds.certificate,
-            OID_SHA256_WITH_RSA,
-            SignerDigest::Sha256,
-            msg,
-            &sig256_bytes,
-        ));
-        assert!(verify_signer_signature(
-            &creds.certificate,
-            OID_RSA_ENCRYPTION,
-            SignerDigest::Sha256,
-            msg,
-            &sig256_bytes,
-        ));
-        assert!(!verify_signer_signature(
-            &creds.certificate,
-            OID_SHA1_WITH_RSA,
-            SignerDigest::Sha256,
-            msg,
-            &sig256_bytes,
-        ));
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+            .is_ok(),
+            "sha256/rsa mismatch case, got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+        );
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_RSA_ENCRYPTION,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+            .is_ok(),
+            "rsaEncryption/sha256 case, got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_RSA_ENCRYPTION,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+        );
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA1_WITH_RSA,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+            .is_err(),
+            "sha1-oid/sha256-digest must fail, got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA1_WITH_RSA,
+                SignerDigest::Sha256,
+                msg,
+                &sig256_bytes,
+            )
+        );
 
         let sha1_key = rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(key.clone());
         let sig1: rsa::pkcs1v15::Signature = sha1_key.sign(msg);
         let sig1_bytes = sig1.to_vec();
-        assert!(verify_signer_signature(
-            &creds.certificate,
-            OID_SHA1_WITH_RSA,
-            SignerDigest::Sha1,
-            msg,
-            &sig1_bytes,
-        ));
-        assert!(verify_signer_signature(
-            &creds.certificate,
-            OID_RSA_ENCRYPTION,
-            SignerDigest::Sha1,
-            msg,
-            &sig1_bytes,
-        ));
-        assert!(!verify_signer_signature(
-            &creds.certificate,
-            OID_SHA256_WITH_RSA,
-            SignerDigest::Sha1,
-            msg,
-            &sig256_bytes,
-        ));
-        assert!(!verify_signer_signature(
-            &creds.certificate,
-            OID_SHA256_WITH_RSA,
-            SignerDigest::Sha1,
-            msg,
-            &sig1_bytes,
-        ));
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA1_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+            .is_ok(),
+            "sha1/sha1 case, got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA1_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+        );
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_RSA_ENCRYPTION,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+            .is_ok(),
+            "rsaEncryption/sha1 case, got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_RSA_ENCRYPTION,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+        );
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig256_bytes,
+            )
+            .is_err(),
+            "sha256-oid/sha1-digest must fail (sha256 sig), got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig256_bytes,
+            )
+        );
+        assert!(
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+            .is_err(),
+            "sha256-oid/sha1-digest must fail (sha1 sig), got {:?}",
+            verify_signer_signature(
+                &creds.certificate,
+                OID_SHA256_WITH_RSA,
+                SignerDigest::Sha1,
+                msg,
+                &sig1_bytes,
+            )
+        );
     }
 
     #[test]
