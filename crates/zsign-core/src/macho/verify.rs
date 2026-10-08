@@ -1589,4 +1589,17 @@ mod tests {
             report.slices[0].errors
         );
     }
+
+    #[test]
+    fn verify_rejects_zero_arch_fat_container() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xcafebabeu32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let res = verify_macho(&bytes, &SignatureInputs::none());
+        assert!(
+            matches!(&res, Err(crate::Error::MachO(m)) if m.contains("Empty FAT binary")),
+            "zero-arch FAT must not verify as success, got {:?}",
+            res.as_ref().err()
+        );
+    }
 }

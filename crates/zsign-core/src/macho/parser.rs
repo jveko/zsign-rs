@@ -719,4 +719,18 @@ mod tests {
             "execSegLimit must be __TEXT.filesize, not __TEXT_EXEC's"
         );
     }
+
+    #[test]
+    fn parse_rejects_zero_arch_fat_container() {
+        // Magic-only universal container: fat_header with nfat_arch = 0.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xcafebabeu32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let res = MachOFile::parse(bytes);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("Empty FAT binary")),
+            "zero-arch FAT must be rejected at parse, got {:?}",
+            res.as_ref().err()
+        );
+    }
 }
