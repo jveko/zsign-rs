@@ -23,7 +23,7 @@ validation never runs.
 
 Gap: an overlapping-arch container is FULLY signed (CMS built, superblob
 embedded) and only rejected afterwards inside `embed_signature_fat`'s
-`validate_fat_arches` (writer.rs:418-441, called at writer.rs:340/:408/:1008).
+`validate_fat_arches` (writer.rs:418-443, called at writer.rs:340/:408/:1008).
 A caller that trusts `sign_macho_all_slices`'s `Ok` receives signed slices
 from a structurally impossible container. The repo's own test
 `test_embed_fat_rejects_overlapping_slices` (writer.rs:~2751-2789) records

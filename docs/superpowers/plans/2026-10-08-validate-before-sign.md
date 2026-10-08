@@ -17,7 +17,7 @@
 - No ticket IDs in code, comments, docs, or commit messages.
 - Edits ONLY in `crates/zsign-core/src/macho/signer.rs` and `crates/zsign-core/src/macho/writer.rs` (the latter: visibility + doc line on `validate_fat_arches` only — no other writer changes).
 - parser.rs is read-only (other lanes own FAT-parse).
-- Reuse existing error strings — overlap keeps `"FAT slices {} and {} overlap"` from the validator; no new message variants.
+- Reuse existing error strings — overlap/bounds/overflow come verbatim from the validator (`"FAT slices {} and {} overlap"` etc.); parse/read/empty strings copy `embed_signature_fat`. The single permitted new string is the unreachable non-Fat fail-closed arm.
 - Existing tests must stay green — migrate, never weaken.
 
 ## Review Focus
@@ -54,19 +54,19 @@
             .map_err(|e| crate::Error::MachO(format!("Failed to parse Mach-O: {}", e)))?
         {
             Mach::Fat(fat) => {
-                if fat.narch == 0 {
-                    return Err(crate::Error::MachO("Empty FAT binary".into()));
-                }
                 fat.iter_arches()
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| crate::Error::MachO(format!("Failed to read FAT arches: {}", e)))?
             }
             _ => return Err(crate::Error::MachO("Expected a FAT container".into())),
         };
+        if arches.is_empty() {
+            return Err(crate::Error::MachO("Empty FAT binary".into()));
+        }
         super::writer::validate_fat_arches(&arches, macho.data())?;
     }
     ```
-    Adjust `narch == 0` vs `arches.is_empty()` and the non-Fat arm wording to whatever `embed_signature_fat` actually uses (the empty check must reuse its `"Empty FAT binary"` string; the non-Fat arm is unreachable under the `is_fat()` gate — fail closed, never `unreachable!`).
+    Order note: collect first, then the `arches.is_empty()` check (the field is `fat.narches` in goblin 0.10 if you prefer checking the header directly — either lands on the same behavior; `arches.is_empty()` matches `embed_signature_fat`'s idiom at writer.rs:405). The non-Fat arm wording is the one permitted new string — it is unreachable under the `is_fat()` gate and exists only to fail closed; every OTHER string (parse, read, empty, overlap/bounds/overflow from the validator) must be reused verbatim.
 - [ ] **Step 4: Run scoped tests**
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core writer` and `... signer` → ALL green (new test passes; migrated test passes; FAT suite, sign_any/adhoc/sha256 tests, Items 1-2 tests unchanged).
 
