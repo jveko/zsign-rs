@@ -169,6 +169,9 @@ ZSIGN_PASSWORD=secret zsign-cli -k cert.p12 -m app.mobileprovision -o signed.ipa
 # PEM certificate + PEM/DER key pair
 zsign-cli -k key.pem -c cert.pem -m app.mobileprovision -o signed.ipa input.ipa
 
+# No -o: the default output keeps the extension (input.ipa -> input-signed.ipa)
+zsign-cli -a input.ipa
+
 # Ad-hoc sign an app bundle in place
 zsign-cli -a MyApp.app
 
@@ -185,8 +188,8 @@ Complete surface of `zsign-cli` (from `zsign-cli --help`, captured 2026-09-27):
 
 |Flag|Value|Description|
 |---|---|---|
-|`<INPUT>`|path|Input file (IPA, Mach-O, or app bundle); required|
-|`-o, --output`|path|Output file|
+|`<INPUT>`|path|Input: app bundle directory, IPA/ZIP archive, or Mach-O binary — detected by content, not extension; required|
+|`-o, --output`|path|Output file; without it, archives and binaries default to `<name>-signed.<ext>` (extension preserved, e.g. `in.ipa` → `in-signed.ipa`) and bundles sign in place|
 |`-c, --certificate`|path|Certificate file (PEM format); requires `-k`|
 |`-k, --private-key`|path|Private key **or** PKCS#12 file — format detected by content (PEM `-----BEGIN` key, DER key, or PKCS#12; use `-k` alone for PKCS#12)|
 |`--pkcs12`|path|PKCS#12 file (`.p12`); long-only, conflicts `-c`/`-k`|
@@ -386,6 +389,7 @@ elsewhere (contract: `docs/superpowers/specs/2026-09-25-cli-surface-design.md`):
 |`-C`|standalone certificate report whose exit codes scripts may depend on|**warning-only** OCSP probe while signing; never gates|
 |exit codes|`0` / catch-all `255`|`0` / `1` / `2` contract above|
 |`-l`/`-P`|copies to the app root and injects `@executable_path/<name>`, extensions only with `-P`, silently skips a failed copy|matches the layout and scope, fails loudly instead of skipping, validates `-l` at parse time, and never injects XPC/Watch/AppClips (upstream does not either)|
+|input routing / default `-o`|sniffs the 2-byte `PK` marker and folders (no extension check); zip without `-o` errors, Mach-O signs in place|same content sniff (directory, `PK`, Mach-O magic incl. FAT) with an explicit unsupported-input error; default output preserves the extension (`in-signed.ipa`) instead of signing in place|
 
 There is no compatibility shim: old `zsign-cli -p cert.p12 …` invocations fail loudly
 at parse time. `zsign-cli --help` ends with the same reminder:
