@@ -38,7 +38,7 @@
 - Modify: `crates/zsign/src/bundle/code_resources.rs` — `hash_entry` (conversion chain and exclusion filter, current lines `:219-232`) and the test module (append after `test_scan_bundle_records_exact_utf8_symlink_target`, which ends ~`:593`).
 
 **Interfaces:**
-- Consumes: `path.strip_prefix(bundle_path)` returning `Result<&Path, StripPrefixError>`; `inner.should_exclude(&str) -> bool` (`crates/zsign-core/src/bundle/code_resources.rs:420`); `crate::{Error, Result}` already imported at the top of the file; `From<zsign_core::Error> for Error` (`crates/zsign/src/error.rs:61-69`), which hoists unknown core variants into `Error::Core(..)`.
+- Consumes: `path.strip_prefix(bundle_path)` returning `Result<&Path, StripPrefixError>`; `inner.should_exclude(&str) -> bool` (`crates/zsign-core/src/bundle/code_resources.rs:420`); `crate::{Error, Result}` already imported at the top of the file; `From<zsign_core::Error> for Error` (`crates/zsign/src/error.rs:62-70`), which hoists unknown core variants into `Error::Core(..)`.
 - Produces: unchanged signatures — `fn hash_entry(store: &dyn Store, bundle_path: &Path, inner: &zsign_core::bundle::CodeResourcesBuilder, path: &Path, kind: StoreKind) -> Result<Option<ScannedEntry>>` and `pub fn scan(&mut self) -> Result<&mut Self>`; `ScannedEntry.path: String` (`:44`) is now guaranteed valid UTF-8. New observable behavior: `scan()` returns `Err(Error::Core(zsign_core::Error::Signing(..)))` whose message contains `File name is not valid UTF-8` for any bundle with a non-UTF-8 entry name. No public API changes.
 
 - [ ] **Step 1: Write the failing collision test**
@@ -208,7 +208,7 @@ Controller commits exactly `crates/zsign/src/bundle/code_resources.rs` with subj
 
 **Files:**
 - Modify: `crates/zsign/src/bundle/code_resources.rs` — `scan()` `#Errors` list (line `:153`, append one bullet after the symlink bullet) and the `hash_entry` doc comment (lines `:204-205`).
-- Modify: `crates/zsign-core/src/bundle/code_resources.rs` — `add_file` doc comment (the paragraph ending at `:494`) and `add_symlink` doc comment (the paragraph ending at `:529`).
+- Modify: `crates/zsign-core/src/bundle/code_resources.rs` — `add_file` doc comment (the paragraph ending at `:484`) and `add_symlink` doc comment (the paragraph ending at `:519`).
 
 **Interfaces:**
 - Consumes: nothing new — doc comments only, no signature or behavior change.

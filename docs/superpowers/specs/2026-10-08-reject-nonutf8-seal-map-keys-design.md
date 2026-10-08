@@ -31,7 +31,7 @@ signing path (`crates/zsign/src/ipa/mod.rs:2022-2024`). The verifier re-derives
 disk keys with the same lossy conversion
 (`crates/zsign/src/verify.rs:891-892`), so the disk→sealed sweep dedups both
 real names onto the one sealed key and never reports either as unsealed; the
-sealed→disk direction (`verify_code_resource_entry`, `verify.rs:614-766`) joins
+sealed→disk direction (`verify_code_resource_entry`, `verify.rs:614-762`) joins
 the fabricated key against disk, finds nothing, and reports a `missing` path
 that never existed — the actually-dropped file is never identified
 (`[INFERENCE]` for the full report shape: derived from the two loops in
