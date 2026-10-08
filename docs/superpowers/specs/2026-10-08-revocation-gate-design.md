@@ -57,10 +57,19 @@ and `-C` conflicts with `-a`/`-V` (`main.rs:157`).
   Core tests pin it: `from_pem_rejects_expired_leaf` (`cert.rs:1710`),
   not-yet-valid (`:1742`), expired intermediate (`:1264`). A check-only run
   that loads credentials inherits these as exit-1 failures with no new code.
-- The pin test's identity names no OCSP responder (no AIA), so a real `-C`
-  signing run with `IDENTITY_P12` deterministically yields
-  `NotChecked(NoOcspUrl)` **without opening a socket** — an offline-safe
-  integration case.
+- The pin test's identity names no OCSP responder — proven, not assumed:
+  `openssl pkcs12 -in identity_single.p12 -nokeys -passin pass:testpassword |
+  openssl x509 -noout -ext authorityInfoAccess` prints `No extensions in
+  certificate` and `-noout -ocspuri` prints nothing, so a real `-C` signing
+  run with `IDENTITY_P12` (`main.rs:1211-1212`) deterministically yields
+  `NotChecked(NoOcspUrl)` with **no socket opened**.
+- The committed OCSP fixtures work under a wall clock, so `status_of(now =
+  None)` stays deterministic: the window rule is
+  `this_update > now || next_update.is_some_and(|n| n < now)`
+  (`revocation.rs:553`) — no upper bound when `nextUpdate` is absent — pinned
+  by `an_absent_next_update_bounds_nothing_by_design` (`revocation.rs:1454`,
+  `Good` at +400 days), and `openssl ocsp -respin revoked.der -text` shows
+  `This Update: Sep 26 2026` with **no** Next Update line.
 - No public cert-only parse API exists in the editable surface (grep: none in
   `crypto/`), and extracting signer certificates from signed artifacts lives
   in `cms_verify.rs`/`codesign/verify.rs`/`zsign/src/verify.rs` — all
@@ -73,7 +82,8 @@ and `-C` conflicts with `-a`/`-V` (`main.rs:157`).
   (`src/zsign.cpp:360-362`) — checks the *input file* (IPA/Mach-O/provision/
   p12/cer/pem, extension+content sniff, `certcheck.cpp:654-698`) and returns
   its code straight from `main`: **0 valid, 1 revoked, 2 expired, −1 error,
-  −2 not signed** (`certcheck.h:5-11`), so the shell sees 0/1/2/255.
+  −2 not signed** (`certcheck.h:5-11`); the shell sees the low byte of that
+  status — 0/1/2, 255 from −1, 254 from −2.
 - During signing, upstream's post-sign `CheckSignedBinary` return value is
   **discarded** (`src/zsign.cpp:473-476`, final `return bRet ? 0 : -1` at
   `:515-517`) — upstream is fail-open during signing and gates only in
@@ -140,8 +150,16 @@ printed). `warning()`, `warning_of`, `warn_revocation` are untouched.
 ### `crates/zsign-cli/src/main.rs`
 
 **Clap:**
-- `input`: add `required_unless_present = "check_revocation"` — `-C` without
-  an input parses (check-only); every other invocation still requires input.
+- `input` becomes `Option<PathBuf>` with
+  `required_unless_present = "check_revocation"` — `-C` without an input
+  parses (check-only); every other invocation still requires input. The nine
+  unconditional `cli.input` uses (`main.rs:314,380,382,385,389,390,394,395,401`)
+  are restructured: the verify branch guards its use (clap invariant: input
+  can be absent only with `-C`, and `-C` conflicts with `-V`), the check-only
+  early return consumes the `None` case, and one
+  `let input = cli.input.as_ref() …` binding before the dispatch match feeds
+  the remaining arms. No test constructs `Cli` literally — all parse via
+  `try_parse_from` — so nothing else breaks.
 - `-k`/`--pkcs12` requirement is untouched: bare `zsign -C` still fails with
   a missing-credentials usage error (exit 2).
 - `-C` conflicts (`verify`, `adhoc`) unchanged.
@@ -172,15 +190,25 @@ before any signing and before input dispatch):
 ```text
 if cli.check_revocation:
     status = probe(&credentials)
-    match status:
-        Revoked  -> return Err(<warning() text>)            # exit 1, nothing signed
-        _        -> continue
-    if cli.input.is_none():                                  # check-only mode
-        match status:
-            Good       -> print "revocation: good" (or the success JSON doc) ; return 0
-            NotChecked -> emit_error("revocation could not be checked: {reason:?}") ; return 2
-            Revoked    -> (already returned above)
+    match &status:
+        Revoked -> emit_error(cli.json, status.warning() or "certificate is revoked")
+                   ; return Ok(ExitCode::from(1))            # exit 1, nothing signed
+        Good    and cli.input.is_none():
+                   print check_good_report(cli.json) ; return Ok(ExitCode::from(0))
+        NotChecked(r) and cli.input.is_none():
+                   emit_error(cli.json, "revocation could not be checked: {r:?}")
+                   ; return Ok(ExitCode::from(2))
+        _       -> continue                                   # during-sign Good/NotChecked: fail open
 ```
+
+The Revoked arm returns `Ok(ExitCode::from(1))` after calling `emit_error`
+itself rather than returning `Err`: `emit_error` (`main.rs:668-680`) is the
+same function `main()`'s error path calls, so the observable contract —
+`error: certificate is revoked …` on stderr, `{"status":"error",…}` under
+`--json`, exit 1 — is byte-identical either way, while the in-process pin
+test can assert the exit code directly and both modes (during-sign and
+check-only) share one arm. Input absence (`cli.input.is_none()`) can only
+occur here because clap ties it to `-C`.
 
 Expired/not-yet-valid credentials never reach the probe: `load_credentials`
 refuses them first (exit 1 via the existing `Error::Certificate` path).

@@ -28,9 +28,11 @@ loopback listener for the network-bound test.
   `crates/zsign-core/src/crypto/revocation.rs`, `README.md` ONLY.
 - `warning()`, `warning_of`, `warn_revocation` semantics preserved verbatim;
   `status_of` is an addition, cfg-gated `not(wasm32)` like `warn_revocation`.
-- Exit contract stays 0/1/2: during-sign revocation → 1 (Err path, nothing
-  signed); check-only → 0 Good / 1 Revoked (and any credential-load failure,
-  which is where expired lands) / 2 NotChecked; usage errors → 2.
+- Exit contract stays 0/1/2: during-sign revocation → 1 via
+  `emit_error` + `Ok(ExitCode::from(1))` (byte-identical to the Err path's
+  observable output, and nothing is signed); check-only → 0 Good / 1 Revoked
+  (and any credential-load failure, which is where expired lands) /
+  2 NotChecked; usage errors → 2.
 - `NotChecked` during signing stays silent + exit 0 (the documented
   fail-open posture).
 - Zero-warning gate at item end: `cargo fmt --all -- --check` AND
@@ -110,7 +112,13 @@ fn status_of_reports_revoked_against_a_loopback_responder() {
 (Read the existing `parse_and_verify`-revoked test first and copy its exact
 expected `RevocationStatus` value — the loopback test must assert the same
 equality shape. If `RevocationStatus` is not `PartialEq`-comparable in that
-form, mirror however the existing tests assert it.)
+form, mirror however the existing tests assert it. The wall clock is safe
+here by evidence, not assumption: `revoked.der` has `This Update: Sep 26
+2026` and NO Next Update (`openssl ocsp -respin … -text`), the window rule
+at `revocation.rs:553` has no upper bound without `nextUpdate`, and
+`an_absent_next_update_bounds_nothing_by_design` (`:1454`) already pins
+`Good` at +400 days — so `status_of`'s `now = None` (wall clock) stays in
+window and yields `Revoked` deterministically.)
 
 - [ ] **Step 2: Run it, watch it fail**
 
@@ -191,8 +199,12 @@ footers print actual values.
    - scenario B (fail-open through production code): a fresh parse, then
      `run(cli).expect("fail-open run must succeed")`; assert
      `code == ExitCode::SUCCESS` and `out.exists()` — the identity names no
-     OCSP responder, so `status_of` short-circuits `NoOcspUrl` with no
-     socket and the documented posture applies.
+     OCSP responder (proven in-session: `openssl pkcs12 -in
+     identity_single.p12 -nokeys -passin pass:testpassword | openssl x509
+     -noout -ext authorityInfoAccess` → `No extensions in certificate`;
+     `-noout -ocspuri` → empty, count 0; full-text grep for
+     `authority information access|ocsp` → 0), so `status_of` short-circuits
+     `NoOcspUrl` with no socket and the documented posture applies.
    - RED today: `run_with_revocation` does not exist (compile RED); the old
      assertion `assert_eq!(code, ExitCode::SUCCESS)` for the stubbed-Revoked
      scenario is exactly what the rewrite flips.
@@ -212,7 +224,8 @@ footers print actual values.
    - one real-binary arm: `run_cli(&[OsStr::new("-k"), key.as_os_str(),
      OsStr::new("-p"), OsStr::new("testpassword"), OsStr::new("-C")], &[])`
      → exit 2, stderr contains `could not be checked` (production
-     `status_of` → `NoOcspUrl`, offline-safe, no socket).
+     `status_of` → `NoOcspUrl` via the same proven no-AIA fixture, so this
+     arm is offline-safe: no socket is opened).
    - RED today: parse fails; `run_with_revocation` does not exist.
 
 3. **New** `check_only_still_requires_credentials` (preservation guard,
@@ -238,8 +251,20 @@ vs runtime.
 
 `main.rs`:
 
-1. `input` field: add `required_unless_present = "check_revocation"` to the
-   `#[arg]` (`:22-23`). Do NOT touch `-k`/`--pkcs12` requirements.
+1. `input` field (`:23-24`): change the type to `Option<PathBuf>` and add
+   `required_unless_present = "check_revocation"` to the `#[arg]` — `-C`
+   without an input parses (check-only); every other invocation still
+   requires input (a non-Option positional cannot be absent — the derive's
+   required-field retrieval fails at runtime even when clap's requirement is
+   satisfied). Do NOT touch `-k`/`--pkcs12` requirements. Restructure every
+   unconditional use (the complete set, verified by grep): `:314`
+   (`run_verify(&cli.input, json)` — guard with
+   `cli.input.as_ref().expect("clap: <INPUT> is required unless -C, and -C conflicts with -V")`),
+   then, AFTER the check-only early return below, bind once
+   `let input = cli.input.as_ref().expect("check-only returned above; clap requires <INPUT> otherwise");`
+   and rewrite the dispatch arms (`:380,382,385,389,390,394,395,401`) to use
+   `input` instead of `&cli.input`. No test constructs `Cli` literally (all
+   `try_parse_from`), so nothing else breaks.
 2. `-C` doc comment rewrite (`:153-156`) — gate first, then loud fail-open,
    then check-only exits; keep the `#[arg(short = 'C', long,
    conflicts_with_all = ["verify", "adhoc"])]` line as-is:
@@ -286,45 +311,50 @@ file's single-use-block style; drop the `warn_revocation` import if now
 unused.)
 
 4. In the credentials branch, replacing the current `:320-326` block —
-   SAME position (after `load_credentials`, before `ZSign::new`):
+   SAME position (after `load_credentials`, before `ZSign::new`, so the gate
+   fires before any signing and before input dispatch; `probe` only borrows
+   `credentials` here, which is moved into `ZSign::new` afterwards):
 
 ```rust
         let credentials = load_credentials(&cli)?;
         if cli.check_revocation {
             let status = probe(&credentials);
+            let check_only = cli.input.is_none();
             match &status {
                 RevocationStatus::Revoked { .. } => {
-                    return Err(status
-                        .warning()
-                        .unwrap_or_else(|| "certificate is revoked".into())
-                        .into());
+                    // Same observable contract as the Err path: emit_error
+                    // is what main() calls, exit 1 — but the pin test can
+                    // assert the code in-process, and both modes share one arm.
+                    emit_error(
+                        cli.json,
+                        &status
+                            .warning()
+                            .unwrap_or_else(|| "certificate is revoked".into()),
+                    );
+                    return Ok(ExitCode::from(1));
                 }
-                _ if cli.input.is_none() => {
-                    return Ok(match status {
-                        RevocationStatus::Good => {
-                            println!("{}", check_good_report(cli.json));
-                            ExitCode::from(0)
-                        }
-                        RevocationStatus::NotChecked(reason) => {
-                            emit_error(
-                                cli.json,
-                                &format!("revocation could not be checked: {reason:?}"),
-                            );
-                            ExitCode::from(2)
-                        }
-                        // Revoked returned above.
-                        RevocationStatus::Revoked { .. } => ExitCode::from(1),
-                    });
+                RevocationStatus::Good if check_only => {
+                    println!("{}", check_good_report(cli.json));
+                    return Ok(ExitCode::from(0));
                 }
+                RevocationStatus::NotChecked(reason) if check_only => {
+                    emit_error(
+                        cli.json,
+                        &format!("revocation could not be checked: {reason:?}"),
+                    );
+                    return Ok(ExitCode::from(2));
+                }
+                // During-sign Good/NotChecked: the documented fail-open.
                 _ => {}
             }
         }
         ZSign::new().credentials(credentials)
 ```
 
-(If `NotCheckedReason` already implements `Display`, prefer `{reason}`
-over `{reason:?}` — check first and use the nicer one consistently in the
-test assertion too.)
+(If `NotCheckedReason` already implements `Display`, prefer `{reason}` over
+`{reason:?}` — check first and use the same spelling in the test assertion.
+The guarded arms fall through to `_` — there is deliberately no unreachable
+inner arm: the Revoked early return covers check-only too.)
 
 5. `check_good_report`:
 
