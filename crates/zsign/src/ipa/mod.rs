@@ -328,7 +328,9 @@ pub struct IpaSigner<'a> {
     bundle_version: Option<String>,
     /// Emit only the SHA-256 code directory (no SHA-1 code directory)
     sha256_only: bool,
-    /// Dylib load paths to inject into signed binaries
+    /// Dylibs copied to the app root and injected as `@executable_path/<basename>`
+    /// for bundle/IPA inputs (root scope in this task; extension widening
+    /// described by Task 3), while a bare Mach-O gets the path verbatim
     dylibs: Vec<PathBuf>,
     /// Inject with LC_LOAD_WEAK_DYLIB instead of LC_LOAD_DYLIB
     weak_dylibs: bool,
@@ -597,7 +599,12 @@ impl<'a> IpaSigner<'a> {
         self
     }
 
-    /// Injects the given dylib load paths into every signed bundle binary.
+    /// Injects the given dylibs into signed bundle binaries.
+    ///
+    /// Each file is copied to the app root and injected as
+    /// `@executable_path/<basename>` for bundle/IPA inputs (root scope in
+    /// this task; extension widening described by Task 3), while a bare
+    /// Mach-O gets the path verbatim.
     ///
     /// `weak` selects `LC_LOAD_WEAK_DYLIB`; otherwise `LC_LOAD_DYLIB` is used.
     pub fn dylib_injection(mut self, dylibs: Vec<PathBuf>, weak: bool) -> Self {
@@ -1026,8 +1033,47 @@ impl<'a> IpaSigner<'a> {
             self.rewrite_nested_identifiers(store, &bundles, bundle_path, &old_root_id, new_root)?;
         }
 
-        let dylibs = self.find_standalone_dylibs(store, bundle_path)?;
+        // Injected dylibs are embedded at the app root (the single copy every
+        // load command references). Host-read like load_profile's Path arm;
+        // the wasm surface never sets `dylibs`.
+        let mut copied_dylibs: Vec<PathBuf> = Vec::new();
+        for dylib in &self.dylibs {
+            let bytes = std::fs::read(dylib)?;
+            let name = dylib.file_name().ok_or_else(|| {
+                Error::Core(zsign_core::Error::Config(format!(
+                    "dylib path must name a file: {}",
+                    dylib.display()
+                )))
+            })?;
+            let dest = bundle_path.join(name);
+            store.write(&dest, &bytes)?;
+            copied_dylibs.push(dest);
+        }
+        let mut dylibs = self.find_standalone_dylibs(store, bundle_path)?;
+        for dest in copied_dylibs {
+            if !dylibs.contains(&dest) {
+                dylibs.push(dest);
+            }
+        }
         let already_signed: HashSet<PathBuf> = dylibs.iter().cloned().collect();
+        // Which bundles receive injected load commands: the root always (the -P
+        // widening arm lands with the scope flag). Empty map = no injection.
+        let mut injection: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        if !self.dylibs.is_empty() {
+            let bases: Vec<String> = self
+                .dylibs
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            injection.insert(
+                bundle_path.to_path_buf(),
+                bases
+                    .iter()
+                    .map(|b| format!("@executable_path/{b}"))
+                    .collect(),
+            );
+        }
 
         // --- only now does anything mutate ---
         #[cfg(not(target_arch = "wasm32"))]
@@ -1041,15 +1087,16 @@ impl<'a> IpaSigner<'a> {
             self.sign_standalone_dylib(store, bundle_path, dylib_path)?;
         }
         for (path, entitlements, profile_data) in &plan {
+            let injected = injection.get(path).map(Vec::as_slice).unwrap_or(&[]);
             self.sign_single_bundle(
                 store,
                 path,
                 entitlements.as_deref(),
                 profile_data.as_deref(),
                 &already_signed,
+                injected,
             )?;
         }
-
         Ok(())
     }
 
@@ -1440,6 +1487,7 @@ impl<'a> IpaSigner<'a> {
         entitlements: Option<&[u8]>,
         profile_data: Option<&[u8]>,
         already_signed: &HashSet<PathBuf>,
+        injected: &[String],
     ) -> Result<()> {
         // Strip first: the removal must be visible to the CodeResources scan
         // below, or the seal would record a file that is no longer there.
@@ -1474,13 +1522,27 @@ impl<'a> IpaSigner<'a> {
 
         #[cfg(not(target_arch = "wasm32"))]
         non_main_binaries.par_iter().try_for_each(|binary_path| {
-            self.sign_one_binary(store, bundle_path, binary_path, &identifier, entitlements)
+            self.sign_one_binary(
+                store,
+                bundle_path,
+                binary_path,
+                &identifier,
+                entitlements,
+                injected,
+            )
         })?;
         // rayon's thread pool cannot run on wasm32; each binary is signed
         // independently, so sequential iteration yields the same tree.
         #[cfg(target_arch = "wasm32")]
         for binary_path in &non_main_binaries {
-            self.sign_one_binary(store, bundle_path, binary_path, &identifier, entitlements)?;
+            self.sign_one_binary(
+                store,
+                bundle_path,
+                binary_path,
+                &identifier,
+                entitlements,
+                injected,
+            )?;
         }
 
         // The plan build hands this bundle the profile it resolved, so embedding
@@ -1514,6 +1576,7 @@ impl<'a> IpaSigner<'a> {
                 &identifier,
                 code_resources_data.as_deref(),
                 entitlements,
+                injected,
             )?;
         }
 
@@ -1529,6 +1592,7 @@ impl<'a> IpaSigner<'a> {
         binary_path: &Path,
         identifier: &str,
         entitlements: Option<&[u8]>,
+        injected: &[String],
     ) -> Result<()> {
         let binary_identifier = binary_path
             .file_stem()
@@ -1541,6 +1605,7 @@ impl<'a> IpaSigner<'a> {
             binary_identifier,
             None,
             entitlements,
+            injected,
         )
     }
 
@@ -1784,6 +1849,11 @@ impl<'a> IpaSigner<'a> {
     /// (enforced in `zsign-core`'s signing context; the C++ upstream
     /// instead emits an empty-dict slot, which this port deliberately
     /// does not reproduce).
+    // Eight args like `sign_all_slices_impl`'s frozen set: the `injected`
+    // scope slice threads uniformly through the three signing layers, so a
+    // params struct for one extra slice would add indirection without
+    // shrinking the call surface.
+    #[allow(clippy::too_many_arguments)]
     fn sign_binary<S: Store>(
         &self,
         store: &S,
@@ -1792,7 +1862,9 @@ impl<'a> IpaSigner<'a> {
         identifier: &str,
         code_resources: Option<&[u8]>,
         entitlements: Option<&[u8]>,
+        injected: &[String],
     ) -> Result<()> {
+        let direct_child = binary_path.parent() == Some(root);
         let validated = Self::resolve_within(store, root, binary_path)?;
         let binary_path = validated.as_path();
         let binary_data = store.read(binary_path)?;
@@ -1818,13 +1890,14 @@ impl<'a> IpaSigner<'a> {
             }
         }
 
-        // Dylib injection applies to executables, before they are signed.
+        // Dylib injection applies to executables directly inside an in-scope
+        // bundle directory, before they are signed.
         let mut binary_data = binary_data;
-        if !self.dylibs.is_empty() && is_executable {
-            for name in &self.dylibs {
+        if !injected.is_empty() && is_executable && direct_child {
+            for load_path in injected {
                 binary_data = zsign_core::macho::writer::inject_dylib_command(
                     &binary_data,
-                    &name.to_string_lossy(),
+                    load_path,
                     self.weak_dylibs,
                 )?;
             }
@@ -2609,8 +2682,9 @@ mod tests {
 
         let credentials = crate::test_util::test_credentials();
         let before = std::fs::read(app.join("Enc")).unwrap();
-        let signer = IpaSigner::new(&credentials)
-            .dylib_injection(vec![std::path::PathBuf::from("lib.dylib")], false);
+        let inject_path = temp_dir.path().join("inject.dylib");
+        std::fs::write(&inject_path, fixtures::make_minimal_dylib()).unwrap();
+        let signer = IpaSigner::new(&credentials).dylib_injection(vec![inject_path], false);
         let err = signer
             .sign_folder_in_place(&app)
             .expect_err("encrypted main executable must refuse");
@@ -2655,6 +2729,180 @@ mod tests {
             .sign_folder_in_place(&app)
             .expect("allow_encrypted=true must sign");
         assert!(app.join("_CodeSignature/CodeResources").exists());
+    }
+
+    /// Read the dylib load-command list of the Mach-O at `path`, exactly as
+    /// `builder.rs`'s `test_sign_macho_applies_dylibs_and_bundle_id` does.
+    fn load_command_dylibs(path: &Path) -> Vec<String> {
+        let data = std::fs::read(path).unwrap();
+        let mach = goblin::mach::Mach::parse(&data).unwrap();
+        match mach {
+            goblin::mach::Mach::Binary(b) => b.libs.iter().map(|s| s.to_string()).collect(),
+            goblin::mach::Mach::Fat(_) => panic!("thin binary expected"),
+        }
+    }
+
+    #[test]
+    fn injected_dylib_is_copied_into_root_and_load_path_rewritten() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let source = temp.path().join("libfoo.dylib");
+        let original = fixtures::make_minimal_dylib();
+        std::fs::write(&source, &original).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source.clone()], false)
+            .sign_folder_in_place(&app)
+            .expect("signing with an injected dylib must succeed");
+
+        let copied = std::fs::read(app.join("libfoo.dylib"))
+            .expect("the injected dylib must be copied to the app root");
+        let m =
+            crate::macho::MachOFile::parse(copied).expect("the copied dylib must parse as Mach-O");
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "the copied dylib must be signed"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original,
+            "the source dylib outside the bundle must stay untouched"
+        );
+        let all_libs = load_command_dylibs(&app.join("Test"));
+        let injected: Vec<String> = all_libs
+            .iter()
+            .filter(|l| l.contains("libfoo"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            injected,
+            vec!["@executable_path/libfoo.dylib"],
+            "the root executable must reference the embedded copy, got {all_libs:?}"
+        );
+    }
+
+    #[test]
+    fn default_scope_leaves_extensions_uninjected_but_signed() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let source = temp.path().join("libfoo.dylib");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .sign_folder_in_place(&app)
+            .expect("signing with an injected dylib must succeed");
+
+        let root_libs = load_command_dylibs(&app.join("Test"));
+        assert!(
+            root_libs.contains(&"@executable_path/libfoo.dylib".to_string()),
+            "the root executable must carry the injected entry: {root_libs:?}"
+        );
+        let ext_libs = load_command_dylibs(&appex.join("Ext"));
+        assert!(
+            ext_libs.iter().all(|l| !l.contains("libfoo")),
+            "the appex executable must not carry the injected entry: {ext_libs:?}"
+        );
+        let ext_data = std::fs::read(appex.join("Ext")).unwrap();
+        let m = crate::macho::MachOFile::parse(ext_data).unwrap();
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "the appex executable must still be signed"
+        );
+        assert!(
+            appex.join("_CodeSignature/CodeResources").exists(),
+            "default scope must narrow only injection, not signing"
+        );
+    }
+
+    #[test]
+    fn dylib_copy_survives_repack_and_verifies() {
+        use std::io::Read as _;
+
+        let temp = TempDir::new().unwrap();
+        let ipa = create_test_ipa(temp.path());
+        let output = temp.path().join("out.ipa");
+        let source = temp.path().join("libfoo.dylib");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .sign(&ipa, &output)
+            .expect("signing with an injected dylib must succeed");
+
+        let file = std::fs::File::open(&output).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let mut entry = archive
+            .by_name("Payload/Test.app/libfoo.dylib")
+            .expect("the copied dylib must exist in the repacked IPA");
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        drop(entry);
+        drop(archive);
+        let m = crate::macho::MachOFile::parse(bytes)
+            .expect("the repacked dylib copy must parse as Mach-O");
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "the repacked dylib copy must be signed"
+        );
+
+        let report = crate::verify::verify_ipa(&output).expect("verify must run");
+        assert!(
+            report.valid(),
+            "ipa sign→verify must pass: {:?}",
+            report.bundle.as_ref().map(|b| &b.errors)
+        );
+    }
+
+    #[test]
+    fn dylib_copy_overwrites_preexisting_file_with_same_name() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        std::fs::write(app.join("libfoo.dylib"), b"stale bytes").unwrap();
+        let source = temp.path().join("libfoo.dylib");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .sign_folder_in_place(&app)
+            .expect("the copy phase must run before the standalone scan");
+
+        let data = std::fs::read(app.join("libfoo.dylib")).unwrap();
+        let m = crate::macho::MachOFile::parse(data)
+            .expect("the destination must be replaced by the copied dylib");
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "the replaced copy must be signed"
+        );
+    }
+
+    #[test]
+    fn extensionless_dylib_copy_is_signed_and_sealed() {
+        let temp = TempDir::new().unwrap();
+        let app = create_folder_bundle(temp.path(), "Test", true);
+        let source = temp.path().join("helper");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .sign_folder_in_place(&app)
+            .expect("signing with an extensionless injected dylib must succeed");
+
+        let data = std::fs::read(app.join("helper"))
+            .expect("the extensionless copy must exist at the app root");
+        let m = crate::macho::MachOFile::parse(data)
+            .expect("the extensionless copy must parse as Mach-O");
+        assert!(
+            m.slices()[0].code_sig_offset.is_some(),
+            "the extensionless copy must be signed"
+        );
+
+        let report = crate::verify::verify_bundle(&app).expect("verify must run");
+        assert!(
+            report.valid(),
+            "bundle sign→verify must pass: {:?}",
+            report.bundle.as_ref().map(|b| &b.errors)
+        );
     }
 
     #[test]

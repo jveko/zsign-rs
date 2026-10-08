@@ -82,6 +82,9 @@ pub struct ZSign {
     bundle_version: Option<String>,
     sha256_only: bool,
     adhoc: bool,
+    /// Dylibs copied to the app root and injected as `@executable_path/<basename>`
+    /// for bundle/IPA inputs (root scope in this task; extension widening
+    /// described by Task 3), while a bare Mach-O gets the path verbatim
     dylibs: Vec<PathBuf>,
     weak_dylibs: bool,
     allow_encrypted: bool,
@@ -339,7 +342,12 @@ impl ZSign {
         self
     }
 
-    /// Injects dylib load paths into every signed executable.
+    /// Injects the given dylibs into signed bundle executables.
+    ///
+    /// Each file is copied to the app root and injected as
+    /// `@executable_path/<basename>` for bundle/IPA inputs (root scope in
+    /// this task; extension widening described by Task 3), while a bare
+    /// Mach-O gets the path verbatim.
     ///
     /// `weak` selects `LC_LOAD_WEAK_DYLIB`.
     pub fn dylib_injection(mut self, dylibs: Vec<PathBuf>, weak: bool) -> Self {
