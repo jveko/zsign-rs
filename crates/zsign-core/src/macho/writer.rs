@@ -661,6 +661,8 @@ fn embed_signature_single(data: &[u8], macho: &MachO, signature: &[u8]) -> Resul
             .checked_sub(seg_fileoff)
             .ok_or_else(|| Error::MachO("signature end precedes the __LINKEDIT segment".into()))?;
         update_linkedit_segment(&mut output, offset, new_filesize, is_64)?;
+    } else {
+        return Err(Error::MachO("No __LINKEDIT segment found".into()));
     }
 
     Ok(output)
@@ -3169,6 +3171,17 @@ mod tests {
         assert!(
             written >= HUGE,
             "vmsize passthrough must not clamp: got {written:#x}"
+        );
+    }
+
+    #[test]
+    fn test_embed_signature_rejects_missing_linkedit() {
+        let data = crate::macho::fixtures::make_minimal_macho_32_mixed_linkedit();
+        let err = embed_signature(&data, &signature_bytes())
+            .expect_err("embedding without a usable __LINKEDIT must fail closed");
+        assert!(
+            err.to_string().contains("No __LINKEDIT segment found"),
+            "{err}"
         );
     }
 }
