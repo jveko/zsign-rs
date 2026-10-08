@@ -495,11 +495,17 @@ fn embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice]) 
     let mut new_offsets: Vec<(u32, u32)> = Vec::with_capacity(arches.len());
     let mut cursor = header_size;
 
-    for (arch, slice) in arches.iter().zip(&slice_data_vec) {
-        if arch.align >= 32 {
+    for (i, (arch, slice)) in arches.iter().zip(&slice_data_vec).enumerate() {
+        if arch.align > 15 {
             return Err(Error::MachO(format!(
-                "FAT arch align exponent {} exceeds the 32-bit FAT offset space",
+                "FAT arch align exponent {} exceeds the maximum supported exponent 15",
                 arch.align
+            )));
+        }
+        if !(arch.offset as usize).is_multiple_of(1usize << arch.align) {
+            return Err(Error::MachO(format!(
+                "FAT slice {i}: offset {} is not aligned to 2^{}",
+                arch.offset, arch.align
             )));
         }
         let align = 1usize << arch.align;
@@ -2866,6 +2872,77 @@ mod tests {
         assert!(injected.windows(dylib.len()).any(|w| w == dylib.as_bytes()));
         let m = crate::macho::MachOFile::parse(injected).unwrap();
         assert_eq!(m.slices().len(), 2, "both slices must survive injection");
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_align_exponent_above_15() {
+        let fat = make_fat_macho(&[make_minimal_macho()], &[16]);
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.aligncap",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = embed_signature_fat(&fat, &full)
+            .expect_err("align exponent 16 must be rejected, not reassembled");
+        assert!(err.to_string().contains("align exponent"), "{err}");
+        assert!(err.to_string().contains("15"), "{err}");
+    }
+    #[test]
+    fn test_embed_fat_rejects_align_exponent_31() {
+        let fat = make_fat_macho(&[make_minimal_macho()], &[31]);
+        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap();
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.aligncap31",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = embed_signature_fat(&fat, &full)
+            .expect_err("align exponent 31 must be rejected, not reassembled");
+        assert!(err.to_string().contains("align exponent"), "{err}");
+        assert!(err.to_string().contains("15"), "{err}");
+    }
+
+    #[test]
+    fn test_embed_fat_rejects_unaligned_input_offset() {
+        // Align-12 fixture places arch0 at [0x1000, 0x3000). Shift the slice
+        // body by one byte and point the arch table at it, so the input
+        // offset (0x1001) is not a multiple of 2^12 while the range stays
+        // inside the file; the signed identity fields are taken from the
+        // patched container itself, so they match and only the alignment
+        // check can fire.
+        let fat = make_fat_macho(&[make_minimal_macho()], &[12]);
+        let mut bad = fat.clone();
+        bad.push(0);
+        bad.copy_within(0x1000..0x3000, 0x1001);
+        bad[16..20].copy_from_slice(&0x1001u32.to_be_bytes());
+        let macho = crate::macho::MachOFile::parse(bad.clone()).unwrap();
+        let creds = test_signing_credentials();
+        let full = crate::macho::sign_macho_all_slices(
+            &macho,
+            "com.zsign.alignoff",
+            None,
+            &creds,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = embed_signature_fat(&bad, &full)
+            .expect_err("input offset not aligned to 2^align must be rejected");
+        assert!(err.to_string().contains("not aligned"), "{err}");
     }
 
     /// The public single-path entry points accept little-endian 32-bit input:
