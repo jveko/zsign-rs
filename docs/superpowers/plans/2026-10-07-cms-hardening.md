@@ -19,7 +19,7 @@ per-signer fields locally, and records summaries/warnings — `CmsVerifyReport`
 gains only additive fields.
 
 **Tech Stack:** Rust (edition 2021), der 0.7 `SliceReader`, rsa 0.9.10
-(`n().bits()`), cms 0.2.3 (dev `builder`), inline `#[cfg(test)]` tests.
+(`rsa::traits::PublicKeyParts::n().bits()`), cms 0.2.3 (dev `builder`), inline `#[cfg(test)]` tests.
 
 **Spec:** `docs/superpowers/specs/2026-10-07-cms-hardening-design.md`
 
@@ -42,9 +42,10 @@ gains only additive fields.
 - Tests run with `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test …`;
   multi-filter commands go through `cargo test -p zsign-core -- f1 f2 …`.
 - Every assertion prints the actual received value in its failure footer.
-- rsa 0.9.10 reality: measure with `pub_key.n().bits()` (u64) against
-  `const MIN_RSA_MODULUS_BITS: u64 = 2048`; there is no `key_size()`/`bits()`
-  method and `PublicKeyParts::size()` is BYTES.
+- rsa 0.9.10 reality: measure with `rsa::traits::PublicKeyParts::n(&key).bits()`
+  (u64; `n()` is a TRAIT method — bring `rsa::traits::PublicKeyParts` into
+  scope) against `const MIN_RSA_MODULUS_BITS: u64 = 2048`; there is no
+  `key_size()`/`bits()` method and `PublicKeyParts::size()` is BYTES.
 
 ## Review Focus
 
@@ -56,7 +57,10 @@ gains only additive fields.
   Task 3.
 - Unsupported-digest / missing-cert signers become per-signer rejections
   (graceful handling) instead of whole-envelope aborts, with identical
-  single-signer reports — pinned by Task 3's regression run.
+  single-signer reports — pinned by Task 3's
+  `missing_signing_cert_signer_is_rejected_gracefully` (multi-signer) plus
+  the pre-existing single-signer
+  `digest_algorithms_missing_signer_digest_fails_verification` regression.
 - A SignerInfo ending in `[1] unsignedAttrs` still verifies; ANY other
   trailing bytes reject — pinned by Task 1.
 - 2048-bit keys still verify everywhere (existing suite), 1024-bit keys
@@ -192,7 +196,9 @@ Expected: all green — no existing fixture carries trailing SignerInfo bytes.
   floor, `verify_chain` pre-checks, inline tests.
 
 **Interfaces:**
-- Consumes: `rsa::RsaPublicKey` (inherent `n()` → `.bits() -> u64`),
+- Consumes: `rsa::RsaPublicKey` via `rsa::traits::PublicKeyParts`
+  (`n(&self) -> &BigUint`, a TRAIT method — `use rsa::traits::PublicKeyParts;`,
+  then `.n().bits() -> u64`),
   `OID_RSA_ENCRYPTION`, `verify_chain` sites (parent branch after the
   name-constraints hook; self-signed terminal before
   `verify_cert_signature(current, current)`; resolved-anchor branch before
@@ -212,7 +218,8 @@ Expected: all green — no existing fixture carries trailing SignerInfo bytes.
     fixed push.
   - `verify_cert_signature` KEEPS `-> bool`; inside the RSA branch, right
     after decoding `pub_key`, `if pub_key.n().bits() < MIN_RSA_MODULUS_BITS
-    { return false; }` (fail-closed for the deferred-file caller).
+    { return false; }` with `PublicKeyParts` in scope (fail-closed for the
+    deferred-file caller).
   - Chain reasons (exact strings, all containing
     `below the 2048-bit minimum`):
     - parent: `format!("certificate at depth {depth} has an rsa key below the 2048-bit minimum")`
@@ -260,7 +267,9 @@ fn trust_anchor_rsa_key_below_minimum_is_rejected() {
 #[test]
 fn self_signed_rsa_key_below_minimum_is_rejected() {
     // a self-signed 1024-bit cert used as its own chain leaf (mirror the
-    // existing self-signed-leaf test's construction, keying it at 1024):
+    // existing self-signed-leaf test's construction, keying it at 1024 AND
+    // adding the codeSigning EKU extension — without it leaf_purpose_reason
+    // rejects before the floor is ever consulted):
     // verify_chain over [self_signed] with empty/skip anchors ->
     // the self-signed terminal pre-check fires; assert !out.ok && reason
     // contains "self-signed certificate at depth … below the 2048-bit
@@ -284,6 +293,14 @@ Per the Interfaces block: constant, `rsa_key_below_floor`, the `Result`
 refactor + caller update, the internal floor in `verify_cert_signature`
 (signature unchanged), and the three `verify_chain` pre-checks placed after
 the name-constraints hook / at their respective terminal branches.
+
+**Migration required in the same step (compile depends on it):** the
+existing direct-call test `rsa_signature_rejects_digest_and_signature_oid_mismatches`
+(`cms_verify.rs:5854-5905`) asserts `verify_signer_signature(...)` returns
+`bool`. Convert every assert without changing which cases pass:
+`assert!(f(...))` → `assert!(f(...).is_ok(), "…, got {:?}", f_err_footer)`
+and `assert!(!f(...))` → `assert!(f(...).is_err(), …)` — footers must print
+the received `Result`. Same commit, same task; the suite must compile.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -354,17 +371,24 @@ changed signature-failure string (the generic message is unchanged).
        through `seal(report, global_errors)` as today.
     6. The `no SignerInfo present` path and all envelope-level errors are
        unchanged.
-- Fixture helper: `fn spliced_signer_info(cms: &[u8], at_front: bool,
-  corrupt: bool) -> Vec<u8>` — a clone of `replace_first_sid`'s rewriter
+- Fixture helper: `enum SignerCorruption { CorruptSignatureBytes,
+  UnresolvableSerial }` and `fn spliced_signer_info(cms: &[u8], at_front:
+  bool, corruption: SignerCorruption) -> Vec<u8>` — a clone of
+  `replace_first_sid`'s rewriter
   (WITHOUT its `assert!(set_r.is_finished(), "fixture assumes a single
-  SignerInfo")`) that inserts an additional SignerInfo into the SET OF
-  (front or back). `corrupt = true` flips ONE byte of the inserted
-  SignerInfo's signature OCTET STRING CONTENT (structure stays valid DER;
-  content is only checked by crypto) so the clone fails signature
-  verification with the ordinary generic reason. The insertion is a copy of
-  the genuine SignerInfo (same sid ⇒ same signer certificate — the tests
-  pin traceability, not subject diversity; note this in the helper's doc
-  comment).
+  SignerInfo")`) that inserts an additional SignerInfo (front or back of the
+  SET OF):
+  - `CorruptSignatureBytes` flips ONE byte of the inserted SignerInfo's
+    signature OCTET STRING CONTENT (structure stays valid DER; content is
+    only checked by crypto) ⇒ ordinary signature-verification rejection.
+  - `UnresolvableSerial` flips ONE byte of the serial INTEGER content inside
+    the inserted signer's issuerAndSerialNumber sid (structure stays valid)
+    ⇒ the signing certificate is not found (the per-signer rejection that
+    today early-returns at ~:1059 — this corruption exists to pin that
+    conversion).
+  The insertion is a copy of the genuine SignerInfo (same issuer ⇒ same
+  signer certificate when uncorrupted — the tests pin traceability, not
+  subject diversity; note this in the helper's doc comment).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -372,7 +396,8 @@ changed signature-failure string (the generic message is unchanged).
 #[test]
 fn appended_rejected_signer_is_traced_but_chain_stays_valid() {
     // (creds, content, cd_sha256, cms) as Task 1's fixture;
-    // let spliced = spliced_signer_info(&cms, /*at_front=*/false, /*corrupt=*/true);
+    // let spliced = spliced_signer_info(&cms, /*at_front=*/false,
+    //                                   SignerCorruption::CorruptSignatureBytes);
     // let report = verify_code_signature_with_anchors(&wrap(&spliced), …).unwrap();
     // assert report.valid                       // OR-reduction kept
     // assert_eq!(report.signers_total, 2)
@@ -382,7 +407,8 @@ fn appended_rejected_signer_is_traced_but_chain_stays_valid() {
 }
 #[test]
 fn rejected_signer_before_valid_still_traces_and_valid_signer_owns_scalars() {
-    // spliced = spliced_signer_info(&cms, /*at_front=*/true, /*corrupt=*/true);
+    // spliced = spliced_signer_info(&cms, /*at_front=*/true,
+    //                               SignerCorruption::CorruptSignatureBytes);
     // assert report.valid
     // assert_eq!(report.signers.len(), 2)
     // warnings contains "rejected signer #1 of 2"
@@ -391,14 +417,28 @@ fn rejected_signer_before_valid_still_traces_and_valid_signer_owns_scalars() {
 }
 #[test]
 fn all_rejected_signers_are_listed_and_warned() {
-    // two corrupted signers (genuine corrupted in place is not enough —
-    // use spliced_signer_info(cms, false, true) AND corrupt the original
-    // first entry, OR splice two corrupted clones; whichever construction
-    // you use must produce signers_total == 2 with both rejected).
+    // simplest construction: spliced_signer_info(&cms, false,
+    // SignerCorruption::CorruptSignatureBytes) PLUS corrupting the genuine
+    // first entry in place (extend the helper with a flag/second corruption
+    // if cleaner); whichever construction you use must produce
+    // signers_total == 2 with BOTH signers rejected.
     // assert !report.valid && !report.errors.is_empty()
     // assert_eq!(report.signers_total, 2); assert_eq!(report.signers.len(), 2)
     // both summaries carry subject Some("CN=zsign verify test") (footer prints signers)
     // warnings contain BOTH "#1 of 2" and "#2 of 2"
+}
+#[test]
+fn missing_signing_cert_signer_is_rejected_gracefully() {
+    // spliced = spliced_signer_info(&cms, /*at_front=*/false,
+    //                               SignerCorruption::UnresolvableSerial);
+    // let report = verify_code_signature_with_anchors(&wrap(&spliced), …).unwrap();
+    // The genuine signer must still validate (graceful per-signer handling
+    // of the rejection that today early-returns the whole envelope):
+    // assert report.valid
+    // assert_eq!(report.signers_total, 2); assert_eq!(report.signers.len(), 2)
+    // assert!(report.warnings.iter().any(|w|
+    //     w.contains("rejected signer #2 of 2") && w.contains("signing certificate not found")),
+    //     "…, got warnings: {:?}", report.warnings)
 }
 ```
 
@@ -409,7 +449,7 @@ the observable requirements above are binding, the construction is yours.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- rejected_signer all_rejected`
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- rejected_signer all_rejected missing_signing_cert`
 Expected: COMPILE ERROR (red): `signers_total`/`signers` do not exist yet —
 the API-creating red state. (Behaviorally today: the appended-corrupt case
 returns `valid == true` with empty warnings.)
@@ -422,8 +462,8 @@ bookkeeping/warning/copy rules, and the post-loop valid/errors settlement.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- rejected_signer all_rejected`
-Expected: all three PASS.
+Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core -- rejected_signer all_rejected missing_signing_cert`
+Expected: all four PASS.
 
 - [ ] **Step 5: Single-signer behavior regression**
 
@@ -472,8 +512,9 @@ paths) and commit per task in plan order, e.g.
   Task 3 consumes Task 2's `Result` call site by name.
 - Review Focus: all five lines have owning tests (Task 1: trailing +
   unsignedAttrs control; Task 2: four floor positions + preserved generic
-  string via regression; Task 3: appended-trace, front-trace/scalar
-  ownership, all-rejected listing).
+  string via regression + the migrated direct-call test; Task 3:
+  appended-trace, front-trace/scalar ownership, all-rejected listing,
+  graceful missing-cert rejection).
 - Proportion: the plan fixes decisions (exact strings, ownership rules,
   rejection conversions, fixture constructions); bodies stay with the
   implementers.

@@ -55,8 +55,10 @@ Three hardening gaps in `crates/zsign-core/src/crypto/cms_verify.rs`:
 ## External contracts (verified against vendored source / primary docs)
 
 1. **rsa 0.9.10 (locked):** there is **no `key_size()`/`bits()`** on
-   `RsaPublicKey`; the API is the inherent `n()` accessor and
-   `PublicKeyParts::size()` (BYTES — a 2048-bit floor is `size() < 256`).
+   `RsaPublicKey`; the API is the `rsa::traits::PublicKeyParts` trait —
+   `n()` (implemented at `key.rs:134-137`) and `size()` (BYTES — a
+   2048-bit floor is `size() < 256`) — which must be in scope
+   (`use rsa::traits::PublicKeyParts;`).
    The crate enforces only a maximum (4096-bit default cap,
    `key.rs:173-182`); `pkcs1v15::VerifyingKey::new` performs zero
    validation (`verifying_key.rs:33-39`), and `verify` only checks
@@ -114,8 +116,8 @@ Three hardening gaps in `crates/zsign-core/src/crypto/cms_verify.rs`:
   which RFC 5652 §5.3/§11.4 permit.
 
 **RSA-floor design candidates:**
-- **C1 (CHOSEN):** `const MIN_RSA_MODULUS_BITS: u32 = 2048` measured via
-  `pub_key.n().bits()` (inherent `n()`, exact bits — avoids the byte
+- **C1 (CHOSEN):** `const MIN_RSA_MODULUS_BITS: u64 = 2048` measured via
+  `PublicKeyParts::n(&key).bits()` (exact bits — avoids the byte
   rounding of `size()`).
   - Signer path: `verify_signer_signature` returns `Result<(), String>`;
     the weak key yields `Err("rsa public key is below the 2048-bit minimum")`,
@@ -126,11 +128,11 @@ Three hardening gaps in `crates/zsign-core/src/crypto/cms_verify.rs`:
     deferred and must keep compiling) but enforces the floor internally —
     fail-closed for the revocation caller without a signature change. The
     explicit reason surfaces in `verify_chain` via a pre-check helper
-    `rsa_floor_reason(cert) -> Option<String>` at all three
+    `rsa_key_below_floor(cert) -> bool` at all three
     signature-verifying sites (parent, self-signed terminus, resolved
-    trust anchor), producing
-    `reason: Some("rsa public key is below the 2048-bit minimum for certificate at depth …")`-style
-    lowercase prose (exact strings pinned in the plan).
+    trust anchor), each formatting its own reason
+    (exact strings pinned in the plan, all containing
+    `below the 2048-bit minimum`).
 - C2 — change `verify_cert_signature` to a Result and migrate revocation.rs.
   Rejected: revocation.rs is a deferred file owned by another wave.
 
