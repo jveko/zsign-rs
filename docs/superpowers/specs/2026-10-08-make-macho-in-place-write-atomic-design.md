@@ -25,7 +25,8 @@ and no read lock.
   affects external consumers only; nothing in-repo to migrate.
 - **No existing atomic-replace facility** anywhere in the workspace: every
   production write site uses plain `File::create`/`std::fs::write`. The only
-  tempfile use in production is a scratch `TempDir` (`verify.rs:393`).
+  tempfile use in production is scratch `TempDir`s (`verify.rs:393`,
+  `ipa/mod.rs:667`).
 - **`tempfile = "3.10"` is already a normal runtime dependency** of `zsign-rs`
   (`crates/zsign/Cargo.toml:27`, resolved 3.27.0 in Cargo.lock:1472). No
   manifest change is needed; no second convention is introduced.
