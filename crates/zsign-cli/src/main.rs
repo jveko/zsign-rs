@@ -7,6 +7,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use zsign_rs::codesign::verify::{PageCheck, SpecialSlotCheck};
+use zsign_rs::crypto::revocation::RevocationStatus;
 use zsign_rs::verify::MachOVerifyReport;
 use zsign_rs::{SigningCredentials, ZSign};
 
@@ -21,7 +22,8 @@ use zsign_rs::{SigningCredentials, ZSign};
     .multiple(true))]
 struct Cli {
     /// Input: app bundle directory, IPA/ZIP archive, or Mach-O binary (detected by content, not extension)
-    input: PathBuf,
+    #[arg(required_unless_present = "check_revocation")]
+    input: Option<PathBuf>,
 
     /// Output file
     #[arg(short, long)]
@@ -150,10 +152,16 @@ struct Cli {
     #[arg(short = 'P', long)]
     inject_extensions: bool,
 
-    /// Check the signing certificate's revocation status via OCSP and print a
-    /// warning if an authenticated responder says it is revoked. Signing always
-    /// proceeds — this is a signal, not a gate. One bounded network request
-    /// (3s budget) per run; unreachable responders and offline use stay silent.
+    /// Check the signing certificate's revocation status via OCSP and GATE
+    /// on it: an authenticated revocation aborts the run with exit 1 before
+    /// anything is signed. FAIL-OPEN by design: offline use, an unreachable
+    /// responder inside the 3s budget, or a certificate that names no
+    /// responder leaves the run exactly as without -C (signing proceeds,
+    /// exit 0) — only a definitive revocation stops it, and invalid or
+    /// expired credentials fail at load as they always do. Without an input
+    /// file this is a check that never signs: exit 0 (good), 1 (revoked or
+    /// invalid credentials), 2 (status could not be determined). One bounded
+    /// network request per run.
     #[arg(short = 'C', long, conflicts_with_all = ["verify", "adhoc"])]
     check_revocation: bool,
 
@@ -309,9 +317,23 @@ fn main() -> ExitCode {
 
 /// Runs the CLI from parsed arguments (testable without argv).
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    run_with_revocation(cli, &|credentials| {
+        zsign_rs::crypto::revocation::status_of(&credentials.certificate, &credentials.cert_chain)
+    })
+}
+
+/// `run` with the OCSP status source injected; production passes
+/// [`zsign_rs::crypto::revocation::status_of`], tests pass stubs.
+fn run_with_revocation(
+    cli: Cli,
+    probe: &dyn Fn(&SigningCredentials) -> RevocationStatus,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let json = cli.json;
     if cli.verify {
-        return Ok(run_verify(&cli.input, json));
+        // `-C` conflicts with `--verify` at parse time, so the input
+        // requirement is never lifted on this path.
+        let input = cli.input.as_ref().expect("verify requires an input");
+        return Ok(run_verify(input, json));
     }
 
     let mut signer = if cli.adhoc {
@@ -319,10 +341,34 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     } else {
         let credentials = load_credentials(&cli)?;
         if cli.check_revocation {
-            zsign_rs::crypto::revocation::warn_revocation(
-                &credentials.certificate,
-                &credentials.cert_chain,
-            );
+            let status = probe(&credentials);
+            match &status {
+                RevocationStatus::Revoked { .. } => {
+                    let message = status
+                        .warning()
+                        .unwrap_or_else(|| "certificate is revoked".into());
+                    emit_error(cli.json, &message);
+                    return Ok(ExitCode::from(1));
+                }
+                _ if cli.input.is_none() => {
+                    return Ok(match &status {
+                        RevocationStatus::Good => {
+                            println!("{}", check_good_report(cli.json));
+                            ExitCode::from(0)
+                        }
+                        RevocationStatus::NotChecked(reason) => {
+                            emit_error(
+                                cli.json,
+                                &format!("revocation could not be checked: {reason:?}"),
+                            );
+                            ExitCode::from(2)
+                        }
+                        // Revoked returned above.
+                        RevocationStatus::Revoked { .. } => ExitCode::from(1),
+                    });
+                }
+                _ => {}
+            }
         }
         ZSign::new().credentials(credentials)
     }
@@ -377,34 +423,52 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         signer = signer.allow_encrypted(true);
     }
 
-    match classify_input(&cli.input)? {
+    // The check-only early return above and the `-C` conflicts with
+    // `--verify`/`--adhoc` mean every path reaching here carries an input.
+    let input = cli.input.as_ref().expect("signing requires an input");
+    match classify_input(input)? {
         InputKind::Bundle => {
-            signer.sign_bundle(&cli.input, cli.output.as_deref())?;
+            signer.sign_bundle(input, cli.output.as_deref())?;
             match &cli.output {
                 Some(ipa) => report_sign(json, false, &ipa.display().to_string()),
-                None => report_sign(json, true, &cli.input.display().to_string()),
+                None => report_sign(json, true, &input.display().to_string()),
             }
         }
         InputKind::Archive => {
-            let output = cli.output.unwrap_or_else(|| signed_output_path(&cli.input));
-            signer.sign_ipa(&cli.input, &output)?;
+            let output = cli
+                .output
+                .clone()
+                .unwrap_or_else(|| signed_output_path(input));
+            signer.sign_ipa(input, &output)?;
             report_sign(json, false, &output.display().to_string());
         }
         InputKind::MachO => {
-            let output = cli.output.unwrap_or_else(|| signed_output_path(&cli.input));
-            signer.sign_macho(&cli.input, &output)?;
+            let output = cli
+                .output
+                .clone()
+                .unwrap_or_else(|| signed_output_path(input));
+            signer.sign_macho(input, &output)?;
             report_sign(json, false, &output.display().to_string());
         }
         InputKind::Unknown => {
             return Err(format!(
                 "unsupported input '{}': expected an app bundle directory, ZIP archive, or Mach-O binary",
-                cli.input.display()
+                input.display()
             )
             .into());
         }
     }
 
     Ok(ExitCode::from(0))
+}
+
+/// The check-only success document: human line or the `--json` object.
+fn check_good_report(json: bool) -> String {
+    if json {
+        "{\"status\":\"checked\",\"revocation\":\"good\"}".to_string()
+    } else {
+        "revocation: good".to_string()
+    }
 }
 
 /// Maps verification to the exit-code contract: 0 valid, 1 invalid,
@@ -1113,6 +1177,7 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
     use zsign_core::macho::fixtures;
+    use zsign_rs::crypto::revocation::{NotCheckedReason, RevocationStatus};
 
     /// Builds `dir/Enc.app` containing the encrypted executable.
     fn make_encrypted_app(dir: &Path) -> std::path::PathBuf {
@@ -1574,17 +1639,19 @@ mod tests {
     }
 
     #[test]
-    fn check_revocation_flag_never_gates_a_signing_run() {
-        // The flag is exposed in help (user-visible surface), and with -C the
-        // run still exits 0 — the warn-only contract ZSN-21 promises. The
-        // test identity's certificate names no OCSP responder, so the
-        // lookup short-circuits without touching the network; either way
-        // the signing result must be identical to a run without -C.
+    fn check_revocation_gates_revoked_and_fails_open_when_uncheckable() {
+        // The flag is exposed in help (user-visible surface), and the help
+        // text pins the fail-open posture in loud words.
         let help = run_cli(&[OsStr::new("--help")], &[]);
         assert_eq!(help.code, 0);
         assert!(
             help.stdout.contains("--check-revocation"),
             "flag missing from help: {}",
+            help.stdout
+        );
+        assert!(
+            help.stdout.to_uppercase().contains("FAIL-OPEN"),
+            "help must pin the fail-open posture: {}",
             help.stdout
         );
 
@@ -1594,21 +1661,138 @@ mod tests {
         let input = dir.path().join("in.bin");
         std::fs::write(&input, fixtures::make_minimal_macho()).unwrap();
         let out = dir.path().join("out.bin");
-        let cli = Cli::try_parse_from([
-            "zsign",
-            "-k",
-            key.to_str().unwrap(),
-            "-p",
-            "testpassword",
-            "-C",
-            "-o",
-            out.to_str().unwrap(),
-            input.to_str().unwrap(),
-        ])
-        .expect("args parse");
-        let code = run(cli).expect("-C must never gate signing");
-        assert_eq!(code, ExitCode::SUCCESS);
-        assert!(out.exists());
+        // `Cli` is not `Clone`, so parse fresh for each run from one shape.
+        let parse = || {
+            Cli::try_parse_from([
+                "zsign",
+                "-k",
+                key.to_str().unwrap(),
+                "-p",
+                "testpassword",
+                "-C",
+                "-o",
+                out.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ])
+            .expect("args parse")
+        };
+
+        // A stubbed authenticated revocation gates the run before anything
+        // is signed.
+        let code = run_with_revocation(parse(), &|_| RevocationStatus::Revoked {
+            revoked_at: None,
+            reason: Some("stubbed".into()),
+        })
+        .expect("gate returns an exit code");
+        assert_eq!(code, ExitCode::from(1), "gate must exit 1, got {code:?}");
+        assert!(!out.exists(), "gated run must not sign: {}", out.display());
+
+        // The test identity's certificate names no OCSP responder, so the
+        // production probe short-circuits without touching the network and
+        // the documented fail-open posture lets signing proceed.
+        let code = run(parse()).expect("fail-open run must succeed");
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "fail-open must exit 0, got {code:?}"
+        );
+        assert!(out.exists(), "fail-open run must sign: {}", out.display());
+    }
+
+    #[test]
+    fn check_only_mode_reports_and_gates_without_signing() {
+        // No input file: with -C this is a check that never signs.
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("identity.p12");
+        std::fs::write(&key, IDENTITY_P12).unwrap();
+        // `Cli` is not `Clone`, so parse fresh for each run from one shape.
+        let parse = || {
+            Cli::try_parse_from([
+                "zsign",
+                "-k",
+                key.to_str().unwrap(),
+                "-p",
+                "testpassword",
+                "-C",
+            ])
+            .expect("check-only must parse without an input")
+        };
+
+        // In-process stdout is not capturable, so these runs pin exit codes only.
+        let code =
+            run_with_revocation(parse(), &|_| RevocationStatus::Good).expect("good check runs");
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "good check must exit 0, got {code:?}"
+        );
+        let code = run_with_revocation(parse(), &|_| RevocationStatus::Revoked {
+            revoked_at: None,
+            reason: Some("stubbed".into()),
+        })
+        .expect("revoked check runs");
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "revoked check must exit 1, got {code:?}"
+        );
+        let code = run_with_revocation(parse(), &|_| {
+            RevocationStatus::NotChecked(NotCheckedReason::NoOcspUrl)
+        })
+        .expect("unchecked check runs");
+        assert_eq!(
+            code,
+            ExitCode::from(2),
+            "unchecked check must exit 2, got {code:?}"
+        );
+
+        // Check-only still LOADS credentials before the probe — load-time
+        // validity and anchoring stay enforced in this mode. The shipped
+        // binary's `load_p12_credentials` is always Apple-root anchored
+        // (main.rs:1102-1121), so it could never reach the probe with this
+        // self-issued fixture, and that rejection is pinned separately by
+        // `pkcs12_load_rejects_unanchored_chain` — this suite's cfg(test)
+        // loader is what makes the identity loadable here.
+        let key_str = key.to_str().unwrap().to_string();
+        let cli =
+            Cli::try_parse_from(["zsign", "-k", key_str.as_str(), "-p", "testpassword", "-C"])
+                .expect("check-only must parse without an input");
+        let creds =
+            load_credentials(&cli).expect("check-only must load credentials before the probe");
+        assert!(
+            creds
+                .certificate
+                .tbs_certificate
+                .subject
+                .to_string()
+                .contains("zsign-test-fixture"),
+            "loaded identity must be the fixture certificate, got {}",
+            creds.certificate.tbs_certificate.subject
+        );
+    }
+
+    #[test]
+    fn check_only_still_requires_credentials() {
+        // Dropping the input requirement for -C must not drop the key
+        // requirement: a check with nothing to check against is a usage error.
+        let err = parse_err(&["zsign", "-C"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("private-key"),
+            "message must name the key flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_good_report_formats() {
+        let human = check_good_report(false);
+        assert_eq!(human, "revocation: good", "actual human line: {human}");
+        let machine = check_good_report(true);
+        assert_eq!(
+            machine, "{\"status\":\"checked\",\"revocation\":\"good\"}",
+            "actual json document: {machine}"
+        );
     }
 
     #[test]
