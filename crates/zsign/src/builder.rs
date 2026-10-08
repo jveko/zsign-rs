@@ -87,6 +87,8 @@ pub struct ZSign {
     /// described by Task 3), while a bare Mach-O gets the path verbatim
     dylibs: Vec<PathBuf>,
     weak_dylibs: bool,
+    /// Widen injection to top-level PlugIns/Extensions .appex (CLI -P)
+    inject_extensions: bool,
     allow_encrypted: bool,
     /// Custom entitlements file: replaces profile-derived entitlements
     entitlements: Option<PathBuf>,
@@ -122,6 +124,7 @@ impl ZSign {
             adhoc: false,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            inject_extensions: false,
             allow_encrypted: false,
             entitlements: None,
             entitlements_dir: None,
@@ -356,6 +359,12 @@ impl ZSign {
         self
     }
 
+    /// Widens dylib injection to top-level app extensions (CLI `-P`).
+    pub fn inject_extensions(mut self, inject: bool) -> Self {
+        self.inject_extensions = inject;
+        self
+    }
+
     /// Overrides the FairPlay-encryption refusal (`-f/--force` on the CLI).
     pub fn allow_encrypted(mut self, allow: bool) -> Self {
         self.allow_encrypted = allow;
@@ -547,6 +556,9 @@ impl ZSign {
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
         }
+        if self.inject_extensions {
+            signer = signer.inject_extensions(true);
+        }
         signer = signer.allow_encrypted(self.allow_encrypted);
         signer = signer.remove_embedded_profile(self.remove_embedded_profile);
         if self.allow_unsafe_profile {
@@ -615,6 +627,9 @@ impl ZSign {
         };
         if !self.dylibs.is_empty() {
             signer = signer.dylib_injection(self.dylibs.clone(), self.weak_dylibs);
+        }
+        if self.inject_extensions {
+            signer = signer.inject_extensions(true);
         }
         signer = signer.allow_encrypted(self.allow_encrypted);
         signer = signer.remove_embedded_profile(self.remove_embedded_profile);

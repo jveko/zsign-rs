@@ -334,6 +334,8 @@ pub struct IpaSigner<'a> {
     dylibs: Vec<PathBuf>,
     /// Inject with LC_LOAD_WEAK_DYLIB instead of LC_LOAD_DYLIB
     weak_dylibs: bool,
+    /// Widen injection to top-level PlugIns/Extensions .appex (CLI -P)
+    inject_extensions: bool,
     /// Override the FairPlay-encryption refusal (sign an encrypted binary anyway).
     allow_encrypted: bool,
     /// Custom entitlements replacing the profile-derived entitlements
@@ -402,6 +404,7 @@ impl<'a> IpaSigner<'a> {
             sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            inject_extensions: false,
             allow_encrypted: false,
             entitlements_override: None,
             entitlements_dir: None,
@@ -425,6 +428,7 @@ impl<'a> IpaSigner<'a> {
             sha256_only: true,
             dylibs: Vec::new(),
             weak_dylibs: false,
+            inject_extensions: false,
             allow_encrypted: false,
             entitlements_override: None,
             entitlements_dir: None,
@@ -610,6 +614,17 @@ impl<'a> IpaSigner<'a> {
     pub fn dylib_injection(mut self, dylibs: Vec<PathBuf>, weak: bool) -> Self {
         self.dylibs = dylibs;
         self.weak_dylibs = weak;
+        self
+    }
+
+    /// Widens dylib injection to top-level app extensions.
+    ///
+    /// Without it only the root bundle directory is injected; with it,
+    /// top-level `PlugIns/<name>.appex` and `Extensions/<name>.appex`
+    /// executables are added, each referencing the app-root copy via
+    /// `@executable_path/<../ × N><name>`.
+    pub fn inject_extensions(mut self, inject: bool) -> Self {
+        self.inject_extensions = inject;
         self
     }
 
@@ -1066,13 +1081,24 @@ impl<'a> IpaSigner<'a> {
                 .filter_map(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .collect();
-            injection.insert(
-                bundle_path.to_path_buf(),
-                bases
-                    .iter()
-                    .map(|b| format!("@executable_path/{b}"))
-                    .collect(),
-            );
+            for (path, _) in &bundles {
+                let Ok(relative) = path.strip_prefix(bundle_path) else {
+                    continue;
+                };
+                let in_scope = path == bundle_path
+                    || (self.inject_extensions && Self::is_top_level_app_extension(relative));
+                if !in_scope {
+                    continue;
+                }
+                let up = "../".repeat(relative.components().count());
+                injection.insert(
+                    path.clone(),
+                    bases
+                        .iter()
+                        .map(|b| format!("@executable_path/{up}{b}"))
+                        .collect(),
+                );
+            }
         }
 
         // --- only now does anything mutate ---
@@ -1379,6 +1405,17 @@ impl<'a> IpaSigner<'a> {
         }
 
         depth
+    }
+
+    /// Upstream single-level app-extension classification for `-P`: exactly
+    /// `<PlugIns|Extensions>/<name>.appex`, nothing deeper.
+    fn is_top_level_app_extension(relative: &Path) -> bool {
+        let mut parts = relative.components();
+        let first = matches!(parts.next(), Some(Component::Normal(dir))
+            if dir.to_str().is_some_and(|d| d == "PlugIns" || d == "Extensions"));
+        let second = matches!(parts.next(), Some(Component::Normal(name))
+            if name.to_str().is_some_and(|n| n.ends_with(".appex")));
+        first && second && parts.next().is_none()
     }
 
     /// Find all standalone .dylib files recursively in the bundle.
@@ -2812,6 +2849,62 @@ mod tests {
         assert!(
             appex.join("_CodeSignature/CodeResources").exists(),
             "default scope must narrow only injection, not signing"
+        );
+    }
+
+    #[test]
+    fn inject_extensions_injects_relative_path_into_top_level_appex() {
+        let temp = TempDir::new().unwrap();
+        let (app, appex) = create_bundle_with_appex(temp.path());
+        let source = temp.path().join("libfoo.dylib");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .inject_extensions(true)
+            .sign_folder_in_place(&app)
+            .expect("signing with extension injection must succeed");
+
+        let root_libs = load_command_dylibs(&app.join("Test"));
+        assert!(
+            root_libs.contains(&"@executable_path/libfoo.dylib".to_string()),
+            "the root executable must reference the embedded copy, got {root_libs:?}"
+        );
+        let all_libs = load_command_dylibs(&appex.join("Ext"));
+        let injected: Vec<String> = all_libs
+            .iter()
+            .filter(|l| l.contains("libfoo"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            injected,
+            vec!["@executable_path/../../libfoo.dylib"],
+            "the appex executable must reference the app-root copy two levels up, got {all_libs:?}"
+        );
+    }
+
+    #[test]
+    fn inject_extensions_skips_xpc_services() {
+        let temp = TempDir::new().unwrap();
+        let app = create_bundle_with_xpc(temp.path());
+        let source = temp.path().join("libfoo.dylib");
+        std::fs::write(&source, fixtures::make_minimal_dylib()).unwrap();
+
+        IpaSigner::new_adhoc()
+            .dylib_injection(vec![source], false)
+            .inject_extensions(true)
+            .sign_folder_in_place(&app)
+            .expect("signing with extension injection must succeed");
+
+        let root_libs = load_command_dylibs(&app.join("Test"));
+        assert!(
+            root_libs.contains(&"@executable_path/libfoo.dylib".to_string()),
+            "the root executable must carry the injected entry: {root_libs:?}"
+        );
+        let xpc_libs = load_command_dylibs(&app.join("XPCServices/Foo.xpc/Foo"));
+        assert!(
+            xpc_libs.iter().all(|l| !l.contains("libfoo")),
+            "the XPC executable must not carry the injected entry: {xpc_libs:?}"
         );
     }
 

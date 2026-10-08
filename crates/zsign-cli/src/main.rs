@@ -143,6 +143,13 @@ struct Cli {
     #[arg(short = 'w', long)]
     weak: bool,
 
+    /// Also inject -l dylibs into top-level app extensions (PlugIns/,
+    /// Extensions/): each extension executable references the single
+    /// app-root copy via @executable_path/../../<name>. Without this flag
+    /// only the root bundle directory is injected.
+    #[arg(short = 'P', long)]
+    inject_extensions: bool,
+
     /// Check the signing certificate's revocation status via OCSP and print a
     /// warning if an authenticated responder says it is revoked. Signing always
     /// proceeds — this is a signal, not a gate. One bounded network request
@@ -179,6 +186,7 @@ struct Cli {
             "adhoc",
             "dylibs",
             "weak",
+            "inject_extensions",
             "check_revocation"
         ]
     )]
@@ -290,6 +298,9 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
     if !cli.dylibs.is_empty() {
         signer = signer.dylib_injection(cli.dylibs.clone(), cli.weak);
+    }
+    if cli.inject_extensions {
+        signer = signer.inject_extensions(true);
     }
     if cli.force {
         signer = signer.allow_encrypted(true);
@@ -1727,6 +1738,7 @@ mod tests {
             vec!["zsign", "-V", "--pkcs12", "x.p12", "in.ipa"],
             vec!["zsign", "-V", "-2", "in.ipa"],
             vec!["zsign", "-V", "--allow-unsafe-profile", "in.ipa"],
+            vec!["zsign", "-V", "-P", "in.ipa"],
         ] {
             assert_eq!(
                 parse_err(&extra).kind(),
@@ -1895,6 +1907,12 @@ mod tests {
             .expect("an existing Mach-O must parse");
         let parsed: Vec<PathBuf> = cli.dylibs;
         assert_eq!(parsed, vec![file]);
+    }
+
+    #[test]
+    fn inject_extensions_flag_parses() {
+        let cli = Cli::try_parse_from(["zsign", "-a", "-P", "in.ipa"]).expect("must parse");
+        assert!(cli.inject_extensions);
     }
 
     #[test]

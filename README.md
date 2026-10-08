@@ -205,8 +205,9 @@ Complete surface of `zsign-cli` (from `zsign-cli --help`, captured 2026-09-27):
 |`-L, --legacy-sha1`|—|Legacy SHA-1 + SHA-256 dual code directories (iOS <= 10 only); conflicts `-2`|
 |`-f, --force`|—|Override the FairPlay-encryption refusal and sign encrypted binaries anyway (already-decrypted input only)|
 |`-a, --adhoc`|—|Sign without an identity (ad-hoc); conflicts `-m`, `-C`, `-V`|
-|`-l, --dylibs`|path|Dylib load path to inject (repeatable)|
+|`-l, --dylibs`|path|Dylib to inject (repeatable): must exist and be Mach-O — rejected at parse time; copied to the app root and injected as `@executable_path/<name>`; root bundle directory only unless `-P`; a bare Mach-O input gets the path injected verbatim|
 |`-w, --weak`|—|Inject dylibs as `LC_LOAD_WEAK_DYLIB`|
+|`-P, --inject-extensions`|—|Also inject `-l` dylibs into top-level app extensions (`PlugIns/`, `Extensions/`): each extension executable references the single app-root copy via `@executable_path/../../<name>`; without this flag only the root bundle directory is injected|
 |`-C, --check-revocation`|—|OCSP revocation **warning** (semantics below); conflicts `-V`, `-a`|
 |`-V, --verify`|—|Verify like `codesign --verify --deep --strict`; conflicts with every signing option (clap rejects each pairing at parse time)|
 |`--json`|—|Machine-readable JSON output (documented below); works in both signing and verify modes|
@@ -384,6 +385,7 @@ elsewhere (contract: `docs/superpowers/specs/2026-09-25-cli-surface-design.md`):
 |`-f/--force`|bypass the folder re-sign cache|override the FairPlay-encryption refusal (zsign-rs has no cache layer)|
 |`-C`|standalone certificate report whose exit codes scripts may depend on|**warning-only** OCSP probe while signing; never gates|
 |exit codes|`0` / catch-all `255`|`0` / `1` / `2` contract above|
+|`-l`/`-P`|copies to the app root and injects `@executable_path/<name>`, extensions only with `-P`, silently skips a failed copy|matches the layout and scope, fails loudly instead of skipping, validates `-l` at parse time, and never injects XPC/Watch/AppClips (upstream does not either)|
 
 There is no compatibility shim: old `zsign-cli -p cert.p12 …` invocations fail loudly
 at parse time. `zsign-cli --help` ends with the same reminder:
@@ -393,9 +395,9 @@ Upstream flags with **no** zsign-rs equivalent — transcribed from upstream
 `src/zsign.cpp` (long-option table + `usage()`, commit `614caa8d`, 2026-08-21) by
 this lane's upstream parity research; upstream source is not vendored in this tree:
 `-d -q -i -t -D -x -I -S -M -E -W -U
--P -v` (debug dumps, quiet, ideviceinstaller install, temp folder, dylib removal,
+-v` (debug dumps, quiet, ideviceinstaller install, temp folder, dylib removal,
 metadata/icon extraction, Files-app toggles, MinimumOSVersion, extension/watch/
-UISupportedDevices cleanup, extension injection, version print), plus the
+UISupportedDevices cleanup, version print), plus the
 `.zsign_cache` fast re-sign layer. zsign-rs extensions with no upstream counterpart:
 `--pkcs12`, `--keychain-identity`, `--profile-map`, `--entitlements-dir`, `--json`,
 `-V/--verify`, `ZSIGN_PASSWORD`.
