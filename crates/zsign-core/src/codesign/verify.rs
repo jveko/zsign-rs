@@ -197,9 +197,19 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
     for entry in &entries {
         match entry.slot {
             CSSLOT_CODEDIRECTORY if code_directory.is_none() => {
-                code_directory = Some(CodeDirectory::parse(entry.blob).map_err(|e| {
+                let cd = CodeDirectory::parse(entry.blob).map_err(|e| {
                     crate::Error::Verification(format!("primary CodeDirectory: {e}"))
-                })?);
+                })?;
+                if alternate_code_directories
+                    .iter()
+                    .any(|prev: &CodeDirectory<'_>| prev.hash_type == cd.hash_type)
+                {
+                    return Err(crate::Error::Verification(format!(
+                        "duplicate CodeDirectory hash type {} at slot 0x{:08x}: at most one CodeDirectory per hash type",
+                        cd.hash_type, entry.slot
+                    )));
+                }
+                code_directory = Some(cd);
             }
             CSSLOT_ALTERNATE_CODEDIRECTORIES..=CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT => {
                 let cd = CodeDirectory::parse(entry.blob).map_err(|e| {
@@ -208,6 +218,18 @@ pub fn parse_superblob(blob: &[u8]) -> Result<SuperBlob<'_>> {
                         entry.slot
                     ))
                 })?;
+                if code_directory
+                    .as_ref()
+                    .is_some_and(|primary_cd| primary_cd.hash_type == cd.hash_type)
+                    || alternate_code_directories
+                        .iter()
+                        .any(|prev: &CodeDirectory<'_>| prev.hash_type == cd.hash_type)
+                {
+                    return Err(crate::Error::Verification(format!(
+                        "duplicate CodeDirectory hash type {} at slot 0x{:08x}: at most one CodeDirectory per hash type",
+                        cd.hash_type, entry.slot
+                    )));
+                }
                 alternate_code_directories.push(cd);
             }
             CSSLOT_SIGNATURESLOT => cms = Some(entry.blob),
@@ -1619,6 +1641,45 @@ mod tests {
         assert!(
             parse_superblob(&b).is_err(),
             "duplicate slot 0 must be rejected"
+        );
+    }
+
+    /// Minimal SuperBlob: header + index + children, declared length fixed up.
+    fn test_superblob(children: &[(u32, &[u8])]) -> Vec<u8> {
+        let index_end = 12 + children.len() * 8;
+        let mut out = Vec::new();
+        out.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // declared length, patched below
+        out.extend_from_slice(&(children.len() as u32).to_be_bytes());
+        let mut offset = index_end as u32;
+        for (slot, bytes) in children {
+            out.extend_from_slice(&slot.to_be_bytes());
+            out.extend_from_slice(&offset.to_be_bytes());
+            offset += bytes.len() as u32;
+        }
+        for (_, bytes) in children {
+            out.extend_from_slice(bytes);
+        }
+        let len = out.len() as u32;
+        out[4..8].copy_from_slice(&len.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn duplicate_code_directory_hash_type_is_rejected() {
+        // A second directory of an already-present hash type can never be bound
+        // by the CMS cdhash attributes; Apple rejects duplicate hashType outright.
+        let cd_a = CodeDirectoryBuilder::new("com.example.dup", TEST_CODE).build_sha256();
+        let cd_b = CodeDirectoryBuilder::new("com.example.dup.other", TEST_CODE).build_sha256();
+        let blob = test_superblob(&[
+            (CSSLOT_CODEDIRECTORY, cd_a.as_slice()),
+            (CSSLOT_ALTERNATE_CODEDIRECTORIES, cd_b.as_slice()),
+        ]);
+        let res = parse_superblob(&blob);
+        assert!(
+            matches!(&res, Err(crate::Error::Verification(m)) if m.contains("duplicate CodeDirectory hash type")),
+            "duplicate hash type must be rejected, got {:?}",
+            res.as_ref().err()
         );
     }
 
