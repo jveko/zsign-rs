@@ -269,6 +269,22 @@ fn write_len(out: &mut Vec<u8>, v: usize) {
     }
 }
 
+/// Summary of a single evaluated signer in a CMS verification report.
+///
+/// Carried in [`CmsVerifyReport::signers`], one entry per SignerInfo in CMS
+/// order. Rejected signers are listed too (with `anchored == false` and
+/// whatever identity was resolved before rejection); the rejection reason is
+/// traced as a `rejected signer #i of N` entry in [`CmsVerifyReport::warnings`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CmsSignerSummary {
+    /// The signer certificate's subject, when the signing certificate was found.
+    pub subject: Option<String>,
+    /// The signer certificate's serial number (hex), when found.
+    pub serial: Option<String>,
+    /// Whether the signer's chain terminates at a verified trust anchor.
+    pub anchored: bool,
+}
+
 /// Result of a CMS verification attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CmsVerifyReport {
@@ -281,6 +297,11 @@ pub struct CmsVerifyReport {
     pub signer_subject: Option<String>,
     /// The signer certificate's serial number (hex), when found.
     pub signer_serial: Option<String>,
+    /// Total number of SignerInfo structures evaluated in the CMS.
+    pub signers_total: usize,
+    /// One summary per evaluated SignerInfo, in CMS order (rejected signers
+    /// included; their reasons are traced in `warnings`).
+    pub signers: Vec<CmsSignerSummary>,
     /// Whether the `messageDigest` attribute matched the content digest.
     pub message_digest_ok: bool,
     /// Whether the Apple CDHash v1 attribute matched the CodeDirectory.
@@ -705,6 +726,316 @@ fn decode_octet_string_stream(bytes: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Per-signer verification outputs, staged locally while one SignerInfo is
+/// evaluated. The caller copies them into the report per the ownership rules
+/// (first valid signer wins; last rejected one otherwise), so a rejected
+/// signer can never overwrite a valid signer's scalars.
+#[derive(Default)]
+struct StagedSigner {
+    subject: Option<String>,
+    serial: Option<String>,
+    message_digest_ok: bool,
+    cdhash_v1_ok: bool,
+    cdhash_v2_ok: bool,
+    signature_ok: bool,
+    chain_ok: bool,
+    anchored: bool,
+    chain: Vec<String>,
+    chain_reason: Option<String>,
+}
+
+impl StagedSigner {
+    fn claim_into(&self, report: &mut CmsVerifyReport) {
+        report.signer_subject = self.subject.clone();
+        report.signer_serial = self.serial.clone();
+        report.message_digest_ok = self.message_digest_ok;
+        report.cdhash_v1_ok = self.cdhash_v1_ok;
+        report.cdhash_v2_ok = self.cdhash_v2_ok;
+        report.signature_ok = self.signature_ok;
+        report.chain_ok = self.chain_ok;
+        report.anchored = self.anchored;
+        report.chain.clone_from(&self.chain);
+        report.chain_reason.clone_from(&self.chain_reason);
+    }
+}
+
+/// Evaluates one SignerInfo against the embedded certificates and trust
+/// anchors. Returns the staged per-signer outputs plus that signer's errors;
+/// empty errors mean the signer is valid. Structural per-signer failures
+/// (unsupported digest, unresolvable identity, missing certificate) are
+/// rejections — a one-element error list whose first entry is the reason —
+/// not envelope failures. Malformed CMS structure is still a hard
+/// [`Error::Verification`].
+#[allow(clippy::too_many_arguments)]
+fn eval_one_signer(
+    si_raw: &[u8],
+    mode: &SignedDataMode<'_>,
+    certs: &[x509_cert::Certificate],
+    bound_content: &Option<Vec<u8>>,
+    digest_alg_oids: &[ObjectIdentifier],
+    anchors: &TrustAnchors,
+    now: time::OffsetDateTime,
+    warnings: &mut Vec<String>,
+    global_errors: &mut Vec<String>,
+) -> Result<(StagedSigner, Vec<String>)> {
+    let mut staged = StagedSigner::default();
+    let mut si_r = reader(si_raw, "malformed SignerInfo")?;
+    let _si_version = u32::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed SignerInfo version: {e}")))?;
+
+    // sid: issuerAndSerialNumber SEQUENCE or [0] subjectKeyIdentifier.
+    let sid = AnyRef::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed signer id: {e}")))?;
+    let sid_body = sid.value();
+    let mut ski_cert: Option<&x509_cert::Certificate> = None;
+    let mut issuer_der: &[u8] = &[];
+    let mut serial_der: &[u8] = &[];
+    match sid.tag() {
+        Tag::Sequence => {
+            let mut sidr = reader(sid_body, "malformed issuerAndSerialNumber")?;
+            let ib = usize::try_from(sidr.position()).unwrap_or(0);
+            let _issuer_any = AnyRef::decode(&mut sidr)
+                .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
+            let ie = usize::try_from(sidr.position()).unwrap_or(0);
+            let sb = usize::try_from(sidr.position()).unwrap_or(0);
+            let _serial_any = AnyRef::decode(&mut sidr)
+                .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
+            let se = usize::try_from(sidr.position()).unwrap_or(0);
+            issuer_der = sid_body.get(ib..ie).unwrap_or_default();
+            serial_der = sid_body.get(sb..se).unwrap_or_default();
+        }
+        // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
+        // STRING (der-derive default); tolerate a constructed wrapper too — its
+        // value is then the inner OCTET STRING TLV rather than the raw key id.
+        Tag::ContextSpecific {
+            number,
+            constructed,
+        } if number == TagNumber::new(0) => {
+            let key_id: Option<Vec<u8>> = if constructed {
+                der::asn1::OctetString::from_der(sid_body)
+                    .ok()
+                    .map(|o| o.as_bytes().to_vec())
+            } else {
+                Some(sid_body.to_vec())
+            };
+            let resolved = key_id
+                .as_deref()
+                .and_then(|kid| find_cert_by_ski(certs, kid));
+            match resolved {
+                Some(c) => ski_cert = Some(c),
+                None => {
+                    // Per-signer rejection: record why this SignerInfo is
+                    // unusable and fall through to bookkeeping.
+                    let reason =
+                        "signer subjectKeyIdentifier does not match any embedded certificate"
+                            .to_string();
+                    return Ok((staged, vec![reason]));
+                }
+            }
+        }
+        other => {
+            return Err(Error::Verification(format!(
+                "unexpected signer id tag {other:?}"
+            )))
+        }
+    };
+
+    // digestAlgorithm
+    let dig_alg = AnyRef::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed digestAlgorithm: {e}")))?;
+    let dig_oid = {
+        let mut dar = reader(dig_alg.value(), "malformed digestAlgorithm body")?;
+        ObjectIdentifier::decode(&mut dar)
+            .map_err(|e| Error::Verification(format!("malformed digest OID: {e}")))?
+    };
+    let signer_digest = match mode {
+        SignedDataMode::CodeSignature { .. } => {
+            if dig_oid != OID_SHA256 {
+                let reason =
+                    format!("unsupported digest algorithm {dig_oid} (only SHA-256 is supported)");
+                return Ok((staged, vec![reason]));
+            }
+            SignerDigest::Sha256
+        }
+        SignedDataMode::AttachedProfile => match dig_oid {
+            OID_SHA256 => SignerDigest::Sha256,
+            OID_SHA1 => {
+                let w = "profile CMS is signed with a SHA-1 message digest";
+                if !warnings.iter().any(|x| x == w) {
+                    warnings.push(w.to_string());
+                }
+                SignerDigest::Sha1
+            }
+            other => {
+                let reason = format!(
+                    "unsupported digest algorithm {other} (profile CMS allows SHA-256 or SHA-1)"
+                );
+                return Ok((staged, vec![reason]));
+            }
+        },
+    };
+    if !digest_alg_oids.contains(&dig_oid) {
+        let msg =
+            format!("digestAlgorithms does not include the SignerInfo digest algorithm {dig_oid}");
+        if !global_errors.contains(&msg) {
+            global_errors.push(msg);
+        }
+    }
+
+    // signedAttrs [0] — capture raw bytes (the signed message).
+    let attrs_start = usize::try_from(si_r.position()).unwrap_or(0);
+    let attrs_any = AnyRef::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed signedAttrs: {e}")))?;
+    if attrs_any.tag() != TAG_CTX0 {
+        return Err(Error::Verification("signedAttrs is not [0]-tagged".into()));
+    }
+    let attrs_end = usize::try_from(si_r.position()).unwrap_or(0);
+    let attrs_raw = &si_raw[attrs_start..attrs_end];
+    let attrs = parse_signed_attrs(attrs_any.value())?;
+
+    // signatureAlgorithm + signature
+    let sig_alg = AnyRef::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed signatureAlgorithm: {e}")))?;
+    let sig_oid = {
+        let mut sar = reader(sig_alg.value(), "malformed signatureAlgorithm body")?;
+        ObjectIdentifier::decode(&mut sar)
+            .map_err(|e| Error::Verification(format!("malformed signature OID: {e}")))?
+    };
+    let sig_any = AnyRef::decode(&mut si_r)
+        .map_err(|e| Error::Verification(format!("malformed signature: {e}")))?;
+    if sig_any.tag() != Tag::OctetString {
+        return Err(Error::Verification(
+            "signature is not an OCTET STRING".into(),
+        ));
+    }
+    let signature = sig_any.value();
+    // RFC 5652 §5.3: unsignedAttrs [1] IMPLICIT is the only field after the
+    // signature; consume it if present, then the SEQUENCE must be done.
+    if !si_r.is_finished() {
+        let clean = AnyRef::decode(&mut si_r)
+            .map(|next| next.tag() == TAG_CTX1)
+            .unwrap_or(false)
+            && si_r.is_finished();
+        if !clean {
+            return Err(Error::Verification(
+                "SignerInfo has trailing fields after signature".into(),
+            ));
+        }
+    }
+
+    // Locate the signing certificate by resolved SKI or issuer+serial.
+    let signer_cert = match ski_cert {
+        Some(c) => Some(c),
+        None => certs.iter().find(|c| {
+            c.tbs_certificate
+                .issuer
+                .to_der()
+                .map(|d| d.as_slice() == issuer_der)
+                .unwrap_or(false)
+                && c.tbs_certificate
+                    .serial_number
+                    .to_der()
+                    .map(|d| d.as_slice() == serial_der)
+                    .unwrap_or(false)
+        }),
+    };
+
+    let Some(cert) = signer_cert else {
+        let reason = "signing certificate not found in embedded set".to_string();
+        return Ok((staged, vec![reason]));
+    };
+
+    staged.subject = Some(cert.tbs_certificate.subject.to_string());
+    staged.serial = cert
+        .tbs_certificate
+        .serial_number
+        .to_der()
+        .ok()
+        .map(|d| hex(&d));
+
+    // 1. messageDigest attribute == digest(bound content)
+    let md_ok = match bound_content {
+        Some(b) => {
+            let computed: Vec<u8> = match signer_digest {
+                SignerDigest::Sha1 => sha1::Sha1::digest(b).to_vec(),
+                SignerDigest::Sha256 => Sha256::digest(b).to_vec(),
+            };
+            // `SignedAttrs::message_digest` is `Option<&[u8]>` — compare
+            // the slices directly, mirroring the existing check.
+            attrs
+                .message_digest
+                .map(|md| md == computed.as_slice())
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+    staged.message_digest_ok = md_ok;
+
+    // 2. Apple CDHash attributes bind this CodeDirectory.
+    if let SignedDataMode::CodeSignature { cd_sha1, cd_sha256 } = mode {
+        staged.cdhash_v1_ok = attrs
+            .cdhash_v1_plist
+            .as_ref()
+            .map(|p| cdhash_v1_matches(p, *cd_sha1, cd_sha256))
+            .unwrap_or(false);
+        staged.cdhash_v2_ok = attrs
+            .cdhash_v2_der
+            .as_ref()
+            .map(|d| cdhash_v2_matches(d, cd_sha256))
+            .unwrap_or(false);
+    }
+
+    // 3. Signature over the raw signedAttrs bytes.
+    let res = verify_signer_signature(cert, sig_oid, signer_digest, attrs_raw, signature);
+    staged.signature_ok = res.is_ok();
+
+    // 4. Chain structure and trust anchoring.
+    let purpose = match mode {
+        SignedDataMode::CodeSignature { .. } => SignerPurpose::CodeSigning,
+        SignedDataMode::AttachedProfile => SignerPurpose::ProvisioningProfile,
+    };
+    let outcome = verify_chain(certs, cert, anchors, now, purpose);
+    staged.chain_ok = outcome.ok;
+    staged.anchored = outcome.anchored;
+    staged.chain = outcome.subjects;
+    staged.chain_reason = outcome.reason.clone();
+    for w in outcome.warnings {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+
+    let mut errors = Vec::new();
+    if !md_ok {
+        errors.push("messageDigest attribute does not match the signed content".into());
+    }
+    if let SignedDataMode::CodeSignature { .. } = mode {
+        if !staged.cdhash_v1_ok {
+            errors.push("Apple CDHash v1 attribute does not match the CodeDirectory".into());
+        }
+        if !staged.cdhash_v2_ok {
+            errors.push("Apple CDHash v2 attribute does not match the CodeDirectory".into());
+        }
+    }
+    if let Err(reason) = res {
+        errors.push(reason);
+    }
+    if !outcome.ok {
+        errors.push(
+            staged
+                .chain_reason
+                .clone()
+                .unwrap_or_else(|| "certificate chain is not structurally valid".into()),
+        );
+    } else if !outcome.anchored {
+        errors.push("certificate chain is not anchored to a trusted root".into());
+    }
+    if let Some(reason) = content_type_reason(attrs.content_type_count, &attrs.content_types) {
+        errors.push(reason);
+    }
+    Ok((staged, errors))
+}
+
 fn verify_signed_data(
     cms: &[u8],
     content: Option<&[u8]>,
@@ -903,279 +1234,63 @@ fn verify_signed_data(
         return Ok((seal(report, global_errors)?, econtent));
     }
 
-    // Verify each SignerInfo; the report reflects the best (valid) one.
-    for si_raw in &signer_infos_raw {
-        let mut si_r = reader(si_raw, "malformed SignerInfo")?;
-        let _si_version = u32::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed SignerInfo version: {e}")))?;
-
-        // sid: issuerAndSerialNumber SEQUENCE or [0] subjectKeyIdentifier.
-        let sid = AnyRef::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed signer id: {e}")))?;
-        let sid_body = sid.value();
-        let mut ski_cert: Option<&x509_cert::Certificate> = None;
-        let mut issuer_der: &[u8] = &[];
-        let mut serial_der: &[u8] = &[];
-        match sid.tag() {
-            Tag::Sequence => {
-                let mut sidr = reader(sid_body, "malformed issuerAndSerialNumber")?;
-                let ib = usize::try_from(sidr.position()).unwrap_or(0);
-                let _issuer_any = AnyRef::decode(&mut sidr)
-                    .map_err(|e| Error::Verification(format!("malformed issuer: {e}")))?;
-                let ie = usize::try_from(sidr.position()).unwrap_or(0);
-                let sb = usize::try_from(sidr.position()).unwrap_or(0);
-                let _serial_any = AnyRef::decode(&mut sidr)
-                    .map_err(|e| Error::Verification(format!("malformed serial: {e}")))?;
-                let se = usize::try_from(sidr.position()).unwrap_or(0);
-                issuer_der = sid_body.get(ib..ie).unwrap_or_default();
-                serial_der = sid_body.get(sb..se).unwrap_or_default();
+    // Evaluate every SignerInfo; the scalars describe the best signer (first
+    // valid wins; last rejected otherwise), `errors` falls back to the first
+    // rejection, and every signer is traced in `signers` with rejections warned about.
+    report.signers_total = signer_infos_raw.len();
+    let total = signer_infos_raw.len();
+    let mut any_valid = false;
+    let mut first_rejected_errors: Option<Vec<String>> = None;
+    for (idx, si_raw) in signer_infos_raw.iter().enumerate() {
+        let (staged, errors) = eval_one_signer(
+            si_raw,
+            mode,
+            &certs,
+            &bound_content,
+            &digest_alg_oids,
+            anchors,
+            now,
+            &mut report.warnings,
+            &mut global_errors,
+        )?;
+        let rejected = !errors.is_empty();
+        if rejected {
+            let reason = errors.first().cloned().unwrap_or_default();
+            let warning = match &staged.subject {
+                Some(subject) => format!(
+                    "rejected signer #{} of {total} (\"{subject}\"): {reason}",
+                    idx + 1
+                ),
+                None => format!("rejected signer #{} of {total}: {reason}", idx + 1),
+            };
+            if !report.warnings.contains(&warning) {
+                report.warnings.push(warning);
             }
-            // cms 0.2.3 encodes the SKI sid as an IMPLICIT *primitive* [0] OCTET
-            // STRING (der-derive default); tolerate a constructed wrapper too — its
-            // value is then the inner OCTET STRING TLV rather than the raw key id.
-            Tag::ContextSpecific {
-                number,
-                constructed,
-            } if number == TagNumber::new(0) => {
-                let key_id: Option<Vec<u8>> = if constructed {
-                    der::asn1::OctetString::from_der(sid_body)
-                        .ok()
-                        .map(|o| o.as_bytes().to_vec())
-                } else {
-                    Some(sid_body.to_vec())
-                };
-                let resolved = key_id
-                    .as_deref()
-                    .and_then(|kid| find_cert_by_ski(&certs, kid));
-                match resolved {
-                    Some(c) => ski_cert = Some(c),
-                    None => {
-                        // Never leave the report invalid-with-empty-errors: record why
-                        // this SignerInfo was unusable and move to the next one.
-                        if report.errors.is_empty() {
-                            report.errors.push(
-                                "signer subjectKeyIdentifier does not match any embedded certificate"
-                                    .into(),
-                            );
-                        }
-                        continue;
-                    }
-                }
+            if first_rejected_errors.is_none() {
+                first_rejected_errors = Some(errors.clone());
             }
-            other => {
-                return Err(Error::Verification(format!(
-                    "unexpected signer id tag {other:?}"
-                )))
-            }
-        };
-
-        // digestAlgorithm
-        let dig_alg = AnyRef::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed digestAlgorithm: {e}")))?;
-        let dig_oid = {
-            let mut dar = reader(dig_alg.value(), "malformed digestAlgorithm body")?;
-            ObjectIdentifier::decode(&mut dar)
-                .map_err(|e| Error::Verification(format!("malformed digest OID: {e}")))?
-        };
-        let signer_digest = match mode {
-            SignedDataMode::CodeSignature { .. } => {
-                if dig_oid != OID_SHA256 {
-                    report.errors.push(format!(
-                        "unsupported digest algorithm {dig_oid} (only SHA-256 is supported)"
-                    ));
-                    return Ok((seal(report, global_errors)?, econtent));
-                }
-                SignerDigest::Sha256
-            }
-            SignedDataMode::AttachedProfile => match dig_oid {
-                OID_SHA256 => SignerDigest::Sha256,
-                OID_SHA1 => {
-                    let w = "profile CMS is signed with a SHA-1 message digest";
-                    if !report.warnings.iter().any(|x| x == w) {
-                        report.warnings.push(w.to_string());
-                    }
-                    SignerDigest::Sha1
-                }
-                other => {
-                    report.errors.push(format!(
-                        "unsupported digest algorithm {other} (profile CMS allows SHA-256 or SHA-1)"
-                    ));
-                    return Ok((seal(report, global_errors)?, econtent));
-                }
-            },
-        };
-        if !digest_alg_oids.contains(&dig_oid) {
-            global_errors.push(format!(
-                "digestAlgorithms does not include the SignerInfo digest algorithm {dig_oid}"
-            ));
+        } else {
+            any_valid = true;
         }
-
-        // signedAttrs [0] — capture raw bytes (the signed message).
-        let attrs_start = usize::try_from(si_r.position()).unwrap_or(0);
-        let attrs_any = AnyRef::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed signedAttrs: {e}")))?;
-        if attrs_any.tag() != TAG_CTX0 {
-            return Err(Error::Verification("signedAttrs is not [0]-tagged".into()));
+        report.signers.push(CmsSignerSummary {
+            subject: staged.subject.clone(),
+            serial: staged.serial.clone(),
+            anchored: staged.anchored,
+        });
+        // First valid signer claims the scalars; before any valid signer the
+        // last rejected signer owns them (so single-signer reports read exactly
+        // as before).
+        if !rejected || !any_valid {
+            staged.claim_into(&mut report);
         }
-        let attrs_end = usize::try_from(si_r.position()).unwrap_or(0);
-        let attrs_raw = &si_raw[attrs_start..attrs_end];
-        let attrs = parse_signed_attrs(attrs_any.value())?;
+    }
 
-        // signatureAlgorithm + signature
-        let sig_alg = AnyRef::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed signatureAlgorithm: {e}")))?;
-        let sig_oid = {
-            let mut sar = reader(sig_alg.value(), "malformed signatureAlgorithm body")?;
-            ObjectIdentifier::decode(&mut sar)
-                .map_err(|e| Error::Verification(format!("malformed signature OID: {e}")))?
-        };
-        let sig_any = AnyRef::decode(&mut si_r)
-            .map_err(|e| Error::Verification(format!("malformed signature: {e}")))?;
-        if sig_any.tag() != Tag::OctetString {
-            return Err(Error::Verification(
-                "signature is not an OCTET STRING".into(),
-            ));
-        }
-        let signature = sig_any.value();
-        // RFC 5652 §5.3: unsignedAttrs [1] IMPLICIT is the only field after the
-        // signature; consume it if present, then the SEQUENCE must be done.
-        if !si_r.is_finished() {
-            let clean = AnyRef::decode(&mut si_r)
-                .map(|next| next.tag() == TAG_CTX1)
-                .unwrap_or(false)
-                && si_r.is_finished();
-            if !clean {
-                return Err(Error::Verification(
-                    "SignerInfo has trailing fields after signature".into(),
-                ));
-            }
-        }
-
-        // Locate the signing certificate by resolved SKI or issuer+serial.
-        let signer_cert = match ski_cert {
-            Some(c) => Some(c),
-            None => certs.iter().find(|c| {
-                c.tbs_certificate
-                    .issuer
-                    .to_der()
-                    .map(|d| d.as_slice() == issuer_der)
-                    .unwrap_or(false)
-                    && c.tbs_certificate
-                        .serial_number
-                        .to_der()
-                        .map(|d| d.as_slice() == serial_der)
-                        .unwrap_or(false)
-            }),
-        };
-
-        let Some(cert) = signer_cert else {
-            report
-                .errors
-                .push("signing certificate not found in embedded set".into());
-            return Ok((seal(report, global_errors)?, econtent));
-        };
-
-        let cn = cert.tbs_certificate.subject.to_string();
-        report.signer_subject = Some(cn.clone());
-        report.signer_serial = cert
-            .tbs_certificate
-            .serial_number
-            .to_der()
-            .ok()
-            .map(|d| hex(&d));
-
-        // 1. messageDigest attribute == digest(bound content)
-        let md_ok = match &bound_content {
-            Some(b) => {
-                let computed: Vec<u8> = match signer_digest {
-                    SignerDigest::Sha1 => sha1::Sha1::digest(b).to_vec(),
-                    SignerDigest::Sha256 => Sha256::digest(b).to_vec(),
-                };
-                // `SignedAttrs::message_digest` is `Option<&[u8]>` — compare
-                // the slices directly, mirroring the existing check.
-                attrs
-                    .message_digest
-                    .map(|md| md == computed.as_slice())
-                    .unwrap_or(false)
-            }
-            None => false,
-        };
-        report.message_digest_ok = md_ok;
-
-        // 2. Apple CDHash attributes bind this CodeDirectory.
-        if let SignedDataMode::CodeSignature { cd_sha1, cd_sha256 } = mode {
-            report.cdhash_v1_ok = attrs
-                .cdhash_v1_plist
-                .as_ref()
-                .map(|p| cdhash_v1_matches(p, *cd_sha1, cd_sha256))
-                .unwrap_or(false);
-            report.cdhash_v2_ok = attrs
-                .cdhash_v2_der
-                .as_ref()
-                .map(|d| cdhash_v2_matches(d, cd_sha256))
-                .unwrap_or(false);
-        }
-
-        // 3. Signature over the raw signedAttrs bytes.
-        let res = verify_signer_signature(cert, sig_oid, signer_digest, attrs_raw, signature);
-        report.signature_ok = res.is_ok();
-
-        // 4. Chain structure and trust anchoring.
-        let purpose = match mode {
-            SignedDataMode::CodeSignature { .. } => SignerPurpose::CodeSigning,
-            SignedDataMode::AttachedProfile => SignerPurpose::ProvisioningProfile,
-        };
-        let outcome = verify_chain(&certs, cert, anchors, now, purpose);
-        report.chain_ok = outcome.ok;
-        report.anchored = outcome.anchored;
-        report.chain = outcome.subjects;
-        report.chain_reason = outcome.reason.clone();
-        for w in outcome.warnings {
-            if !report.warnings.contains(&w) {
-                report.warnings.push(w);
-            }
-        }
-
-        let mut errors = Vec::new();
-        if !md_ok {
-            errors.push("messageDigest attribute does not match the signed content".into());
-        }
-        if let SignedDataMode::CodeSignature { .. } = mode {
-            if !report.cdhash_v1_ok {
-                errors.push("Apple CDHash v1 attribute does not match the CodeDirectory".into());
-            }
-            if !report.cdhash_v2_ok {
-                errors.push("Apple CDHash v2 attribute does not match the CodeDirectory".into());
-            }
-        }
-        if let Err(reason) = res {
-            errors.push(reason);
-        }
-        if !outcome.ok {
-            errors.push(
-                report
-                    .chain_reason
-                    .clone()
-                    .unwrap_or_else(|| "certificate chain is not structurally valid".into()),
-            );
-        } else if !outcome.anchored {
-            errors.push("certificate chain is not anchored to a trusted root".into());
-        }
-        if let Some(reason) = content_type_reason(attrs.content_type_count, &attrs.content_types) {
-            errors.push(reason);
-        }
-
-        if errors.is_empty() {
-            if global_errors.is_empty() {
-                report.valid = true;
-                report.errors.clear();
-            }
-            // No-op when globals are empty; otherwise the structural errors
-            // land first and keep `valid` false.
-            return Ok((seal(report, global_errors)?, econtent));
-        }
-        if report.errors.is_empty() {
-            report.errors = errors;
+    if any_valid && global_errors.is_empty() {
+        report.valid = true;
+        report.errors.clear();
+    } else if report.errors.is_empty() {
+        if let Some(first) = first_rejected_errors {
+            report.errors = first;
         }
     }
 
@@ -5308,6 +5423,387 @@ mod tests {
         ci2.extend_from_slice(&ci_body[..oid_end]);
         ci2.extend_from_slice(&new_wrap);
         der_tlv(cms[0], &ci2)
+    }
+
+    /// Which single-byte corruption `spliced_signer_info` applies to the
+    /// inserted SignerInfo copy.
+    enum SignerCorruption {
+        /// Flip one byte of the signature OCTET STRING content: the structure
+        /// stays valid DER, but signature verification rejects the signer.
+        CorruptSignatureBytes,
+        /// Flip one byte of the serial INTEGER content inside the
+        /// issuerAndSerialNumber sid: the structure stays valid DER, but the
+        /// signing certificate no longer resolves ("signing certificate not
+        /// found in embedded set").
+        UnresolvableSerial,
+    }
+
+    /// Byte offsets (relative to the SignerInfo SEQUENCE body) of the
+    /// signature OCTET STRING content and — for issuerAndSerialNumber sids —
+    /// the serial INTEGER content. Flipping a content byte keeps tags and
+    /// lengths intact, so the structure stays valid DER while the crypto or
+    /// the certificate lookup rejects the signer.
+    fn signer_info_corruption_offsets(si_body: &[u8]) -> (usize, Option<usize>) {
+        let mut si_r = SliceReader::new(si_body).unwrap();
+        let _version = AnyRef::decode(&mut si_r).unwrap();
+        let sid_start = usize::try_from(si_r.position()).unwrap();
+        let sid_any = AnyRef::decode(&mut si_r).unwrap();
+        let sid_end = usize::try_from(si_r.position()).unwrap();
+        let _digest_algorithm = AnyRef::decode(&mut si_r).unwrap();
+        let _signed_attrs = AnyRef::decode(&mut si_r).unwrap();
+        let _signature_algorithm = AnyRef::decode(&mut si_r).unwrap();
+        let sig_start = usize::try_from(si_r.position()).unwrap();
+        let sig_any = AnyRef::decode(&mut si_r).unwrap();
+        let sig_end = usize::try_from(si_r.position()).unwrap();
+        assert_eq!(
+            sig_any.tag(),
+            Tag::OctetString,
+            "signature must be an OCTET STRING"
+        );
+        let sig_tlv_len = sig_end - sig_start;
+        let sig_content_off = sig_start + (sig_tlv_len - sig_any.value().len());
+        assert!(
+            !sig_any.value().is_empty(),
+            "signature content must be non-empty"
+        );
+
+        let serial_content_off = if sid_any.tag() == Tag::Sequence {
+            let sid_inner = sid_any.value();
+            let sid_tlv_len = sid_end - sid_start;
+            let sid_content_base = sid_start + (sid_tlv_len - sid_inner.len());
+            let mut sid_r = SliceReader::new(sid_inner).unwrap();
+            let _issuer = AnyRef::decode(&mut sid_r).unwrap();
+            let serial_start = usize::try_from(sid_r.position()).unwrap();
+            let serial_any = AnyRef::decode(&mut sid_r).unwrap();
+            let serial_end = usize::try_from(sid_r.position()).unwrap();
+            assert_eq!(serial_any.tag(), Tag::Integer, "serial must be an INTEGER");
+            assert!(
+                !serial_any.value().is_empty(),
+                "serial content must be non-empty"
+            );
+            let serial_tlv_len = serial_end - serial_start;
+            Some(sid_content_base + serial_start + (serial_tlv_len - serial_any.value().len()))
+        } else {
+            None
+        };
+        (sig_content_off, serial_content_off)
+    }
+
+    /// Re-encodes the raw CMS with a corrupted copy of the first SignerInfo
+    /// spliced into the signerInfos SET — at the front when `at_front`, at
+    /// the back otherwise — leaving the genuine entry untouched.
+    ///
+    /// The insertion is a copy of the genuine SignerInfo (same issuer and
+    /// serial), so it resolves to the same signer certificate and carries the
+    /// same subject; the tests pin traceability (counts, warnings, scalar
+    /// ownership), not subject diversity.
+    fn spliced_signer_info(cms: &[u8], at_front: bool, corruption: SignerCorruption) -> Vec<u8> {
+        // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap.tag(), TAG_CTX0);
+        let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
+        let sd_tlv = wrap.value();
+        let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_body_src = sd_seq.value();
+
+        // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms is
+        // also a SET — select by position, never by tag, or it gets dropped).
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new();
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        let set_tlv = fields.pop().expect("SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(set_tlv).unwrap().tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let fixed: Vec<&[u8]> = fields;
+
+        // First SignerInfo: keep its bytes verbatim and preserve any remaining
+        // entries untouched (unlike `replace_first_sid` there is no
+        // single-SignerInfo assert — the splice must compose with the output
+        // of a previous splice).
+        let set_any = AnyRef::from_der(set_tlv).unwrap();
+        let si_list = set_any.value();
+        let mut set_r = SliceReader::new(si_list).unwrap();
+        let si_any = AnyRef::decode(&mut set_r).unwrap();
+        assert_eq!(si_any.tag(), Tag::Sequence);
+        let first_end = usize::try_from(set_r.position()).unwrap();
+        let si_tlv = &si_list[..first_end];
+        let rest = &si_list[first_end..];
+        let si_body = si_any.value();
+
+        // The inserted entry is a copy of the genuine SignerInfo with exactly
+        // one content byte flipped; tags and lengths are untouched so the
+        // structure stays valid DER.
+        let (sig_off, serial_off) = signer_info_corruption_offsets(si_body);
+        let mut inserted = si_body.to_vec();
+        match corruption {
+            SignerCorruption::CorruptSignatureBytes => inserted[sig_off] ^= 0x01,
+            SignerCorruption::UnresolvableSerial => {
+                let off = serial_off.expect("fixture uses issuerAndSerialNumber sid");
+                inserted[off] ^= 0x01;
+            }
+        }
+
+        // Rebuild bottom-up: SignerInfo → SET → SignedData → [0] → ContentInfo.
+        // Both entries stay version 1, so the SignedData version is untouched.
+        let new_si = der_tlv(si_tlv[0], &inserted);
+        let mut new_set_body = Vec::new();
+        if at_front {
+            new_set_body.extend_from_slice(&new_si);
+        }
+        new_set_body.extend_from_slice(si_tlv);
+        new_set_body.extend_from_slice(rest);
+        if !at_front {
+            new_set_body.extend_from_slice(&new_si);
+        }
+        let new_set = der_tlv(set_tlv[0], &new_set_body);
+        let mut sd_body = Vec::new();
+        for f in &fixed {
+            sd_body.extend_from_slice(f);
+        }
+        sd_body.extend_from_slice(&new_set);
+        let new_sd = der_tlv(sd_tlv[0], &sd_body);
+        let new_wrap = der_tlv(wrap_tlv[0], &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(&ci_body[..oid_end]);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms[0], &ci2)
+    }
+
+    /// Flips one content byte of the FIRST SignerInfo's signature OCTET
+    /// STRING in place (structure stays valid DER). Companion to
+    /// `spliced_signer_info` for the all-rejected test: applied after a
+    /// back-splice it leaves two rejected signers behind.
+    fn corrupt_first_signer_signature(cms: &[u8]) -> Vec<u8> {
+        // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap.tag(), TAG_CTX0);
+        let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
+        let sd_tlv = wrap.value();
+        let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_body_src = sd_seq.value();
+
+        // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms is
+        // also a SET — select by position, never by tag, or it gets dropped).
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new();
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        let set_tlv = fields.pop().expect("SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(set_tlv).unwrap().tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let fixed: Vec<&[u8]> = fields;
+
+        // First SignerInfo: corrupt its signature in place, leaving any
+        // remaining SignerInfos untouched.
+        let set_any = AnyRef::from_der(set_tlv).unwrap();
+        let si_list = set_any.value();
+        let mut set_r = SliceReader::new(si_list).unwrap();
+        let si_any = AnyRef::decode(&mut set_r).unwrap();
+        assert_eq!(si_any.tag(), Tag::Sequence);
+        let first_end = usize::try_from(set_r.position()).unwrap();
+        let si_tlv = &si_list[..first_end];
+        let rest = &si_list[first_end..];
+        let si_body = si_any.value();
+        let (sig_off, _) = signer_info_corruption_offsets(si_body);
+        let mut new_first = si_body.to_vec();
+        new_first[sig_off] ^= 0x01;
+
+        // Rebuild bottom-up: SignerInfo → SET → SignedData → [0] → ContentInfo.
+        let new_si = der_tlv(si_tlv[0], &new_first);
+        let mut new_set_body = new_si;
+        new_set_body.extend_from_slice(rest);
+        let new_set = der_tlv(set_tlv[0], &new_set_body);
+        let mut sd_body = Vec::new();
+        for f in &fixed {
+            sd_body.extend_from_slice(f);
+        }
+        sd_body.extend_from_slice(&new_set);
+        let new_sd = der_tlv(sd_tlv[0], &sd_body);
+        let new_wrap = der_tlv(wrap_tlv[0], &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(&ci_body[..oid_end]);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms[0], &ci2)
+    }
+
+    #[test]
+    fn appended_rejected_signer_is_traced_but_chain_stays_valid() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let spliced = spliced_signer_info(
+            &cms,
+            /*at_front=*/ false,
+            SignerCorruption::CorruptSignatureBytes,
+        );
+        let report = verify_code_signature_with_anchors(
+            &wrap(&spliced),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert_eq!(report.signers_total, 2);
+        assert_eq!(report.signers.len(), 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("rejected signer #2 of 2")),
+            "appended rejection must be traced, got warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn rejected_signer_before_valid_still_traces_and_valid_signer_owns_scalars() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let spliced = spliced_signer_info(
+            &cms,
+            /*at_front=*/ true,
+            SignerCorruption::CorruptSignatureBytes,
+        );
+        let report = verify_code_signature_with_anchors(
+            &wrap(&spliced),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert_eq!(report.signers.len(), 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("rejected signer #1 of 2")),
+            "front rejection must be traced, got warnings: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            report.signer_subject.as_deref(),
+            Some("CN=zsign verify test")
+        );
+        assert!(
+            report.signature_ok,
+            "scalars must describe the valid signer, got {:?}",
+            report
+        );
+    }
+
+    #[test]
+    fn all_rejected_signers_are_listed_and_warned() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        // Back-splice a corrupt copy, then corrupt the genuine first entry in
+        // place: both signers end up rejected.
+        let spliced = spliced_signer_info(
+            &cms,
+            /*at_front=*/ false,
+            SignerCorruption::CorruptSignatureBytes,
+        );
+        let both_bad = corrupt_first_signer_signature(&spliced);
+        let report = verify_code_signature_with_anchors(
+            &wrap(&both_bad),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(!report.valid, "both signers rejected, got {:?}", report);
+        assert!(!report.errors.is_empty(), "rejections must surface errors");
+        assert_eq!(report.signers_total, 2);
+        assert_eq!(report.signers.len(), 2);
+        assert!(
+            report
+                .signers
+                .iter()
+                .all(|s| s.subject.as_deref() == Some("CN=zsign verify test")),
+            "both summaries carry the signer subject, got signers: {:?}",
+            report.signers
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("#1 of 2")),
+            "first rejection must be warned, got warnings: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("#2 of 2")),
+            "second rejection must be warned, got warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn missing_signing_cert_signer_is_rejected_gracefully() {
+        let (creds, _key) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let spliced = spliced_signer_info(
+            &cms,
+            /*at_front=*/ false,
+            SignerCorruption::UnresolvableSerial,
+        );
+        let report = verify_code_signature_with_anchors(
+            &wrap(&spliced),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert_eq!(report.signers_total, 2);
+        assert_eq!(report.signers.len(), 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("rejected signer #2 of 2")
+                    && w.contains("signing certificate not found")),
+            "unresolvable serial must be rejected gracefully, got warnings: {:?}",
+            report.warnings
+        );
     }
 
     /// Appends raw `tail` bytes to the first SignerInfo SEQUENCE body,
