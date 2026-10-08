@@ -150,6 +150,7 @@ impl<'a> CodeResourcesBuilder<'a> {
     /// - The bundle directory cannot be read
     /// - A file cannot be read for hashing
     /// - Symlink targets cannot be resolved (on Unix)
+    /// - A symlink target is not valid UTF-8 (the seal would otherwise differ from disk)
     ///
     /// # Examples
     ///
@@ -302,8 +303,9 @@ impl<'a> CodeResourcesBuilder<'a> {
     /// valid UTF-8 is rejected so the recorded string always equals the bytes
     /// on disk.
     fn hash_symlink_entry(store: &dyn Store, path: &Path) -> Result<SymlinkHashes> {
-        // `FsStore::read_link` serves the raw target bytes on unix and
-        // reproduces this fn's non-unix rejection on other platforms.
+        // On unix `FsStore::read_link` returns the raw target bytes; on other
+        // platforms it already rejects, so bytes reaching this conversion are
+        // meant to be UTF-8.
         let target_bytes = store.read_link(path)?;
         let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&target_bytes);
         let target_str = String::from_utf8(target_bytes).map_err(|_| {
