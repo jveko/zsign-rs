@@ -45,7 +45,7 @@
 Shared shape: `let macho = MachOFile::parse(make_minimal_macho()).unwrap();` then `let mut signed = sign_macho_adhoc(&macho, "com.example.window", None, None, None, false).unwrap();`. Window location: parse `signed`, take `slices()[0]`, `sig_off = code_sig_offset.unwrap() as usize`, `sig_len = code_sig_size.unwrap() as usize`, `declared = u32::from_be_bytes(signed[sig_off + 4..sig_off + 8].try_into().unwrap()) as usize` (fixture is little-endian arm64; the SuperBlob header fields themselves are big-endian).
 
 1. `planted_second_superblob_in_window_tail_is_rejected`
-   - Baseline: `verify_macho(&signed, &SignatureInputs::none())` → `assert!(baseline.is_valid(), "{:?}", baseline.slices[0].errors)` (ad-hoc fixtures verify clean; pinned precedent at verify.rs:769-777).
+   - Baseline: `verify_macho(&signed, &SignatureInputs::none())` → `assert!(baseline.is_valid(), "{:?}", baseline.slices[0].errors)` (ad-hoc fixtures verify clean; pinned precedent at verify.rs:1390-1393).
    - Precondition: `assert!(sig_len >= 2 * declared, "reserve must fit a full duplicate: sig_len={sig_len} declared={declared}")` (reserve ≈ 20 KB, blob ≈ well under 2 KB for this fixture).
    - Plant a complete second signature: `signed.copy_within(sig_off..sig_off + declared, sig_off + declared);` (adjacent, non-overlapping ranges).
    - Assert: `!report.is_valid()` with message `"planted second signature must not verify clean: {:?}"` + errors; `report.error_count() == 1` with footer printing `report.slices[0].errors`; `slice.errors[0].contains("nonzero bytes past the declared SuperBlob length")`.
@@ -86,7 +86,7 @@ Commit message: `test(macho): cover signature window tail strictness`
 ### Task 2: Implement the window-tail check
 
 **Files:**
-- Modify: `crates/zsign-core/src/macho/verify.rs` — `verify_slice`, immediately after the `parse_superblob` `match` arm and before the `let Some(primary) = superblob.code_directory` check (currently around lines 156-166).
+- Modify: `crates/zsign-core/src/macho/verify.rs` — `verify_slice`, immediately after the `parse_superblob` `match` arm (:157-165) and before the `let Some(primary) = superblob.code_directory` check (:167-172).
 
 **Interfaces:**
 - Consumes: the `sig: &[u8]` window already validated by `parse_superblob` (`sig.len() >= 12`, `declared <= sig.len()` — so both header and tail slices below are in bounds); Task 1's four tests.
@@ -117,7 +117,7 @@ if nonzero > 0 {
 ```
 
 Notes: `.unwrap()` mirrors the identical header read in `parse_superblob`
-(`codesign/verify.rs:109`) and cannot fire — `Ok` guarantees the bounds. The
+(`codesign/verify.rs:110`) and cannot fire — `Ok` guarantees the bounds. The
 error is pushed, not returned; downstream checks still run so a valid-but-tailed
 binary reports exactly one error. Do not reorder or edit any neighbouring
 check (no-LC, bounds, parse, primary-CD, coverage, codeLimit regions).

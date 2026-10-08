@@ -2,15 +2,15 @@
 
 ## Problem
 
-`verify_slice` (`crates/zsign-core/src/macho/verify.rs:127-164`) extracts the
-whole `LC_CODE_SIGNATURE` window (`sig = data[sig_file_off..+sig_size]`,
-:149-154) and hands it to `parse_superblob` (:156-164). It never compares the
+`verify_slice` (`crates/zsign-core/src/macho/verify.rs`, fn at :127) extracts
+the whole `LC_CODE_SIGNATURE` window (`sig = data[sig_file_off..+sig_size]`,
+:150-155) and hands it to `parse_superblob` (:157-165). It never compares the
 SuperBlob's *declared* length (header field at bytes 4..8) against the window
 size.
 
 `parse_superblob` (`crates/zsign-core/src/codesign/verify.rs:87+`) bounds every
 read to `blob[..declared]` and tolerates trailing bytes *by design* (comment at
-:100-105: the own writer reserves the LC window larger than the SuperBlob).
+:104-109: the own writer reserves the LC window larger than the SuperBlob).
 That tolerance is correct for a parser, but it means any data after the first
 SuperBlob inside the reserved window — including a complete planted second
 signature smuggled into a re-signed bundle — is invisible to `-V`. The binary
@@ -44,7 +44,7 @@ and is exactly the carrier for a planted second SuperBlob.
 ## Repository facts (verified against current source)
 
 - Failure idiom: `verify_slice` accumulates `report.errors: Vec<String>`;
-  `SliceVerifyReport::is_valid()` is `errors.is_empty()` (:77-79); warnings do
+  `SliceVerifyReport::is_valid()` is `errors.is_empty()` (:62-64); warnings do
   not invalidate (pinned by the test at :1586-1590).
 - `-V` path: slice errors make the report invalid → CLI exit 1 ("invalid");
   only top-level report errors exit 2. Adding a slice error does not change
@@ -54,11 +54,11 @@ and is exactly the carrier for a planted second SuperBlob.
   `datasize` is set to a *reserve* (`writer.rs:1630-1652`,
   `signer.rs:791-818`), re-signing keeps `max(original, estimated)`
   (`signer.rs:530-535`), and the tail is zero-filled
-  (`writer.rs:1641-1642` truncate + zero resize, `signer.rs:785-787`).
+  (`writer.rs:1642-1643` truncate + zero resize, `signer.rs:785-787`).
   Our own output therefore always carries an all-zero tail of arbitrary length.
 - In-process sign→verify round-trip tests (e.g. `verify_signed_binary_round_trip`
-  :949, ad-hoc validity at :769-777, FAT round-trip :1018) are the regression
-  net for false positives.
+  :949, bare ad-hoc validity at :1390-1393, FAT round-trip :1018) are the
+  regression net for false positives.
 
 ## Decision
 
