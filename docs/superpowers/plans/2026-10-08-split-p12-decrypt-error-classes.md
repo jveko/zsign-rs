@@ -250,7 +250,10 @@ fn mac_damage_on_an_otherwise_intact_container_is_not_a_password_failure() {
     let mut damaged = MODERN.to_vec();
     damaged[offset] ^= 0xff;
 
-    let res = p12_load_error(extract_p12(&damaged, "testpassword").unwrap_err());
+    let Err(e) = extract_p12(&damaged, "testpassword") else {
+        panic!("a container with a damaged MAC must not extract");
+    };
+    let res = p12_load_error(e);
     assert!(
         matches!(&res, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
         "a damaged MAC over intact contents must keep the certificate class, got {res:?}"
@@ -259,7 +262,10 @@ fn mac_damage_on_an_otherwise_intact_container_is_not_a_password_failure() {
 
 #[test]
 fn wrong_password_on_an_encrypted_container_is_invalid_password() {
-    let res = p12_load_error(extract_p12(MODERN, "wrong").unwrap_err());
+    let Err(e) = extract_p12(MODERN, "wrong") else {
+        panic!("wrong password must not extract the container");
+    };
+    let res = p12_load_error(e);
     assert!(
         matches!(res, Error::InvalidPassword),
         "a wrong password must stay retryable, got {res:?}"
@@ -270,7 +276,10 @@ fn wrong_password_on_an_encrypted_container_is_invalid_password() {
 fn wrong_password_on_a_password_transparent_container_is_invalid_password() {
     // raw_keybag has no encrypted layer: the walk succeeds for any password,
     // so the MAC is the only password signal and must decide alone.
-    let res = p12_load_error(extract_p12(RAW_KEYBAG, "wrong").unwrap_err());
+    let Err(e) = extract_p12(RAW_KEYBAG, "wrong") else {
+        panic!("wrong password must not extract the container");
+    };
+    let res = p12_load_error(e);
     assert!(
         matches!(res, Error::InvalidPassword),
         "a password-transparent container must keep the credential verdict, got {res:?}"
