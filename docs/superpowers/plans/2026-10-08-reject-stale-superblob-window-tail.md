@@ -62,7 +62,9 @@ Shared shape: `let macho = MachOFile::parse(make_minimal_macho()).unwrap();` the
 4. `exact_fit_window_tail_is_accepted`
    - Same baseline sign; read `(lc_off, dataoff, datasize)` from `slices()[0].metadata.code_sig_cmd.expect("fixture is signed")`; `declared` as above (also assert `declared < datasize as usize` so the shrink is real).
    - Shrink the window to exact fit: `signed[lc_off + 12..lc_off + 16].copy_from_slice(&(declared as u32).to_le_bytes());` (little-endian fixture; the load command stores native-endian fields, precedent at writer.rs:2151-2152).
+   - The load-command area is inside the hashed code region (page 0 covers header + load commands), so the shrink invalidates the stored page-0 hashes: patch code slot 0 in BOTH CodeDirectories (`entry_offset` with `CSSLOT_CODEDIRECTORY` / `CSSLOT_ALTERNATE_CODEDIRECTORIES`; hash offset = u32 at cd+16, hash size = byte at cd+36, hash type = byte at cd+37, code slot 0 at `cd + hash_offset` — special slots sit below, see `bind_special_slot`) with `digest(bytes[0 .. 1 << page_size_log2])` under each CD's own hash type, computed AFTER the datasize shrink. Fixture surgery only — this mirrors the existing `bind_special_slot` precedent; it must not touch CD-validation code. Sanity-assert `page_size == 4096` and `hash_size` matching the hash type.
    - Assert: `report.is_valid()` with errors footer and `error_count() == 0`.
+   - Fallback (controller-ruled, only if a binding check beyond page hashes makes full validity unreachable by fixture surgery): assert that no error contains `nonzero bytes past the declared SuperBlob length`, keep the `declared < datasize` precondition, and document which checks fired in the task report.
 
 Follow the file's assertion idiom: every negative assertion carries a footer that prints the actual errors (e.g. `"{:?}", slice.errors`).
 
