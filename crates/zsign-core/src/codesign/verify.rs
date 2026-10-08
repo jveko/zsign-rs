@@ -1196,7 +1196,17 @@ fn decode_der_entries(content: &[u8], depth: u32) -> Result<plist::Value> {
         if !value_rest.is_empty() {
             return Err(der_error("DER entitlement entry has extra values"));
         }
-        dictionary.insert(key, decode_der_value(value_tag, value_bytes, depth + 1)?);
+        if dictionary
+            .insert(
+                key.clone(),
+                decode_der_value(value_tag, value_bytes, depth + 1)?,
+            )
+            .is_some()
+        {
+            return Err(der_error(format!(
+                "DER entitlement entry has duplicate key '{key}'"
+            )));
+        }
         remaining = rest;
     }
     Ok(plist::Value::Dictionary(dictionary))
@@ -1699,6 +1709,32 @@ mod tests {
                 .and_then(|v| v.as_signed_integer());
             assert_eq!(got, Some(value), "round trip of {value}");
         }
+    }
+
+    #[test]
+    fn der_entries_reject_duplicate_keys() {
+        // Two-entry SET (v0 shape): distinct keys parse...
+        let distinct = [
+            0x31, 0x10, 0x30, 0x06, 0x0c, 0x01, b'k', 0x0c, 0x01, b'a', 0x30, 0x06, 0x0c, 0x01,
+            b'j', 0x0c, 0x01, b'b',
+        ];
+        let parsed = der_entitlements_to_plist(&distinct).unwrap();
+        let dict = parsed.as_dictionary().unwrap();
+        assert_eq!(dict.get("k").and_then(|v| v.as_string()), Some("a"));
+        assert_eq!(dict.get("j").and_then(|v| v.as_string()), Some("b"));
+
+        // ...the same shape with a repeated key is rejected (last-wins vs
+        // first-wins vs reject is a consumer divergence; we fail closed).
+        let duplicate = [
+            0x31, 0x10, 0x30, 0x06, 0x0c, 0x01, b'k', 0x0c, 0x01, b'a', 0x30, 0x06, 0x0c, 0x01,
+            b'k', 0x0c, 0x01, b'b',
+        ];
+        let res = der_entitlements_to_plist(&duplicate);
+        assert!(
+            matches!(&res, Err(crate::Error::DerEncoding(m)) if m.contains("duplicate key")),
+            "duplicate key must be rejected, got {:?}",
+            res.as_ref().err()
+        );
     }
 
     #[test]
