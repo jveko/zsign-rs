@@ -163,6 +163,17 @@ fn verify_slice(
             return Ok(report);
         }
     };
+    // `parse_superblob` validated the header (sig.len() >= 12, declared <=
+    // sig.len()), so both slices below are in bounds. The declared length is
+    // authoritative: the rest of the LC window is empty by contract, so a
+    // nonzero tail is stale or smuggled data (e.g. a planted second SuperBlob).
+    let declared = u32::from_be_bytes(sig[4..8].try_into().unwrap()) as usize;
+    let nonzero = sig[declared..].iter().filter(|&&b| b != 0).count();
+    if nonzero > 0 {
+        report.errors.push(format!(
+            "code signature window contains {nonzero} nonzero bytes past the declared SuperBlob length"
+        ));
+    }
 
     let Some(primary) = superblob.code_directory.as_ref() else {
         report
