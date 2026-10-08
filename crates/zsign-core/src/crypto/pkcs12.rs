@@ -77,6 +77,8 @@ pub(crate) enum P12Error {
     Mac,
     /// A password-derived key could not decrypt a layer.
     Decrypt(String),
+    /// Password-independent structural damage to the container.
+    Corrupt(String),
     /// Unsupported algorithm or structure.
     Unsupported(String),
 }
@@ -87,6 +89,7 @@ impl fmt::Display for P12Error {
             P12Error::Der(msg) => write!(f, "malformed PKCS#12: {msg}"),
             P12Error::Mac => write!(f, "invalid PKCS#12 password (MAC mismatch)"),
             P12Error::Decrypt(msg) => write!(f, "PKCS#12 decryption failed: {msg}"),
+            P12Error::Corrupt(msg) => write!(f, "corrupt PKCS#12 container: {msg}"),
             P12Error::Unsupported(msg) => write!(f, "unsupported PKCS#12: {msg}"),
         }
     }
@@ -427,7 +430,7 @@ fn decrypt_with_algorithm(
             data,
             5,
             |key| Some(Rc2::new_with_eff_key_len(key, 40)),
-            P12Error::Decrypt("RC2-40".into()),
+            "RC2-40",
         );
     }
     if algorithm.oid == oid::PBE_RC2_128 {
@@ -437,7 +440,7 @@ fn decrypt_with_algorithm(
             data,
             16,
             |key| Some(Rc2::new_with_eff_key_len(key, 128)),
-            P12Error::Decrypt("RC2-128".into()),
+            "RC2-128",
         );
     }
     if algorithm.oid == oid::PBE_3DES {
@@ -447,7 +450,7 @@ fn decrypt_with_algorithm(
             data,
             24,
             |key| TdesEde3::new_from_slice(key).ok(),
-            P12Error::Decrypt("3-key Triple-DES".into()),
+            "3-key Triple-DES",
         );
     }
     if algorithm.oid == oid::PBE_2DES {
@@ -457,7 +460,7 @@ fn decrypt_with_algorithm(
             data,
             16,
             |key| TdesEde2::new_from_slice(key).ok(),
-            P12Error::Decrypt("2-key Triple-DES".into()),
+            "2-key Triple-DES",
         );
     }
 
@@ -477,15 +480,29 @@ fn pbes1_decrypt<C>(
     data: &[u8],
     key_len: usize,
     make_cipher: impl FnOnce(&[u8]) -> Option<C>,
-    label: P12Error,
+    name: &'static str,
 ) -> Result<Vec<u8>>
 where
     C: BlockDecrypt,
 {
     let key = pkcs12_kdf::<Sha1>(password, pbe.salt, pbe.iterations, 1, key_len)?;
     let iv = pkcs12_kdf::<Sha1>(password, pbe.salt, pbe.iterations, 2, 8)?;
-    let cipher = make_cipher(&key).ok_or_else(|| label.clone())?;
-    cbc_decrypt(&cipher, &iv, data).ok_or(label)
+    let cipher = make_cipher(&key).ok_or_else(|| {
+        P12Error::Corrupt(format!(
+            "{name} key length {key_len} rejected by the cipher"
+        ))
+    })?;
+    cbc_decrypt(&cipher, &iv, data).map_err(|failure| match failure {
+        CbcFailure::Padding => P12Error::Decrypt(name.to_string()),
+        CbcFailure::Misaligned => P12Error::Corrupt(format!(
+            "{name} ciphertext length {} is not a multiple of the block size",
+            data.len()
+        )),
+        CbcFailure::ShortIv => P12Error::Corrupt(format!(
+            "{name} IV of {} bytes is shorter than the block size",
+            iv.len()
+        )),
+    })
 }
 
 /// PBES2 ::= SEQUENCE { keyDerivationFunc PBKDF2-params,
@@ -629,21 +646,37 @@ where
     C: BlockDecrypt + KeyInit,
 {
     let cipher = C::new_from_slice(key)
-        .map_err(|_| P12Error::Decrypt(format!("invalid AES key length {}", key.len())))?;
-    cbc_decrypt(&cipher, iv, data).ok_or_else(|| P12Error::Decrypt("AES-CBC".into()))
+        .map_err(|_| P12Error::Corrupt(format!("invalid AES key length {}", key.len())))?;
+    cbc_decrypt(&cipher, iv, data).map_err(|failure| match failure {
+        CbcFailure::Padding => P12Error::Decrypt("AES-CBC".into()),
+        CbcFailure::Misaligned => P12Error::Corrupt(format!(
+            "AES-CBC ciphertext length {} is not a multiple of the block size",
+            data.len()
+        )),
+        CbcFailure::ShortIv => P12Error::Corrupt(format!(
+            "AES-CBC IV of {} bytes is shorter than the block size",
+            iv.len()
+        )),
+    })
 }
 
 /// CBC decryption with PKCS#7 padding removal, generic over block cipher.
-fn cbc_decrypt<C>(cipher: &C, iv: &[u8], data: &[u8]) -> Option<Vec<u8>>
+enum CbcFailure {
+    Misaligned,
+    ShortIv,
+    Padding,
+}
+
+fn cbc_decrypt<C>(cipher: &C, iv: &[u8], data: &[u8]) -> Result<Vec<u8>, CbcFailure>
 where
     C: BlockDecrypt,
 {
     let block_size = std::mem::size_of::<Block<C>>();
     if block_size == 0 || data.len() < block_size || !data.len().is_multiple_of(block_size) {
-        return None;
+        return Err(CbcFailure::Misaligned);
     }
     if iv.len() < block_size {
-        return None;
+        return Err(CbcFailure::ShortIv);
     }
 
     let mut previous = iv[..block_size].to_vec();
@@ -661,9 +694,9 @@ where
     }
 
     if !unpad_pkcs7(&mut out, block_size) {
-        return None;
+        return Err(CbcFailure::Padding);
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Removes PKCS#7 padding, returning `false` if the padding is invalid.
@@ -817,24 +850,24 @@ pub(crate) fn decrypt_key_bag(value: &[u8], password: &str) -> Result<Vec<u8>> {
 }
 
 /// Translates a container failure into the credential error a caller reports. PBES2 inside
-/// PKCS#12 and inside an encrypted PKCS#8 PEM share this machinery: a decryption failure is a
-/// passphrase failure, an unknown algorithm is a policy refusal, anything else is a malformed
-/// container.
+/// PKCS#12 and inside an encrypted PKCS#8 PEM share this machinery: password-shaped outcomes
+/// (`Mac` and `Decrypt` padding failures) are passphrase failures, an unknown algorithm is a
+/// policy refusal, while `Corrupt`, `Der` and `Unsupported` keep the certificate class.
 pub(crate) fn pem_load_error(e: P12Error) -> Error {
     match e {
         P12Error::Mac | P12Error::Decrypt(_) => Error::InvalidPassword,
         P12Error::Unsupported(msg) => {
             Error::Certificate(format!("unsupported key encryption: {msg}"))
         }
-        P12Error::Der(msg) => {
+        P12Error::Der(msg) | P12Error::Corrupt(msg) => {
             Error::Certificate(format!("failed to parse encrypted private key: {msg}"))
         }
     }
 }
 
 /// Translates a container failure into the credential error a caller
-/// reports. MAC verification failure and password-derived decryption
-/// failure are passphrase outcomes; malformed or unsupported containers
+/// reports. Password-shaped outcomes (`Mac` and `Decrypt` padding
+/// failures) are passphrase outcomes; `Corrupt`, `Der` and `Unsupported`
 /// keep their certificate class with the same wrapper text the PKCS#12
 /// loaders have always produced.
 pub(crate) fn p12_load_error(e: P12Error) -> Error {
@@ -1442,6 +1475,41 @@ mod tests {
         assert!(
             matches!(&unsupported, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
             "an unsupported container must keep its certificate class, got {unsupported:?}"
+        );
+    }
+
+    #[test]
+    fn misaligned_ciphertext_is_container_damage_not_a_password_failure() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let truncated = vec![0u8; 15];
+        let res = p12_load_error(aes_decrypt::<Aes128>(&key, &iv, &truncated).unwrap_err());
+        assert!(
+            matches!(&res, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
+            "non-block-aligned ciphertext must keep the certificate class, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_padding_after_decryption_is_still_a_password_failure() {
+        // Fixed vector: AES-128-CBC decrypting 32 zero bytes under a zero key/IV
+        // ends in byte 0x3a, so PKCS#7 unpadding fails deterministically.
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let garbage = [0u8; 32];
+        let res = p12_load_error(aes_decrypt::<Aes128>(&key, &iv, &garbage).unwrap_err());
+        assert!(
+            matches!(res, Error::InvalidPassword),
+            "an invalid-padding verdict must stay password-shaped, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn structural_damage_keeps_the_certificate_class_on_the_pem_path() {
+        let res = pem_load_error(P12Error::Corrupt("ciphertext is not block-aligned".into()));
+        assert!(
+            matches!(&res, Error::Certificate(m) if m.contains("failed to parse encrypted private key")),
+            "structural damage must not become a password failure on the PEM path, got {res:?}"
         );
     }
 }
