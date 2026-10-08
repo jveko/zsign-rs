@@ -1034,6 +1034,19 @@ fn verify_signed_data(
             ));
         }
         let signature = sig_any.value();
+        // RFC 5652 §5.3: unsignedAttrs [1] IMPLICIT is the only field after the
+        // signature; consume it if present, then the SEQUENCE must be done.
+        if !si_r.is_finished() {
+            let clean = AnyRef::decode(&mut si_r)
+                .map(|next| next.tag() == TAG_CTX1)
+                .unwrap_or(false)
+                && si_r.is_finished();
+            if !clean {
+                return Err(Error::Verification(
+                    "SignerInfo has trailing fields after signature".into(),
+                ));
+            }
+        }
 
         // Locate the signing certificate by resolved SKI or issuer+serial.
         let signer_cert = match ski_cert {
@@ -5024,6 +5037,122 @@ mod tests {
         ci2.extend_from_slice(&ci_body[..oid_end]);
         ci2.extend_from_slice(&new_wrap);
         der_tlv(cms[0], &ci2)
+    }
+
+    /// Appends raw `tail` bytes to the first SignerInfo SEQUENCE body,
+    /// rebuilding SignerInfo → SET OF → SignedData → [0] → ContentInfo.
+    fn append_first_signer_info_tail(cms: &[u8], tail: &[u8]) -> Vec<u8> {
+        // ContentInfo ::= SEQUENCE { contentType OID, [0] EXPLICIT SignedData }
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap.tag(), TAG_CTX0);
+        let wrap_tlv = &ci_body[oid_end..]; // [0] wrapper TLV (last field)
+        let sd_tlv = wrap.value();
+        let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_body_src = sd_seq.value();
+
+        // SignedData fields; signerInfos SET is the LAST one (digestAlgorithms
+        // is also a SET — select by position, never by tag).
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new();
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        let set_tlv = fields.pop().expect("SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(set_tlv).unwrap().tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let fixed: Vec<&[u8]> = fields;
+
+        // First SignerInfo: append the tail to its SEQUENCE body, leaving any
+        // remaining SignerInfos untouched.
+        let set_any = AnyRef::from_der(set_tlv).unwrap();
+        let si_list = set_any.value();
+        let mut set_r = SliceReader::new(si_list).unwrap();
+        let si_any = AnyRef::decode(&mut set_r).unwrap();
+        assert_eq!(si_any.tag(), Tag::Sequence);
+        let first_end = usize::try_from(set_r.position()).unwrap();
+        let rest = &si_list[first_end..];
+        let mut new_si_body = si_any.value().to_vec();
+        new_si_body.extend_from_slice(tail);
+
+        // Rebuild bottom-up: SignerInfo → SET → SignedData → [0] → ContentInfo.
+        let new_si = der_tlv(si_list[0], &new_si_body);
+        let mut new_set_body = new_si;
+        new_set_body.extend_from_slice(rest);
+        let new_set = der_tlv(set_tlv[0], &new_set_body);
+        let mut sd_body = Vec::new();
+        for f in &fixed {
+            sd_body.extend_from_slice(f);
+        }
+        sd_body.extend_from_slice(&new_set);
+        let new_sd = der_tlv(sd_tlv[0], &sd_body);
+        let new_wrap = der_tlv(wrap_tlv[0], &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(&ci_body[..oid_end]);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms[0], &ci2)
+    }
+
+    #[test]
+    fn signer_info_trailing_bytes_are_rejected() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        let tampered = append_first_signer_info_tail(&cms, &[0x05, 0x00]); // DER NULL TLV
+        let res = verify_code_signature_with_anchors(
+            &wrap(&tampered),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        );
+        assert!(
+            res.as_ref()
+                .err()
+                .map(|e| e
+                    .to_string()
+                    .contains("SignerInfo has trailing fields after signature"))
+                .unwrap_or(false),
+            "trailing bytes after the signature must be rejected, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn signer_info_with_unsigned_attrs_still_verifies() {
+        let (creds, _k) = rsa_credentials();
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms = sign_code_directory(content, &creds, None, &cd_sha256).unwrap();
+        // One empty [1] IMPLICIT TLV — the only field RFC 5652 §5.3 allows
+        // after signatureValue.
+        let tampered = append_first_signer_info_tail(&cms, &[0xA1, 0x00]);
+        let report = verify_code_signature_with_anchors(
+            &wrap(&tampered),
+            content,
+            None,
+            &cd_sha256,
+            &anchors_for(&creds),
+        )
+        .unwrap();
+        assert!(
+            report.valid,
+            "a SignerInfo ending in unsignedAttrs must still verify: {:?}",
+            report.errors
+        );
     }
 
     /// Replaces the digestAlgorithms SET (SignedData field 2, RFC 5652 §5.1
