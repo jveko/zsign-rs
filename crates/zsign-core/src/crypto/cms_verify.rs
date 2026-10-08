@@ -761,7 +761,9 @@ impl StagedSigner {
 
 /// Evaluates one SignerInfo against the embedded certificates and trust
 /// anchors. Returns the staged per-signer outputs plus that signer's errors;
-/// empty errors mean the signer is valid. Structural per-signer failures
+/// empty errors mean the signer is valid. `warnings` and `global_errors` are
+/// intentional accumulators written during evaluation; scalar report fields
+/// stay staged until the caller claims them. Structural per-signer failures
 /// (unsupported digest, unresolvable identity, missing certificate) are
 /// rejections — a one-element error list whose first entry is the reason —
 /// not envelope failures. Malformed CMS structure is still a hard
@@ -875,11 +877,9 @@ fn eval_one_signer(
         },
     };
     if !digest_alg_oids.contains(&dig_oid) {
-        let msg =
-            format!("digestAlgorithms does not include the SignerInfo digest algorithm {dig_oid}");
-        if !global_errors.contains(&msg) {
-            global_errors.push(msg);
-        }
+        global_errors.push(format!(
+            "digestAlgorithms does not include the SignerInfo digest algorithm {dig_oid}"
+        ));
     }
 
     // signedAttrs [0] — capture raw bytes (the signed message).
@@ -1254,6 +1254,7 @@ fn verify_signed_data(
             &mut global_errors,
         )?;
         let rejected = !errors.is_empty();
+        let had_valid = any_valid;
         if rejected {
             let reason = errors.first().cloned().unwrap_or_default();
             let warning = match &staged.subject {
@@ -1269,8 +1270,6 @@ fn verify_signed_data(
             if first_rejected_errors.is_none() {
                 first_rejected_errors = Some(errors.clone());
             }
-        } else {
-            any_valid = true;
         }
         report.signers.push(CmsSignerSummary {
             subject: staged.subject.clone(),
@@ -1280,9 +1279,10 @@ fn verify_signed_data(
         // First valid signer claims the scalars; before any valid signer the
         // last rejected signer owns them (so single-signer reports read exactly
         // as before).
-        if !rejected || !any_valid {
+        if !had_valid {
             staged.claim_into(&mut report);
         }
+        any_valid |= !rejected;
     }
 
     if any_valid && global_errors.is_empty() {
@@ -5723,6 +5723,211 @@ mod tests {
         assert!(
             report.signature_ok,
             "scalars must describe the valid signer, got {:?}",
+            report
+        );
+    }
+
+    /// Builds leaf credentials under `root` with caller-chosen CN and serial.
+    /// Serials must differ across leaves sharing an issuer so
+    /// issuerAndSerialNumber sids resolve to distinct certificates in a
+    /// combined CMS.
+    fn leaf_credentials_under_root(
+        cn: &str,
+        serial: u32,
+        root: &x509_cert::Certificate,
+        root_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+    ) -> SigningCredentials {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let leaf_signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone());
+        let pub_key = SubjectPublicKeyInfoOwned::from_der(
+            key.to_public_key().to_public_key_der().unwrap().as_ref(),
+        )
+        .unwrap();
+        let mut b = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: root.tbs_certificate.subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::from(serial),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str(cn).unwrap(),
+            pub_key,
+            root_signing,
+        )
+        .unwrap();
+        b.add_extension(&ExtendedKeyUsage(vec![OID_CODE_SIGNING]))
+            .unwrap();
+        let cert = b.build::<rsa::pkcs1v15::Signature>().unwrap();
+        SigningCredentials {
+            certificate: cert,
+            signing_key: SigningKeyType::Rsa(leaf_signing),
+            cert_chain: vec![root.clone()],
+            team_id: None,
+        }
+    }
+
+    /// Splits `sign_code_directory` output into its ContentInfo prefix (through
+    /// the contentType OID), the [0] wrapper tag, the SignedData tag, and the
+    /// SignedData field TLVs.
+    fn split_signed_data(cms: &[u8]) -> (&[u8], u8, u8, Vec<&[u8]>) {
+        let ci = AnyRef::from_der(cms).unwrap();
+        assert_eq!(ci.tag(), Tag::Sequence);
+        let ci_body = ci.value();
+        let mut ci_r = SliceReader::new(ci_body).unwrap();
+        let _oid = AnyRef::decode(&mut ci_r).unwrap();
+        let oid_end = usize::try_from(ci_r.position()).unwrap();
+        let wrap = AnyRef::decode(&mut ci_r).unwrap();
+        assert_eq!(wrap.tag(), TAG_CTX0);
+        let wrap_tlv = &ci_body[oid_end..];
+        let wrap_tag = wrap_tlv[0];
+        let sd_tlv = wrap.value();
+        let sd_tag = sd_tlv[0];
+        let sd_seq = AnyRef::from_der(sd_tlv).expect("SignedData SEQUENCE inside [0]");
+        assert_eq!(sd_seq.tag(), Tag::Sequence);
+        let sd_body_src = sd_seq.value();
+        let mut sd_r = SliceReader::new(sd_body_src).unwrap();
+        let mut fields: Vec<&[u8]> = Vec::new();
+        while !sd_r.is_finished() {
+            let start = usize::try_from(sd_r.position()).unwrap();
+            let _field = AnyRef::decode(&mut sd_r).unwrap();
+            let end = usize::try_from(sd_r.position()).unwrap();
+            fields.push(&sd_body_src[start..end]);
+        }
+        (&ci_body[..oid_end], wrap_tag, sd_tag, fields)
+    }
+
+    /// Splits an IMPLICIT-concatenated block into its element TLVs.
+    fn split_concatenated_tlvs(block: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut r = SliceReader::new(block).unwrap();
+        while !r.is_finished() {
+            let start = usize::try_from(r.position()).unwrap();
+            let _elem = AnyRef::decode(&mut r).unwrap();
+            let end = usize::try_from(r.position()).unwrap();
+            out.push(&block[start..end]);
+        }
+        out
+    }
+
+    /// Combines two single-signer `sign_code_directory` outputs into one CMS:
+    /// B's SignerInfo is appended to A's signerInfos SET and every B
+    /// certificate missing from A is appended to A's certificates block. Both
+    /// leaves must chain to the same root so one anchor set covers both signers.
+    fn combine_two_signer_cms(cms_a: &[u8], cms_b: &[u8]) -> Vec<u8> {
+        let (prefix_a, wrap_tag_a, sd_tag_a, fields_a) = split_signed_data(cms_a);
+        let (_, _, _, fields_b) = split_signed_data(cms_b);
+        // B's SignerInfo (single-signer fixture: the SET body is one TLV).
+        let set_b = AnyRef::from_der(fields_b.last().expect("SignedData fields required")).unwrap();
+        assert_eq!(
+            set_b.tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let si_b_tlv: &[u8] = set_b.value();
+        let mut si_b_r = SliceReader::new(si_b_tlv).unwrap();
+        let si_b_any = AnyRef::decode(&mut si_b_r).unwrap();
+        assert_eq!(si_b_any.tag(), Tag::Sequence);
+        assert!(
+            si_b_r.is_finished(),
+            "fixture B assumes a single SignerInfo"
+        );
+        // B's certificates not already in A (the shared root is already there;
+        // SET OF order is sorting-defined, so match by bytes, not position).
+        let certs_b_tlv = fields_b
+            .iter()
+            .copied()
+            .find(|f| AnyRef::from_der(f).unwrap().tag() == TAG_CTX0)
+            .expect("B embeds certificates");
+        let certs_b = AnyRef::from_der(certs_b_tlv).unwrap();
+        let new_certs_b = split_concatenated_tlvs(certs_b.value());
+        // Rebuild A's fields: the certificates block gains B's missing certs,
+        // then the signerInfos SET (last field) gains B's SignerInfo. Both
+        // SignerInfos stay version 1, so the SignedData version is untouched.
+        let set_a_tlv = fields_a.last().expect("SignedData fields required");
+        assert_eq!(
+            AnyRef::from_der(set_a_tlv).unwrap().tag(),
+            Tag::Set,
+            "signerInfos SET must be the last SignedData field"
+        );
+        let mut sd_body = Vec::new();
+        for f in &fields_a[..fields_a.len() - 1] {
+            if AnyRef::from_der(f).unwrap().tag() == TAG_CTX0 {
+                let body = AnyRef::from_der(f).unwrap().value();
+                let existing = split_concatenated_tlvs(body);
+                let mut new_body = body.to_vec();
+                for cert in &new_certs_b {
+                    if !existing.contains(cert) {
+                        new_body.extend_from_slice(cert);
+                    }
+                }
+                sd_body.extend_from_slice(&der_tlv(f[0], &new_body));
+            } else {
+                sd_body.extend_from_slice(f);
+            }
+        }
+        let mut set_body = AnyRef::from_der(set_a_tlv).unwrap().value().to_vec();
+        set_body.extend_from_slice(si_b_tlv);
+        sd_body.extend_from_slice(&der_tlv(set_a_tlv[0], &set_body));
+        let new_sd = der_tlv(sd_tag_a, &sd_body);
+        let new_wrap = der_tlv(wrap_tag_a, &new_sd);
+        let mut ci2 = Vec::new();
+        ci2.extend_from_slice(prefix_a);
+        ci2.extend_from_slice(&new_wrap);
+        der_tlv(cms_a[0], &ci2)
+    }
+
+    #[test]
+    fn first_valid_signer_owns_report_scalars_with_two_valid_signers() {
+        let (_root_key, root, root_signing) = build_rsa_root("CN=zsign two-signer root");
+        let creds_a =
+            leaf_credentials_under_root("CN=zsign first signer", 101, &root, &root_signing);
+        let creds_b =
+            leaf_credentials_under_root("CN=zsign second signer", 102, &root, &root_signing);
+        let content: &[u8] = b"the code directory bytes";
+        let cd_sha256: [u8; 32] = Sha256::digest(content).into();
+        let cms_a = sign_code_directory(content, &creds_a, None, &cd_sha256).unwrap();
+        let cms_b = sign_code_directory(content, &creds_b, None, &cd_sha256).unwrap();
+        let combined = combine_two_signer_cms(&cms_a, &cms_b);
+        let anchors = TrustAnchors::from_certificates(vec![root.clone()]);
+        let report = verify_code_signature_with_anchors(
+            &wrap(&combined),
+            content,
+            None,
+            &cd_sha256,
+            &anchors,
+        )
+        .unwrap();
+        assert!(report.valid, "errors: {:?}", report.errors);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("rejected signer")),
+            "both signers valid, no rejections expected, got warnings: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.signers_total, 2, "signers: {:?}", report.signers);
+        assert_eq!(report.signers.len(), 2, "signers: {:?}", report.signers);
+        let subjects: Vec<_> = report.signers.iter().map(|s| s.subject.clone()).collect();
+        assert_eq!(
+            subjects,
+            vec![
+                Some("CN=zsign first signer".to_string()),
+                Some("CN=zsign second signer".to_string())
+            ],
+            "summaries carry both distinct subjects in order, got: {:?}",
+            report.signers
+        );
+        assert_eq!(
+            report.signer_subject.as_deref(),
+            Some("CN=zsign first signer"),
+            "first valid signer owns the scalars, got {:?}",
+            report
+        );
+        assert!(
+            report.signature_ok,
+            "scalars describe the first valid signer, got {:?}",
             report
         );
     }
