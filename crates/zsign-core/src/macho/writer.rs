@@ -414,8 +414,9 @@ pub fn embed_signature_fat(data: &[u8], signed_slices: &[SignedSlice]) -> Result
 /// Validates a FAT arch table against the container bytes: every arch's
 /// `[offset, offset + size)` range must lie inside `data`, must not overflow,
 /// and ranges must be pairwise disjoint. Reused by every writer entry point
-/// that consumes a container.
-fn validate_fat_arches(arches: &[FatArch], data: &[u8]) -> Result<()> {
+/// that consumes a container, and by the signer's shared per-slice signing
+/// engine so invalid containers are rejected before any slice is signed.
+pub(crate) fn validate_fat_arches(arches: &[FatArch], data: &[u8]) -> Result<()> {
     let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(arches.len());
     for (i, arch) in arches.iter().enumerate() {
         let start = arch.offset as usize;
@@ -2771,21 +2772,29 @@ mod tests {
         }
         fat[0x1000..0x3000].copy_from_slice(&make_minimal_macho());
         fat[0x2000..0x4000].copy_from_slice(&make_minimal_macho());
-        let macho = crate::macho::MachOFile::parse(fat.clone()).unwrap(); // both slices parse
-        let creds = test_signing_credentials();
-        let full = crate::macho::sign_macho_all_slices(
-            &macho,
-            "com.zsign.overlap",
-            None,
-            &creds,
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        // Hand-built slices matching the hostile arch identity fields
+        // (offset/original_size/cpu_type); the container check in
+        // `embed_signature_fat` fires before `signed_data` is touched, so
+        // dummy data suffices.
+        let slices = [
+            SignedSlice {
+                slice_index: 0,
+                offset: 0x1000,
+                original_size: 0x2000,
+                cpu_type: 0x0100_000c,
+                signed_data: Vec::new(),
+            },
+            SignedSlice {
+                slice_index: 1,
+                offset: 0x2000,
+                original_size: 0x2000,
+                cpu_type: 0x0100_000c,
+                signed_data: Vec::new(),
+            },
+        ];
         let err =
-            embed_signature_fat(&fat, &full).expect_err("overlapping slices must be rejected");
-        assert!(err.to_string().contains("overlap"), "{err}"); // pre-fix: Ok
+            embed_signature_fat(&fat, &slices).expect_err("overlapping slices must be rejected");
+        assert!(err.to_string().contains("overlap"), "{err}");
     }
 
     #[test]

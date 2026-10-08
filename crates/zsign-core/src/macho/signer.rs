@@ -34,6 +34,7 @@ use crate::codesign::superblob::{
 use crate::crypto::cms;
 use crate::crypto::SigningCredentials;
 use crate::Result;
+use goblin::mach::Mach;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -417,6 +418,21 @@ fn sign_all_slices_impl(
     allow_encrypted: bool,
     sha256_only: bool,
 ) -> Result<Vec<SignedSlice>> {
+    if macho.is_fat() {
+        let arches = match Mach::parse(macho.data())
+            .map_err(|e| crate::Error::MachO(format!("Failed to parse Mach-O: {}", e)))?
+        {
+            Mach::Fat(fat) => fat
+                .iter_arches()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::MachO(format!("Failed to read FAT arches: {}", e)))?,
+            _ => return Err(crate::Error::MachO("Expected a FAT container".into())),
+        };
+        if arches.is_empty() {
+            return Err(crate::Error::MachO("Empty FAT binary".into()));
+        }
+        super::writer::validate_fat_arches(&arches, macho.data())?;
+    }
     let is_executable = macho
         .slices()
         .first()
@@ -2013,5 +2029,36 @@ mod tests {
                 "{via}: not anchored without an injected root"
             );
         }
+    }
+
+    #[test]
+    fn test_sign_macho_all_slices_rejects_overlapping_container() {
+        // Hostile FAT construction copied from writer's overlap fixture:
+        // arch[0] = [0x1000, 0x3000), arch[1] = [0x2000, 0x4000) overlap by
+        // 0x1000 bytes. The fat_arch table starts at offset 8 (right after
+        // the 8-byte fat_header); slice placement at 0x1000+ clears it.
+        const HEADER: usize = 8;
+        let mut fat = vec![0u8; 0x4000];
+        fat[0..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
+        fat[4..8].copy_from_slice(&2u32.to_be_bytes());
+        for (i, (off, size)) in [(0x1000u32, 0x2000u32), (0x2000u32, 0x2000u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let e = HEADER + i * 20;
+            fat[e..e + 4].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+            fat[e + 4..e + 8].copy_from_slice(&0u32.to_be_bytes());
+            fat[e + 8..e + 12].copy_from_slice(&off.to_be_bytes());
+            fat[e + 12..e + 16].copy_from_slice(&size.to_be_bytes());
+            fat[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
+        }
+        fat[0x1000..0x3000].copy_from_slice(&make_minimal_macho());
+        fat[0x2000..0x4000].copy_from_slice(&make_minimal_macho());
+        let macho = MachOFile::parse(fat).unwrap(); // both slices parse
+        let creds = crate::macho::fixtures::test_signing_credentials();
+        let err =
+            sign_macho_all_slices(&macho, "com.zsign.overlap", None, &creds, None, None, false)
+                .expect_err("overlapping container must be rejected before signing");
+        assert!(err.to_string().contains("overlap"), "{err}");
     }
 }
