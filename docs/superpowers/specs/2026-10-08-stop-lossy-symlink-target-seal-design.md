@@ -12,13 +12,16 @@ so the seal records a target that does not exist on disk. The seal hash
 covers bytes the plist entry cannot express.
 
 The verifier makes it worse by being self-consistent rather than correct:
-`check_code_resources` compares `fs::read_link(..).to_string_lossy()` against
-the recorded string (`crates/zsign/src/verify.rs:699`), so a lossy seal
+`verify_code_resource_entry` (called per entry by `check_code_resources`)
+compares `fs::read_link(..).to_string_lossy()` against the recorded string
+(`crates/zsign/src/verify.rs:699`, fn at `:614`, caller at `:766`),
+so a lossy seal
 verifies green against its own lossy record. Both sides agree on a value
 that is neither what is on disk nor what an Apple-signed seal would hold.
 
 There is no test today covering a non-UTF-8 symlink target anywhere in the
-workspace; every symlink test uses ASCII targets.
+workspace; every symlink test uses ASCII or valid-UTF-8 targets, none uses
+an invalid (non-UTF-8) target.
 
 ## External contract (researched)
 
