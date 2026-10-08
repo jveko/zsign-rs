@@ -128,11 +128,14 @@ if let Some(cd) = first_sha256.filter(|cd| !std::ptr::eq(*cd, primary)) {
     bound.push(cd);
 }
 let strongest = if cms_is_real {
-    bound.iter().copied().fold(None, |acc, cd| match acc {
-        Some(best) if best.hash_size >= cd.hash_size => Some(best),
-        _ => Some(cd),
-    })
-    .unwrap_or(primary)
+    bound
+        .iter()
+        .copied()
+        .fold(None::<&CodeDirectory<'_>>, |acc, cd| match acc {
+            Some(best) if best.hash_size >= cd.hash_size => Some(best),
+            _ => Some(cd),
+        })
+        .unwrap_or(primary)
 } else {
     primary
 };

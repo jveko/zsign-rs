@@ -327,7 +327,7 @@ with:
         bound
             .iter()
             .copied()
-            .fold(None, |acc, cd| match acc {
+            .fold(None::<&CodeDirectory<'_>>, |acc, cd| match acc {
                 Some(best) if best.hash_size >= cd.hash_size => Some(best),
                 _ => Some(cd),
             })
