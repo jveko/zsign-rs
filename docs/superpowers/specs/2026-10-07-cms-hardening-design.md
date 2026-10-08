@@ -116,8 +116,8 @@ Three hardening gaps in `crates/zsign-core/src/crypto/cms_verify.rs`:
   which RFC 5652 §5.3/§11.4 permit.
 
 **RSA-floor design candidates:**
-- **C1 (CHOSEN):** `const MIN_RSA_MODULUS_BITS: u64 = 2048` measured via
-  `PublicKeyParts::n(&key).bits()` (exact bits — avoids the byte
+- **C1 (CHOSEN):** `const MIN_RSA_MODULUS_BITS: usize = 2048` measured via
+  `PublicKeyParts::n(&key).bits()` (`-> usize`, exact bits — avoids the byte
   rounding of `size()`).
   - Signer path: `verify_signer_signature` returns `Result<(), String>`;
     the weak key yields `Err("rsa public key is below the 2048-bit minimum")`,

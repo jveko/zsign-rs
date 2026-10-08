@@ -43,8 +43,9 @@ gains only additive fields.
   multi-filter commands go through `cargo test -p zsign-core -- f1 f2 …`.
 - Every assertion prints the actual received value in its failure footer.
 - rsa 0.9.10 reality: measure with `rsa::traits::PublicKeyParts::n(&key).bits()`
-  (u64; `n()` is a TRAIT method — bring `rsa::traits::PublicKeyParts` into
-  scope) against `const MIN_RSA_MODULUS_BITS: u64 = 2048`; there is no
+  (returns `usize`; `n()` is a TRAIT method — bring
+  `rsa::traits::PublicKeyParts` into scope) against
+  `const MIN_RSA_MODULUS_BITS: usize = 2048`; there is no
   `key_size()`/`bits()` method and `PublicKeyParts::size()` is BYTES.
 
 ## Review Focus
@@ -198,14 +199,14 @@ Expected: all green — no existing fixture carries trailing SignerInfo bytes.
 **Interfaces:**
 - Consumes: `rsa::RsaPublicKey` via `rsa::traits::PublicKeyParts`
   (`n(&self) -> &BigUint`, a TRAIT method — `use rsa::traits::PublicKeyParts;`,
-  then `.n().bits() -> u64`),
+  then `.n().bits() -> usize`),
   `OID_RSA_ENCRYPTION`, `verify_chain` sites (parent branch after the
   name-constraints hook; self-signed terminal before
   `verify_cert_signature(current, current)`; resolved-anchor branch before
   `verify_cert_signature(current, anchor)`), `rsa_credentials()` /
   `build_rsa_root` / `build_leaf_signed` / `chain_with` test helpers.
 - Produces:
-  - `const MIN_RSA_MODULUS_BITS: u64 = 2048;` (private, near the OID consts)
+  - `const MIN_RSA_MODULUS_BITS: usize = 2048;` (private, near the OID consts)
   - `fn rsa_key_below_floor(cert: &x509_cert::Certificate) -> bool` — true
     iff SPKI alg == `OID_RSA_ENCRYPTION` and `modulus.bits() < MIN_…`
     (decode failures ⇒ false; the signature path handles those as today).
