@@ -137,8 +137,10 @@ pub(crate) fn extract_p12(data: &[u8], password: &str) -> Result<P12Contents> {
 
     // The MAC verdict alone cannot separate a mistyped password from a damaged
     // container (RFC 7292 derives the MAC key from the password), so decide
-    // together with what this password could actually read: the spec's rule
-    // table lives above this function.
+    // together with what this password could actually read: a MAC mismatch over
+    // contents that this password decrypted and parsed intact means the
+    // container is damaged; in every other case the mismatch (or an absent
+    // MAC's padding heuristic) stands as the credential verdict.
     let mac_state = match &mac_data {
         Some(mac) => {
             if verify_mac(mac, &auth_contents, password)? {
