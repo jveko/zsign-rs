@@ -4,7 +4,7 @@
 
 **Goal:** Make `MachOFile::code_bytes` and `MachOFile::slice_data` return a typed error instead of panicking when handed a forged or cross-file `ArchSlice`, and migrate every caller.
 
-**Architecture:** Both accessors switch from unchecked `start + len` + direct indexing to the module's existing `checked_add(...).and_then(|end| data.get(start..end)).ok_or_else(|| Error::MachO(..))?` shape, changing their return type to `crate::Result<&[u8]>`. The `zsign-rs` facade wrappers mirror the new signatures. The core signature change, the four production callers, the four test call sites, and the two facade wrappers are one atomic unit — splitting them would leave a commit that does not compile — so Task 1 carries the whole change behind a single test-first cycle.
+**Architecture:** Both accessors switch from unchecked `start + len` + direct indexing to the `checked_add(...).and_then(|end| data.get(start..end)).ok_or_else(|| Error::MachO(..))?` shape — extending the `checked_add` validation idiom at `parser.rs:201-211` with the `checked_add`-then-`data.get(...)` extraction used at `writer.rs:344-349` and `verify.rs:559-562` — changing their return type to `crate::Result<&[u8]>`. The `zsign-rs` facade wrappers mirror the new signatures. The core signature change, the four production callers, the four test call sites, and the two facade wrappers are one atomic unit — splitting them would leave a commit that does not compile — so Task 1 carries the whole change behind a single test-first cycle.
 
 **Tech Stack:** Rust 2021 workspace, existing `crate::Error` (`thiserror`), `crate::Result` alias, rayon (already in use at one call site).
 
@@ -147,7 +147,7 @@ Notes for the Tester: `Error` and `MachOFile` are in scope via `use super::*`; a
 - [ ] **Step 2: Run the tests, confirm the expected failure**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core parser::tests::test_forged`
-Expected: FAIL to compile — `error[E0308]: mismatched types` at the new assertions (`expected \`Result<…>\`, found \`&[u8]\``), because `slice_data`/`code_bytes` still return `&[u8]`. Record the exact error; no other outcome counts.
+Expected: FAIL to compile, because `slice_data`/`code_bytes` still return `&[u8]`. The exact diagnostics depend on the assertion shape: `matches!(&res, Err(..))` reports `error[E0308]: mismatched types` (the pattern expects an enum, found `&[u8]`), and `.expect(..)` / `.err()` report `error[E0599]` (no such method on `&[u8]`). The gate is that compilation fails on the new tests; record the exact output. No other outcome counts.
 
 - [ ] **Step 3: Implement the checked accessors in `parser.rs`**
 

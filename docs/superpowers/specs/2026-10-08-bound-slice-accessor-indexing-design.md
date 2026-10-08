@@ -43,7 +43,7 @@ not untrusted-bytes handling; the design must not pretend otherwise.
 | `m.slice_data(sl)` (test) | `writer.rs:3073, 3078` | `.expect(...)` at the assertion |
 | facade wrappers | `crates/zsign/src/macho/parser.rs:56-61` | signature → `Result<&[u8]>`, body `Ok(self.inner.…?)` |
 | production callers of `code_bytes` | none anywhere in the workspace | — |
-| callers in `zsign-cli`, `zsign-wasm`, `fuzz` | none (`wasm` uses only `slices().len()`) | — |
+| callers in `zsign-cli`, `zsign-wasm`, `fuzz` | none — `zsign-wasm` reads only `slices()` and slice fields, never these accessors | — |
 
 No struct-update syntax exists; construction sites are `parser.rs:375` (parse),
 mutation at `parser.rs:219-220` (FAT branch), and rebuilds at `signer.rs:498, 632` —
@@ -55,7 +55,9 @@ all untouched by this design.
 
 Both accessors return `crate::Result<&[u8]>`; the body is the module's own
 `checked_add(...).and_then(|end| data.get(start..end)).ok_or_else(|| Error::MachO(..))?`
-shape, already used at `parser.rs:201-211` and `writer.rs:344-349`.
+shape: it extends the `checked_add` validation idiom at `parser.rs:201-211` with the
+`checked_add`-then-`data.get(...)` extraction already used at `writer.rs:344-349` and
+`verify.rs:559-562`.
 
 - Removes both failure modes in every build profile: overflow becomes `Err`, an
   out-of-range end becomes `Err`, and no wrapped arithmetic is ever indexed.
