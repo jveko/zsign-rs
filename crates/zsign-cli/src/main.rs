@@ -20,7 +20,7 @@ use zsign_rs::{SigningCredentials, ZSign};
     .args(["pkcs12", "certificate", "private_key", "keychain_identity"])
     .multiple(true))]
 struct Cli {
-    /// Input file (IPA, Mach-O, or app bundle)
+    /// Input: app bundle directory, IPA/ZIP archive, or Mach-O binary (detected by content, not extension)
     input: PathBuf,
 
     /// Output file
@@ -223,6 +223,77 @@ fn parse_dylib(s: &str) -> std::result::Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Content classes the CLI routes on. Detection order (upstream parity):
+/// directory, then the 2-byte `PK` zip marker, then Mach-O magic.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum InputKind {
+    Bundle,
+    Archive,
+    MachO,
+    Unknown,
+}
+
+/// Mach-O magic as seen by a little-endian reader: thin 32/64 (native and
+/// byte-swapped headers) plus FAT/FAT64 containers. Dispatch is permissive —
+/// the Mach-O arm's parser decides signability.
+const MACHO_MAGICS: [u32; 8] = [
+    0xfeed_face,
+    0xcefa_edfe, // MH_MAGIC, MH_CIGAM
+    0xfeed_facf,
+    0xcffa_edfe, // MH_MAGIC_64, MH_CIGAM_64
+    0xcafe_babe,
+    0xbeba_feca, // FAT_MAGIC, FAT_CIGAM
+    0xcafe_babf,
+    0xbfbafeca, // FAT_MAGIC_64, FAT_CIGAM_64
+];
+
+/// Classifies the input by content, never by extension. Read failures keep
+/// the path the raw OS error would drop: NotFound becomes "input not found:
+/// <path>", everything else "cannot read input <path>: <err>".
+fn classify_input(path: &std::path::Path) -> Result<InputKind, String> {
+    use std::io::Read as _;
+
+    if path.is_dir() {
+        return Ok(InputKind::Bundle);
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("input not found: {}", path.display())
+        } else {
+            format!("cannot read input {}: {e}", path.display())
+        }
+    })?;
+    let mut buf = [0u8; 4];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| format!("cannot read input {}: {e}", path.display()))?;
+    if n >= 2 && buf[..2] == *b"PK" {
+        return Ok(InputKind::Archive);
+    }
+    if n == 4 && MACHO_MAGICS.contains(&u32::from_le_bytes(buf)) {
+        return Ok(InputKind::MachO);
+    }
+    Ok(InputKind::Unknown)
+}
+
+/// Default output for archive/binary signing: insert `-signed` before the
+/// existing extension (`in.ipa` → `in-signed.ipa`, `app` → `app-signed`),
+/// preserving the extension so `-V` round trips on content.
+fn signed_output_path(input: &std::path::Path) -> PathBuf {
+    let mut name = std::ffi::OsString::new();
+    if let Some(stem) = input.file_stem() {
+        name.push(stem);
+    }
+    name.push("-signed");
+    if let Some(ext) = input.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    let mut out = input.to_path_buf();
+    out.set_file_name(name);
+    out
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
@@ -306,34 +377,30 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         signer = signer.allow_encrypted(true);
     }
 
-    let ext = cli.input.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    match ext.to_lowercase().as_str() {
-        "ipa" => {
-            let output = cli.output.unwrap_or_else(|| {
-                let mut out = cli.input.clone();
-                out.set_extension("signed");
-                out
-            });
-            signer.sign_ipa(&cli.input, &output)?;
-            report_sign(json, false, &output.display().to_string());
-        }
-        "app" => {
-            // Folder signing: with -o ending in .ipa, repack; otherwise in place.
+    match classify_input(&cli.input)? {
+        InputKind::Bundle => {
             signer.sign_bundle(&cli.input, cli.output.as_deref())?;
             match &cli.output {
                 Some(ipa) => report_sign(json, false, &ipa.display().to_string()),
                 None => report_sign(json, true, &cli.input.display().to_string()),
             }
         }
-        _ => {
-            let output = cli.output.unwrap_or_else(|| {
-                let mut out = cli.input.clone();
-                out.set_extension("signed");
-                out
-            });
+        InputKind::Archive => {
+            let output = cli.output.unwrap_or_else(|| signed_output_path(&cli.input));
+            signer.sign_ipa(&cli.input, &output)?;
+            report_sign(json, false, &output.display().to_string());
+        }
+        InputKind::MachO => {
+            let output = cli.output.unwrap_or_else(|| signed_output_path(&cli.input));
             signer.sign_macho(&cli.input, &output)?;
             report_sign(json, false, &output.display().to_string());
+        }
+        InputKind::Unknown => {
+            return Err(format!(
+                "unsupported input '{}': expected an app bundle directory, ZIP archive, or Mach-O binary",
+                cli.input.display()
+            )
+            .into());
         }
     }
 
@@ -344,15 +411,27 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 /// 2 could-not-complete (unreadable/unsupported input or a report with
 /// top-level errors).
 fn run_verify(input: &std::path::Path, json: bool) -> ExitCode {
-    let report = match input
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .as_deref()
-    {
-        Some("ipa") => zsign_rs::verify::verify_ipa(input),
-        Some("app") => zsign_rs::verify::verify_bundle(input),
-        _ => zsign_rs::verify::verify_macho_file(input),
+    let kind = match classify_input(input) {
+        Ok(kind) => kind,
+        Err(msg) => {
+            emit_error(json, &msg);
+            return ExitCode::from(2);
+        }
+    };
+    let report = match kind {
+        InputKind::Bundle => zsign_rs::verify::verify_bundle(input),
+        InputKind::Archive => zsign_rs::verify::verify_ipa(input),
+        InputKind::MachO => zsign_rs::verify::verify_macho_file(input),
+        InputKind::Unknown => {
+            emit_error(
+                json,
+                &format!(
+                    "unsupported input '{}': expected an app bundle directory, ZIP archive, or Mach-O binary",
+                    input.display()
+                ),
+            );
+            return ExitCode::from(2);
+        }
     };
     let report = match report {
         Ok(report) => report,
@@ -1054,6 +1133,25 @@ mod tests {
             fixtures::make_minimal_macho_encrypted(1, 0x1000),
         )
         .unwrap();
+        std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
+        app
+    }
+
+    /// Builds `dir/<name>` containing an unsigned adhoc-signable executable.
+    fn make_signable_app(dir: &Path, name: &str) -> std::path::PathBuf {
+        let app = dir.join(name);
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Test</string>
+  <key>CFBundleIdentifier</key><string>com.test.plain</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Test"), fixtures::make_minimal_macho()).unwrap();
         std::fs::write(app.join("data.bin"), [0xAB; 2048]).unwrap();
         app
     }
@@ -2478,5 +2576,222 @@ mod tests {
         let code = run(cli).expect("the explicit bypass must sign");
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(out.exists(), "the explicit bypass must sign output");
+    }
+
+    #[test]
+    fn classify_input_routes_by_content_not_name() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let sneaky = root.join("sneaky.ipa");
+        std::fs::create_dir_all(&sneaky).unwrap();
+        let kind = classify_input(&sneaky).unwrap();
+        assert_eq!(
+            kind,
+            InputKind::Bundle,
+            "directory sneaky.ipa must classify as Bundle, got {:?}",
+            kind
+        );
+        let renamed = root.join("renamed.signed");
+        std::fs::write(&renamed, b"PK\x03\x04payload").unwrap();
+        let kind = classify_input(&renamed).unwrap();
+        assert_eq!(
+            kind,
+            InputKind::Archive,
+            "renamed.signed with zip magic must classify as Archive, got {:?}",
+            kind
+        );
+        let empty_archive = root.join("empty.bin");
+        std::fs::write(&empty_archive, b"PK\x05\x06").unwrap();
+        let kind = classify_input(&empty_archive).unwrap();
+        assert_eq!(
+            kind,
+            InputKind::Archive,
+            "empty archive magic must classify as Archive, got {:?}",
+            kind
+        );
+        let macho_cases: &[(&str, [u8; 4])] = &[
+            ("thin64", [0xcf, 0xfa, 0xed, 0xfe]),
+            ("thin32", [0xce, 0xfa, 0xed, 0xfe]),
+            ("fat", [0xca, 0xfe, 0xba, 0xbe]),
+            ("fat64", [0xca, 0xfe, 0xba, 0xbf]),
+        ];
+        for (name, magic) in macho_cases {
+            let path = root.join(format!("{name}.bin"));
+            std::fs::write(&path, magic).unwrap();
+            let kind = classify_input(&path).unwrap();
+            assert_eq!(
+                kind,
+                InputKind::MachO,
+                "case {name} must classify as MachO, got {:?}",
+                kind
+            );
+        }
+        let plain = root.join("plain.bin");
+        std::fs::write(&plain, b"neither a zip nor a mach-o").unwrap();
+        let kind = classify_input(&plain).unwrap();
+        assert_eq!(
+            kind,
+            InputKind::Unknown,
+            "plain text must classify as Unknown, got {:?}",
+            kind
+        );
+        let err = classify_input(&root.join("nope.bin")).unwrap_err();
+        assert!(
+            err.contains("nope.bin"),
+            "missing-file error must name the path, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn signed_output_path_preserves_extension() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let cases = [
+            ("in.ipa", "in-signed.ipa"),
+            ("tool.bin", "tool-signed.bin"),
+            ("app", "app-signed"),
+            ("a.b.tar.gz", "a.b.tar-signed.gz"),
+        ];
+        for (input, expected) in cases {
+            let input_path = root.join(input);
+            let expected_path = root.join(expected);
+            let actual = signed_output_path(&input_path);
+            assert_eq!(
+                actual,
+                expected_path,
+                "signed_output_path({input}) must be {expected}, got {}",
+                actual.display()
+            );
+        }
+    }
+
+    #[test]
+    fn default_output_preserves_extension_and_verifies() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let app = make_signable_app(root, "App.app");
+        let ipa = root.join("app.ipa");
+        zsign_rs::create_ipa(&app, &ipa, zsign_rs::CompressionLevel::DEFAULT).unwrap();
+        let sign = run_cli(&[OsStr::new("-a"), ipa.as_os_str()], &[]);
+        assert_eq!(sign.code, 0, "adhoc sign failed: {}", sign.stderr);
+        let listing: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            root.join("app-signed.ipa").exists(),
+            "app-signed.ipa must exist, dir: {:?}",
+            listing
+        );
+        assert!(
+            !root.join("app.signed").exists(),
+            "app.signed must not exist, dir: {:?}",
+            listing
+        );
+        let v = run_cli(
+            &[OsStr::new("-V"), root.join("app-signed.ipa").as_os_str()],
+            &[],
+        );
+        assert_eq!(v.code, 0, "expected 0, stderr: {}", v.stderr);
+        assert!(v.stdout.contains("verified: yes"), "stdout: {}", v.stdout);
+    }
+
+    #[test]
+    fn zip_input_routes_to_archive() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let app = make_signable_app(root, "App.app");
+        let ipa = root.join("app.ipa");
+        zsign_rs::create_ipa(&app, &ipa, zsign_rs::CompressionLevel::DEFAULT).unwrap();
+        let bytes = std::fs::read(&ipa).unwrap();
+        let zipped = root.join("bundle.zip");
+        std::fs::write(&zipped, &bytes).unwrap();
+        let out = root.join("out.ipa");
+        let sign = run_cli(
+            &[
+                OsStr::new("-a"),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                zipped.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(sign.code, 0, "zip sign failed: {}", sign.stderr);
+        assert!(
+            out.exists(),
+            "out.ipa must exist after signing bundle.zip, stderr: {}",
+            sign.stderr
+        );
+        let v = run_cli(&[OsStr::new("-V"), out.as_os_str()], &[]);
+        assert_eq!(v.code, 0, "expected 0, stderr: {}", v.stderr);
+    }
+
+    #[test]
+    fn directory_without_app_suffix_routes_to_bundle() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let bundle = make_signable_app(root, "PlainBundle");
+        let sign = run_cli(&[OsStr::new("-a"), bundle.as_os_str()], &[]);
+        assert_eq!(sign.code, 0, "bundle sign failed: {}", sign.stderr);
+        assert!(
+            bundle.join("Info.plist").exists(),
+            "in-place sign must keep Info.plist in {:?}",
+            bundle
+        );
+        let v = run_cli(&[OsStr::new("-V"), bundle.as_os_str()], &[]);
+        assert_eq!(v.code, 0, "expected 0, stderr: {}", v.stderr);
+        assert!(v.stdout.contains("verified: yes"), "stdout: {}", v.stdout);
+        let repack = root.join("repack.ipa");
+        let sign2 = run_cli(
+            &[
+                OsStr::new("-a"),
+                OsStr::new("-o"),
+                repack.as_os_str(),
+                bundle.as_os_str(),
+            ],
+            &[],
+        );
+        assert_eq!(sign2.code, 0, "bundle repack failed: {}", sign2.stderr);
+        assert!(
+            repack.exists(),
+            "repack.ipa must exist, stderr: {}",
+            sign2.stderr
+        );
+    }
+
+    #[test]
+    fn unknown_input_is_reported_clearly() {
+        let dir = TempDir::new().unwrap();
+        let blob = dir.path().join("blob.dat");
+        std::fs::write(&blob, b"neither a zip nor a mach-o").unwrap();
+        let sign = run_cli(&[OsStr::new("-a"), blob.as_os_str()], &[]);
+        assert_eq!(sign.code, 1, "expected 1, stderr: {}", sign.stderr);
+        assert!(
+            sign.stderr.contains("unsupported input"),
+            "stderr must say unsupported input, got: {}",
+            sign.stderr
+        );
+        assert!(
+            sign.stderr.contains("blob.dat"),
+            "stderr must name the input, got: {}",
+            sign.stderr
+        );
+        let v = run_cli(&[OsStr::new("-V"), blob.as_os_str()], &[]);
+        assert_eq!(v.code, 2, "expected 2, stderr: {}", v.stderr);
+        assert!(
+            v.stderr.contains("unsupported input"),
+            "stderr must say unsupported input, got: {}",
+            v.stderr
+        );
+    }
+
+    #[test]
+    fn missing_input_sign_exits_one() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nope.ipa");
+        let r = run_cli(&[OsStr::new("-a"), missing.as_os_str()], &[]);
+        assert_eq!(r.code, 1, "expected 1, stderr: {}", r.stderr);
+        assert!(r.stderr.starts_with("error: "), "stderr: {}", r.stderr);
     }
 }
