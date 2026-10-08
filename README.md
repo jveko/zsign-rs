@@ -20,7 +20,7 @@ zsign-rs signs iOS application packages (IPA files) and Mach-O binaries on macOS
 - **Bundle Editing** — rewrite bundle id/name/version (`-b`/`-n`/`-r`), custom entitlements (`-e`, `--entitlements-dir`), profiles (`-m`, `--profile-map`, `-R`)
 - **Ad-hoc Signing & Dylib Injection** — `-a` signs without an identity; `-l`/`-w` inject dylib load commands
 - **Machine-Readable Output** — `--json` schema v1 (documented below)
-- **OCSP Revocation Warning** — `-C` warns on authenticated revocation, never gates; 3s budget, silent offline
+- **OCSP Revocation Gate** — `-C` aborts signing on authenticated revocation (exit 1 before anything is signed), runs check-only with no input (0/1/2); FAIL-OPEN while signing: offline, unreachable responder inside the 3s budget, or no responder URL signs as before (exit 0)
 - **macOS Keychain Identities** — `--keychain-identity` signs with identities from the macOS keychain
 - **Deterministic Output** — sorted zip entries, pinned timestamps, RFC 6979 ECDSA (documented below)
 - **WASM Support** — browser-based signing, including whole-IPA `sign_ipa` bytes-to-bytes
@@ -81,8 +81,12 @@ Apple frameworks and no OpenSSL are involved.
 - **Load-time credential policy** checks key type and strength (RSA ≥ 2048),
   codeSigning EKU + digitalSignature KU, `CA:FALSE` leaf rules, and validity windows —
   it never grants chain trust, which happens only at verify time.
-- **Revocation is a warning, never a gate** (`-C`, documented below), and CRL,
-  `https:` OCSP responders, stapling, and hard-fail modes are explicitly out of scope
+- **Revocation gates on `-C`** (documented below): an authenticated revocation
+  aborts signing with exit 1 before anything is signed; FAIL-OPEN while
+  signing (offline / unreachable responder within the 3s budget / no responder
+  URL signs as before, exit 0), and check-only mode (no input) exits 0/1/2.
+  CRL, `https:` OCSP responders, stapling, and any hard-fail mode beyond `-C`
+  are explicitly out of scope
   (`docs/superpowers/specs/2026-09-26-crypto-repro-credentials-design.md`).
 
 ## How iOS Code Signing Works
@@ -211,7 +215,7 @@ Complete surface of `zsign-cli` (from `zsign-cli --help`, captured 2026-09-27):
 |`-l, --dylibs`|path|Dylib to inject (repeatable): must exist and be Mach-O — rejected at parse time; copied to the app root and injected as `@executable_path/<name>`; root bundle directory only unless `-P`; a bare Mach-O input gets the path injected verbatim|
 |`-w, --weak`|—|Inject dylibs as `LC_LOAD_WEAK_DYLIB`|
 |`-P, --inject-extensions`|—|Also inject `-l` dylibs into top-level app extensions (`PlugIns/`, `Extensions/`): each extension executable references the single app-root copy via `@executable_path/../../<name>`; without this flag only the root bundle directory is injected|
-|`-C, --check-revocation`|—|OCSP revocation **warning** (semantics below); conflicts `-V`, `-a`|
+|`-C, --check-revocation`|—|OCSP revocation **gate** (semantics below): an authenticated revocation aborts signing with exit 1 before anything is signed; FAIL-OPEN while signing (offline / unreachable responder within the 3s budget / no responder URL signs as before, exit 0); without an input runs check-only (`zsign-cli -C -k dev.p12 -p 123`, never signs) exiting 0 good / 1 revoked-or-invalid-credentials / 2 status-undeterminable; conflicts `-V`, `-a`|
 |`-V, --verify`|—|Verify like `codesign --verify --deep --strict`; conflicts with every signing option (clap rejects each pairing at parse time)|
 |`--json`|—|Machine-readable JSON output (documented below); works in both signing and verify modes|
 |`-h, --help`|—|Print help (there is no `--version` flag)|
@@ -240,11 +244,11 @@ zsign-cli -V Test
 
 ### Exit status
 
-|Code|Signing|`--verify`|
-|---|---|---|
-|`0`|signed successfully|verification completed, input **valid**|
-|`1`|any signing or credential failure|verification completed, input **invalid** (issues printed)|
-|`2`|usage/parse errors (clap)|could not complete — unreadable/unsupported input, or a report with top-level errors (e.g. a slot that cannot be verified without bundle context); also usage/parse errors (clap)|
+|Code|Signing|`--verify`|Check-only (`-C`, no input)|
+|---|---|---|---|
+|`0`|signed successfully|verification completed, input **valid**|`revocation: good` (certificate usable)|
+|`1`|any signing or credential failure; an authenticated revocation aborts before anything is signed|verification completed, input **invalid** (issues printed)|revoked, or expired/invalid credentials refused at load|
+|`2`|usage/parse errors (clap); bare `-C` with no credential flags fails here|could not complete — unreadable/unsupported input, or a report with top-level errors (e.g. a slot that cannot be verified without bundle context); also usage/parse errors (clap)|status could not be determined (`revocation could not be checked: …`), or usage/parse errors (clap)|
 
 - With `--json`, failures are JSON objects on **stderr**
   (`{"status":"error","error":"…"}`); clap usage errors stay human-readable by design.
@@ -263,6 +267,7 @@ breaking change (source: `docs/superpowers/specs/2026-09-25-cli-surface-design.m
 
 - Sign: `{"status":"signed","output":"<path>"}`
 - Verify: `{"status":"valid"|"invalid"|"error","input":"<path as given>","report":{…}}`
+- Check-only success (stdout): `{"status":"checked","revocation":"good"}` (check-only failures reuse the error document on stderr)
 - Error (stderr): `{"status":"error","error":"<message>"}`
 - “Could not complete” emits both: the verify document on stdout with
   `"status":"error"` **and** the error object on stderr.
@@ -302,17 +307,34 @@ Resolution order for PKCS#12 material:
 
 ### Revocation checking (`-C/--check-revocation`)
 
-- **Warn-only, never a gate:** only an *authenticated* responder saying “revoked”
-  prints `warning: …` to stderr; signing always proceeds and exit codes never change.
-  Every other outcome — good, unreachable, offline, missing OCSP URL, budget expired —
-  stays silent.
+- **Gate during signing:** with `-C`, an *authenticated* responder saying
+  “revoked” aborts the run with exit 1 **before anything is signed** (the
+  error goes through `emit_error`, so `--json` yields the usual
+  `{"status":"error",…}` document on stderr).
+- **FAIL-OPEN while signing:** every other outcome — good, offline, responder
+  unreachable within the 3s budget, no responder URL on the certificate,
+  budget expired — leaves the run exactly as without `-C` (signing proceeds,
+  exit 0). Only a definitive revocation stops a signing run; expired or
+  otherwise invalid credentials still fail at load as they always do.
+- **Check-only (no input):** `-C` without an input never signs — the
+  certificate always comes from the credential flags (`-k`/`--pkcs12`/
+  `--keychain-identity`), so bare `zsign-cli -C` still fails with a
+  missing-credentials usage error (exit 2):
+  ```bash
+  zsign-cli -C -k dev.p12 -p 123   # no input: check the credentials, sign nothing
+  ```
+  |Status|Exit|Output|
+  |---|---|---|
+  |good|`0`|`revocation: good` on stdout (`{"status":"checked","revocation":"good"}` with `--json`)|
+  |revoked|`1`|`error: …revoked…` on stderr (the `--json` error document)|
+  |could not be determined|`2`|`revocation could not be checked: <reason>` on stderr (the `--json` error document)|
 - One bounded network request per run with a 3s budget covering connect/read/write
   (DNS runs on a short-lived native worker thread under the same budget); native
   targets only.
 - Known limits, recorded rather than papered over: plaintext `http:` OCSP proves the
   responder's key, not the channel; `https:` responder URLs are not fetched (reported
   as a distinct reason); no `nextUpdate` freshness ceiling when the responder omits it;
-  CRL, stapling, and hard-fail modes are out of scope
+  CRL, stapling, and any hard-fail mode beyond `-C` are out of scope
   (`docs/superpowers/specs/2026-09-26-crypto-repro-credentials-design.md`).
 - Conflicts `-V` and `-a`; ad-hoc signing runs no credential check at all.
 
@@ -386,7 +408,7 @@ elsewhere (contract: `docs/superpowers/specs/2026-09-25-cli-surface-design.md`):
 |`--pkcs12`|—|the PKCS#12 path flag, **long-only** (no `-p` short anymore)|
 |`-z/--zip-level`|0–9, default `0`, rejects out-of-range|0–9, **default `6`**, rejects out-of-range (never clamps)|
 |`-f/--force`|bypass the folder re-sign cache|override the FairPlay-encryption refusal (zsign-rs has no cache layer)|
-|`-C`|standalone certificate report whose exit codes scripts may depend on|**warning-only** OCSP probe while signing; never gates|
+|`-C`|standalone certificate report whose exit codes scripts may depend on (0 valid, 1 revoked, 2 expired, 255 error); during signing the result is discarded — upstream stays fail-open|this port gates **during signing** on an authenticated revocation (exit 1 before anything is signed) and adds a credentials-sourced check-only mode (0/1/2, no input); keyless artifact checking is not ported (certificate extraction lives in modules owned by another lane)|
 |exit codes|`0` / catch-all `255`|`0` / `1` / `2` contract above|
 |`-l`/`-P`|copies to the app root and injects `@executable_path/<name>`, extensions only with `-P`, silently skips a failed copy|matches the layout and scope, fails loudly instead of skipping, validates `-l` at parse time, and never injects XPC/Watch/AppClips (upstream does not either)|
 |input routing / default `-o`|sniffs the 2-byte `PK` marker and folders (no extension check); zip without `-o` errors, Mach-O signs in place|same content sniff (directory, `PK`, Mach-O magic incl. FAT) with an explicit unsupported-input error; default output preserves the extension (`in-signed.ipa`) instead of signing in place|
@@ -500,7 +522,7 @@ This project serves as a learning exercise for:
 | Certificate Handling | `zsign-core::crypto::cert` — PKCS#12, PEM, X.509 parsing |
 | WASM Bindings | `zsign-wasm` — Browser-compatible signing via `wasm-bindgen` |
 |CMS Verification|`zsign-core::crypto::cms_verify` — Apple-order checks + trust anchoring|
-|Revocation (OCSP)|`zsign-core::crypto::revocation` — warn-only probe, 3s budget|
+|Revocation (OCSP)|`zsign-core::crypto::revocation` — gated OCSP check (`status_of`) + `-C` check-only mode, 3s budget|
 |macOS Keychain|`zsign-core::crypto::keychain` — `security` shell-out + identity selector|
 |Full verification (`-V`)|`zsign::verify` — bundle/Mach-O/IPA report engine|
 
