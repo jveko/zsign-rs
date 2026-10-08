@@ -10,8 +10,9 @@ of collapsing them last-wins.
 
 **Architecture:** Both fixes live in one file,
 `crates/zsign-core/src/codesign/verify.rs`: a corrected sign seed in
-`der_integer`, a size-guard ceiling of 9 content octets, and an
-`insert`-return duplicate check in `decode_der_entries`. The writer
+`der_integer` and an `insert`-return duplicate check in
+`decode_der_entries`. The size guard `content.len() > 8` stays unchanged
+(audited: every canonical i64 INTEGER has ≤ 8 content octets). The writer
 (`der.rs`) is reference-only; tests round-trip through
 `plist_to_der` → `der_entitlements_to_plist`.
 
@@ -35,17 +36,18 @@ of collapsing them last-wins.
 - Duplicate-key rejection is parser-divergence hardening, never described as
   an X.690 conformance requirement (X.690 11.6 is ordering only; X.680 28.3
   NOTE 3 allows repeated SET OF elements — see spec).
-- The minimality check `prefix.len() - significant > 1` stays byte-for-byte
-  as-is (its laxness is another ticket's ownership); only the adjacent size
-  ceiling changes `8` → `9`.
+- The minimality check `prefix.len() - significant > 1` and the size guard
+  `content.len() > 8` both stay byte-for-byte as-is (their laxness/ceiling is
+  another ticket's ownership; the guard was audited correct for canonical i64
+  encodings).
 
 ## Review Focus
 
-- **9-octet inputs other than i64::MAX:** minimal positive `00 FF×8` must
-  decode to i64::MAX; minimal negative 9-octet encodings must still be
-  rejected by `i64::try_from` with the existing message — Task 1's table
-  covers i64::MAX; the oversized path is covered by the unchanged
-  `der_malformed_is_error` plus Task 1's run of the whole crate module.
+- **Already-green table entries:** i64::MAX (`02 08 7F FF×7`, 8 content
+  octets) and 0 must stay green through the fix while −1, −128, −129 (wrong
+  values), −2^31, and i64::MIN (`i64::try_from` rejection) are the red set
+  before it — Task 1's table pins both directions, and its Step 2 records
+  the actual red set the run prints.
 - **Seed double-count:** folding `prefix` (not `content`) after seeding from
   `first` must leave positives and zero bit-identical — Task 1's table keeps
   0 and uses only writer-produced inputs, so a double-counted first byte
@@ -97,7 +99,7 @@ fn der_integers_round_trip_signed_extremes() {
         let got = decoded
             .as_dictionary()
             .and_then(|dict| dict.get("v"))
-            .and_then(|v| v.as_integer());
+            .and_then(|v| v.as_signed_integer());
         assert_eq!(got, Some(value), "round trip of {value}");
     }
 }
@@ -106,18 +108,16 @@ fn der_integers_round_trip_signed_extremes() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test -p zsign-core der_integers_round_trip_signed_extremes`
-Expected: FAIL — either an assertion mismatch (−1, −128, −129, −2^31, i64::MIN
-decode wrong) or an `.unwrap()` panic on `Err("DER encoding error: non-minimal
-or oversized DER INTEGER")` for i64::MAX. Record which values failed and how.
+Expected: FAIL on the first red value — pre-fix, −1, −128, −129 decode to
+wrong values (assertion mismatch, `round trip of -1` etc.), and −2^31 plus
+i64::MIN are `Err("DER INTEGER does not fit i64")` (`.unwrap()` panic; for
+i64::MIN the i128 accumulator wraps to +2^63 — signed `<<` discards bits
+without panicking). i64::MAX and 0 pass pre-fix (stability pins). Record the
+red set the run prints.
 
 - [ ] **Step 3: Fix `der_integer` in `crates/zsign-core/src/codesign/verify.rs`**
 
-Replace the size guard `content.len() > 8` (in
-`if prefix.len() - significant > 1 || content.len() > 8`) with
-`content.len() > 9` — the widest canonical i64 INTEGER is 9 content octets;
-`i64::try_from` below still rejects out-of-range values.
-
-Replace the seed + loop:
+Replace the seed + loop (currently `verify.rs:1094-1101`):
 
 ```rust
 let mut value = if negative {
@@ -144,13 +144,15 @@ for &byte in prefix {
 ```
 
 Nothing else in the function changes: the `split_first`, the minimality
-pre-check expression (other than the literal `8` → `9`), and the
-`i64::try_from(...)` conversion stay byte-for-byte.
+pre-check with its `content.len() > 8` guard (audited correct — canonical i64
+encodings are ≤ 8 content octets), and the `i64::try_from(...)` conversion
+all stay byte-for-byte.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core der_integers_round_trip_signed_extremes`
-Expected: PASS — `7 passed` loop iterations inside 1 test.
+Expected: PASS — the whole table (7 values: 5 red values now correct, i64::MAX
+and 0 unchanged).
 
 - [ ] **Step 5: Run the whole zsign-core crate to catch regressions**
 
@@ -230,7 +232,7 @@ with:
 
 ```rust
 if dictionary
-    .insert(key, decode_der_value(value_tag, value_bytes, depth + 1)?)
+    .insert(key.clone(), decode_der_value(value_tag, value_bytes, depth + 1)?)
     .is_some()
 {
     return Err(der_error(format!(
@@ -238,6 +240,11 @@ if dictionary
     )));
 }
 ```
+
+(`Dictionary::insert` takes the `String` by value — plist 1.10.1
+`dictionary.rs:61-63` — so the key is cloned to remain available for the
+message; a bare `insert(key, …)` followed by `format!("…{key}")` would not
+compile.)
 
 No other line of the loop changes; the value decode still runs as the
 `insert` argument (nested duplicates error first — accepted, see spec D3).

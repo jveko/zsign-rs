@@ -18,9 +18,9 @@ Two independent defects in the DER entitlement reader, fixed in one bundle:
 ## Defect 1 — negative INTEGER sign extension (verified at d087c9d)
 
 - `der_integer` lives at `verify.rs:1081-1104`. The negative seed
-  `-1i128 << (8 * content.len())` (`verify.rs:1095`) already places the sign
-  correction at magnitude 2^(8·len), then the Horner loop
-  (`verify.rs:1098-1100`) shifts the accumulator left 8 bits once per content
+  `-1i128 << (8 * content.len())` (`verify.rs:1094-1098`) already places the
+  sign correction at magnitude 2^(8·len), then the Horner loop
+  (`verify.rs:1099-1101`) shifts the accumulator left 8 bits once per content
   byte. The result is N − 2^(16·len) instead of N − 2^(8·len).
 - Traced outcomes of today's code: content `[0x80]` → −65408 (correct −128);
   `[0xFF]` → −65281 (correct −1); `[0x80,0x00,0x00,0x00]` (−2^31) →
@@ -30,14 +30,18 @@ Two independent defects in the DER entitlement reader, fixed in one bundle:
   `crates/zsign-core/src/macho/verify.rs:261` on the
   CSSLOT_DER_ENTITLEMENTS payload.
 - The writer (`der.rs:211-262`) emits canonical minimal two's-complement and
-  pins four encodings at `der.rs:700-728`: −1 → `02 01 FF`, −128 → `02 01 80`,
-  −129 → `02 02 FF 7F`, i64::MIN → `02 08 80 00×7`, plus zero `02 01 00`
-  (`der.rs:722-728`); i64::MAX traces to `02 09 00 FF×8` (sign pad + 8
-  value octets). The reader must read every one of these.
-- Secondary defect the required round-trip table exposes: the size guard
-  `content.len() > 8` (`verify.rs:1092`) rejects i64::MAX outright — its
-  canonical content is 9 octets. The guard's ceiling, not the sign logic, is
-  what blocks that round-trip.
+  pins four encodings at `der.rs:700-728`: −1 → `02 01 FF`, −128 →
+  `02 01 80`, −129 → `02 02 FF 7F`, i64::MIN → `02 08 80 00×7`, plus zero
+  `02 01 00` (`der.rs:722-728`). Traced through the positive branch
+  (`der.rs:241-266`): i64::MAX has 63 significant bits → 8 octets and
+  `needs_sign_pad` false (its first byte is 0x7F), so it encodes as
+  `02 08 7F FF×7`. The reader must read every one of these.
+- Size-guard audit: `content.len() > 8` (`verify.rs:1092`) is correct as-is
+  and stays unchanged — every canonical i64 INTEGER has at most 8 content
+  octets (a positive first byte ≥ 0x80 would mean a value ≥ 2^63, outside i64,
+  so no positive encoding ever needs a sign pad; i64::MIN is 8 octets).
+  i64::MAX and 0 therefore round-trip before the fix; the required table
+  keeps them as stability pins that the fix changes nothing for them.
 
 ### External contract (verified: ITU-T X.690 02/2021, §8.3)
 
@@ -124,23 +128,23 @@ for &byte in prefix {
   `i64::try_from` final conversion (`verify.rs:1102`) stay as they are; both
   remain correct against the new accumulator.
 
-### D2 — raise the size guard from 8 to 9 content octets
+### D2 — size guard `content.len() > 8` stays unchanged (audited, not a defect)
 
-- `content.len() > 8` becomes `content.len() > 9`. i64's widest canonical
-  DER INTEGER is 9 octets (00 sign pad + 8 value octets); the mandated
-  round-trip table includes i64::MAX, which is impossible under a ceiling of
-  8. A minimal 10-octet encoding cannot fit i64, and `i64::try_from` still
-  rejects anything outside the range, so behavior for genuinely oversized
-  input is unchanged ("non-minimal or oversized DER INTEGER").
-- Rejected: keeping 8 — fails the required i64::MAX round-trip. Rejected:
-  dropping the guard — unbounded content would let the Horner fold leave the
-  i128 range.
+- An earlier draft of this design claimed the guard rejected i64::MAX and
+  proposed raising the ceiling to 9. Cold review disproved it: i64::MAX's
+  canonical content is 8 octets (`02 08 7F FF×7`, no sign pad possible for
+  positives), so it passes the guard today; every writer-produced i64 INTEGER
+  fits in ≤ 8 octets.
+- Decision: the guard keeps `> 8`. Raising it to 9 would admit non-minimal
+  9-octet inputs (widening the pre-existing minimality laxness) for no
+  benefit; dropping it would let the Horner fold leave the i128 range.
+  `i64::try_from` (`verify.rs:1102`) remains the final range check.
 
 ### D3 — duplicate detection via the `insert` return value
 
 ```rust
 if dictionary
-    .insert(key, decode_der_value(value_tag, value_bytes, depth + 1)?)
+    .insert(key.clone(), decode_der_value(value_tag, value_bytes, depth + 1)?)
     .is_some()
 {
     return Err(der_error(format!(
@@ -148,6 +152,11 @@ if dictionary
     )));
 }
 ```
+
+- `plist::Dictionary::insert` takes the `String` key by value (verified in
+  plist 1.10.1 `dictionary.rs:61-63`), so the key must be cloned into the
+  insert to stay available for the error message; formatting it after a bare
+  `insert(key, …)` would not compile (use of moved value).
 
 - Candidates considered:
   - **A (chosen):** check `insert`'s `Option` return — one pass, no double
@@ -172,10 +181,12 @@ if dictionary
    single-entry XML dict, encode with `crate::codesign::der::plist_to_der`
    (the writer), decode with `der_entitlements_to_plist`, and assert the
    decoded integer equals the input, with the value in the assertion message.
-   Fails before the fix for −1, −128, −129, −2^31, i64::MIN (wrong value or
-   rejection) and i64::MAX (size-guard rejection); 0 is the in-test control
-   that already passes. This is writer→reader, so the writer octets pinned at
-   `der.rs:700-728` and the reader are exercised end to end.
+   Pre-fix, −1/−128/−129 decode to wrong values and −2^31/i64::MIN are
+   rejected by `i64::try_from` (probed: the i128 accumulator wraps to +2^63
+   for i64::MIN — signed `<<` discards bits without panicking), so those five
+   are red; i64::MAX and 0 already pass and pin stability across the fix.
+   This is writer→reader, so the writer octets pinned at `der.rs:700-728` and
+   the reader are exercised end to end.
 2. **Duplicate-key regression** (new test `der_entries_reject_duplicate_keys`):
    hand-built two-entry SET — distinct keys parse (control asserting both
    keys present), then the same shape with the key repeated must be
@@ -188,11 +199,9 @@ if dictionary
 - **Minimality laxness (BER-lax family, other ticket):** the existing check
   `prefix.len() - significant > 1` accepts one extra leading 0x00
   (e.g. content `00 00 FF FF FF FF FF FF` decodes as 2^48−1 today). This is
-  pre-existing for ≤8-octet inputs and this work neither fixes nor deepens it
-  deliberately; raising the size ceiling to 9 extends the same pre-existing
-  window to 9-octet inputs (`00 00` + 7 octets, values ≤ 2^56−1). Recorded
-  here so the minimality ticket can pick it up; fixing it would put a second
-  convention beside §8.3.2 and is out of this queue item's ownership.
+  pre-existing for ≤8-octet inputs and this work neither fixes nor deepens
+  it — the size guard stays `> 8`, so 9-octet inputs remain rejected as they
+  are today. Recorded here so the minimality ticket can pick it up.
 - No changes to the writer (`der.rs`), to `macho/verify.rs`, to the facade or
   CLI, and no new DER tags, containers, or depth rules.
 - Rejecting duplicate keys does NOT implement any broader requirement-blob
