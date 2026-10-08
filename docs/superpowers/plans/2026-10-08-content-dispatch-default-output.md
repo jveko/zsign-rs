@@ -114,39 +114,47 @@ takes `&[&OsStr]`.
    (unsigned; adhoc-signable), plus a `data.bin` (2048 × 0xAB, same as the
    encrypted helper). Returns the bundle directory path.
 4. `default_output_preserves_extension_and_verifies`
-   - `make_signable_app(root, "App.app")` → `zsign_rs::create_ipa(app, root/"app.ipa", zsign_rs::CompressionLevel::DEFAULT)`;
-   - `run_cli(["-a", "app.ipa"])` → exit 0;
-   - assert `app-signed.ipa` EXISTS and `app.signed` does NOT (footer prints
-     the directory listing);
-   - `run_cli(["-V", "app-signed.ipa"])` → exit 0, stdout contains
-     `verified: yes`.
+   - `let app = make_signable_app(root, "App.app"); let ipa = root.join("app.ipa");`
+     then `zsign_rs::create_ipa(&app, &ipa, zsign_rs::CompressionLevel::DEFAULT).unwrap();`
+   - `run_cli(&[OsStr::new("-a"), ipa.as_os_str()], &[])` → exit 0
+     (absolute TempDir paths via `.as_os_str()`, the `&[…], &[]` two-argument
+     form of `run_cli` at :1099);
+   - assert `root.join("app-signed.ipa")` EXISTS and `root.join("app.signed")`
+     does NOT (footer prints the directory entries);
+   - `run_cli(&[OsStr::new("-V"), root.join("app-signed.ipa").as_os_str()], &[])`
+     → exit 0, stdout contains `verified: yes`.
    - RED today: the sign writes `app.signed`, so `app-signed.ipa` is missing.
 5. `zip_input_routes_to_archive`
-   - same IPA fixture bytes, written/copied as `bundle.zip`;
-   - `run_cli(["-a", "-o", "out.ipa", "bundle.zip"])` → exit 0, `out.ipa`
-     exists; `run_cli(["-V", "out.ipa"])` → exit 0.
+   - `let app = make_signable_app(root, "App.app"); let zip = root.join("bundle.zip");`
+     then `zsign_rs::create_ipa(&app, &zip, zsign_rs::CompressionLevel::DEFAULT).unwrap();`
+     (the fixture is a real zip regardless of its `.zip` name);
+   - `let out = root.join("out.ipa"); run_cli(&[OsStr::new("-a"), OsStr::new("-o"), out.as_os_str(), zip.as_os_str()], &[])`
+     → exit 0, `out` exists; `run_cli(&[OsStr::new("-V"), out.as_os_str()], &[])`
+     → exit 0.
    - RED today: extension `_` arm hits the Mach-O parser → exit 1.
 6. `directory_without_app_suffix_routes_to_bundle`
-   - `make_signable_app(root, "PlainBundle")` (no `.app` suffix);
-   - `run_cli(["-a", "PlainBundle"])` → exit 0 (in place: `PlainBundle`
-     still has `Info.plist`);
-   - `run_cli(["-V", "PlainBundle"])` → exit 0, stdout contains
-     `verified: yes`;
-   - second sign with `["-a", "-o", "repack.ipa", "PlainBundle"]` → exit 0
-     and `repack.ipa` exists (bundle arm still forwards `-o` to the facade).
+   - `let plain = make_signable_app(root, "PlainBundle");` (no `.app` suffix);
+   - `run_cli(&[OsStr::new("-a"), plain.as_os_str()], &[])` → exit 0 (in
+     place: `plain` still has `Info.plist`);
+   - `run_cli(&[OsStr::new("-V"), plain.as_os_str()], &[])` → exit 0, stdout
+     contains `verified: yes`;
+   - second sign: `let repack = root.join("repack.ipa"); run_cli(&[OsStr::new("-a"), OsStr::new("-o"), repack.as_os_str(), plain.as_os_str()], &[])`
+     → exit 0 and `repack` exists (bundle arm still forwards `-o` to the
+     facade).
    - RED today: extension `""` arm reads a directory → exit 1; `-V` routes to
      `verify_macho_file` → 2.
 7. `unknown_input_is_reported_clearly`
-   - file `blob.dat` = `b"neither a zip nor a mach-o"`;
-   - `run_cli(["-a", "blob.dat"])` → exit 1 and stderr contains
-     `unsupported input` AND `blob.dat`;
-   - `run_cli(["-V", "blob.dat"])` → exit 2 and stderr contains
-     `unsupported input`.
+   - `let blob = root.join("blob.dat"); std::fs::write(&blob, b"neither a zip nor a mach-o").unwrap();`
+   - `run_cli(&[OsStr::new("-a"), blob.as_os_str()], &[])` → exit 1 and
+     stderr contains `unsupported input` AND `blob.dat`;
+   - `run_cli(&[OsStr::new("-V"), blob.as_os_str()], &[])` → exit 2 and
+     stderr contains `unsupported input`.
    - RED today: both fail with the Mach-O parser's `Failed to parse` message,
      which contains neither phrase.
 8. `missing_input_sign_exits_one` (preservation guard — expected to PASS
    before AND after; it defends the refactor):
-   - `run_cli(["-a", "nope.ipa"])` → exit 1; stderr starts with `error: `.
+   - `run_cli(&[OsStr::new("-a"), root.join("nope.ipa").as_os_str()], &[])`
+     → exit 1; stderr starts with `error: `.
 
 - [ ] **Step 2: Run them, watch them fail**
 

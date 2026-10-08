@@ -20,7 +20,7 @@ constants: zero hits; the only content sniff in the file is PEM detection at
 1. **Mis-routed archives.** `zsign -o out.ipa app.zip` — the standard upstream
    invocation — falls into the `_` arm and hits the Mach-O parser
    (`ZSign::sign_macho` → `MachOFile::parse` at
-   `crates/zsign/src/builder.rs:442`, `Error::MachO "Failed to parse: …"`),
+   `crates/zsign/src/builder.rs:446`, `Error::MachO "Failed to parse: …"`),
    failing a perfectly valid input. Any archive or bundle whose name lacks the
    magic suffixes fails the same way.
 2. **Broken default output / verify round trip.** With no `-o`, both file arms
@@ -55,14 +55,23 @@ and top-level `report.errors` to 2 (`:385-388`). `-V` conflicts with `-o`
   `zsign_rs` (`ipa/archive.rs:212`, re-export `lib.rs:60`) and synthesizes
   `Payload/` itself — tests can build real IPA fixtures with no new
   dependencies. `zsign-cli` already depends on `zsign-rs` and on
-  `zsign-core` with `test-fixtures` (Cargo.toml:14-18).
+  `zsign-core` with the `test-fixtures` feature
+  (`crates/zsign-cli/Cargo.toml`, dev-dependencies; feature line :22).
 - No existing test pins the `set_extension("signed")` default (zero `.signed`
   literals in the tests module), and every existing `-V` test preserves its
   exit code under content routing: valid → 0, unsigned Mach-O → 1, missing /
-  garbage / script files → 2 (`main.rs:1141-1198`), signed-out-of-bundle → 2
-  (`:1207-1215`).
+  garbage / script files → 2 (`main.rs:1138-1198`), signed-out-of-bundle → 2
+  (`:1201-1215`).
 
 ## External contract (verified against real sources)
+
+*These sources are external and not vendored in this worktree; the citations
+below are transcriptions from this item's research pass (upstream at commit
+614caa8d; xnu/cctools headers; PKWARE APPNOTE 6.3.x) — the same way the
+README migration table already labels its upstream transcriptions. The
+in-repo facts this design actually gates on are `validate_ipa`'s 2-byte `PK`
+rule (`crates/zsign/src/ipa/extract.rs:918-922`) and the six-magic private
+helpers (`verify.rs:583-599`, `ipa/mod.rs:1852-1876`).*
 
 - **Upstream zsign dispatches on content, not extension** at commit 614caa8d:
   `src/zsign.cpp:364-366` — `bZipFile = ZFile::IsZipFile(path)`; if not zip
