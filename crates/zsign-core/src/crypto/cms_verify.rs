@@ -120,6 +120,10 @@ const OID_NAME_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 /// codeSigning EKU: `1.3.6.1.5.5.7.3.3`
 const OID_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+/// emailAddress attribute (PKCS#9): `1.2.840.113549.1.9.1`
+const OID_EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
+/// userId attribute (RFC 4519), accepted as an emailAddress equivalent: `0.9.2342.19200300.100.1.1`
+const OID_UID: ObjectIdentifier = ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.1");
 
 /// Maximum accepted nesting depth for BER constructed TLVs. Matches the
 /// DER parser's depth cap; real CMS structures nest well under this.
@@ -1426,25 +1430,71 @@ const MAX_NAME_COMPARISONS: usize = 4096;
 
 /// Evaluates `constraints` (one entry per CA above `cert`) against `cert`.
 ///
-/// Only the directoryName form is evaluated here; the remaining name forms
-/// follow later, with the per-form structure below left open for them.
-/// Returns the first rejection reason, if any.
+/// Checked names are the subject DN, every subjectAltName entry, and — when
+/// the certificate carries no subjectAltName extension — any emailAddress
+/// subject attribute as an rfc822Name instance. Excluded entries reject on
+/// any same-form match; permitted entries need at least one same-form match
+/// per CA that restricts the form. Returns the first rejection reason, if any.
 fn check_certificate_names(
     cert: &x509_cert::Certificate,
     is_final: bool,
     constraints: &[x509_cert::ext::pkix::constraints::NameConstraints],
     budget: &mut usize,
 ) -> Option<String> {
+    use x509_cert::ext::pkix::name::GeneralName;
     if !is_final && cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
         return None;
     }
-    // Evaluated names in directoryName form; later forms (subjectAltName,
-    // legacy-email) extend this list.
-    let mut names = Vec::new();
+    let san_bytes = ext_value(cert, OID_SUBJECT_ALT_NAME);
+    let has_san = san_bytes.is_some();
+    let san =
+        san_bytes.and_then(|bytes| x509_cert::ext::pkix::SubjectAltName::from_der(bytes).ok());
+    // Evaluated name instances per form; cross-form entries never compare.
+    let mut dir_names = Vec::new();
     if !cert.tbs_certificate.subject.0.is_empty() {
-        names.push(&cert.tbs_certificate.subject);
+        dir_names.push(&cert.tbs_certificate.subject);
     }
-    for name in names {
+    let mut dns_names = Vec::new();
+    let mut rfc822_names = Vec::new();
+    let mut uri_hosts: Vec<Option<String>> = Vec::new();
+    let mut ip_present = false;
+    let mut other_present = false;
+    let mut edi_present = false;
+    let mut rid_present = false;
+    if let Some(san) = san.as_ref() {
+        for entry in san.0.iter() {
+            match entry {
+                GeneralName::DirectoryName(name) => {
+                    if !name.0.is_empty() {
+                        dir_names.push(name);
+                    }
+                }
+                GeneralName::DnsName(name) => dns_names.push(name.as_str().to_lowercase()),
+                GeneralName::Rfc822Name(address) => {
+                    rfc822_names.push(address.as_str().to_lowercase())
+                }
+                GeneralName::UniformResourceIdentifier(uri) => {
+                    uri_hosts.push(uri_host(uri.as_str()))
+                }
+                GeneralName::IpAddress(_) => ip_present = true,
+                GeneralName::OtherName(_) => other_present = true,
+                GeneralName::EdiPartyName(_) => edi_present = true,
+                GeneralName::RegisteredId(_) => rid_present = true,
+            }
+        }
+    }
+    if !has_san {
+        for rdn in cert.tbs_certificate.subject.0.iter() {
+            for atv in rdn.0.iter() {
+                if atv.oid == OID_EMAIL_ADDRESS || atv.oid == OID_UID {
+                    if let Some(address) = attr_str(&atv.value) {
+                        rfc822_names.push(address.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    for name in dir_names {
         // Excluded beats permitted unconditionally, across every CA.
         for nc in constraints {
             for base in nc.excluded_subtrees.iter().flatten().filter_map(dir_base) {
@@ -1489,6 +1539,186 @@ fn check_certificate_names(
             }
         }
     }
+    if !dns_names.is_empty() {
+        for name in &dns_names {
+            for nc in constraints {
+                for base in nc
+                    .excluded_subtrees
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| dns_base(&s.base))
+                {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if dns_name_matches(base, name) {
+                        return Some(
+                            "subject or alternative name within excluded name constraints".into(),
+                        );
+                    }
+                }
+            }
+        }
+        for nc in constraints {
+            let permitted: Vec<_> = nc
+                .permitted_subtrees
+                .iter()
+                .flatten()
+                .filter_map(|s| dns_base(&s.base))
+                .collect();
+            if permitted.is_empty() {
+                continue;
+            }
+            let mut matched = false;
+            for name in &dns_names {
+                for base in &permitted {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if dns_name_matches(base, name) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
+            }
+            if !matched {
+                return Some(
+                    "subject or alternative name outside permitted name constraints".into(),
+                );
+            }
+        }
+    }
+    if !rfc822_names.is_empty() {
+        for address in &rfc822_names {
+            for nc in constraints {
+                for base in nc
+                    .excluded_subtrees
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| ia5_base(&s.base, NcForm::Rfc822))
+                {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if rfc822_name_matches(base, address) {
+                        return Some(
+                            "subject or alternative name within excluded name constraints".into(),
+                        );
+                    }
+                }
+            }
+        }
+        for nc in constraints {
+            let permitted: Vec<_> = nc
+                .permitted_subtrees
+                .iter()
+                .flatten()
+                .filter_map(|s| ia5_base(&s.base, NcForm::Rfc822))
+                .collect();
+            if permitted.is_empty() {
+                continue;
+            }
+            let mut matched = false;
+            'outer: for address in &rfc822_names {
+                for base in &permitted {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if rfc822_name_matches(base, address) {
+                        matched = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if !matched {
+                return Some(
+                    "subject or alternative name outside permitted name constraints".into(),
+                );
+            }
+        }
+    }
+    if uri_hosts.iter().any(Option::is_none)
+        && constraints
+            .iter()
+            .any(|nc| has_ia5_entries(nc, NcForm::Uri))
+    {
+        return Some("uri name constraint cannot be applied to a uri without a host".into());
+    }
+    let uri_names: Vec<&str> = uri_hosts.iter().filter_map(Option::as_deref).collect();
+    if !uri_names.is_empty() {
+        for host in &uri_names {
+            for nc in constraints {
+                for base in nc
+                    .excluded_subtrees
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| ia5_base(&s.base, NcForm::Uri))
+                {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if uri_name_matches(base, host) {
+                        return Some(
+                            "subject or alternative name within excluded name constraints".into(),
+                        );
+                    }
+                }
+            }
+        }
+        for nc in constraints {
+            let permitted: Vec<_> = nc
+                .permitted_subtrees
+                .iter()
+                .flatten()
+                .filter_map(|s| ia5_base(&s.base, NcForm::Uri))
+                .collect();
+            if permitted.is_empty() {
+                continue;
+            }
+            let mut matched = false;
+            'outer: for host in &uri_names {
+                for base in &permitted {
+                    *budget += 1;
+                    if *budget > MAX_NAME_COMPARISONS {
+                        return Some("name constraints comparison budget exceeded".into());
+                    }
+                    if uri_name_matches(base, host) {
+                        matched = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if !matched {
+                return Some(
+                    "subject or alternative name outside permitted name constraints".into(),
+                );
+            }
+        }
+    }
+    for (present, form) in [
+        (ip_present, "ip address"),
+        (other_present, "other name"),
+        (edi_present, "edi party name"),
+        (rid_present, "registered id"),
+    ] {
+        if present
+            && constraints
+                .iter()
+                .any(|nc| has_unsupported_entries(nc, form))
+        {
+            return Some(format!(
+                "unsupported name form under name constraints: {form}"
+            ));
+        }
+    }
     None
 }
 
@@ -1501,6 +1731,144 @@ fn dir_base(
         GeneralName::DirectoryName(base) => Some(base),
         _ => None,
     }
+}
+
+/// Name forms carried as IA5 strings: which variant `ia5_base` extracts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NcForm {
+    Rfc822,
+    Uri,
+}
+
+/// The dNSName base of a subtree, if it constrains that form.
+fn dns_base(base: &x509_cert::ext::pkix::name::GeneralName) -> Option<&str> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    match base {
+        GeneralName::DnsName(name) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// The IA5-string base of a subtree for the rfc822Name or URI form.
+fn ia5_base(base: &x509_cert::ext::pkix::name::GeneralName, form: NcForm) -> Option<&str> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    match (base, form) {
+        (GeneralName::Rfc822Name(name), NcForm::Rfc822) => Some(name.as_str()),
+        (GeneralName::UniformResourceIdentifier(uri), NcForm::Uri) => Some(uri.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether any CA restricts the given IA5-string form.
+fn has_ia5_entries(nc: &x509_cert::ext::pkix::constraints::NameConstraints, form: NcForm) -> bool {
+    nc.permitted_subtrees
+        .iter()
+        .flatten()
+        .chain(nc.excluded_subtrees.iter().flatten())
+        .any(|s| ia5_base(&s.base, form).is_some())
+}
+
+/// Whether any CA restricts the named unsupported form.
+fn has_unsupported_entries(
+    nc: &x509_cert::ext::pkix::constraints::NameConstraints,
+    form: &str,
+) -> bool {
+    use x509_cert::ext::pkix::name::GeneralName;
+    nc.permitted_subtrees
+        .iter()
+        .flatten()
+        .chain(nc.excluded_subtrees.iter().flatten())
+        .any(|s| match &s.base {
+            GeneralName::IpAddress(_) => form == "ip address",
+            GeneralName::OtherName(_) => form == "other name",
+            GeneralName::EdiPartyName(_) => form == "edi party name",
+            GeneralName::RegisteredId(_) => form == "registered id",
+            _ => false,
+        })
+}
+
+/// dNSName match: case-insensitive equality, or the name gains labels to the
+/// left of the constraint. A leading-period constraint only matches strict
+/// subdomains of its remainder.
+fn dns_name_matches(constraint: &str, name: &str) -> bool {
+    let constraint = constraint.to_lowercase();
+    let constraint = constraint.as_str();
+    if let Some(suffix) = constraint.strip_prefix('.') {
+        return is_strict_subdomain(name, suffix);
+    }
+    name == constraint || is_strict_subdomain(name, constraint)
+}
+
+/// rfc822Name match on the lowercased full address: `@` constrains the whole
+/// address, a leading period constrains strict subdomains of the remainder,
+/// and a plain host constrains the address domain exactly.
+fn rfc822_name_matches(constraint: &str, address: &str) -> bool {
+    let constraint = constraint.to_lowercase();
+    let constraint = constraint.as_str();
+    if constraint.contains('@') {
+        return address == constraint;
+    }
+    let domain = address.rsplit('@').next().unwrap_or(address);
+    if let Some(suffix) = constraint.strip_prefix('.') {
+        return is_strict_subdomain(domain, suffix);
+    }
+    domain == constraint
+}
+
+/// URI match on the lowercased host: plain constraints need host equality, a
+/// leading period needs a strict subdomain of the remainder.
+fn uri_name_matches(constraint: &str, host: &str) -> bool {
+    let constraint = constraint.to_lowercase();
+    let constraint = constraint.as_str();
+    if let Some(suffix) = constraint.strip_prefix('.') {
+        return is_strict_subdomain(host, suffix);
+    }
+    host == constraint
+}
+
+/// Strict subdomain: longer than the parent, dot-separated at the boundary.
+fn is_strict_subdomain(name: &str, parent: &str) -> bool {
+    !parent.is_empty()
+        && name.len() > parent.len()
+        && name.ends_with(parent)
+        && name.as_bytes()[name.len() - parent.len() - 1] == b'.'
+}
+
+/// Host component of a URI (`scheme://[userinfo@]host[:port]/...`), lowercased.
+/// Returns `None` when the authority has no host or names an IP address.
+fn uri_host(uri: &str) -> Option<String> {
+    let rest = uri.split_once("://")?.1;
+    let authority = rest
+        .split_terminator(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.split_once(']').map(|(addr, _)| addr))
+    {
+        if stripped.parse::<std::net::Ipv6Addr>().is_ok() {
+            return None;
+        }
+        return Some(stripped.to_lowercase());
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let host = match host.rsplit_once(':') {
+        Some((left, right)) if !right.is_empty() && right.chars().all(|c| c.is_ascii_digit()) => {
+            left
+        }
+        _ => host,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host.to_lowercase())
 }
 
 /// A directoryName constraint matches when its RDN sequence is a prefix of
@@ -3600,6 +3968,531 @@ mod tests {
                 .contains("outside permitted name constraints"),
             "self-issued final certificate must be evaluated, got {:?}",
             reason
+        );
+    }
+
+    #[test]
+    fn dns_subtree_constraint_accepts_subdomain_leaf() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign dns subtree root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DnsName(der::asn1::Ia5String::new("example.com").unwrap()),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign dns subtree leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![GeneralName::DnsName(
+                    der::asn1::Ia5String::new("api.dev.example.com").unwrap(),
+                )]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            out.ok,
+            "dns subtree constraint must accept a subdomain leaf: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.anchored,
+            "dns subtree constraint must stay anchored: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn dns_constraint_rejects_name_outside_subtree() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign dns reject root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DnsName(der::asn1::Ia5String::new("example.com").unwrap()),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign dns reject leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![GeneralName::DnsName(
+                    der::asn1::Ia5String::new("evil.example.org").unwrap(),
+                )]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "dns name outside the permitted subtree must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn constraint_form_without_instance_is_inert() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign inert form root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::DnsName(der::asn1::Ia5String::new("example.com").unwrap()),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign inert form leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            out.ok,
+            "constraint on a form with no instance must stay valid: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn uri_constraint_matches_host_and_subdomain_forms() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        fn uri_root(
+            cn: &str,
+            constraint: &str,
+        ) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>) {
+            let (_root_key, root, root_signing) = build_root_signed(cn, |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::UniformResourceIdentifier(
+                            der::asn1::Ia5String::new(constraint).unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+            let _ = _root_key;
+            (root, root_signing)
+        }
+        fn uri_leaf(
+            root: &x509_cert::Certificate,
+            root_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+        ) -> x509_cert::Certificate {
+            let (_, leaf) = build_leaf_signed(
+                "CN=zsign uri leaf",
+                &root.tbs_certificate.subject,
+                root_signing,
+                |b| {
+                    b.add_extension(&SubjectAltName(vec![
+                        GeneralName::UniformResourceIdentifier(
+                            der::asn1::Ia5String::new("https://build.example.com/x").unwrap(),
+                        ),
+                    ]))
+                    .unwrap();
+                },
+            );
+            leaf
+        }
+        let (period_root, period_signing) = uri_root("CN=zsign uri period root", ".example.com");
+        let out = chain_with(&period_root, &uri_leaf(&period_root, &period_signing));
+        assert!(
+            out.ok,
+            "period uri constraint must accept a subdomain host: reason={:?}",
+            out.reason
+        );
+        let (host_root, host_signing) = uri_root("CN=zsign uri host root", "build.example.com");
+        let out = chain_with(&host_root, &uri_leaf(&host_root, &host_signing));
+        assert!(
+            out.ok,
+            "plain uri constraint must accept an equal host: reason={:?}",
+            out.reason
+        );
+        let (plain_root, plain_signing) = uri_root("CN=zsign uri plain root", "example.com");
+        let out = chain_with(&plain_root, &uri_leaf(&plain_root, &plain_signing));
+        assert!(
+            !out.ok,
+            "plain uri constraint must reject a subdomain host: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn uri_without_host_under_constraint_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) = build_root_signed("CN=zsign uri no-host root", |b| {
+            b.add_extension(&NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::UniformResourceIdentifier(
+                        der::asn1::Ia5String::new("example.com").unwrap(),
+                    ),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            })
+            .unwrap();
+        });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign uri no-host leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![
+                    GeneralName::UniformResourceIdentifier(
+                        der::asn1::Ia5String::new("file:///tmp/x").unwrap(),
+                    ),
+                ]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "uri without a host under a uri constraint must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("uri name constraint"),
+            "expected uri-host rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn email_constraint_matches_san_address() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        fn email_root(
+            cn: &str,
+            constraint: &str,
+        ) -> (x509_cert::Certificate, rsa::pkcs1v15::SigningKey<Sha256>) {
+            let (_root_key, root, root_signing) = build_root_signed(cn, |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::Rfc822Name(
+                            der::asn1::Ia5String::new(constraint).unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+            let _ = _root_key;
+            (root, root_signing)
+        }
+        fn email_leaf(
+            root: &x509_cert::Certificate,
+            root_signing: &rsa::pkcs1v15::SigningKey<Sha256>,
+            address: &str,
+        ) -> x509_cert::Certificate {
+            let (_, leaf) = build_leaf_signed(
+                "CN=zsign email leaf",
+                &root.tbs_certificate.subject,
+                root_signing,
+                |b| {
+                    b.add_extension(&SubjectAltName(vec![GeneralName::Rfc822Name(
+                        der::asn1::Ia5String::new(address).unwrap(),
+                    )]))
+                    .unwrap();
+                },
+            );
+            leaf
+        }
+        let (host_root, host_signing) = email_root("CN=zsign email host root", "example.com");
+        let out = chain_with(
+            &host_root,
+            &email_leaf(&host_root, &host_signing, "dev@example.com"),
+        );
+        assert!(
+            out.ok,
+            "host email constraint must accept an address at that host: reason={:?}",
+            out.reason
+        );
+        let out = chain_with(
+            &host_root,
+            &email_leaf(&host_root, &host_signing, "dev@other.org"),
+        );
+        assert!(
+            !out.ok,
+            "host email constraint must reject a foreign domain: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        let out = chain_with(
+            &host_root,
+            &email_leaf(&host_root, &host_signing, "dev@mail.example.com"),
+        );
+        assert!(
+            !out.ok,
+            "host email constraint must reject a subdomain address: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        let (period_root, period_signing) =
+            email_root("CN=zsign email period root", ".example.com");
+        let out = chain_with(
+            &period_root,
+            &email_leaf(&period_root, &period_signing, "dev@mail.example.com"),
+        );
+        assert!(
+            out.ok,
+            "period email constraint must accept a subdomain address: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn legacy_email_dn_attribute_is_constrained_when_san_absent() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        let email_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
+        let uid_oid = ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.1");
+        let has_email_attr = |cert: &x509_cert::Certificate| {
+            cert.tbs_certificate
+                .subject
+                .0
+                .iter()
+                .flat_map(|rdn| rdn.0.iter())
+                .any(|atv| atv.oid == email_oid || atv.oid == uid_oid)
+        };
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign legacy email root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::Rfc822Name(
+                            der::asn1::Ia5String::new("example.com").unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+        let (_, good_leaf) = build_leaf_signed(
+            "CN=zsign legacy email leaf,emailAddress=dev@example.com",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        assert!(
+            has_email_attr(&good_leaf),
+            "fixture must carry a matched emailAddress attribute in the subject DN"
+        );
+        let out = chain_with(&root, &good_leaf);
+        assert!(
+            out.ok,
+            "legacy dn email at the constrained host must stay valid: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.anchored,
+            "legacy dn email at the constrained host must stay anchored: reason={:?}",
+            out.reason
+        );
+        let (_, bad_leaf) = build_leaf_signed(
+            "CN=zsign legacy email leaf,emailAddress=dev@other.org",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        assert!(
+            has_email_attr(&bad_leaf),
+            "fixture must carry a matched emailAddress attribute in the subject DN"
+        );
+        let out = chain_with(&root, &bad_leaf);
+        assert!(
+            !out.ok,
+            "legacy dn email outside the constrained host must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn unsupported_ip_constraint_with_instance_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign unsupported ip root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::IpAddress(
+                            der::asn1::OctetString::new(vec![127, 0, 0, 0, 255, 0, 0, 0]).unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign unsupported ip leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![GeneralName::IpAddress(
+                    der::asn1::OctetString::new(vec![127, 0, 0, 1]).unwrap(),
+                )]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "ip instance under an ip constraint must reject as unsupported: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported name form under name constraints: ip address"),
+            "expected unsupported-form rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+        let (_, clean_leaf) = build_leaf_signed(
+            "CN=zsign unsupported ip control leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |_| {},
+        );
+        let out = chain_with(&root, &clean_leaf);
+        assert!(
+            out.ok,
+            "ip constraint with no ip instance must stay valid: reason={:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn comparison_budget_exceeds_and_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign comparison budget root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(
+                        (0..5000)
+                            .map(|i| GeneralSubtree {
+                                base: GeneralName::DnsName(
+                                    der::asn1::Ia5String::new(&format!("host{i}.example")).unwrap(),
+                                ),
+                                minimum: 0,
+                                maximum: None,
+                            })
+                            .collect(),
+                    ),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign comparison budget leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![GeneralName::DnsName(
+                    der::asn1::Ia5String::new("nomatch.example").unwrap(),
+                )]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "exhausting the comparison budget must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("comparison budget exceeded"),
+            "expected budget rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
         );
     }
 
