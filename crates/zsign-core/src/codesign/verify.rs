@@ -387,24 +387,12 @@ fn parse_requirement_expr(bytes: &[u8], offset: &mut usize, depth: u32) -> Resul
         3 => Ok(Expr::AppleAnchor),
         6 => {
             let left = parse_requirement_expr(bytes, offset, depth + 1)?;
-            if matches!(left, Expr::Unsupported(_)) {
-                return Ok(left);
-            }
             let right = parse_requirement_expr(bytes, offset, depth + 1)?;
-            if matches!(right, Expr::Unsupported(_)) {
-                return Ok(right);
-            }
             Ok(Expr::And(Box::new(left), Box::new(right)))
         }
         7 => {
             let left = parse_requirement_expr(bytes, offset, depth + 1)?;
-            if matches!(left, Expr::Unsupported(_)) {
-                return Ok(left);
-            }
             let right = parse_requirement_expr(bytes, offset, depth + 1)?;
-            if matches!(right, Expr::Unsupported(_)) {
-                return Ok(right);
-            }
             Ok(Expr::Or(Box::new(left), Box::new(right)))
         }
         8 => Ok(Expr::CdHash(read_aligned_data(bytes, offset)?)),
@@ -1461,23 +1449,57 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_not_a_hard_error() {
-        // opCertField(11): a zero-flag opcode OUTSIDE the supported set. The whole DR
-        // becomes Unsupported (operands never inspected) - never a hard error, because
+        // opCertField(11): a zero-flag opcode OUTSIDE the supported set. On its own
+        // the whole DR is Unsupported - a warning, never a hard error, because
         // Apple's DRs carry cert-chain ops whose chain DER crypto/cms_verify.rs does
-        // not expose (out of scope).
-        let mut expr = 11u32.to_be_bytes().to_vec();
-        expr.extend_from_slice(&[0u8; 16]); // junk operands - must NOT be parsed
-        let blob = req_blob_with_dr(&expr);
-        let set = parse_requirements(&blob).unwrap();
-        let v = set
-            .designated()
-            .expect("dr present")
-            .evaluate(&RequirementContext {
-                identifier: Some("com.example"),
-                cdhashes: &[],
-                anchored: None,
-            });
-        assert!(matches!(v, RequirementVerdict::Unsupported(_)), "{v:?}");
+        // not expose (out of scope). Inside and/or the sibling operand must still
+        // be parsed and decide the verdict: a decisive false/true operand cannot be
+        // masked by the Unsupported leaf.
+        let ctx = RequirementContext {
+            identifier: Some("com.example"),
+            cdhashes: &[],
+            anchored: None,
+        };
+
+        // Alone: warning, not a hard error; an unknown opcode's operands are never
+        // consumed (the junk tail parses as nothing and does not error).
+        let mut alone = 11u32.to_be_bytes().to_vec(); // opCertField
+        alone.extend_from_slice(&[0u8; 16]); // junk operands - must NOT be parsed
+        let alone_set = parse_requirements(&req_blob_with_dr(&alone)).unwrap();
+        let alone_dr = alone_set.designated().expect("dr present");
+        let alone_v = alone_dr.evaluate(&ctx);
+        assert!(
+            matches!(alone_v, RequirementVerdict::Unsupported(_)),
+            "{alone_v:?}"
+        );
+
+        // and(opFalse, opCertField) -> Violated: the false operand decides.
+        let mut and_expr = 6u32.to_be_bytes().to_vec(); // opAnd
+        and_expr.extend_from_slice(&0u32.to_be_bytes()); // opFalse
+        and_expr.extend_from_slice(&11u32.to_be_bytes()); // opCertField (unsupported here)
+        and_expr.extend_from_slice(&[0u8; 16]); // junk operands - must NOT be parsed
+        let and_set = parse_requirements(&req_blob_with_dr(&and_expr)).unwrap();
+        let and_dr = and_set.designated().expect("dr present");
+        let and_v = and_dr.evaluate(&ctx);
+        assert_eq!(
+            and_v,
+            RequirementVerdict::Violated,
+            "false operand must decide, got {and_v:?}"
+        );
+
+        // or(opTrue, opCertField) -> Satisfied: the true operand decides.
+        let mut or_expr = 7u32.to_be_bytes().to_vec(); // opOr
+        or_expr.extend_from_slice(&1u32.to_be_bytes()); // opTrue
+        or_expr.extend_from_slice(&11u32.to_be_bytes()); // opCertField (unsupported here)
+        or_expr.extend_from_slice(&[0u8; 16]); // junk operands - must NOT be parsed
+        let or_set = parse_requirements(&req_blob_with_dr(&or_expr)).unwrap();
+        let or_dr = or_set.designated().expect("dr present");
+        let or_v = or_dr.evaluate(&ctx);
+        assert_eq!(
+            or_v,
+            RequirementVerdict::Satisfied,
+            "true operand must decide, got {or_v:?}"
+        );
     }
 
     #[test]
