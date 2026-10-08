@@ -18,14 +18,15 @@ Observed consequences of that `Ok` today:
   `Ok(MachOVerifyReport { fat: true, slices: [] })`. `is_valid()` is already
   `false` (verify.rs:78-80), but `error_count()` is 0 and the report is a
   success result.
-- Facade `verify_bundle` (crates/zsign/src/verify.rs:502-529) iterates
-  `report.slices`; an empty list means nothing is checked (vacuous pass).
-- WASM `parse_macho` (crates/zsign-wasm/src/lib.rs:528-532) returns
+- Facade `verify_bundle_dir` (crates/zsign/src/verify.rs:409; slice loop
+  at :503-504 inside the :494-538 region) iterates `report.slices`; an
+  empty list means nothing is checked (vacuous pass).
+- WASM `parse_macho` (crates/zsign-wasm/src/lib.rs:520-532) returns
   `MachOInfo { is_fat: true, slices_count: 0 }` with no error — the clearest
   consumer-visible symptom.
 - CLI dylib validation (crates/zsign-cli/src/main.rs:229) checks only parse
   success, so a magic-only FAT passes.
-- IPA executable probe (crates/zsign/src/ipa/mod.rs:1908-1911) reads
+- IPA executable probe (crates/zsign/src/ipa/mod.rs:1909-1914) reads
   `slices().first()` → `None`, silently treated as not-executable.
 
 The signing path is already guarded independently: `sign_all_slices_impl`
