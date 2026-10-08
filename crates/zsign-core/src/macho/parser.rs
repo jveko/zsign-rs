@@ -220,6 +220,9 @@ impl MachOFile {
                     slice.size = size;
                     slices.push(slice);
                 }
+                if slices.is_empty() {
+                    return Err(Error::MachO("Empty FAT binary".into()));
+                }
                 (true, slices)
             }
         };
