@@ -30,9 +30,9 @@
 //!
 //! The pure half of the module — request building, response parsing, status —
 //! compiles for every target including `wasm32`, and never opens a socket. The
-//! only function that does, [`warn_revocation`], and the [`HttpTransport`] it
-//! uses, are `cfg(not(target_arch = "wasm32"))`. `now` is taken as
-//! `Option<OffsetDateTime>` and resolved through
+//! only functions that do, [`warn_revocation`] and [`status_of`], and the
+//! [`HttpTransport`] they use, are `cfg(not(target_arch = "wasm32"))`. `now`
+//! is taken as `Option<OffsetDateTime>` and resolved through
 //! [`super::cms_verify::resolve_now`], which keeps the crate's existing
 //! fixed-clock wasm convention (`1_800_000_000`) in one place.
 
@@ -837,10 +837,11 @@ pub(crate) fn transport_reason(e: TransportError) -> NotCheckedReason {
 ///
 /// This function is network-free and compiles for every target, including
 /// `wasm32`: it performs no lookup of its own, only delegating to [`check`]
-/// through the [`OcspTransport`] it is handed. That is what keeps the wasm
-/// surface honest — the only function in this module that can open a socket is
-/// [`warn_revocation`], which is native-only, and it is this function's
-/// caller.
+/// through the [`OcspTransport`] it is handed, so it can only reach a socket
+/// through a caller-supplied transport. That is what keeps the wasm surface
+/// honest — the only functions in this module that can open a socket of their
+/// own are [`warn_revocation`] and [`status_of`], which are native-only, and
+/// the former is this function's caller.
 pub fn warning_of(
     leaf: &Certificate,
     chain: &[Certificate],
@@ -857,7 +858,8 @@ pub fn warning_of(
 /// revoked; every other outcome — no AIA URI, unreachable responder, refused
 /// request, unverifiable answer, expired answer — is silent, and the function
 /// cannot fail a signing run. It exists on native targets only, because it is
-/// the one place a lookup actually opens a socket.
+/// one of the two places a lookup actually opens a socket (the other is
+/// [`status_of`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn warn_revocation(leaf: &Certificate, chain: &[Certificate]) {
     if let Some(warning) = warning_of(leaf, chain, &HttpTransport::default(), None) {
