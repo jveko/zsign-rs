@@ -3069,13 +3069,16 @@ mod tests {
             "LC_CODE_SIGNATURE datasize must follow the embedded blob"
         );
         let sig_off = sl.code_sig_offset.expect("signature offset declared") as usize;
+        let image = m.slice_data(sl).expect("embedded slice must be in bounds");
         assert_eq!(
-            &m.slice_data(sl)[sig_off..sig_off + replacement.len()],
+            &image[sig_off..sig_off + replacement.len()],
             replacement.as_slice(),
             "the replacement superblob must be the bytes actually embedded"
         );
         assert_eq!(
-            m.slice_data(sl).len(),
+            m.slice_data(sl)
+                .expect("embedded slice must be in bounds")
+                .len(),
             sig_off + replacement.len(),
             "embedding must size the image to the replacement signature"
         );

@@ -256,7 +256,7 @@ pub fn sign_macho(
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
-    let slice_data = macho.slice_data(slice);
+    let slice_data = macho.slice_data(slice)?;
 
     let ctx = SigningContext::new(
         identifier,
@@ -309,7 +309,7 @@ pub fn sign_macho_adhoc(
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
-    let slice_data = macho.slice_data(slice);
+    let slice_data = macho.slice_data(slice)?;
     let ctx = SigningContext::new(
         identifier,
         None,
@@ -353,7 +353,7 @@ pub fn sign_macho_sha256_only(
     }
     reject_encrypted(macho, identifier, allow_encrypted)?;
     let slice = &macho.slices()[0];
-    let slice_data = macho.slice_data(slice);
+    let slice_data = macho.slice_data(slice)?;
     let ctx = SigningContext::new(
         identifier,
         Some(credentials),
@@ -455,7 +455,7 @@ fn sign_all_slices_impl(
         .par_iter()
         .enumerate()
         .map(|(index, slice)| -> Result<SignedSlice> {
-            let slice_data = macho.slice_data(slice);
+            let slice_data = macho.slice_data(slice)?;
 
             let mut signed = sign_slice_complete(
                 slice_data,
@@ -1390,7 +1390,13 @@ mod tests {
         assert!(macho.slices()[0].is_executable);
         assert_eq!(macho.slices()[0].text_segment_size, 0x1000);
         assert_eq!(macho.slices()[0].text_segment_base, 0x1_0000_0000);
-        assert_eq!(macho.code_bytes(&macho.slices()[0]).len(), 0x2000);
+        assert_eq!(
+            macho
+                .code_bytes(&macho.slices()[0])
+                .expect("code region is in bounds")
+                .len(),
+            0x2000
+        );
     }
 
     #[test]
@@ -1464,7 +1470,9 @@ mod tests {
         // The signed binary must still parse with the same code region.
         let signed_macho = MachOFile::parse(signed.clone()).unwrap();
         let slice = &signed_macho.slices()[0];
-        let code = signed_macho.code_bytes(slice);
+        let code = signed_macho
+            .code_bytes(slice)
+            .expect("code region is in bounds");
         assert_eq!(code.len(), 0x2000, "signing must not alter the code region");
 
         // Locate the embedded code signature through goblin.

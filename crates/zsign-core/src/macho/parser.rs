@@ -425,22 +425,54 @@ impl MachOFile {
     /// This is the portion of the binary that gets hashed during code signing.
     /// The returned bytes include the Mach-O header and load commands.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if `slice.offset + slice.code_length` overflows, or if
+    /// the resulting range exceeds the file.
+    ///
     /// See also: [`slice_data()`](Self::slice_data) for full slice including signature.
-    pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] {
-        let start = slice.offset;
-        let end = start + slice.code_length;
-        &self.data[start..end]
+    pub fn code_bytes(&self, slice: &ArchSlice) -> Result<&[u8]> {
+        let end = slice.offset.checked_add(slice.code_length).ok_or_else(|| {
+            Error::MachO(format!(
+                "slice offset {} + length {} overflows",
+                slice.offset, slice.code_length
+            ))
+        })?;
+        self.data.get(slice.offset..end).ok_or_else(|| {
+            Error::MachO(format!(
+                "slice range {}..{} exceeds file of {} bytes",
+                slice.offset,
+                end,
+                self.data.len()
+            ))
+        })
     }
 
     /// Returns the full slice data including any existing signature area.
     ///
     /// Use this when preparing a slice for re-signing.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if `slice.offset + slice.size` overflows, or if
+    /// the resulting range exceeds the file.
+    ///
     /// See also: [`code_bytes()`](Self::code_bytes) for code region only.
-    pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] {
-        let start = slice.offset;
-        let end = start + slice.size;
-        &self.data[start..end]
+    pub fn slice_data(&self, slice: &ArchSlice) -> Result<&[u8]> {
+        let end = slice.offset.checked_add(slice.size).ok_or_else(|| {
+            Error::MachO(format!(
+                "slice offset {} + length {} overflows",
+                slice.offset, slice.size
+            ))
+        })?;
+        self.data.get(slice.offset..end).ok_or_else(|| {
+            Error::MachO(format!(
+                "slice range {}..{} exceeds file of {} bytes",
+                slice.offset,
+                end,
+                self.data.len()
+            ))
+        })
     }
 }
 
@@ -734,6 +766,97 @@ mod tests {
             matches!(&res, Err(Error::MachO(m)) if m.contains("Empty FAT binary")),
             "zero-arch FAT must be rejected at parse, got {:?}",
             res.as_ref().err()
+        );
+    }
+    #[test]
+    fn test_forged_offset_beyond_file_is_rejected() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+            .expect("fixture must parse");
+        let mut forged = macho.slices()[0].clone();
+        forged.offset = macho.data().len() + 1;
+
+        let res = macho.slice_data(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("exceeds")),
+            "forged offset must be an error, got {:?}",
+            res.as_ref().err()
+        );
+        let res = macho.code_bytes(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("exceeds")),
+            "forged offset must be an error, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_slice_range_pasting_file_end_is_rejected() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+            .expect("fixture must parse");
+        // A range that fits a larger file but not this 0x2000-byte one — the
+        // cross-file aliased-slice case.
+        let mut forged = macho.slices()[0].clone();
+        forged.offset = 0x1800;
+        forged.size = 0x1000;
+        forged.code_length = 0x1000;
+
+        let res = macho.slice_data(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("exceeds")),
+            "range past the file end must be an error, got {:?}",
+            res.as_ref().err()
+        );
+        let res = macho.code_bytes(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("exceeds")),
+            "range past the file end must be an error, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_forged_slice_offset_length_overflow_is_rejected() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+            .expect("fixture must parse");
+        let mut forged = macho.slices()[0].clone();
+        forged.offset = usize::MAX - 3;
+        forged.size = 100;
+        forged.code_length = 100;
+
+        let res = macho.slice_data(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("overflows")),
+            "offset + length overflow must be an error, got {:?}",
+            res.as_ref().err()
+        );
+        let res = macho.code_bytes(&forged);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("overflows")),
+            "offset + length overflow must be an error, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_zero_length_range_at_file_end_is_valid() {
+        let macho = MachOFile::parse(crate::macho::fixtures::make_minimal_macho())
+            .expect("fixture must parse");
+        let mut at_end = macho.slices()[0].clone();
+        at_end.offset = macho.data().len();
+        at_end.size = 0;
+        at_end.code_length = 0;
+
+        assert_eq!(
+            macho
+                .slice_data(&at_end)
+                .expect("empty range at the end is in bounds"),
+            b""
+        );
+        assert_eq!(
+            macho
+                .code_bytes(&at_end)
+                .expect("empty range at the end is in bounds"),
+            b""
         );
     }
 }

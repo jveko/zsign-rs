@@ -53,10 +53,10 @@ impl MachOFile {
     pub fn slices(&self) -> &[ArchSlice] {
         self.inner.slices()
     }
-    pub fn code_bytes(&self, slice: &ArchSlice) -> &[u8] {
-        self.inner.code_bytes(slice)
+    pub fn code_bytes(&self, slice: &ArchSlice) -> Result<&[u8]> {
+        Ok(self.inner.code_bytes(slice)?)
     }
-    pub fn slice_data(&self, slice: &ArchSlice) -> &[u8] {
-        self.inner.slice_data(slice)
+    pub fn slice_data(&self, slice: &ArchSlice) -> Result<&[u8]> {
+        Ok(self.inner.slice_data(slice)?)
     }
 }
