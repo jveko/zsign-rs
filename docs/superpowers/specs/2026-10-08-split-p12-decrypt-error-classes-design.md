@@ -2,7 +2,7 @@
 
 ## Problem
 
-`P12Error::Decrypt` (`crates/zsign-core/src/crypto/pkcs12.rs:73-83`) is the catch-all for
+`P12Error::Decrypt` (`crates/zsign-core/src/crypto/pkcs12.rs:71-82`) is the catch-all for
 every failure of a password-derived decryption, and both flatten sites map it — together
 with `P12Error::Mac` — to `zsign_core::Error::InvalidPassword`
 (`pkcs12.rs:825`, `pkcs12.rs:842`; the variant is `crates/zsign-core/src/error.rs:19-20`).
@@ -31,7 +31,7 @@ Consumers were re-verified against current source and need **no change**: the CL
 retryability with the typed discriminant `matches!(&trial,
 Err(zsign_core::Error::InvalidPassword))` (`crates/zsign-cli/src/main.rs:1135`), and wasm
 maps the typed variant to `WasmErrorCode::InvalidPassword`
-(`crates/zsign-wasm/src/lib.rs:189`, exhaustive delegation at `:140-150`). Neither widens
+(`crates/zsign-wasm/src/lib.rs:189`, exhaustive delegation at `:140-151`). Neither widens
 on message text or parent variants, so any narrowing done inside `pkcs12.rs` propagates to
 both front-ends automatically.
 
@@ -54,8 +54,9 @@ map the classes:
 the cipher's display name instead, so it can construct the right variant per cause
 (cipher-key construction failure is also structural: the key length comes from algorithm
 parameters, not from the password). `aes_decrypt` (`pkcs12.rs:627-634`) keeps its exact
-signature — its `pub(crate)` consumer `encrypted_pem.rs` flattens the result with `.ok()`
-and is untouched.
+signature — its `pub(crate)` consumers flatten it: all four `encrypted_pem.rs` call sites
+use `.ok()`, and `pbes2_decrypt` propagates three `?` sites in this file, so the signature
+cannot change.
 
 `P12Error::Corrupt` joins `pem_load_error`'s `Der` arm and falls through `p12_load_error`'s
 existing catch-all, so both land in the established `Error::Certificate(String)` bucket —
@@ -82,7 +83,7 @@ Classification table (the whole behavioural contract):
 | Ok, not corroborated| `Ok`                  | `Mac` (password-transparent container: MAC is the only password signal) | `Ok` |
 | Structural (`Corrupt`) | `Corrupt`          | `Corrupt`                              | `Corrupt`                    |
 | Padding (`Decrypt`) | `Corrupt` (password proven by MAC) | `Mac` (both signals failed → credential verdict) | `Decrypt` → `InvalidPassword` |
-| Parse (`Der`)       | `Der` → `Certificate` | `Mac` (see decision D5)                | `Der` → `Certificate`        |
+| Parse (`Der`)       | `Der` → `Certificate` | `Mac` (see decision D4)                | `Der` → `Certificate`        |
 | Policy (`Unsupported`) | `Certificate`       | `Certificate`                          | `Certificate`                |
 
 Errors raised **before** the walk — the outer authSafe decryption at `pkcs12.rs:122` —

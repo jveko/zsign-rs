@@ -51,8 +51,9 @@ the plan argues from the spec; executors read both.
    short IV, cipher-rejected key length map to `P12Error::Corrupt` → `Error::Certificate`
    even when the MAC is absent or mismatched. Pinned by Task 1's misalignment test and
    the exhaustive `Match` arms (clippy catches a missed arm).
-4. **`aes_decrypt` keeps its exact signature** — `encrypted_pem.rs` flattens it with
-   `.ok()`; a signature change would force edits in a file this plan forbids touching.
+4. **`aes_decrypt` keeps its exact signature** — `encrypted_pem.rs` flattens all four of
+   its call sites with `.ok()` and `pbes2_decrypt` three with `?`; a signature change
+   would force edits in a file this plan forbids touching.
    Its existing tests must pass unmodified.
 5. **The MAC-damage cell is the whole point of Task 2**: one flipped digest byte with the
    correct password must yield `Error::Certificate`, never `InvalidPassword`. Pinned by
@@ -63,8 +64,8 @@ the plan argues from the spec; executors read both.
 ### Task 1: Split structural damage out of the decrypt error
 
 **Files:**
-- Modify: `crates/zsign-core/src/crypto/pkcs12.rs` — `P12Error` enum (`:72-83`),
-  `Display` (`:85-93`), `decrypt_with_algorithm` pbes1 call sites (`:429-461`),
+- Modify: `crates/zsign-core/src/crypto/pkcs12.rs` — `P12Error` enum (`:71-82`),
+  `Display` (`:84-93`), `decrypt_with_algorithm` pbes1 call sites (`:429-461`),
   `pbes1_decrypt` (`:474-489`), `aes_decrypt` (`:627-634`), `cbc_decrypt` (`:637-667`),
   `pem_load_error` (`:823-834`), `p12_load_error` docs (`:835-845`), inline tests.
 
@@ -88,7 +89,7 @@ the plan argues from the spec; executors read both.
 - [ ] **Step 1: Write the failing tests**
 
 Add to `crates/zsign-core/src/crypto/pkcs12.rs` inline tests (beside
-`p12_load_error_maps_password_classes_and_keeps_container_classes` `:1422`):
+`p12_load_error_maps_password_classes_and_keeps_container_classes` `:1423`):
 
 ```rust
 #[test]
@@ -176,7 +177,7 @@ cbc_decrypt(&cipher, iv, data).map_err(|failure| match failure {
 `P12Error::Corrupt(format!("{name} key length {key_len} rejected by the cipher"))`;
 the `cbc_decrypt` result maps exactly as `aes_decrypt` does but with `{name}` in the two
 structural messages and `P12Error::Decrypt(name.to_string())` for `Padding`. Update the
-four call sites (`:430`, `:440`, `:450`, `:460`) to pass the bare name string.
+four label arguments (`:430`, `:440`, `:450`, `:460`) to pass the bare name string.
 
 - [ ] **Step 6: Join `Corrupt` to `pem_load_error`'s `Der` arm**
 
@@ -296,7 +297,9 @@ Both call sites live in this file.
 Cut the `AuthenticatedSafe` parsing loop (`:131-143`, from `let mut contents =
 DerReader::new(&auth_contents);` through the `while` loop) into the helper, taking
 `corroborated: bool` and returning `Result<(P12Contents, bool)>` with the flag. The
-helper body is otherwise byte-identical; `collect_bags` is untouched.
+helper body is otherwise byte-identical except for one line: shadow the parameter with
+`let mut corroborated = corroborated;` at the top so the loop can pass
+`&mut corroborated` to `decrypt_content_info`. `collect_bags` is untouched.
 
 - [ ] **Step 5: Replace the early MAC return with the classification**
 
@@ -325,6 +328,7 @@ match walk_authenticated_safe(&auth_contents, password, corroborated) {
     Ok((_, true)) if mac_state == MacState::Mismatch => Err(P12Error::Corrupt(
         "MAC mismatch on contents that decrypted and parsed intact".into(),
     )),
+    Ok((_, false)) if mac_state == MacState::Mismatch => Err(P12Error::Mac),
     Ok((contents, _)) => Ok(contents),
     Err(e) => match e {
         P12Error::Decrypt(_) | P12Error::Der(_) if mac_state == MacState::Mismatch => {
