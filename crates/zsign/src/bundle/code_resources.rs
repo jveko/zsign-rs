@@ -31,8 +31,9 @@ use crate::{Error, Result};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-/// Hash of a symlink's raw target bytes, plus the lossy string form recorded
-/// in the plist.
+/// Hash of a symlink's raw target bytes, plus the exact UTF-8 form recorded
+/// in the plist (byte-identical to the target on disk; non-UTF-8 targets are
+/// rejected by the scan).
 type SymlinkHashes = ([u8; 20], [u8; 32], String);
 
 /// One `(PathBuf, StoreKind)` entry of a pre-collected walk.
@@ -297,13 +298,20 @@ impl<'a> CodeResourcesBuilder<'a> {
             .map(|s| s.to_string()))
     }
 
-    /// Hash a symlink by hashing its target path
+    /// Hash a symlink by hashing its raw target bytes; a target that is not
+    /// valid UTF-8 is rejected so the recorded string always equals the bytes
+    /// on disk.
     fn hash_symlink_entry(store: &dyn Store, path: &Path) -> Result<SymlinkHashes> {
         // `FsStore::read_link` serves the raw target bytes on unix and
         // reproduces this fn's non-unix rejection on other platforms.
         let target_bytes = store.read_link(path)?;
         let (sha1, sha256) = zsign_core::bundle::CodeResourcesBuilder::hash_data(&target_bytes);
-        let target_str = String::from_utf8_lossy(&target_bytes).to_string();
+        let target_str = String::from_utf8(target_bytes).map_err(|_| {
+            zsign_core::Error::Signing(format!(
+                "Symlink target is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
         Ok((sha1, sha256, target_str))
     }
 }
@@ -497,6 +505,87 @@ mod tests {
         assert!(
             plist_str.contains("<key>symlink</key>"),
             "Symlink entries should have symlink key in plist"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_rejects_non_utf8_symlink_target() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+
+        let link_path = bundle_path.join("LinkToFile.txt");
+        symlink(std::ffi::OsStr::from_bytes(b"real\xFFtarget"), &link_path).unwrap();
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        let res = builder.scan();
+        assert!(
+            matches!(&res, Err(Error::Core(zsign_core::Error::Signing(m)))
+                if m.contains("Symlink target is not valid UTF-8")),
+            "non-UTF-8 symlink target must fail the seal, got {:?}",
+            res.as_ref().err()
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_ignores_excluded_non_utf8_symlink_target() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+        let excluded_dir = bundle_path.join("Excluded");
+        fs::create_dir(&excluded_dir).unwrap();
+
+        symlink(
+            std::ffi::OsStr::from_bytes(b"real\xFFtarget"),
+            excluded_dir.join("Link.txt"),
+        )
+        .unwrap();
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        builder.exclude("Excluded/");
+        builder
+            .scan()
+            .expect("excluded entries are never sealed, so their targets are never validated");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_records_exact_utf8_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        const TARGET: &str = "dir/targ\u{00E9}\u{FFFD}\u{65E5}";
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+
+        symlink(TARGET, bundle_path.join("LinkUnicode.txt")).unwrap();
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        builder.scan().unwrap();
+        let plist_data = builder.build().unwrap();
+
+        let value: plist::Value = plist::from_bytes(&plist_data).unwrap();
+        let files2 = value
+            .as_dictionary()
+            .and_then(|d| d.get("files2"))
+            .and_then(|v| v.as_dictionary())
+            .expect("files2 dictionary");
+        let recorded = files2
+            .get("LinkUnicode.txt")
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("symlink"))
+            .and_then(|v| v.as_string());
+        assert_eq!(
+            recorded,
+            Some(TARGET),
+            "recorded symlink target must be byte-identical to the on-disk target"
         );
     }
 }
