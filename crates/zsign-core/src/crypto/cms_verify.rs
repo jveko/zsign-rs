@@ -1447,8 +1447,13 @@ fn check_certificate_names(
     }
     let san_bytes = ext_value(cert, OID_SUBJECT_ALT_NAME);
     let has_san = san_bytes.is_some();
-    let san =
-        san_bytes.and_then(|bytes| x509_cert::ext::pkix::SubjectAltName::from_der(bytes).ok());
+    let san = match san_bytes.map(x509_cert::ext::pkix::SubjectAltName::from_der) {
+        Some(Ok(san)) => Some(san),
+        Some(Err(_)) => {
+            return Some("subject alternative name extension is malformed".into());
+        }
+        None => None,
+    };
     // Evaluated name instances per form; cross-form entries never compare.
     let mut dir_names = Vec::new();
     if !cert.tbs_certificate.subject.0.is_empty() {
@@ -1570,8 +1575,8 @@ fn check_certificate_names(
             if permitted.is_empty() {
                 continue;
             }
-            let mut matched = false;
             for name in &dns_names {
+                let mut matched = false;
                 for base in &permitted {
                     *budget += 1;
                     if *budget > MAX_NAME_COMPARISONS {
@@ -1582,14 +1587,11 @@ fn check_certificate_names(
                         break;
                     }
                 }
-                if matched {
-                    break;
+                if !matched {
+                    return Some(
+                        "subject or alternative name outside permitted name constraints".into(),
+                    );
                 }
-            }
-            if !matched {
-                return Some(
-                    "subject or alternative name outside permitted name constraints".into(),
-                );
             }
         }
     }
@@ -1624,8 +1626,8 @@ fn check_certificate_names(
             if permitted.is_empty() {
                 continue;
             }
-            let mut matched = false;
-            'outer: for address in &rfc822_names {
+            for address in &rfc822_names {
+                let mut matched = false;
                 for base in &permitted {
                     *budget += 1;
                     if *budget > MAX_NAME_COMPARISONS {
@@ -1633,14 +1635,14 @@ fn check_certificate_names(
                     }
                     if rfc822_name_matches(base, address) {
                         matched = true;
-                        break 'outer;
+                        break;
                     }
                 }
-            }
-            if !matched {
-                return Some(
-                    "subject or alternative name outside permitted name constraints".into(),
-                );
+                if !matched {
+                    return Some(
+                        "subject or alternative name outside permitted name constraints".into(),
+                    );
+                }
             }
         }
     }
@@ -1683,8 +1685,8 @@ fn check_certificate_names(
             if permitted.is_empty() {
                 continue;
             }
-            let mut matched = false;
-            'outer: for host in &uri_names {
+            for host in &uri_names {
+                let mut matched = false;
                 for base in &permitted {
                     *budget += 1;
                     if *budget > MAX_NAME_COMPARISONS {
@@ -1692,14 +1694,14 @@ fn check_certificate_names(
                     }
                     if uri_name_matches(base, host) {
                         matched = true;
-                        break 'outer;
+                        break;
                     }
                 }
-            }
-            if !matched {
-                return Some(
-                    "subject or alternative name outside permitted name constraints".into(),
-                );
+                if !matched {
+                    return Some(
+                        "subject or alternative name outside permitted name constraints".into(),
+                    );
+                }
             }
         }
     }
@@ -3955,10 +3957,11 @@ mod tests {
             excluded_subtrees: None,
         };
         let mut budget = 0usize;
+        let skipped =
+            check_certificate_names(&subca, false, std::slice::from_ref(&nc), &mut budget);
         assert!(
-            check_certificate_names(&subca, false, std::slice::from_ref(&nc), &mut budget)
-                .is_none(),
-            "self-issued non-final certificate must skip name constraints"
+            skipped.is_none(),
+            "self-issued non-final certificate must skip name constraints, got {skipped:?}"
         );
         let reason = check_certificate_names(&subca, true, &[nc], &mut budget);
         assert!(
@@ -4050,6 +4053,156 @@ mod tests {
                 .unwrap_or_default()
                 .contains("outside permitted name constraints"),
             "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+    #[test]
+    fn malformed_subject_alt_name_rejects_under_constraints() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign malformed san root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: None,
+                    excluded_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::DnsName(
+                            der::asn1::Ia5String::new("evil.example.com").unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                })
+                .unwrap();
+            });
+        let (_, mut leaf) = build_leaf_signed(
+            "CN=zsign malformed san leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![GeneralName::DnsName(
+                    der::asn1::Ia5String::new("good.example.com").unwrap(),
+                )]))
+                .unwrap();
+            },
+        );
+        // Garbage bytes are not a valid GeneralNames SEQUENCE, so the SAN
+        // decode fails. The mutation breaks the leaf signature, but the
+        // parent-arm name check runs before any child-signature check.
+        replace_extension(
+            &mut leaf,
+            OID_SUBJECT_ALT_NAME,
+            &der::asn1::OctetString::new(vec![0xde, 0xad, 0xbe, 0xef]).unwrap(),
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "malformed SAN under name constraints must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("subject alternative name extension is malformed"),
+            "expected malformed-SAN rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn each_dns_name_must_be_within_permitted_subtrees() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign dns per-name root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::DnsName(
+                            der::asn1::Ia5String::new("example.com").unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                })
+                .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign dns per-name leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![
+                    GeneralName::DnsName(der::asn1::Ia5String::new("good.example.com").unwrap()),
+                    GeneralName::DnsName(der::asn1::Ia5String::new("evil.com").unwrap()),
+                ]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "every DNS name must sit within permitted subtrees: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside permitted name constraints"),
+            "expected permitted-subtree rejection, got ok={} reason={:?}",
+            out.ok,
+            out.reason
+        );
+    }
+
+    #[test]
+    fn any_dns_name_within_excluded_subtrees_rejects() {
+        use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::SubjectAltName;
+        let (_root_key, root, root_signing) =
+            build_root_signed("CN=zsign dns excluded root", |b| {
+                b.add_extension(&NameConstraints {
+                    permitted_subtrees: None,
+                    excluded_subtrees: Some(vec![GeneralSubtree {
+                        base: GeneralName::DnsName(
+                            der::asn1::Ia5String::new("blocked.example.com").unwrap(),
+                        ),
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                })
+                .unwrap();
+            });
+        let (_, leaf) = build_leaf_signed(
+            "CN=zsign dns excluded leaf",
+            &root.tbs_certificate.subject,
+            &root_signing,
+            |b| {
+                b.add_extension(&SubjectAltName(vec![
+                    GeneralName::DnsName(der::asn1::Ia5String::new("good.example.com").unwrap()),
+                    GeneralName::DnsName(der::asn1::Ia5String::new("blocked.example.com").unwrap()),
+                ]))
+                .unwrap();
+            },
+        );
+        let out = chain_with(&root, &leaf);
+        assert!(
+            !out.ok,
+            "any DNS name inside an excluded subtree must reject: reason={:?}",
+            out.reason
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("within excluded name constraints"),
+            "expected excluded-subtree rejection, got ok={} reason={:?}",
             out.ok,
             out.reason
         );

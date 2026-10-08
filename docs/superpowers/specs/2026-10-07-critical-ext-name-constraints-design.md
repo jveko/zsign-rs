@@ -206,8 +206,15 @@ Per name-form semantics:
   is present").
 
 Semantics guards: excluded beats permitted unconditionally; permitted is
-"at least one same-form entry exists ⇒ at least one must match"; entries of
-other forms neither help nor hurt.
+evaluated **per name instance** — every name of a constrained form present in
+an evaluated certificate must lie within at least one same-form permitted
+basis (RFC 5280 §6.1.3(b): "verify that EACH of the alternative names ...
+is within one of the permitted_subtrees"), while one name matching an
+excluded basis rejects the certificate; entries of other forms neither help
+nor hurt. A subjectAltName extension that fails to decode while any CA in
+the path imposes constraints rejects with `subject alternative name extension
+is malformed` (a decoded-absent SAN must not silently drop instances —
+that would be the exact evasion this design closes).
 
 **Comparison budget:** a saturating counter caps total
 (name × subtree) comparisons (`MAX_NAME_COMPARISONS`); exceeding it returns a
@@ -241,7 +248,13 @@ untouched; no `CmsVerifyReport` change.
   (`caseIgnoreMatch` + insignificant-space handling) is implemented; a
   documented deviation, acceptable because name constraints in code-signing
   chains are absent in practice and the comparison errs toward the encoded
-  identity being matched, not looser trust.
+  identity being matched, not looser trust. BMPString/UniversalString DN
+  values fall back to exact tag+bytes comparison instead of normalization
+  (defense-in-depth residual: constraint base and subject encodings are
+  CA-consistent in practice; a mismatch fails closed on permitted subtrees).
+- **`uri_host` keeps a trailing-colon empty port** (`host:`) — treated as a
+  distinct host; fail-closed for permitted constraints (never matches an
+  equality basis) on malformed input.
 
 ## Residual risks / out of scope
 
