@@ -33,7 +33,7 @@
 ### Task 1: Exponent cap + input offset cross-check (TDD)
 
 **Files:**
-- Modify: `crates/zsign-core/src/macho/writer.rs` (fn `embed_fat_from_signed_slices`, loop at :498-518; tests appended in inline test mod after :2757)
+- Modify: `crates/zsign-core/src/macho/writer.rs` (fn `embed_fat_from_signed_slices`, loop at :498-518; tests appended at the end of the FAT region, after :2869 — not mid-suite)
 - Test: same file, inline `#[cfg(test)]` tests
 
 **Interfaces:**
@@ -49,31 +49,29 @@
   In the loop at writer.rs:499, replace `if arch.align >= 32` with `if arch.align > 15`, message: `"FAT arch align exponent {} exceeds the maximum supported exponent 15"`. Keep the rest of the chain untouched.
 - [ ] **Step 4: Implement the offset cross-check**
   Immediately after the cap, reject `arch.offset as usize % (1usize << arch.align) != 0` with `"FAT slice {i}: offset {} is not aligned to 2^{}"`.
-  Add failing-before test `test_embed_fat_rejects_unaligned_input_offset`: patch a well-formed fixture arch's offset field (`8 + i*20 + 8`, big-endian) to a non-multiple of `2^align` (e.g. offset+1), call `embed_signature_fat` → `Err` containing `"not aligned"`.
+  Add failing-before test `test_embed_fat_rejects_unaligned_input_offset`: patch a well-formed fixture arch's offset field (`8 + i*20 + 8`, big-endian) to a non-multiple of `2^align` (e.g. offset+1), **and update the corresponding `SignedSlice`'s `offset` (and any other identity fields) to match the patched arch** so the identity check at writer.rs:469 passes and the new alignment check is what fires — keep the patched range inside the file and disjoint so `validate_fat_arches` (:413-438, runs before the loop) does not fire first. Expect `Err` containing `"not aligned"`. Guard order: the exponent cap check must run before the cross-check inside the loop.
 - [ ] **Step 5: Run tests**
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core writer` → all FAT tests green.
 
 ### Task 2: total_size guard vs input_len (TDD)
 
 **Files:**
-- Modify: `crates/zsign-core/src/macho/writer.rs` (fn signature + 3 call sites :357, :404, :1004; guard before :521; tests)
+- Modify: `crates/zsign-core/src/macho/writer.rs` (fn signature + 3 call sites :357, :404, :1004; guard before :521; tests appended at the end of the FAT region, after :2869 — not mid-suite)
 
 **Interfaces:**
 - Consumes: Task 1 guards.
 - Produces: `embed_fat_from_signed_slices(fat: &MultiArch, signed_slices: &[SignedSlice], input_len: usize)`.
 
-- [ ] **Step 1: Write failing test**
-  `test_embed_fat_output_bounded_by_input`: for a successful reassembly (align 15/12 fixture), assert `output.len() <= input_len + signed_total + arches * (1 << 15)` — pins the invariant the guard enforces. Plus a direct trip test only if constructible without contrivance (see spec §Testing).
-- [ ] **Step 2: Run, expect failure**
-  The invariant assertion is observationally true pre-guard (it bounds a successful output); the guard-trip case is the real failing-before signal. Run `cargo test -p zsign-core embed_fat_output_bounded` to record state.
-- [ ] **Step 3: Thread `input_len`**
+- [ ] **Step 1: Write the invariant-pin test**
+  `test_embed_fat_output_bounded_by_input`: for a successful reassembly (align 15/12 fixture), assert `output.len() <= input_len + signed_total + arches * (1 << 15)` — pins the invariant the guard enforces. This is an **invariant-pin**: it passes before and after the guard (it constrains a successful output, which already satisfies the bound under guards 1+2 — no constructible input trips guard 3 once the cap and cross-check are in place, by design). The failing-before/passing-after coverage for this item is the cap and cross-check tests of Task 1.
+- [ ] **Step 2: Thread `input_len`**
   Add `input_len: usize` parameter; update all three call sites with `data.len()` (`embed_signature` :357, `embed_signature_fat` :404, `inject_dylib_command` :1004). Grep for any other caller before finishing (`embed_fat_from_signed_slices` must have zero remaining 2-arg call sites).
-- [ ] **Step 4: Implement the guard**
+- [ ] **Step 3: Implement the guard**
   After the cursor loop (`let total_size = cursor;` :520) and BEFORE `vec![0u8; total_size]` (:521):
   compute `signed_total = slice_data_vec.iter().map(|s| s.len()).sum::<usize>()`;
   `let max_total = input_len.checked_add(signed_total).and_then(|v| v.checked_add(arches.len().checked_mul(1 << 15)?)).ok_or_else(|| Error::MachO("FAT output size bound overflows".into()))?;`
   `if total_size > max_total { return Err(Error::MachO(format!("FAT output size {total_size} exceeds bound {max_total} for input of {input_len} bytes"))); }`
-- [ ] **Step 5: Run scoped gate**
+- [ ] **Step 4: Run scoped gate**
   `TMPDIR=$PWD/target/tmp cargo test -p zsign-core` then `cargo fmt --all -- --check` && `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Task 3: Full gate + commit (controller-owned)

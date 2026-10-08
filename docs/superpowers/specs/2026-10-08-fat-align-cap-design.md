@@ -23,7 +23,7 @@ Scope: `crates/zsign-core/src/macho/writer.rs` only.
 
 Verified arithmetic: one arch with `align = 31` and a signed slice of length L
 yields `total_size = 2^31 + L`; for the 12,288-byte reference container
-(L = 28,672) that is a 2,147,512,320-byte allocation ≈ 174,768× amplification.
+(L = 28,672) that is a 2,147,512,320-byte allocation ≈ 174,765× amplification.
 Reachable from four public families: `embed_signature_fat` /
 `embed_signature` (re-exported by `zsign_core::macho` and `zsign_rs::macho`),
 `sign_any_macho` / `sign_macho_adhoc` / `sign_macho_sha256_only` (also via IPA,
@@ -104,8 +104,8 @@ container identity the identity checks deliberately preserve.
 
 ## Testing strategy
 
-TDD; tests live in writer.rs's inline test mod (FAT tests are at
-writer.rs:2504-2757). Reuse `fixtures::make_fat_macho(slices, aligns)`
+TDD; tests live in writer.rs's inline test mod (the FAT/reassembly suite runs
+writer.rs:2504-2869). Reuse `fixtures::make_fat_macho(slices, aligns)`
 (fixtures.rs:663-697) and the established hostile-field idiom of patching the
 arch table bytes at `8 + i*20` (idiom at writer.rs:2707-2712). Assertion style
 matches the surrounding FAT tests (`expect_err(...)` + `contains(...)`, with
@@ -127,4 +127,6 @@ the `matches!` + `res.as_ref().err()` footer where the surrounding test uses it)
 - `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `TMPDIR=$PWD/target/tmp cargo test --workspace` green.
 - New failing-before/passing-after tests for the cap and cross-check.
-- Existing FAT tests (writer.rs:2504-2843) unchanged and green.
+- Existing FAT tests (writer.rs:2504-2869, including the
+  `inject_dylib_command` FAT reassembly tests that exercise call site :1004)
+  unchanged and green.
