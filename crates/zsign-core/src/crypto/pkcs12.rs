@@ -73,7 +73,7 @@ mod oid {
 pub(crate) enum P12Error {
     /// Malformed ASN.1/DER structure.
     Der(String),
-    /// MAC verification failed: wrong password or corrupted file.
+    /// The MAC failed and this password could not read the contents — a passphrase outcome.
     Mac,
     /// A password-derived key could not decrypt a layer.
     Decrypt(String),
@@ -104,6 +104,16 @@ pub(crate) struct P12Contents {
     pub certs: Vec<Vec<u8>>,
 }
 
+/// MAC verdict for one `extract_p12` run: `Verified` (macData present, HMAC
+/// ok), `Mismatch` (present, bad), or `Absent` (macData is optional per RFC
+/// 7292 Appendix D). Weighed against the content walk below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacState {
+    Verified,
+    Mismatch,
+    Absent,
+}
+
 /// Extract private keys and certificates from a `.p12` / `.pfx` file.
 ///
 /// The password is used only during parsing and is not retained.
@@ -122,18 +132,57 @@ pub(crate) fn extract_p12(data: &[u8], password: &str) -> Result<P12Contents> {
         None
     };
 
-    let auth_contents = decrypt_content_info(auth_safe, password)?;
+    let mut corroborated = false;
+    let auth_contents = decrypt_content_info(auth_safe, password, &mut corroborated)?;
 
-    if let Some(mac) = &mac_data {
-        if !verify_mac(mac, &auth_contents, password)? {
-            return Err(P12Error::Mac);
+    // The MAC verdict alone cannot separate a mistyped password from a damaged
+    // container (RFC 7292 derives the MAC key from the password), so decide
+    // together with what this password could actually read: the spec's rule
+    // table lives above this function.
+    let mac_state = match &mac_data {
+        Some(mac) => {
+            if verify_mac(mac, &auth_contents, password)? {
+                MacState::Verified
+            } else {
+                MacState::Mismatch
+            }
         }
-    }
+        None => MacState::Absent,
+    };
 
+    match walk_authenticated_safe(&auth_contents, password, corroborated) {
+        Ok((_, true)) if mac_state == MacState::Mismatch => Err(P12Error::Corrupt(
+            "MAC mismatch on contents that decrypted and parsed intact".into(),
+        )),
+        Ok((_, false)) if mac_state == MacState::Mismatch => Err(P12Error::Mac),
+        Ok((contents, _)) => Ok(contents),
+        Err(e) => match e {
+            P12Error::Decrypt(_) | P12Error::Der(_) if mac_state == MacState::Mismatch => {
+                Err(P12Error::Mac)
+            }
+            P12Error::Decrypt(_) if mac_state == MacState::Verified => Err(P12Error::Corrupt(
+                "decryption failed after the MAC verified".into(),
+            )),
+            other => Err(other),
+        },
+    }
+}
+
+/// Walks the decrypted AuthenticatedSafe, collecting keys and certs.
+///
+/// Returns the collected contents plus whether any `encryptedData` layer
+/// decrypted under the supplied password (password corroboration for the
+/// MAC classification in [`extract_p12`]).
+fn walk_authenticated_safe(
+    auth_contents: &[u8],
+    password: &str,
+    corroborated: bool,
+) -> Result<(P12Contents, bool)> {
+    let mut corroborated = corroborated;
     // auth_contents is the AuthenticatedSafe: SEQUENCE OF ContentInfo.
     // Each ContentInfo's content holds a SafeContents (SEQUENCE OF SafeBag),
     // either plain or inside an encryptedData layer.
-    let mut contents = DerReader::new(&auth_contents);
+    let mut contents = DerReader::new(auth_contents);
     let ci_list = contents.read_sequence()?;
 
     let mut keys = Vec::new();
@@ -141,11 +190,11 @@ pub(crate) fn extract_p12(data: &[u8], password: &str) -> Result<P12Contents> {
     let mut ci_reader = DerReader::new(ci_list);
     while ci_reader.remaining() > 0 {
         let ci = ci_reader.read_sequence()?;
-        let safe_contents = decrypt_content_info(ci, password)?;
+        let safe_contents = decrypt_content_info(ci, password, &mut corroborated)?;
         collect_bags(&safe_contents, password, 0, &mut keys, &mut certs)?;
     }
 
-    Ok(P12Contents { keys, certs })
+    Ok((P12Contents { keys, certs }, corroborated))
 }
 
 /// Minimum and maximum PBKDF iteration counts accepted from untrusted input.
@@ -323,14 +372,16 @@ impl<'a> ContentInfo<'a> {
 /// `data` ContentInfos carry an OCTET STRING payload; `encryptedData`
 /// content infos carry an EncryptedData structure that is decrypted with
 /// the password-derived key.
-fn decrypt_content_info(ci_der: &[u8], password: &str) -> Result<Vec<u8>> {
+fn decrypt_content_info(ci_der: &[u8], password: &str, corroborated: &mut bool) -> Result<Vec<u8>> {
     let ci = ContentInfo::parse(ci_der)?;
     if ci.oid == oid::DATA {
         let octets = DerReader::new(ci.inner).read_octet_string()?;
         return Ok(octets.to_vec());
     }
     if ci.oid == oid::ENCRYPTED_DATA {
-        return decrypt_encrypted_data(ci.inner, password);
+        let plain = decrypt_encrypted_data(ci.inner, password)?;
+        *corroborated = true;
+        return Ok(plain);
     }
     Err(P12Error::Unsupported(format!(
         "content type {ci_oid}",
@@ -1510,6 +1561,56 @@ mod tests {
         assert!(
             matches!(&res, Error::Certificate(m) if m.contains("failed to parse encrypted private key")),
             "structural damage must not become a password failure on the PEM path, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn mac_damage_on_an_otherwise_intact_container_is_not_a_password_failure() {
+        // Locate the stored MAC digest by parsing, then flip one byte of it:
+        // the password is right, only the integrity field is damaged.
+        let mut outer = DerReader::new(MODERN);
+        let pfx = outer.read_sequence().expect("fixture is a PFX SEQUENCE");
+        let mut reader = DerReader::new(pfx);
+        reader.read_integer_u32().expect("version");
+        reader.read_sequence().expect("authSafe");
+        let mac = MacData::parse(&mut reader).expect("fixture carries macData");
+        let offset = mac.digest.as_ptr() as usize - MODERN.as_ptr() as usize;
+        let mut damaged = MODERN.to_vec();
+        damaged[offset] ^= 0xff;
+
+        let Err(e) = extract_p12(&damaged, "testpassword") else {
+            panic!("a container with a damaged MAC must not extract");
+        };
+        let res = p12_load_error(e);
+        assert!(
+            matches!(&res, Error::Certificate(m) if m.contains("Failed to parse PKCS#12")),
+            "a damaged MAC over intact contents must keep the certificate class, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_password_on_an_encrypted_container_is_invalid_password() {
+        let Err(e) = extract_p12(MODERN, "wrong") else {
+            panic!("wrong password must not extract the container");
+        };
+        let res = p12_load_error(e);
+        assert!(
+            matches!(res, Error::InvalidPassword),
+            "a wrong password must stay retryable, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_password_on_a_password_transparent_container_is_invalid_password() {
+        // raw_keybag has no encrypted layer: the walk succeeds for any password,
+        // so the MAC is the only password signal and must decide alone.
+        let Err(e) = extract_p12(RAW_KEYBAG, "wrong") else {
+            panic!("wrong password must not extract the container");
+        };
+        let res = p12_load_error(e);
+        assert!(
+            matches!(res, Error::InvalidPassword),
+            "a password-transparent container must keep the credential verdict, got {res:?}"
         );
     }
 }
