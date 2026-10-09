@@ -152,6 +152,7 @@ impl<'a> CodeResourcesBuilder<'a> {
     /// - Symlink targets cannot be resolved (on Unix)
     /// - A symlink target is not valid UTF-8 (the seal would otherwise differ from disk)
     /// - An entry name is not valid UTF-8 (a lossy key could collide with another entry)
+    /// - A bundle entry is not a regular file, directory, or symlink (it cannot be hashed safely)
     ///
     /// # Examples
     ///
@@ -204,8 +205,9 @@ impl<'a> CodeResourcesBuilder<'a> {
 
     /// Hashes one walked bundle entry (or `None` when it is an excluded
     /// directory), shared verbatim by the parallel and sequential scan arms.
-    /// Fails when the entry name is not valid UTF-8; excluded entries are
-    /// exempt because they are never sealed.
+    /// Fails when the entry name is not valid UTF-8 or the entry is not a
+    /// regular file, directory, or symlink; excluded entries are exempt
+    /// because they are never sealed.
     fn hash_entry(
         store: &dyn Store,
         bundle_path: &Path,
@@ -228,6 +230,17 @@ impl<'a> CodeResourcesBuilder<'a> {
 
         if inner.should_exclude(&relative_path.to_string_lossy()) {
             return Ok(None);
+        }
+
+        // A non-regular entry (FIFO, socket, device node) has no seal shape
+        // and can never be streamed: opening a writerless FIFO blocks
+        // forever. Fail closed before hashing; excluded entries never reach
+        // this gate because they are never sealed.
+        if kind == StoreKind::NonRegular {
+            return Err(Error::Core(zsign_core::Error::Signing(format!(
+                "Unsupported file type (not a regular file, directory, or symlink): {}",
+                path.display()
+            ))));
         }
 
         // A lossy key would collapse distinct invalid byte sequences onto
@@ -685,5 +698,84 @@ mod tests {
                 files2.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_rejects_fifo_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+        fs::write(
+            bundle_path.join("Info.plist"),
+            b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleExecutable</key>\n<string>Test</string>\n</dict>\n</plist>",
+        )
+        .unwrap();
+        let fifo = bundle_path.join("odd.pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mkfifo must create the FIFO at {}",
+            fifo.display()
+        );
+
+        // A regression opens the FIFO and blocks forever, so the scan runs on
+        // a worker thread and the assertion is bounded: the suite fails on
+        // timeout instead of hanging.
+        let (tx, rx) = mpsc::channel();
+        let scanned = bundle_path.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut builder = CodeResourcesBuilder::new(&scanned)?;
+                builder.scan()?;
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("scan must not block on a FIFO");
+        assert!(
+            matches!(&result, Err(Error::Core(zsign_core::Error::Signing(m)))
+                if m.contains("Unsupported file type")),
+            "a FIFO in the bundle must fail the scan with the typed error, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_bundle_ignores_excluded_non_regular_entry() {
+        let temp_dir = tempdir().unwrap();
+        let bundle_path = temp_dir.path().join("Test.app");
+        fs::create_dir(&bundle_path).unwrap();
+        let excluded_dir = bundle_path.join("Skipper");
+        fs::create_dir(&excluded_dir).unwrap();
+        let fifo = excluded_dir.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mkfifo must create the FIFO at {}",
+            fifo.display()
+        );
+
+        let mut builder = CodeResourcesBuilder::new(&bundle_path).unwrap();
+        builder.exclude("Skipper/");
+        builder
+            .scan()
+            .expect("excluded entries are never sealed, so their types are never validated");
+        assert!(
+            builder.files().all(|(p, _, _)| !p.starts_with("Skipper/")),
+            "excluded entries must not be sealed"
+        );
     }
 }
