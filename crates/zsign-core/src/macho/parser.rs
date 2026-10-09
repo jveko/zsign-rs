@@ -277,6 +277,11 @@ impl MachOFile {
 
             match lc.command {
                 CommandVariant::CodeSignature(cs) => {
+                    if code_sig_offset.is_some() {
+                        return Err(Error::MachO(
+                            "multiple LC_CODE_SIGNATURE load commands".into(),
+                        ));
+                    }
                     code_sig_offset = Some(cs.dataoff);
                     code_sig_size = Some(cs.datasize);
                     meta_code_sig_cmd = Some((lc.offset, cs.dataoff, cs.datasize));
@@ -857,6 +862,58 @@ mod tests {
                 .code_bytes(&at_end)
                 .expect("empty range at the end is in bounds"),
             b""
+        );
+    }
+    /// Thin arm64 image carrying TWO conflicting LC_CODE_SIGNATURE commands:
+    /// the first points at (0x2000, 0x800), the second at (0x2400, 0x400) —
+    /// both in bounds, so parse succeeds today with last-wins collapse and
+    /// the conflicting values silently decide the signature location.
+    fn make_duplicate_code_signature_macho() -> Vec<u8> {
+        let mut b = crate::macho::fixtures::make_signed_minimal_macho(0x800);
+        let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
+        let sizeofcmds = u32::from_le_bytes(b[20..24].try_into().unwrap());
+        b[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+        b[20..24].copy_from_slice(&(sizeofcmds + 16).to_le_bytes());
+        let lc = 32 + sizeofcmds as usize;
+        b[lc..lc + 4].copy_from_slice(&0x1du32.to_le_bytes()); // LC_CODE_SIGNATURE
+        b[lc + 4..lc + 8].copy_from_slice(&16u32.to_le_bytes()); // cmdsize
+        b[lc + 8..lc + 12].copy_from_slice(&0x2400u32.to_le_bytes()); // dataoff
+        b[lc + 12..lc + 16].copy_from_slice(&0x400u32.to_le_bytes()); // datasize
+        b
+    }
+
+    #[test]
+    fn test_duplicate_code_signature_command_is_rejected() {
+        let res = MachOFile::parse(make_duplicate_code_signature_macho());
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("multiple LC_CODE_SIGNATURE")),
+            "two LC_CODE_SIGNATURE commands must be rejected, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_duplicate_code_signature_command_rejects_verify() {
+        let res = crate::macho::verify_macho(
+            &make_duplicate_code_signature_macho(),
+            &crate::codesign::verify::SignatureInputs::none(),
+        );
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("multiple LC_CODE_SIGNATURE")),
+            "verification must not pass a duplicate off as one, got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn test_duplicate_code_signature_rejects_fat_slice() {
+        let fat =
+            crate::macho::fixtures::make_fat_macho(&[make_duplicate_code_signature_macho()], &[12]);
+        let res = MachOFile::parse(fat);
+        assert!(
+            matches!(&res, Err(Error::MachO(m)) if m.contains("multiple LC_CODE_SIGNATURE")),
+            "a duplicate inside a FAT slice must be rejected, got {:?}",
+            res.as_ref().err()
         );
     }
 }
