@@ -14,9 +14,11 @@ Two verify-side gaps let a tampered or unverifiable binary ride to
    its parse dispatch (`crates/zsign-core/src/codesign/verify.rs:401-431`)
    handles ops 0, 1, 2, 3, 6, 7, 8, 9, 15; every other op collapses to
    `Expr::Unsupported` via the catch-all at :429 — exactly ops 4, 5, 10-14,
-   16-23, i.e. `anchorHash`, `certField`, `trustedCert(s)`, `certGeneric`,
-   `entitlementField`, `certPolicy`, `namedAnchor`, `namedCode`, `platform`,
-   `notarized`, `certFieldDate`, `legacyDevID`. The security predicates that
+   16-23 (15 opcodes; 12 predicate families: `anchorHash` (1), `infoKeyValue`
+   legacy (1), `infoKeyField` (1), `certField` (1), `trustedCert` +
+   `trustedCerts` (2), `certGeneric` (1), `entitlementField` (1), `certPolicy`
+   (1), `namedAnchor` + `namedCode` (2), `platform` (1), `notarized` (1),
+   `certFieldDate` + `legacyDevID` (2)). The security predicates that
    real Xcode/Developer ID DRs are built from are precisely the unevaluable
    ones.
 

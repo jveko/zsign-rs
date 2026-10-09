@@ -41,8 +41,8 @@
 - Modify: `crates/zsign-core/src/macho/verify.rs` — inline `mod tests` (append after the last existing test, around line 1749).
 
 **Interfaces:**
-- Consumes: existing test-module helpers — `make_minimal_macho`, `sign_macho_adhoc`, `MachOFile::parse`, `SignatureInputs::none()`, `verify_macho`, `ident_dr_blob`, `replace_requirements_child`, `entry_offset`, `CSSLOT_CODEDIRECTORY` / `CSSLOT_ALTERNATE_CODEDIRECTORIES` (all already imported in the module); `ArchSlice::{code_sig_offset, code_sig_size}`.
-- Produces: two new helpers (`certfield_dr_blob`, `tamper_cd_identifiers`) and two tests with the exact names below. These tests use only pre-existing API (`is_valid()`, `errors`, `warnings`, `identifier`) so they compile clean while red. Task 2 must make them pass without modifying them.
+- Consumes: existing test-module helpers — `make_minimal_macho`, `sign_macho_adhoc`, `MachOFile::parse`, `SignatureInputs::none()`, `verify_macho`, `ident_dr_blob`, `replace_requirements_child`, `entry_offset`, `CSSLOT_CODEDIRECTORY` / `CSSLOT_ALTERNATE_CODEDIRECTORIES` (all already imported in the module); `ArchSlice` fields `code_sig_offset` / `code_sig_size` (field access, no import needed).
+- Produces: two new helpers (`certfield_dr_blob`, `tamper_cd_identifiers`) and two tests with the exact names below. These tests use only pre-existing API (`is_valid()`, `errors`, `warnings`, `identifier`) so they compile clean while red. Task 2 must make them pass without changing their meaning; the single additive assertion in Task 2 Step 4 is the only permitted edit.
 
 - [ ] **Step 1: Write the two failing tests plus helpers**
 
@@ -52,8 +52,10 @@ Helper `certfield_dr_blob(cn: &str) -> Vec<u8>` — a requirements SuperBlob who
 
 ```rust
 fn certfield_dr_blob(cn: &str) -> Vec<u8> {
-    // op=11 (opCertField, unimplemented), certIndex=0 (leaf),
-    // then key "subject.CN", match op 1 (equal), value = cn.
+    // op=11 (opCertField, unimplemented — the parse catch-all returns
+    // Unsupported without consuming operands); remaining words are filler
+    // mirroring ident_dr_blob's shape: certIndex 0 (leaf), key "subject.CN",
+    // match op 1, value = cn.
     let mut expr = 11u32.to_be_bytes().to_vec();
     expr.extend_from_slice(&0u32.to_be_bytes());
     let key = b"subject.CN";
@@ -241,7 +243,7 @@ Commit message: `fix(macho): fail closed on unevaluable designated requirement`
 
 **Interfaces:**
 - Consumes: `sign_round_trip(&test_signing_credentials(), ident)` (test module :599, fixture cert subject `CN=zsign roundtrip,OU=TESTTEAM`), `verify_macho`, `MachOFile::parse`, the CD/superblob helpers.
-- Produces: helper `tamper_cd_team_id` and test `code_directory_team_id_must_match_signer_organizational_unit`. Uses only pre-existing API so it compiles red (the binding error does not exist yet). Task 4 must make it pass without modifying it.
+- Produces: helper `tamper_cd_team_id` and test `code_directory_team_id_must_match_signer_organizational_unit`. Uses only pre-existing API so it compiles red (the binding error does not exist yet). Task 4 must make it pass without changing its meaning; the single additive assertion in Task 4 Step 4 is the only permitted edit.
 
 - [ ] **Step 1: Write the failing test plus helper**
 
@@ -327,7 +329,7 @@ Commit message: `test(macho): cover team identifier binding to signer`
 
 **Files:**
 - Modify: `crates/zsign-core/src/crypto/cert.rs` — `extract_team_id` (:924-929): `fn` → `pub(crate) fn` only (no logic change).
-- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` — `CmsVerifyReport` (:289-330), `StagedSigner` (:733-738), the signer-resolution site that sets `staged.subject` (:948), `StagedSigner::claim_into` (:748-752).
+- Modify: `crates/zsign-core/src/crypto/cms_verify.rs` — `CmsVerifyReport` (:289-330), `StagedSigner` (:734-745), the signer-resolution site that sets `staged.subject` (:948), `StagedSigner::claim_into` (:747-760).
 - Modify: `crates/zsign-core/src/macho/verify.rs` — `verify_slice`, between the CMS block and the requirements block; inline `mod tests` (one vacuity assertion).
 
 **Interfaces:**
@@ -347,7 +349,7 @@ In `crypto/cert.rs`, change the signature to `pub(crate) fn extract_team_id(cert
 
 In `crypto/cms_verify.rs`:
 
-1. On `CmsVerifyReport`, directly after `signer_serial` (:299):
+1. On `CmsVerifyReport`, directly after `signer_serial` (:298):
 
 ```rust
 /// The signer certificate's subject organizational unit (the Apple Team
@@ -445,7 +447,7 @@ Commit message: `fix(verify): bind code directory team identifier to signer ou`
 
 - [ ] **Step 1: Add the DTO enum and field**
 
-Near `SlotCheckDto`, following its exact style:
+Near `SlotCheckDto`, following its exact style (and add `use zsign_rs::codesign::verify::RequirementVerdict;` to the imports — the CLI already imports siblings from that path at `main.rs:9`):
 
 ```rust
 #[derive(serde::Serialize)]
