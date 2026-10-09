@@ -55,6 +55,9 @@ pub struct SliceVerifyReport {
     pub errors: Vec<String>,
     /// Non-fatal notes (e.g. unsupported page size).
     pub warnings: Vec<String>,
+    /// Outcome of the designated-requirement evaluation; `None` when the
+    /// signature carries no designated requirement.
+    pub requirement_status: Option<RequirementVerdict>,
 }
 
 impl SliceVerifyReport {
@@ -477,15 +480,17 @@ fn verify_slice(
                         cdhashes: &refs,
                         anchored,
                     };
-                    match dr.evaluate(&context) {
+                    let verdict = dr.evaluate(&context);
+                    match &verdict {
                         RequirementVerdict::Violated => report
                             .errors
                             .push("designated requirement not satisfied".to_string()),
                         RequirementVerdict::Unsupported(why) => report
-                            .warnings
+                            .errors
                             .push(format!("designated requirement not fully evaluated: {why}")),
                         RequirementVerdict::Satisfied => {}
                     }
+                    report.requirement_status = Some(verdict);
                 }
             }
         }
@@ -1829,6 +1834,10 @@ mod tests {
             "must not be a warning: {:?}",
             report.slices[0].warnings
         );
+        assert!(matches!(
+            report.slices[0].requirement_status,
+            Some(RequirementVerdict::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -1856,6 +1865,38 @@ mod tests {
             report.slices[0].identifier.as_deref(),
             Some("com.evil.plz12"),
             "the report must surface the bytes actually present"
+        );
+    }
+
+    #[test]
+    fn requirement_status_reports_evaluation_outcome() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let plain = sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        let r = verify_macho(&plain, &SignatureInputs::none()).unwrap();
+        assert!(r.is_valid(), "{:?}", r.slices[0].errors);
+        assert!(
+            r.slices[0].requirement_status.is_none(),
+            "no designated requirement -> None"
+        );
+
+        let mut satisfied =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut satisfied, &ident_dr_blob("com.example.dr"));
+        let r = verify_macho(&satisfied, &SignatureInputs::none()).unwrap();
+        assert!(r.is_valid(), "{:?}", r.slices[0].errors);
+        assert_eq!(
+            r.slices[0].requirement_status,
+            Some(RequirementVerdict::Satisfied)
+        );
+
+        let mut violated =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut violated, &ident_dr_blob("com.evil"));
+        let r = verify_macho(&violated, &SignatureInputs::none()).unwrap();
+        assert!(!r.is_valid(), "{:?}", r.slices[0].errors);
+        assert_eq!(
+            r.slices[0].requirement_status,
+            Some(RequirementVerdict::Violated)
         );
     }
 }
