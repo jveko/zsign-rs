@@ -16,7 +16,7 @@
 - Keep `TMPDIR` inside the worktree: `mkdir -p target/tmp && TMPDIR=$PWD/target/tmp cargo test …` (`/tmp` is a small tmpfs).
 - Error channel: reuse `Error::MachO(String)` (`crates/zsign-core/src/error.rs:7-8`); payload verbatim `multiple LC_CODE_SIGNATURE load commands`; no new variants, no new dependencies.
 - Minimal diff confined to: the `CommandVariant::CodeSignature` arm in `crates/zsign-core/src/macho/parser.rs` (currently :279-283) and new tests in that file's `#[cfg(test)] mod tests` (starts :509). Nothing else — no changes to `fixtures.rs`, `verify.rs`, `signer.rs`, `writer.rs`, `error.rs`, the facade, CLI, wasm, or fuzz targets.
-- Do NOT touch the other last-wins arms in the same loop (`text_segment_*` :286-288/:303-305, `meta_linkedit_cmd` :293-296/:307-312, `record_encryption` :496-508) — out of scope per the spec's Decision record; sibling lanes own `verify.rs`, `signer.rs`, and `bundle/code_resources.rs`.
+- Do NOT touch the other last-wins arms in the same loop (`text_segment_*` :286-288/:303-305, `meta_linkedit_cmd` :293-296/:307-313, `record_encryption` :496-508) — out of scope per the spec's Decision record; sibling lanes own `verify.rs`, `signer.rs`, and `bundle/code_resources.rs`.
 - SKILL (required): test-driven-development within Task 1 — failing tests first, run them, then implement. SKILL (required): subagent-driven-development — Tester subagent writes the tests, implementer subagent greens them, orchestrator runs gates and commits.
 - Commits: conventional, imperative mood, lowercase, no trailing period, no ticket ID.
 - Scoped gates while working; the full gate list runs in Task 2.
@@ -99,7 +99,7 @@ Append to `crates/zsign-core/src/macho/parser.rs` inside `#[cfg(test)] mod tests
     }
 ```
 
-Notes for the Tester: the helper is a test-local function (the shared `fixtures.rs` stays untouched); byte surgery mirrors `make_signed_minimal_macho_at` (fixtures.rs:422-441) — after it runs, `ncmds == 4` and `sizeofcmds == 264`, so the appended command lands at 296..312 inside the zero-filled first page. The `matches!` + `got {:?}` footer via `res.as_ref().err()` is the module's dominant assertion style.
+Notes for the Tester: the helper is a test-local function (the shared `fixtures.rs` stays untouched); byte surgery mirrors `make_signed_minimal_macho_at` (fixtures.rs:422-441) — after `make_signed_minimal_macho(0x800)` runs, the base carries `ncmds == 4` and `sizeofcmds == 264`; the helper bumps them to 5 / 280, so the appended command lands at 296..312 inside the zero-filled first page. The `matches!` + `got {:?}` footer via `res.as_ref().err()` is the module's dominant assertion style.
 
 - [ ] **Step 2: Run the tests, confirm the expected failure**
 

@@ -30,11 +30,12 @@ consumer can see it:
   a malformed or conflicting first command is never checked.
 - `verify_slice` reads only the survivor (verify.rs:137-144), so
   verification can never report the duplicate; it verifies "as if one".
-- The write path works from the same captured survivor
+- The sign-then-write path works from the same captured survivor
   (`metadata.code_sig_cmd`, writer.rs:1477) plus its own append helpers
   (`add_code_signature_command` writer.rs:723,
   `add_code_signature_command_with_metadata` writer.rs:1568), so it
-  neither sees nor repairs the duplicate either.
+  neither sees nor repairs the duplicate either. (Raw-byte writer entries
+  that re-parse independently are treated in the Decision record.)
 
 Both parse arms funnel through `parse_single`: `Mach::Binary` at
 parser.rs:192 and `Mach::Fat` per-slice at parser.rs:218. Every public
@@ -43,7 +44,7 @@ entry point inherits the loop: sign entries take an already-parsed
 signer.rs:18-19; `sign_macho` signer.rs:242, `sign_macho_adhoc`
 signer.rs:288, `sign_macho_all_slices` signer.rs:380), `verify_macho`
 parses the caller's bytes and propagates the error with `?`
-(verify.rs:99), and the CLI, wasm, and ipa/dylib probes all reach the
+(verify.rs:99-100), and the CLI, wasm, and ipa/dylib probes all reach the
 same parse. A rejection placed in the loop covers every path at once.
 
 No test or fixture in the workspace currently builds a Mach-O with two
@@ -51,8 +52,9 @@ LC_CODE_SIGNATURE commands, so nothing pins the last-wins behaviour.
 
 ## External contract (researched)
 
-Sources pinned at specific commits; every quote below was read directly
-unless marked as inference.
+Sources read directly at the file:line cited (commit-pinned where shown:
+dyld @ `fd8d0c4`, zhlynn/zsign @ `614caa8`); every quote below was read
+directly unless marked as inference.
 
 - **dyld (load-time authority): rejects.**
   `MachOLoaded::getLinkEditLoadCommands` (apple-oss dyld @ `fd8d0c4`,
@@ -121,8 +123,8 @@ Guard the CodeSignature arm: on a second occurrence return
   taxonomy churn. wasm keeps its stable `ZSIGN_INVALID_MACHO` code; the
   wasm docs state `error.message` may change and only the code is a
   contract (zsign-wasm/src/lib.rs:16-22). The CLI prints the message
-  verbatim (cli/main.rs:743; JSON ErrorDoc cli/main.rs:733-741) and no
-  test pins it.
+  verbatim (crates/zsign-cli/src/main.rs:743; error emission in
+  `emit_error`, crates/zsign-cli/src/main.rs:732-744) and no test pins it.
 - Smallest possible diff in a file several lanes rebase on.
 
 ### B. Lossless parse + verify-time report (rejected)
@@ -174,20 +176,26 @@ validations.
   and pins nothing.
 - **Scope: LC_CODE_SIGNATURE only.** The same silent-collapse shape
   exists elsewhere in the loop — `text_segment_*` (parser.rs:286-288,
-  :303-305), `meta_linkedit_cmd` (parser.rs:293-296, :307-312), and the
+  :303-305), `meta_linkedit_cmd` (parser.rs:293-296, :307-313), and the
   shared `record_encryption` helper (parser.rs:496-508) — and dyld's
   uniform class-check implies they deserve the same treatment eventually.
   They are deliberately untouched: this change answers the cited
   behaviour, sibling lanes also touch this file, and widening the diff
   now buys nothing. (One in, one out: recorded here so a follow-up lane
   can pick it up.)
-- **Writer's internal goblin re-parses untouched.** writer.rs re-derives
-  `code_sig_cmd` with the same last-wins shape when it re-parses raw
-  bytes internally (writer.rs:160-162, :597-599, :1250-1252). After this
-  change no public entry point can hand duplicate-bearing bytes to the
-  writer — all of them parse first — so those loops are unreachable for
-  the duplicate case. [INFERENCE: no current caller bypasses `parse`.]
-  Fixing them anyway would enlarge the diff beyond the cited concern.
+- **Writer's internal goblin re-parses untouched — scope, not
+  unreachability.** writer.rs re-derives `code_sig_cmd` with the same
+  last-wins shape when it re-parses raw bytes directly with goblin
+  (writer.rs:160-162, :597-599, :1250-1252), and those loops are
+  reachable through public raw-byte entries that never call
+  `MachOFile::parse` (`embed_signature` writer.rs:324,
+  `realloc_code_sign_space` writer.rs:110, `prepare_code_for_signing`
+  writer.rs:1184, plus their slice/fat variants). They are excluded
+  deliberately: the sign/verify/CLI/wasm/ipa flows all parse first (funnel
+  above), the brief confines this change to `parser.rs`, and fixing three
+  re-derivation loops would enlarge the diff beyond the cited concern.
+  Whether any in-repo caller hands duplicate-bearing bytes straight to
+  those raw-byte entries is unverified [INFERENCE].
 - **Signer untouched.** Every `sign_macho*` entry takes `&MachOFile`
   produced by `parse`; the parse error IS the sign-path rejection.
 
