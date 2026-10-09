@@ -198,12 +198,14 @@ entries would silently change `exists()` answers across the flow.
 - **Extract-side entry types:** whether extraction materializes special files
   from a crafted archive — separate workstream.
 - **Other `store.read` sites for a planted `Info.plist`:** the builder's
-  constructor reads it (`read_main_executable`,
-  `code_resources.rs:290-330`) and the sign flow reads the same path at
-  several sites outside this file (`bundle/mod.rs:110`, `ipa/mod.rs:1136`,
-  `:1161`, `:1711`, `:1747`, `:1788`), each blocking on a FIFO at that exact
-  path. The ticket's fix text gates hashing; guarding every read site is a
-  separate hardening workstream.
+  constructor reads it (`read_main_executable`, `code_resources.rs:290-311`,
+  blocking read at `:297`) and the sign flow reads the same path at several
+  sites outside this file (`bundle/mod.rs:110`, `ipa/mod.rs:1136`, `:1163`,
+  `:1718`, `:1754`, `:1795`, `:1956`) — each of those reads blocks on a FIFO
+  at that exact path, while the `exists()` probes preceding some of them
+  (`ipa/mod.rs:1711`, `:1747`, `:1788`) are lstat-only and do not block. The
+  ticket's fix text gates hashing; guarding every read site is a separate
+  hardening workstream.
 - **Verifier-side policy for irregular entries** beyond the existing skip:
   unchanged by this design.
 
