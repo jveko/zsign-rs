@@ -13,6 +13,11 @@ pub(crate) enum StoreKind {
     File,
     Dir,
     Symlink,
+    /// Anything lstat reports that is not a regular file, directory, or
+    /// symlink (FIFO, socket, device node). Classification only — whether a
+    /// consumer rejects or skips entries of this kind is that consumer's
+    /// policy. `File` always means a regular file.
+    NonRegular,
 }
 
 /// lstat-style metadata for one path.
@@ -91,6 +96,20 @@ pub(crate) trait Store: Sync {
         self.metadata(path).is_ok()
     }
 }
+/// Lstat-style classification of one filesystem file type: `File` means a
+/// regular file (`S_ISREG`); anything that is neither that, a directory, nor
+/// a symlink is [`StoreKind::NonRegular`].
+fn classify(ft: &std::fs::FileType) -> StoreKind {
+    if ft.is_symlink() {
+        StoreKind::Symlink
+    } else if ft.is_dir() {
+        StoreKind::Dir
+    } else if ft.is_file() {
+        StoreKind::File
+    } else {
+        StoreKind::NonRegular
+    }
+}
 
 /// Filesystem-backed store: every method delegates to `std::fs`/`WalkDir`
 /// exactly as the native flow does today. Stateless, hence `Sync` and
@@ -115,26 +134,16 @@ impl Store for FsStore {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let ft = entry.file_type()?;
-            let kind = if ft.is_dir() {
-                StoreKind::Dir
-            } else if ft.is_symlink() {
-                StoreKind::Symlink
-            } else {
-                StoreKind::File
-            };
-            out.push((entry.file_name().to_string_lossy().into_owned(), kind));
+            out.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                classify(&ft),
+            ));
         }
         Ok(out)
     }
     fn metadata(&self, path: &Path) -> Result<StoreStat> {
         let md = std::fs::symlink_metadata(path)?;
-        let kind = if md.is_symlink() {
-            StoreKind::Symlink
-        } else if md.is_dir() {
-            StoreKind::Dir
-        } else {
-            StoreKind::File
-        };
+        let kind = classify(&md.file_type());
         let unix_mode = {
             #[cfg(unix)]
             {
@@ -175,14 +184,7 @@ impl Store for FsStore {
                 }
             };
             let ft = entry.file_type();
-            let kind = if ft.is_dir() {
-                StoreKind::Dir
-            } else if ft.is_symlink() {
-                StoreKind::Symlink
-            } else {
-                StoreKind::File
-            };
-            out.push(Ok((entry.path().to_path_buf(), kind)));
+            out.push(Ok((entry.path().to_path_buf(), classify(&ft))));
         }
         Ok(out)
     }
@@ -194,21 +196,12 @@ impl Store for FsStore {
         // WalkDir::filter_entry semantics: a pruned subtree is never
         // descended into, so errors inside it never surface — identical to
         // find_immediate_macho_binaries today (mod.rs:1326-1346).
-        let kind_of = |ft: std::fs::FileType| {
-            if ft.is_dir() {
-                StoreKind::Dir
-            } else if ft.is_symlink() {
-                StoreKind::Symlink
-            } else {
-                StoreKind::File
-            }
-        };
         let mut out = Vec::new();
         for entry in walkdir::WalkDir::new(root)
             .follow_links(false)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| prune(e.path(), kind_of(e.file_type())))
+            .filter_entry(|e| prune(e.path(), classify(&e.file_type())))
         {
             let entry = match entry {
                 Ok(e) => e,
@@ -220,7 +213,10 @@ impl Store for FsStore {
                     continue;
                 }
             };
-            out.push(Ok((entry.path().to_path_buf(), kind_of(entry.file_type()))));
+            out.push(Ok((
+                entry.path().to_path_buf(),
+                classify(&entry.file_type()),
+            )));
         }
         Ok(out)
     }
@@ -276,5 +272,167 @@ impl Store for FsStore {
             let _ = (path, mode);
             Ok(())
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// `mkfifo` is a POSIX-mandated utility, so no crate dependency is needed.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo must be on PATH");
+        assert!(
+            status.success(),
+            "mkfifo must create the FIFO at {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn regular_file_and_dir_keep_their_kinds() {
+        let td = tempdir().unwrap();
+        let root = td.path().join("bundle");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+
+        assert_eq!(
+            FsStore.metadata(&file).unwrap().kind,
+            StoreKind::File,
+            "regular files must stay File"
+        );
+        assert_eq!(
+            FsStore.metadata(&sub).unwrap().kind,
+            StoreKind::Dir,
+            "directories must stay Dir"
+        );
+
+        let listed = FsStore.list(&root).unwrap();
+        let listed_kind = listed.iter().find(|(n, _)| n == "sub").map(|(_, k)| *k);
+        assert_eq!(
+            listed_kind,
+            Some(StoreKind::Dir),
+            "list must keep classifying directories as Dir, got {listed:?}"
+        );
+
+        let walked = FsStore.walk(&root).unwrap();
+        let walk_kind = walked
+            .iter()
+            .filter_map(|e| e.as_ref().ok())
+            .find(|(p, _)| p == &file)
+            .map(|(_, k)| *k);
+        assert_eq!(
+            walk_kind,
+            Some(StoreKind::File),
+            "walk must keep classifying regular files as File"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_classifies_as_symlink() {
+        let td = tempdir().unwrap();
+        let root = td.path().join("bundle");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("real.txt");
+        fs::write(&target, b"x").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            FsStore.metadata(&link).unwrap().kind,
+            StoreKind::Symlink,
+            "metadata must not follow the final symlink"
+        );
+        let walked = FsStore.walk(&root).unwrap();
+        let walk_kind = walked
+            .iter()
+            .filter_map(|e| e.as_ref().ok())
+            .find(|(p, _)| p == &link)
+            .map(|(_, k)| *k);
+        assert_eq!(
+            walk_kind,
+            Some(StoreKind::Symlink),
+            "walk must classify symlinks as Symlink"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fifo_classifies_as_non_regular_in_every_reporting_method() {
+        let td = tempdir().unwrap();
+        let root = td.path().join("bundle");
+        fs::create_dir(&root).unwrap();
+        let fifo = root.join("odd.pipe");
+        make_fifo(&fifo);
+
+        let stat = FsStore.metadata(&fifo).unwrap();
+        assert_eq!(
+            stat.kind,
+            StoreKind::NonRegular,
+            "metadata must classify a FIFO as non-regular, got {:?}",
+            stat.kind
+        );
+        assert!(!stat.is_file(), "a FIFO must not answer is_file");
+        assert!(!stat.is_dir(), "a FIFO must not answer is_dir");
+        assert!(!stat.is_symlink(), "a FIFO must not answer is_symlink");
+
+        let listed = FsStore.list(&root).unwrap();
+        let listed_kind = listed
+            .iter()
+            .find(|(n, _)| n == "odd.pipe")
+            .map(|(_, k)| *k);
+        assert_eq!(
+            listed_kind,
+            Some(StoreKind::NonRegular),
+            "list must classify a FIFO as non-regular, got {listed:?}"
+        );
+
+        let walked = FsStore.walk(&root).unwrap();
+        let walk_kind = walked
+            .iter()
+            .filter_map(|e| e.as_ref().ok())
+            .find(|(p, _)| p == &fifo)
+            .map(|(_, k)| *k);
+        assert_eq!(
+            walk_kind,
+            Some(StoreKind::NonRegular),
+            "walk must classify a FIFO as non-regular"
+        );
+
+        let pruned = FsStore.walk_pruned(&root, &|_, _| true).unwrap();
+        let pruned_kind = pruned
+            .iter()
+            .filter_map(|e| e.as_ref().ok())
+            .find(|(p, _)| p == &fifo)
+            .map(|(_, k)| *k);
+        assert_eq!(
+            pruned_kind,
+            Some(StoreKind::NonRegular),
+            "walk_pruned must classify a FIFO as non-regular"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_socket_classifies_as_non_regular() {
+        let td = tempdir().unwrap();
+        let sock = td.path().join("app.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let stat = FsStore.metadata(&sock).unwrap();
+        assert_eq!(
+            stat.kind,
+            StoreKind::NonRegular,
+            "metadata must classify a unix socket as non-regular, got {:?}",
+            stat.kind
+        );
     }
 }
