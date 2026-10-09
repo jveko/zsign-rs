@@ -1,4 +1,5 @@
 # Reject Non-Regular Files in Bundle Scan — Design
+> Line citations are anchored to the pre-implementation base commit `b8b71e6`. The gate commit shifted `code_resources.rs` items from `hash_entry` onward down by a few lines; cited statements and symbols remain the ones described.
 
 ## Problem
 

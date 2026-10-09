@@ -231,7 +231,7 @@ pub(crate) enum StoreKind {
 }
 ```
 
-2. Add a private classifier directly above `impl Store for FsStore`:
+2. Add a private classifier in the `FsStore` section, directly above the `FsStore` struct declaration (the landed placement):
 
 ```rust
 /// Lstat-style classification of one filesystem file type: `File` means a
