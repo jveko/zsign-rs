@@ -921,7 +921,7 @@ pub(crate) fn verify_key_matches_cert(key: &SigningKeyType, cert: &Certificate) 
 }
 
 /// Extracts the Apple Team ID from a certificate's Organizational Unit field.
-fn extract_team_id(cert: &Certificate) -> Option<String> {
+pub(crate) fn extract_team_id(cert: &Certificate) -> Option<String> {
     extract_name_attr(
         &cert.tbs_certificate.subject,
         const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME,

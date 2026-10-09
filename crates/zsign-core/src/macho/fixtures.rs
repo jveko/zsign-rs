@@ -818,7 +818,7 @@ fn build_test_signing_credentials() -> crate::crypto::SigningCredentials {
     let mut rng = rand::thread_rng();
     let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone());
-    let subject = Name::from_str("CN=zsign verify test").unwrap();
+    let subject = Name::from_str("CN=zsign verify test,OU=TESTTEAM").unwrap();
     let serial = SerialNumber::from(7u32);
     let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
     let pub_der = key.to_public_key().to_public_key_der().unwrap();

@@ -447,6 +447,18 @@ fn verify_slice(
             .errors
             .push("no CMS signature slot but not ad-hoc flagged".into());
     }
+    // The CD's team identifier is self-asserted metadata; bind it to the
+    // signer's certificate OU when both are present.
+    if let (Some(cd_team), Some(signer_ou)) = (
+        primary.team_id(),
+        report.cms.as_ref().and_then(|cms| cms.signer_ou.as_deref()),
+    ) {
+        if cd_team != signer_ou {
+            report.errors.push(format!(
+                "code directory team identifier {cd_team} does not match signing certificate organizational unit {signer_ou}"
+            ));
+        }
+    }
 
     if let Some(req) = superblob
         .entries
@@ -1938,6 +1950,11 @@ mod tests {
                 .all(|e| !e.contains("does not match signing certificate organizational unit")),
             "matching team id must not trigger the binding check: {:?}",
             base.slices[0].errors
+        );
+        assert_eq!(
+            base.slices[0].cms.as_ref().unwrap().signer_ou.as_deref(),
+            Some("TESTTEAM"),
+            "the signer's OU must reach the verify report"
         );
 
         // Tamper both CDs: claim a different team than the signing certificate.

@@ -297,6 +297,9 @@ pub struct CmsVerifyReport {
     pub signer_subject: Option<String>,
     /// The signer certificate's serial number (hex), when found.
     pub signer_serial: Option<String>,
+    /// The signer certificate's subject organizational unit (the Apple Team
+    /// ID), when the signing certificate was found.
+    pub signer_ou: Option<String>,
     /// Total number of SignerInfo structures evaluated in the CMS.
     pub signers_total: usize,
     /// One summary per evaluated SignerInfo, in CMS order (rejected signers
@@ -734,6 +737,7 @@ fn decode_octet_string_stream(bytes: &[u8]) -> Result<Vec<u8>> {
 struct StagedSigner {
     subject: Option<String>,
     serial: Option<String>,
+    signer_ou: Option<String>,
     message_digest_ok: bool,
     cdhash_v1_ok: bool,
     cdhash_v2_ok: bool,
@@ -748,6 +752,7 @@ impl StagedSigner {
     fn claim_into(&self, report: &mut CmsVerifyReport) {
         report.signer_subject = self.subject.clone();
         report.signer_serial = self.serial.clone();
+        report.signer_ou = self.signer_ou.clone();
         report.message_digest_ok = self.message_digest_ok;
         report.cdhash_v1_ok = self.cdhash_v1_ok;
         report.cdhash_v2_ok = self.cdhash_v2_ok;
@@ -952,6 +957,7 @@ fn eval_one_signer(
         .to_der()
         .ok()
         .map(|d| hex(&d));
+    staged.signer_ou = crate::crypto::cert::extract_team_id(cert);
 
     // 1. messageDigest attribute == digest(bound content)
     let md_ok = match bound_content {
