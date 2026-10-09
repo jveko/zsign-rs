@@ -1899,4 +1899,62 @@ mod tests {
             Some(RequirementVerdict::Violated)
         );
     }
+    /// Rewrite the team-id string in every CodeDirectory (same byte length).
+    fn tamper_cd_team_id(signed: &mut [u8], new_team: &str) {
+        let m = MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let sb = signed[sig_off..sig_off + sig_len].to_vec();
+        let count = u32::from_be_bytes(sb[8..12].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = 12 + i * 8;
+            let slot = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
+            if slot != CSSLOT_CODEDIRECTORY && slot != CSSLOT_ALTERNATE_CODEDIRECTORIES {
+                continue;
+            }
+            let cd = sig_off + u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize;
+            let team_off =
+                u32::from_be_bytes(signed[cd + 48..cd + 52].try_into().unwrap()) as usize;
+            assert!(team_off != 0, "fixture must carry a CD team id");
+            let at = cd + team_off;
+            let old_len = signed[at..].iter().position(|&b| b == 0).unwrap();
+            assert_eq!(old_len, new_team.len(), "same-length team-id tamper");
+            signed[at..at + old_len].copy_from_slice(new_team.as_bytes());
+        }
+    }
+
+    #[test]
+    fn code_directory_team_id_must_match_signer_organizational_unit() {
+        let creds = crate::macho::fixtures::test_signing_credentials();
+        let signed = sign_round_trip(&creds, "com.example");
+
+        // Baseline: CD team id equals the signer's OU ("TESTTEAM") — no finding.
+        let base = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            base.slices[0]
+                .errors
+                .iter()
+                .all(|e| !e.contains("does not match signing certificate organizational unit")),
+            "matching team id must not trigger the binding check: {:?}",
+            base.slices[0].errors
+        );
+
+        // Tamper both CDs: claim a different team than the signing certificate.
+        let mut tampered = sign_round_trip(&creds, "com.example");
+        tamper_cd_team_id(&mut tampered, "EVILTEAM");
+        let report = verify_macho(&tampered, &SignatureInputs::none()).unwrap();
+        assert!(
+            !report.is_valid(),
+            "mismatched team id must fail verification: {:?}",
+            report.slices[0].errors
+        );
+        assert!(
+            report.slices[0].errors.iter().any(|e| e.contains(
+                "code directory team identifier EVILTEAM does not match signing certificate organizational unit TESTTEAM"
+            )),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+    }
 }
