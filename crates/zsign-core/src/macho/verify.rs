@@ -1747,4 +1747,115 @@ mod tests {
         assert!(report.is_valid(), "{:?}", report.slices[0].errors);
         assert_eq!(report.error_count(), 0, "{:?}", report.slices[0].errors);
     }
+    fn certfield_dr_blob(cn: &str) -> Vec<u8> {
+        // op=11 (opCertField, unimplemented — the parse catch-all returns
+        // Unsupported without consuming operands); remaining words are filler
+        // mirroring ident_dr_blob's shape: certIndex 0 (leaf), key "subject.CN",
+        // match op 1, value = cn.
+        let mut expr = 11u32.to_be_bytes().to_vec();
+        expr.extend_from_slice(&0u32.to_be_bytes());
+        let key = b"subject.CN";
+        expr.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        expr.extend_from_slice(key);
+        expr.extend_from_slice(&1u32.to_be_bytes());
+        expr.extend_from_slice(&(cn.len() as u32).to_be_bytes());
+        expr.extend_from_slice(cn.as_bytes());
+        while !expr.len().is_multiple_of(4) {
+            expr.push(0);
+        }
+        let child_len = 12 + expr.len();
+        let total = 0x14 + child_len;
+        let mut b = Vec::with_capacity(total);
+        b.extend_from_slice(&CSMAGIC_REQUIREMENTS.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&3u32.to_be_bytes()); // CSREQ_DESIGNATED
+        b.extend_from_slice(&0x14u32.to_be_bytes());
+        b.extend_from_slice(&CSMAGIC_REQUIREMENT.to_be_bytes());
+        b.extend_from_slice(&(child_len as u32).to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // exprForm
+        b.extend_from_slice(&expr);
+        b
+    }
+
+    fn tamper_cd_identifiers(signed: &mut [u8], new_ident: &str) {
+        let m = MachOFile::parse(signed.to_vec()).unwrap();
+        let sl = &m.slices()[0];
+        let sig_off = sl.code_sig_offset.unwrap() as usize;
+        let sig_len = sl.code_sig_size.unwrap() as usize;
+        let sb = signed[sig_off..sig_off + sig_len].to_vec();
+        let count = u32::from_be_bytes(sb[8..12].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = 12 + i * 8;
+            let slot = u32::from_be_bytes(sb[e..e + 4].try_into().unwrap());
+            if slot != CSSLOT_CODEDIRECTORY && slot != CSSLOT_ALTERNATE_CODEDIRECTORIES {
+                continue;
+            }
+            let cd = sig_off + u32::from_be_bytes(sb[e + 4..e + 8].try_into().unwrap()) as usize;
+            let ident_off =
+                u32::from_be_bytes(signed[cd + 20..cd + 24].try_into().unwrap()) as usize;
+            let at = cd + ident_off;
+            let old_len = signed[at..].iter().position(|&b| b == 0).unwrap();
+            assert_eq!(old_len, new_ident.len(), "same-length identifier tamper");
+            signed[at..at + old_len].copy_from_slice(new_ident.as_bytes());
+        }
+    }
+
+    #[test]
+    fn unimplemented_designated_requirement_opcode_is_invalid() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut signed, &certfield_dr_blob("Whatever"));
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            !report.is_valid(),
+            "an unevaluable designated requirement must not verify clean: {:?}",
+            report.slices[0].errors
+        );
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("designated requirement not fully evaluated")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+        assert!(
+            report.slices[0]
+                .warnings
+                .iter()
+                .all(|w| !w.contains("designated requirement not fully evaluated")),
+            "must not be a warning: {:?}",
+            report.slices[0].warnings
+        );
+    }
+
+    #[test]
+    fn tampered_identifier_under_unimplemented_requirement_is_invalid() {
+        let macho = MachOFile::parse(make_minimal_macho()).unwrap();
+        let mut signed =
+            sign_macho_adhoc(&macho, "com.example.dr", None, None, None, false).unwrap();
+        replace_requirements_child(&mut signed, &certfield_dr_blob("Whatever"));
+        tamper_cd_identifiers(&mut signed, "com.evil.plz12");
+        let report = verify_macho(&signed, &SignatureInputs::none()).unwrap();
+        assert!(
+            !report.is_valid(),
+            "a tampered identity must never verify valid: {:?}",
+            report.slices[0].errors
+        );
+        assert!(
+            report.slices[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("designated requirement not fully evaluated")),
+            "errors: {:?}",
+            report.slices[0].errors
+        );
+        assert_eq!(
+            report.slices[0].identifier.as_deref(),
+            Some("com.evil.plz12"),
+            "the report must surface the bytes actually present"
+        );
+    }
 }
