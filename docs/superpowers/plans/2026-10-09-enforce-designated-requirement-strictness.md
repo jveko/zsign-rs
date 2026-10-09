@@ -14,7 +14,7 @@
 
 - No ticket IDs anywhere: code, comments, commit subjects/bodies, docs, messages.
 - Commits: conventional format `type(scope): subject`, imperative mood, lowercase, no trailing period. Commit, never push. The controller commits; implementers never commit.
-- Files that may change: `crates/zsign-core/src/macho/verify.rs`, `crates/zsign-core/src/crypto/cms_verify.rs`, `crates/zsign-core/src/crypto/cert.rs` (visibility of `extract_team_id` only), `crates/zsign-cli/src/main.rs`. Nothing else — NOT `macho/signer.rs`, NOT `codesign/superblob.rs`, NOT `macho/parser.rs`, NOT `crates/zsign/src/bundle/code_resources.rs`, NOT `crypto/pkcs12.rs`, NOT `codesign/verify.rs`.
+- Files that may change: `crates/zsign-core/src/macho/verify.rs`, `crates/zsign-core/src/crypto/cms_verify.rs`, `crates/zsign-core/src/crypto/cert.rs` (visibility of `extract_team_id` only), `crates/zsign-cli/src/main.rs`, `crates/zsign-core/src/macho/fixtures.rs` (the CANON leaf subject line only — Task 4's invariant restore). Nothing else — NOT `macho/signer.rs`, NOT `codesign/superblob.rs`, NOT `macho/parser.rs`, NOT `crates/zsign/src/bundle/code_resources.rs`, NOT `crypto/pkcs12.rs`, NOT `codesign/verify.rs`.
 - Exact messages (substring-asserted by tests, wording fixed):
   - `designated requirement not fully evaluated: {why}` — moves from `warnings` to `errors`; wording unchanged.
   - `designated requirement not satisfied` — unchanged, stays in `errors`.
@@ -242,7 +242,7 @@ Commit message: `fix(macho): fail closed on unevaluable designated requirement`
 - Modify: `crates/zsign-core/src/macho/verify.rs` — inline `mod tests`.
 
 **Interfaces:**
-- Consumes: `sign_round_trip(&test_signing_credentials(), ident)` (test module :599, fixture cert subject `CN=zsign roundtrip,OU=TESTTEAM`), `verify_macho`, `MachOFile::parse`, the CD/superblob helpers.
+- Consumes: `sign_round_trip(&test_signing_credentials(), ident)` (test module :599; its credentials hardcode `team_id = Some("TESTTEAM")` at `macho/fixtures.rs:849`, so the emitted CDs carry the string), `verify_macho`, `MachOFile::parse`, the CD/superblob helpers. (The fixture cert subject gains `OU=TESTTEAM` in Task 4 so the signer's OU equals the CD team id at baseline.)
 - Produces: helper `tamper_cd_team_id` and test `code_directory_team_id_must_match_signer_organizational_unit`. Uses only pre-existing API so it compiles red (the binding error does not exist yet). Task 4 must make it pass without changing its meaning; the single additive assertion in Task 4 Step 4 is the only permitted edit.
 
 - [ ] **Step 1: Write the failing test plus helper**
@@ -403,7 +403,17 @@ if let (Some(cd_team), Some(signer_ou)) = (
 
 Do not touch the surrounding blocks (anchored computation, cdhashes, requirements evaluation, cross-CD checks).
 
-- [ ] **Step 4: Add the vacuity assertion to Task 3's test**
+- [ ] **Step 4: Restore the fixture team invariant**
+
+In `crates/zsign-core/src/macho/fixtures.rs`, `build_test_signing_credentials` (:821), change the subject:
+
+```rust
+let subject = Name::from_str("CN=zsign verify test,OU=TESTTEAM").unwrap();
+```
+
+This fixture hardcodes `team_id: Some("TESTTEAM")` (:849) while its cert carried no OU — inconsistent with production, where `credentials.team_id` is `extract_team_id(certificate)`. With the OU present, `extract_team_id` yields `TESTTEAM`, so the vacuity assertion in Step 5 passes and the baseline produces no binding finding. This is the only permitted change in `fixtures.rs`; no other fixture, DN string, or assertion may change.
+
+- [ ] **Step 5: Add the vacuity assertion to Task 3's test**
 
 In `code_directory_team_id_must_match_signer_organizational_unit`, inside the baseline block, assert the plumbing is real:
 
@@ -415,22 +425,22 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 5: Run the task tests**
+- [ ] **Step 6: Run the task tests**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core --lib code_directory_team_id_must_match`
 Expected: PASS. Paste output.
 
-- [ ] **Step 6: Run the full crate suite**
+- [ ] **Step 7: Run the full crate suite**
 
 Run: `TMPDIR=$PWD/target/tmp cargo test -p zsign-core`
 Expected: all pass — the binding check must add **no** finding to any fixture where CD team and cert OU match: `verify_signed_binary_round_trip` keeps asserting exactly one error (`not anchored to a trusted root`). Paste the summary line.
 
-- [ ] **Step 7: Scoped gates**
+- [ ] **Step 8: Scoped gates**
 
 Run: `cargo fmt --all -- --check` and `cargo clippy -p zsign-core --all-targets -- -D warnings`
 Expected: both clean.
 
-- [ ] **Step 8: Controller commits**
+- [ ] **Step 9: Controller commits**
 
 Commit message: `fix(verify): bind code directory team identifier to signer ou`
 

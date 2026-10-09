@@ -99,10 +99,16 @@ Verified against Apple open-source, man pages, and tech notes:
   :874-875) and `credentials.team_id` is `extract_team_id(certificate)`
   (`crypto/cert.rs:638`, :832) — CD team and leaf-cert OU are the same value
   by construction.
-- The verify fixture's certificate carries `OU=TESTTEAM`
-  (`macho/fixtures.rs:780`), so a binding test can rewrite the CD team string
-  in place (`teamOffset` is the big-endian u32 at CD byte 48,
-  `codesign/verify.rs:639-642`, `code_directory.rs:679`).
+- The verify fixture's certificate (`macho/fixtures.rs:821`) hardcoded
+  `team_id: Some("TESTTEAM")` while its subject carried **no OU** — an
+  inconsistency with production, where `credentials.team_id` is always
+  `extract_team_id(certificate)` (`crypto/cert.rs:638`, :832). Task 4
+  restores the invariant by adding `OU=TESTTEAM` to the leaf subject
+  (precedent: every other code-signing fixture in the repo, e.g.
+  `zsign/src/test_util.rs:36`, carries `,OU=TESTTEAM`). A binding test can
+  then rewrite the CD team string in place (`teamOffset` is the big-endian
+  u32 at CD byte 48, `codesign/verify.rs:639-642`,
+  `code_directory.rs:679`).
 - `adhoc_report()` builds on `..default()`
   (`crypto/cms_verify.rs:447-452`); the first signer claims the report
   scalars whether or not it validated (`cms_verify.rs:1280-1282`), so a
