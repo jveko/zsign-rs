@@ -6,7 +6,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use zsign_rs::codesign::verify::{PageCheck, SpecialSlotCheck};
+use zsign_rs::codesign::verify::{PageCheck, RequirementVerdict, SpecialSlotCheck};
 use zsign_rs::crypto::revocation::RevocationStatus;
 use zsign_rs::verify::MachOVerifyReport;
 use zsign_rs::{SigningCredentials, ZSign};
@@ -836,6 +836,7 @@ struct SliceDto {
     cms: Option<CmsDto>,
     errors: Vec<String>,
     warnings: Vec<String>,
+    requirement_status: RequirementStatusDto,
 }
 
 impl From<&zsign_rs::verify::SliceVerifyReport> for SliceDto {
@@ -860,6 +861,12 @@ impl From<&zsign_rs::verify::SliceVerifyReport> for SliceDto {
             cms: slice.cms.as_ref().map(CmsDto::from),
             errors: slice.errors.clone(),
             warnings: slice.warnings.clone(),
+            requirement_status: match &slice.requirement_status {
+                None => RequirementStatusDto::Absent,
+                Some(RequirementVerdict::Satisfied) => RequirementStatusDto::Satisfied,
+                Some(RequirementVerdict::Violated) => RequirementStatusDto::Violated,
+                Some(RequirementVerdict::Unsupported(_)) => RequirementStatusDto::NotEvaluated,
+            },
         }
     }
 }
@@ -914,6 +921,15 @@ impl From<&SpecialSlotCheck> for SlotCheckDto {
             SpecialSlotCheck::Missing => Self::Missing,
         }
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequirementStatusDto {
+    Absent,
+    Satisfied,
+    Violated,
+    NotEvaluated,
 }
 
 #[derive(serde::Serialize)]
@@ -1476,6 +1492,10 @@ mod tests {
         assert_eq!(
             doc["report"]["macho"]["slices"][0]["cms"]["no_signature"],
             true
+        );
+        assert_eq!(
+            doc["report"]["macho"]["slices"][0]["requirement_status"], "absent",
+            "the signed fixture carries no designated requirement"
         );
 
         let bad = run_cli(
