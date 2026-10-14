@@ -20,7 +20,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: wasm-pack
       - name: Build wasm package for examples/web
